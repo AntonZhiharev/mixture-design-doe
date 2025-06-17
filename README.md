@@ -332,9 +332,72 @@ model_formula <- ~ X1 + X2 + X3 + I(X1^2) + I(X2^2) + I(X3^2) + X1:X2 + X1:X3 + 
 model_formula <- ~ X1 + X2 + I(X1^2) + I(X2^2) + I(X1^3) + I(X2^3) + X1:X2
 ```
 
-### Design Evaluation Metrics
+### Understanding Design Efficiency Metrics
+
+#### D-Efficiency: What Does It Mean?
+
+**D-Efficiency** measures how well your experimental design estimates model parameters compared to the theoretical best possible design.
+
+```
+D-Efficiency = (det(X'X)/n)^(1/p) / (det(X'X)_optimal/n)^(1/p)
+```
+
+Where:
+- `X` = your design matrix
+- `n` = number of runs  
+- `p` = number of parameters in your model
+- `det(X'X)_optimal` = determinant for the theoretically optimal design
+
+#### How to Interpret D-Efficiency Values:
+
+- **D-Efficiency = 1.00 (100%)**: Perfect! Your design is theoretically optimal
+- **D-Efficiency = 0.90 (90%)**: Excellent - Only 11% more runs needed vs. optimal
+- **D-Efficiency = 0.80 (80%)**: Good - About 25% more runs needed vs. optimal  
+- **D-Efficiency = 0.70 (70%)**: Acceptable - About 43% more runs needed vs. optimal
+- **D-Efficiency = 0.50 (50%)**: Poor - You need 2x more runs vs. optimal design
+
+#### Practical Example:
+
+```python
+# Check your design efficiency
+d_results = doe.evaluate_design(d_optimal_design, model_order=2)
+print(f"D-efficiency: {d_results['d_efficiency']:.4f}")
+
+# If D-efficiency = 0.85, this means:
+# - Your design achieves 85% of theoretical optimum
+# - You need about 17% more runs than the perfect design
+# - Still very good for practical use!
+```
+
+#### Other Efficiency Metrics:
+
+- **I-Efficiency**: How well your design predicts responses
+  - Higher = better prediction accuracy across design space
+  - Important when you want to map response surfaces
+
+- **A-Efficiency**: Based on trace of covariance matrix
+  - Measures average variance of parameter estimates
+  - Alternative to D-efficiency with different weighting
+
+- **Condition Number**: Design numerical stability
+  - Lower = more stable/robust design
+  - High values (>1000) indicate potential numerical problems
+
+#### When to Care About Efficiency:
+
+**High Efficiency Needed (>0.80):**
+- Expensive experiments (time/cost)
+- Limited resources/materials
+- Regulatory studies requiring precision
+
+**Moderate Efficiency OK (0.60-0.80):**
+- Screening experiments
+- Exploratory studies
+- When practical constraints limit design flexibility
+
+#### Design Evaluation Metrics Summary
 - **D-efficiency**: Measure of parameter estimation precision
-- **I-efficiency**: Measure of prediction accuracy
+- **I-efficiency**: Measure of prediction accuracy  
 - **Condition number**: Measure of design stability
 - **A-efficiency**: Measure based on trace criterion
 

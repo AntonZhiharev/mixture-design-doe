@@ -139,20 +139,77 @@ After generating your optimal design and collecting experimental data, use our c
 - **`response_analysis.py`** - Complete statistical analysis framework
 - **`tutorial_response_analysis.py`** - Step-by-step tutorial with real examples
 
+### Loading Data from Files
+
+Most commonly, you'll have your DOE design and experimental results in spreadsheet files. Here's how to load and prepare your data:
+
+#### From CSV Files
+
+```python
+import pandas as pd
+import numpy as np
+from response_analysis import DOEResponseAnalysis, MixtureResponseAnalysis
+
+# Option 1: DOE design and responses in separate files
+design_df = pd.read_csv('doe_design.csv')
+responses_df = pd.read_csv('experimental_results.csv')
+
+# Extract design matrix and responses
+experimental_design = design_df[['Temperature', 'Pressure', 'pH']].values
+experimental_responses = responses_df['Yield'].values
+
+# Option 2: Everything in one file
+data_df = pd.read_csv('complete_experimental_data.csv')
+# Example file structure:
+# Run, Temperature, Pressure, pH, Yield, Purity, Cost
+# 1,    80,         2,        6,   72.5,  98.2,   45.3
+# 2,    120,        2,        6,   78.2,  97.8,   48.1
+
+experimental_design = data_df[['Temperature', 'Pressure', 'pH']].values
+experimental_responses = data_df['Yield'].values  # or 'Purity', 'Cost', etc.
+```
+
+#### From Excel Files
+
+```python
+# Read from Excel
+data_df = pd.read_excel('experimental_data.xlsx', sheet_name='Results')
+
+# Extract design and responses
+experimental_design = data_df[['Factor1', 'Factor2', 'Factor3']].values
+experimental_responses = data_df['Response'].values
+
+# Handle multiple responses
+yield_responses = data_df['Yield'].values
+purity_responses = data_df['Purity'].values
+cost_responses = data_df['Cost'].values
+```
+
+#### Data Preparation
+
+```python
+# Convert to coded units if needed (for statistical analysis)
+def convert_to_coded_units(real_values, low_value, high_value):
+    """Convert real factor values to coded units (-1 to +1)"""
+    center = (high_value + low_value) / 2
+    half_range = (high_value - low_value) / 2
+    return (real_values - center) / half_range
+
+# Example: Convert temperature from 80-120°C to -1 to +1
+temp_coded = convert_to_coded_units(experimental_design[:, 0], 80, 120)
+press_coded = convert_to_coded_units(experimental_design[:, 1], 2, 4)
+pH_coded = convert_to_coded_units(experimental_design[:, 2], 6, 8)
+
+coded_design = np.column_stack([temp_coded, press_coded, pH_coded])
+```
+
 ### Quick Start: Response Analysis
 
 ```python
 from response_analysis import DOEResponseAnalysis, MixtureResponseAnalysis
 
-# After running your experiments with the generated design
-experimental_design = np.array([
-    [80, 2, 6],    # Temperature, Pressure, pH (Run 1)
-    [120, 2, 6],   # Temperature, Pressure, pH (Run 2)
-    # ... more experimental runs
-])
-
-# Your experimental results (what you measured in the lab)
-experimental_responses = np.array([72.5, 78.2, 75.1, ...])  # Yields, strengths, etc.
+# After loading your data from files (see above)
+# experimental_design and experimental_responses are now loaded
 
 # Create analyzer
 analyzer = DOEResponseAnalysis(

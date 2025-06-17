@@ -130,6 +130,22 @@ if design_type == "Regular DOE":
         
         # Design settings
         n_runs = st.number_input("Number of Experimental Runs", min_value=5, max_value=100, value=15)
+        
+        # Add replicates option
+        st.write("**Replication Settings:**")
+        n_replicates = st.number_input(
+            "Number of Replicates per Run", 
+            min_value=1, max_value=10, value=1,
+            help="Each unique experimental condition will be repeated this many times"
+        )
+        
+        # Show total experiments
+        total_experiments = n_runs * n_replicates
+        if n_replicates > 1:
+            st.info(f"Total experiments: {n_runs} runs × {n_replicates} replicates = **{total_experiments}** experiments")
+        else:
+            st.info(f"Total experiments: **{total_experiments}** (no replicates)")
+        
         model_order = st.selectbox("Model Order", [1, 2], index=1, format_func=lambda x: f"{'Linear' if x==1 else 'Quadratic'}")
         criterion = st.selectbox("Optimality Criterion", ["D-optimal", "I-optimal"])
         random_seed = st.number_input("Random Seed (for reproducibility)", value=42)
@@ -152,10 +168,27 @@ if design_type == "Regular DOE":
                     # Evaluate design
                     results = doe.evaluate_design(design, model_order)
                     
+                    # Generate replicated design if requested
+                    if n_replicates > 1:
+                        replicated_design = []
+                        for run in design:
+                            for _ in range(n_replicates):
+                                replicated_design.append(run)
+                        replicated_design = np.array(replicated_design)
+                        
+                        # Evaluate replicated design
+                        replicated_results = doe.evaluate_design(replicated_design, model_order)
+                    else:
+                        replicated_design = design
+                        replicated_results = results
+                    
                     # Store in session state
                     st.session_state.regular_design = design
                     st.session_state.regular_results = results
                     st.session_state.regular_factor_names = factor_names
+                    st.session_state.n_replicates = n_replicates
+                    st.session_state.replicated_design = replicated_design
+                    st.session_state.replicated_results = replicated_results
                     
                     st.success("✅ Design generated successfully!")
                     
@@ -176,6 +209,85 @@ if design_type == "Regular DOE":
                 st.metric("I-Efficiency", f"{results['i_efficiency']:.4f}")
             with col_c:
                 st.metric("Runs", results['n_runs'])
+            
+            # Show replication impact if replicates were requested
+            if 'n_replicates' in st.session_state and st.session_state.n_replicates > 1:
+                n_replicates = st.session_state.n_replicates
+                replicated_results = st.session_state.replicated_results
+                
+                st.subheader("📊 Impact of Replicates on Design Efficiency")
+                
+                # Create comparison
+                comparison_data = {
+                    'Design': ['Base Design', f'With {n_replicates} Replicates'],
+                    'Total Experiments': [results['n_runs'], replicated_results['n_runs']],
+                    'D-Efficiency': [results['d_efficiency'], replicated_results['d_efficiency']],
+                    'I-Efficiency': [results['i_efficiency'], replicated_results['i_efficiency']]
+                }
+                comparison_df = pd.DataFrame(comparison_data)
+                
+                # Display comparison table
+                st.dataframe(comparison_df.round(4))
+                
+                # Efficiency improvement metrics
+                d_improvement = replicated_results['d_efficiency'] / results['d_efficiency']
+                i_improvement = replicated_results['i_efficiency'] / results['i_efficiency']
+                
+                col_d, col_i = st.columns(2)
+                with col_d:
+                    if d_improvement > 1:
+                        st.success(f"D-Efficiency improved by {((d_improvement-1)*100):.1f}%")
+                    else:
+                        st.info(f"D-Efficiency ratio: {d_improvement:.3f}")
+                
+                with col_i:
+                    if i_improvement > 1:
+                        st.success(f"I-Efficiency improved by {((i_improvement-1)*100):.1f}%")
+                    else:
+                        st.info(f"I-Efficiency ratio: {i_improvement:.3f}")
+                
+                # Explanation
+                with st.expander("💡 Understanding Replication Effects"):
+                    st.markdown(f"""
+                    **Key Insights:**
+                    
+                    🔍 **Base Design:** {results['n_runs']} unique experimental conditions
+                    🔄 **With Replicates:** {replicated_results['n_runs']} total experiments ({n_replicates} × {results['n_runs']})
+                    
+                    **Why Replicates Matter:**
+                    - **Error Estimation**: Replicates allow you to estimate pure experimental error
+                    - **Improved Precision**: More data points → better parameter estimates
+                    - **Statistical Power**: Higher confidence in your results
+                    - **Lack-of-Fit Testing**: Can detect if your model is adequate
+                    
+                    **Trade-offs:**
+                    - ✅ **Pros**: Better precision, error estimation, validation capability
+                    - ⚠️ **Cons**: More experiments = higher cost and time
+                    
+                    **Recommendation**: 
+                    - Use 2-3 replicates for critical experiments
+                    - Use 1 replicate for screening studies
+                    - Consider center point replicates for pure error estimation
+                    """)
+                
+                # Visualization of efficiency comparison
+                fig = make_subplots(rows=1, cols=2, 
+                                  subplot_titles=['D-Efficiency', 'I-Efficiency'])
+                
+                fig.add_trace(
+                    go.Bar(x=comparison_df['Design'], y=comparison_df['D-Efficiency'], 
+                          name='D-Efficiency', marker_color='lightblue'),
+                    row=1, col=1
+                )
+                
+                fig.add_trace(
+                    go.Bar(x=comparison_df['Design'], y=comparison_df['I-Efficiency'], 
+                          name='I-Efficiency', marker_color='lightcoral'),
+                    row=1, col=2
+                )
+                
+                fig.update_layout(height=400, title_text="Efficiency Impact of Replicates", showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
             
             st.subheader("Design Matrix")
             design_df = pd.DataFrame(design, columns=factor_names)
@@ -285,6 +397,23 @@ elif design_type == "Mixture Design":
         elif design_method == "Simplex Lattice":
             lattice_degree = st.number_input("Lattice Degree", min_value=2, max_value=5, value=3)
         
+        # Add replicates option for mixture designs
+        st.write("**Replication Settings:**")
+        n_mixture_replicates = st.number_input(
+            "Number of Replicates per Mixture", 
+            min_value=1, max_value=10, value=1,
+            help="Each unique mixture composition will be repeated this many times",
+            key="mixture_replicates"
+        )
+        
+        # Show total experiments for mixtures
+        if design_method in ["D-optimal", "I-optimal"]:
+            total_mixture_experiments = n_runs * n_mixture_replicates
+            if n_mixture_replicates > 1:
+                st.info(f"Total experiments: {n_runs} mixtures × {n_mixture_replicates} replicates = **{total_mixture_experiments}** experiments")
+            else:
+                st.info(f"Total experiments: **{total_mixture_experiments}** (no replicates)")
+        
         random_seed = st.number_input("Random Seed", value=42, key="mixture_seed")
         
         generate_mixture_button = st.button("🧬 Generate Mixture Design", type="primary")
@@ -313,11 +442,28 @@ elif design_type == "Mixture Design":
                         design = mixture.generate_extreme_vertices()
                         results = mixture.evaluate_mixture_design(design, "quadratic")
                     
+                    # Generate replicated mixture design if requested
+                    if n_mixture_replicates > 1:
+                        replicated_mixture_design = []
+                        for mixture_run in design:
+                            for _ in range(n_mixture_replicates):
+                                replicated_mixture_design.append(mixture_run)
+                        replicated_mixture_design = np.array(replicated_mixture_design)
+                        
+                        # Evaluate replicated mixture design
+                        replicated_mixture_results = mixture.evaluate_mixture_design(replicated_mixture_design, model_type if design_method in ["D-optimal", "I-optimal"] else "quadratic")
+                    else:
+                        replicated_mixture_design = design
+                        replicated_mixture_results = results
+                    
                     # Store in session state
                     st.session_state.mixture_design = design
                     st.session_state.mixture_results = results
                     st.session_state.mixture_component_names = component_names
                     st.session_state.mixture_generator = mixture
+                    st.session_state.n_mixture_replicates = n_mixture_replicates
+                    st.session_state.replicated_mixture_design = replicated_mixture_design
+                    st.session_state.replicated_mixture_results = replicated_mixture_results
                     
                     st.success(f"✅ {design_method} mixture design generated successfully!")
                     
@@ -338,6 +484,86 @@ elif design_type == "Mixture Design":
                 st.metric("I-Efficiency", f"{results['i_efficiency']:.4f}")
             with col_c:
                 st.metric("Runs", results['n_runs'])
+            
+            # Show replication impact for mixture designs if replicates were requested
+            if 'n_mixture_replicates' in st.session_state and st.session_state.n_mixture_replicates > 1:
+                n_mixture_replicates = st.session_state.n_mixture_replicates
+                replicated_mixture_results = st.session_state.replicated_mixture_results
+                
+                st.subheader("📊 Impact of Replicates on Mixture Design Efficiency")
+                
+                # Create comparison
+                mixture_comparison_data = {
+                    'Design': ['Base Mixture Design', f'With {n_mixture_replicates} Replicates'],
+                    'Total Experiments': [results['n_runs'], replicated_mixture_results['n_runs']],
+                    'D-Efficiency': [results['d_efficiency'], replicated_mixture_results['d_efficiency']],
+                    'I-Efficiency': [results['i_efficiency'], replicated_mixture_results['i_efficiency']]
+                }
+                mixture_comparison_df = pd.DataFrame(mixture_comparison_data)
+                
+                # Display comparison table
+                st.dataframe(mixture_comparison_df.round(4))
+                
+                # Efficiency improvement metrics
+                mixture_d_improvement = replicated_mixture_results['d_efficiency'] / results['d_efficiency']
+                mixture_i_improvement = replicated_mixture_results['i_efficiency'] / results['i_efficiency']
+                
+                col_d, col_i = st.columns(2)
+                with col_d:
+                    if mixture_d_improvement > 1:
+                        st.success(f"D-Efficiency improved by {((mixture_d_improvement-1)*100):.1f}%")
+                    else:
+                        st.info(f"D-Efficiency ratio: {mixture_d_improvement:.3f}")
+                
+                with col_i:
+                    if mixture_i_improvement > 1:
+                        st.success(f"I-Efficiency improved by {((mixture_i_improvement-1)*100):.1f}%")
+                    else:
+                        st.info(f"I-Efficiency ratio: {mixture_i_improvement:.3f}")
+                
+                # Explanation for mixture replicates
+                with st.expander("💡 Understanding Mixture Replication Effects"):
+                    st.markdown(f"""
+                    **Key Insights for Mixture Experiments:**
+                    
+                    🔍 **Base Design:** {results['n_runs']} unique mixture compositions
+                    🔄 **With Replicates:** {replicated_mixture_results['n_runs']} total experiments ({n_mixture_replicates} × {results['n_runs']})
+                    
+                    **Why Replicates Matter in Mixture Designs:**
+                    - **Blend Variability**: Account for mixing and preparation errors
+                    - **Component Interactions**: Better estimate synergistic/antagonistic effects
+                    - **Process Validation**: Ensure mixture formulations are reproducible
+                    - **Pure Error Estimation**: Separate measurement error from model inadequacy
+                    
+                    **Mixture-Specific Benefits:**
+                    - ✅ **Formulation Robustness**: Test consistency of blend properties
+                    - ✅ **Interaction Detection**: More power to detect component interactions
+                    - ✅ **Scaling Validation**: Verify mixture behavior at different scales
+                    
+                    **Recommendation for Mixtures**: 
+                    - Use 2-3 replicates for formulation development
+                    - Use 3-5 replicates for critical blend validation
+                    - Consider process replicates (different batches) vs. analytical replicates
+                    """)
+                
+                # Visualization of mixture efficiency comparison
+                mixture_fig = make_subplots(rows=1, cols=2, 
+                                          subplot_titles=['D-Efficiency', 'I-Efficiency'])
+                
+                mixture_fig.add_trace(
+                    go.Bar(x=mixture_comparison_df['Design'], y=mixture_comparison_df['D-Efficiency'], 
+                          name='D-Efficiency', marker_color='lightgreen'),
+                    row=1, col=1
+                )
+                
+                mixture_fig.add_trace(
+                    go.Bar(x=mixture_comparison_df['Design'], y=mixture_comparison_df['I-Efficiency'], 
+                          name='I-Efficiency', marker_color='lightsalmon'),
+                    row=1, col=2
+                )
+                
+                mixture_fig.update_layout(height=400, title_text="Mixture Design Efficiency Impact of Replicates", showlegend=False)
+                st.plotly_chart(mixture_fig, use_container_width=True)
             
             st.subheader("Mixture Design Matrix")
             mixture_df = pd.DataFrame(design, columns=component_names)

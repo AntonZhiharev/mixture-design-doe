@@ -130,6 +130,137 @@ generate_fractional_factorial(n_factors, resolution)
 add_center_points(design, n_center)
 ```
 
+## Response Analysis Framework
+
+### Complete Workflow: Design → Experiment → Analyze
+After generating your optimal design and collecting experimental data, use our comprehensive response analysis system to extract insights and optimize your process.
+
+#### Additional Files for Response Analysis
+- **`response_analysis.py`** - Complete statistical analysis framework
+- **`tutorial_response_analysis.py`** - Step-by-step tutorial with real examples
+
+### Quick Start: Response Analysis
+
+```python
+from response_analysis import DOEResponseAnalysis, MixtureResponseAnalysis
+
+# After running your experiments with the generated design
+experimental_design = np.array([
+    [80, 2, 6],    # Temperature, Pressure, pH (Run 1)
+    [120, 2, 6],   # Temperature, Pressure, pH (Run 2)
+    # ... more experimental runs
+])
+
+# Your experimental results (what you measured in the lab)
+experimental_responses = np.array([72.5, 78.2, 75.1, ...])  # Yields, strengths, etc.
+
+# Create analyzer
+analyzer = DOEResponseAnalysis(
+    experimental_design, experimental_responses,
+    factor_names=['Temperature', 'Pressure', 'pH'],
+    response_name='Yield (%)'
+)
+
+# Fit statistical models
+linear_results = analyzer.fit_linear_model()
+quad_results = analyzer.fit_quadratic_model()
+
+print(f"Linear Model R² = {linear_results['r_squared']:.4f}")
+print(f"Quadratic Model R² = {quad_results['r_squared']:.4f}")
+
+# Statistical analysis
+anova_table = analyzer.anova_analysis(linear_results)
+effects = analyzer.effects_analysis(linear_results)
+significant_factors = effects[effects['Significant'] == True]
+
+print("Significant factors (p < 0.05):")
+print(significant_factors)
+
+# Optimize your process
+bounds = [(-1, 1), (-1, 1), (-1, 1)]  # Factor ranges in coded units
+opt_result = analyzer.optimize_response(bounds, maximize=True)
+
+if opt_result['success']:
+    print("Optimal conditions:")
+    for factor, value in opt_result['optimal_factors'].items():
+        print(f"  {factor}: {value:.3f}")
+    print(f"Predicted optimal response: {opt_result['optimal_response']:.2f}")
+
+# Predict new conditions
+new_conditions = np.array([[0.5, -0.5, 0.2], [-0.3, 0.8, -0.1]])
+predictions = analyzer.predict_response(new_conditions)
+print(f"Predictions: {predictions}")
+```
+
+### Mixture Design Analysis
+
+```python
+# For mixture experiments (components sum to 100%)
+mixture_design = np.array([
+    [0.70, 0.20, 0.10],  # 70% A, 20% B, 10% C
+    [0.50, 0.40, 0.10],  # 50% A, 40% B, 10% C
+    # ... more mixture compositions
+])
+
+mixture_responses = np.array([45.2, 52.1, 58.7, ...])  # Measured properties
+
+mixture_analyzer = MixtureResponseAnalysis(
+    mixture_design, mixture_responses,
+    component_names=['Polymer_A', 'Polymer_B', 'Additive'],
+    response_name='Tensile Strength (MPa)'
+)
+
+# Fit Scheffé mixture models
+linear_results = mixture_analyzer.fit_scheffe_linear()
+quad_results = mixture_analyzer.fit_scheffe_quadratic()
+
+print(f"Linear Model R² = {linear_results['r_squared']:.4f}")
+print("Pure component effects:")
+for name, coeff in zip(linear_results['component_names'], linear_results['coefficients']):
+    print(f"  {name}: {coeff:.2f} MPa")
+```
+
+### Complete Tutorial
+
+Run the comprehensive tutorial to see the entire workflow:
+
+```bash
+python tutorial_response_analysis.py
+```
+
+This tutorial shows:
+1. **Data Loading**: How to organize your experimental results
+2. **Model Fitting**: Linear and quadratic model comparison
+3. **Statistical Testing**: ANOVA and significance testing
+4. **Factor Effects**: Identify which factors matter most
+5. **Optimization**: Find optimal process conditions
+6. **Prediction**: Estimate responses for new conditions
+7. **Mixture Analysis**: Handle mixture design constraints
+
+### Analysis Capabilities
+
+#### Statistical Models
+- **Linear models**: Y = β₀ + β₁X₁ + β₂X₂ + ... + ε
+- **Quadratic models**: Includes interactions and squared terms
+- **Scheffé mixture models**: Specialized for mixture experiments
+
+#### Statistical Tests
+- **ANOVA**: Test overall model significance
+- **t-tests**: Individual factor significance (p-values)
+- **R² analysis**: Model fit quality assessment
+- **Residual analysis**: Model assumption validation
+
+#### Optimization Features
+- **Response optimization**: Find conditions for maximum/minimum response
+- **Multi-start optimization**: Robust global optimization
+- **Constraint handling**: Factor bounds and mixture constraints
+- **Prediction intervals**: Uncertainty quantification
+
+#### Visualization
+- **Diagnostic plots**: Residuals, Q-Q plots, scale-location
+- **Response surfaces**: 3D visualization of factor effects
+- **Effects plots**: Bar charts of factor importance
+
 ## Advanced Features
 
 ### Custom Model Formulas (R)

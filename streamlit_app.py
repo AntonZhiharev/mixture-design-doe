@@ -17,8 +17,10 @@ import base64
 try:
     from optimal_doe_python import OptimalDOE, multiple_response_analysis
     from mixture_designs import MixtureDesign, mixture_response_analysis
+    from sequential_doe import SequentialDOE, create_sequential_plan
+    from sequential_mixture_doe import SequentialMixtureDOE
 except ImportError:
-    st.error("Please ensure optimal_doe_python.py and mixture_designs.py are in the same directory")
+    st.error("Please ensure all required files are in the same directory")
     st.stop()
 
 # Page configuration
@@ -64,7 +66,7 @@ st.markdown("**Generate D-optimal, I-optimal, and mixture designs with interacti
 st.sidebar.title("Navigation")
 design_type = st.sidebar.selectbox(
     "Choose Design Type",
-    ["Regular DOE", "Mixture Design", "Compare Designs", "About"]
+    ["Regular DOE", "Mixture Design", "Sequential DOE", "Sequential Mixture DOE", "Compare Designs", "About"]
 )
 
 if design_type == "Regular DOE":
@@ -695,6 +697,1107 @@ elif design_type == "Mixture Design":
                         })
                         
                         st.plotly_chart(fig, use_container_width=True)
+
+elif design_type == "Sequential DOE":
+    st.markdown('<h2 class="sub-header">🔄 Sequential Design of Experiments</h2>', unsafe_allow_html=True)
+    
+    st.info("**Sequential DOE** allows you to start with a screening design (Stage 1), analyze results, and then add targeted experiments (Stage 2) based on what you learned.")
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("Sequential Design Setup")
+        
+        # Number of factors
+        n_factors = st.number_input("Number of Factors", min_value=2, max_value=10, value=6, key="seq_n_factors")
+        
+        # Factor setup
+        st.write("**Factor Details:**")
+        factor_names = []
+        factor_ranges = []
+        
+        for i in range(n_factors):
+            col_a, col_b, col_c = st.columns([2, 1, 1])
+            with col_a:
+                name = st.text_input(f"Factor {i+1} Name", value=f"Factor_{i+1}", key=f"seq_name_{i}")
+                factor_names.append(name)
+            with col_b:
+                min_val = st.number_input(f"Min", value=-1.0, key=f"seq_min_{i}")
+            with col_c:
+                max_val = st.number_input(f"Max", value=1.0, key=f"seq_max_{i}")
+            factor_ranges.append((min_val, max_val))
+        
+        st.write("**Stage Configuration:**")
+        
+        # Get recommendations based on rules of thumb
+        temp_seq_doe = SequentialDOE(n_factors, factor_ranges)
+        seq_recommendations = temp_seq_doe.get_sequential_recommendations()
+        
+        # Quality level selection
+        quality_level = st.selectbox(
+            "Experiment Quality Level",
+            ["minimum", "recommended", "excellent"],
+            index=1,  # Default to recommended
+            help="Minimum: 1x parameters | Recommended: 1.5x parameters | Excellent: 2x parameters"
+        )
+        
+        # Stage 1 settings
+        with st.expander("Stage 1: Screening", expanded=True):
+            st.write(f"**{seq_recommendations['stage1']['purpose']}**")
+            
+            col_min, col_rec, col_exc = st.columns(3)
+            with col_min:
+                st.metric("Minimum", seq_recommendations['stage1']['minimum'])
+            with col_rec:
+                st.metric("Recommended", seq_recommendations['stage1']['recommended'])
+            with col_exc:
+                st.metric("Excellent", seq_recommendations['stage1']['excellent'])
+            
+            # Set default based on quality level
+            stage1_default = {
+                'minimum': seq_recommendations['stage1']['minimum'],
+                'recommended': seq_recommendations['stage1']['recommended'],
+                'excellent': seq_recommendations['stage1']['excellent']
+            }[quality_level]
+            
+            stage1_runs = st.number_input(
+                "Stage 1 Runs", 
+                min_value=seq_recommendations['stage1']['minimum'], 
+                max_value=50, 
+                value=stage1_default,
+                help=seq_recommendations['stage1']['can_fit']
+            )
+            
+            # Show what can be fitted
+            st.info(f"✓ Can fit: {seq_recommendations['stage1']['can_fit']}")
+            
+            # Show expected efficiency
+            stage1_rec_details = temp_seq_doe.get_recommended_runs(1, quality_level)
+            st.success(f"Expected D-efficiency: {stage1_rec_details['efficiency_expected']}")
+        
+        # Stage 2 settings
+        with st.expander("Stage 2: Optimization", expanded=True):
+            st.write(f"**{seq_recommendations['stage2']['purpose']}**")
+            
+            # Calculate recommended additional runs
+            quad_params = temp_seq_doe._count_parameters(2)
+            total_recommended = int(np.ceil(quad_params * {'minimum': 1.0, 'recommended': 1.5, 'excellent': 2.0}[quality_level]))
+            stage2_recommended = max(total_recommended - stage1_runs, 5)
+            
+            st.info(f"Based on Stage 1 ({stage1_runs} runs), recommended additional: **{stage2_recommended}** runs")
+            st.info(f"Total experiments: {stage1_runs + stage2_recommended} to fit quadratic model with {quad_params} parameters")
+            
+            stage2_runs = st.number_input(
+                "Stage 2 Additional Runs", 
+                min_value=5, 
+                max_value=50, 
+                value=stage2_recommended,
+                help=f"Additional runs for quadratic model ({quad_params} parameters total)"
+            )
+            
+            # Show total and efficiency
+            total_runs = stage1_runs + stage2_runs
+            run_to_param_ratio = total_runs / quad_params
+            
+            col_total, col_ratio = st.columns(2)
+            with col_total:
+                st.metric("Total Runs", total_runs)
+            with col_ratio:
+                st.metric("Run/Parameter Ratio", f"{run_to_param_ratio:.2f}")
+                
+            if run_to_param_ratio < 1.0:
+                st.error("⚠️ Not enough runs to fit quadratic model!")
+            elif run_to_param_ratio < 1.5:
+                st.warning("⚠️ Minimum runs - expect 70-80% efficiency")
+            elif run_to_param_ratio < 2.0:
+                st.success("✓ Good coverage - expect 85-95% efficiency")
+            else:
+                st.success("✓ Excellent coverage - expect 95-99% efficiency")
+            
+            # Focus region option
+            use_focus = st.checkbox("Focus on specific region", value=True)
+            if use_focus:
+                st.write("**Focus Region (after Stage 1 analysis):**")
+                focus_factors = st.multiselect(
+                    "Factors to focus on", 
+                    options=factor_names,
+                    default=factor_names[:2] if len(factor_names) >= 2 else factor_names
+                )
+        
+        # Show benefits of sequential approach
+        with st.expander("💡 Why Sequential DOE?", expanded=False):
+            st.markdown("### Benefits of Sequential Approach:")
+            for benefit in seq_recommendations['benefits']:
+                st.write(f"• {benefit}")
+        
+        random_seed = st.number_input("Random Seed", value=42, key="seq_seed")
+        
+        # Response names
+        n_responses = st.number_input("Number of Responses", min_value=1, max_value=5, value=3, key="seq_n_resp")
+        response_names = []
+        for i in range(n_responses):
+            resp_name = st.text_input(f"Response {i+1} Name", value=f"Response_{i+1}", key=f"seq_resp_{i}")
+            response_names.append(resp_name)
+        
+        generate_sequential = st.button("🔄 Generate Sequential Plan", type="primary")
+    
+    with col2:
+        if generate_sequential:
+            with st.spinner("Generating sequential DOE plan..."):
+                try:
+                    # Create sequential DOE generator
+                    seq_doe = SequentialDOE(n_factors, factor_ranges)
+                    
+                    # Generate Stage 1 (screening)
+                    stage1_design = seq_doe.generate_d_optimal(
+                        n_runs=stage1_runs, 
+                        model_order=1,  # Linear for screening
+                        random_seed=random_seed
+                    )
+                    
+                    # Prepare focus region if selected
+                    focus_region = None
+                    if use_focus and focus_factors:
+                        # Create focus region centered around midpoints
+                        focus_indices = [factor_names.index(f) for f in focus_factors]
+                        focus_ranges = []
+                        for idx in focus_indices:
+                            min_val, max_val = factor_ranges[idx]
+                            center = (min_val + max_val) / 2
+                            width = (max_val - min_val) * 0.6  # Focus on 60% of range
+                            focus_ranges.append((center - width/2, center + width/2))
+                        
+                        focus_region = {
+                            'factor_indices': focus_indices,
+                            'ranges': focus_ranges
+                        }
+                    
+                    # Generate Stage 2 (augmentation)
+                    stage2_design = seq_doe.augment_design(
+                        stage1_design,
+                        n_additional_runs=stage2_runs,
+                        model_order=2,  # Quadratic for optimization
+                        criterion="D-optimal",
+                        focus_region=focus_region,
+                        random_seed=random_seed + 1
+                    )
+                    
+                    # Store in session state
+                    st.session_state.seq_doe = seq_doe
+                    st.session_state.stage1_design = stage1_design
+                    st.session_state.stage2_design = stage2_design
+                    st.session_state.seq_factor_names = factor_names
+                    st.session_state.seq_response_names = response_names
+                    
+                    st.success("✅ Sequential DOE plan generated!")
+                    
+                except Exception as e:
+                    st.error(f"Error generating sequential design: {str(e)}")
+        
+        # Display results if available
+        if 'seq_doe' in st.session_state:
+            seq_doe = st.session_state.seq_doe
+            stage1_design = st.session_state.stage1_design
+            stage2_design = st.session_state.stage2_design
+            factor_names = st.session_state.seq_factor_names
+            response_names = st.session_state.seq_response_names
+            
+            # Efficiency analysis
+            st.subheader("📊 Sequential Efficiency Analysis")
+            
+            # Evaluate designs
+            stage1_eval_linear = seq_doe.evaluate_design(stage1_design, model_order=1)
+            stage1_eval_quad = seq_doe.evaluate_design(stage1_design, model_order=2)
+            
+            combined_design = np.vstack([stage1_design, stage2_design])
+            combined_eval_linear = seq_doe.evaluate_design(combined_design, model_order=1)
+            combined_eval_quad = seq_doe.evaluate_design(combined_design, model_order=2)
+            
+            # Create efficiency comparison
+            efficiency_data = []
+            
+            efficiency_data.append({
+                'Stage': 'Stage 1 Only',
+                'Total Runs': len(stage1_design),
+                'Linear D-Eff': stage1_eval_linear['d_efficiency'],
+                'Quadratic D-Eff': stage1_eval_quad['d_efficiency'],
+                'Can Fit': 'Linear model ✓'
+            })
+            
+            efficiency_data.append({
+                'Stage': 'Stage 1 + 2',
+                'Total Runs': len(combined_design),
+                'Linear D-Eff': combined_eval_linear['d_efficiency'],
+                'Quadratic D-Eff': combined_eval_quad['d_efficiency'],
+                'Can Fit': 'Full quadratic model ✓'
+            })
+            
+            efficiency_df = pd.DataFrame(efficiency_data)
+            st.dataframe(efficiency_df.round(4))
+            
+            # Visualization
+            fig = go.Figure()
+            
+            # Stage progression
+            stages = ['Stage 1', 'Stage 1+2']
+            runs = [len(stage1_design), len(combined_design)]
+            linear_eff = [stage1_eval_linear['d_efficiency'], combined_eval_linear['d_efficiency']]
+            quad_eff = [stage1_eval_quad['d_efficiency'], combined_eval_quad['d_efficiency']]
+            
+            fig.add_trace(go.Scatter(
+                x=runs, y=linear_eff,
+                mode='lines+markers',
+                name='Linear D-Efficiency',
+                line=dict(color='blue', width=2),
+                marker=dict(size=10)
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=runs, y=quad_eff,
+                mode='lines+markers',
+                name='Quadratic D-Efficiency',
+                line=dict(color='red', width=2),
+                marker=dict(size=10)
+            ))
+            
+            # Add stage labels
+            for i, (r, stage) in enumerate(zip(runs, stages)):
+                fig.add_annotation(x=r, y=0.5, text=stage,
+                                 showarrow=False, yshift=-30)
+            
+            fig.update_layout(
+                title="Efficiency Progression in Sequential DOE",
+                xaxis_title="Total Number of Runs",
+                yaxis_title="D-Efficiency",
+                height=400,
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Display designs
+            st.subheader("📋 Sequential Design Details")
+            
+            tab1, tab2, tab3 = st.tabs(["Stage 1: Screening", "Stage 2: Augmentation", "Combined Design"])
+            
+            with tab1:
+                st.write("**Stage 1: Screening Design** (Linear Model)")
+                stage1_df = pd.DataFrame(stage1_design, columns=factor_names)
+                stage1_df.insert(0, 'Run', range(1, len(stage1_df) + 1))
+                stage1_df.insert(1, 'Stage', 'Screening')
+                
+                # Add response columns
+                for resp in response_names:
+                    stage1_df[resp] = np.nan
+                
+                st.dataframe(stage1_df.round(3))
+                
+                # Download button
+                csv1 = stage1_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Stage 1 Design",
+                    data=csv1,
+                    file_name="stage1_screening.csv",
+                    mime="text/csv"
+                )
+            
+            with tab2:
+                st.write("**Stage 2: Augmentation Design** (For Quadratic Model)")
+                stage2_df = pd.DataFrame(stage2_design, columns=factor_names)
+                stage2_df.insert(0, 'Run', range(len(stage1_df) + 1, len(stage1_df) + len(stage2_df) + 1))
+                stage2_df.insert(1, 'Stage', 'Augmentation')
+                
+                # Add response columns
+                for resp in response_names:
+                    stage2_df[resp] = np.nan
+                
+                st.dataframe(stage2_df.round(3))
+                
+                # Download button
+                csv2 = stage2_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Stage 2 Design",
+                    data=csv2,
+                    file_name="stage2_augmentation.csv",
+                    mime="text/csv"
+                )
+            
+            with tab3:
+                st.write("**Combined Design** (All Experiments)")
+                combined_df = pd.concat([stage1_df, stage2_df], ignore_index=True)
+                st.dataframe(combined_df.round(3))
+                
+                # Download complete plan
+                csv_all = combined_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Complete Sequential Plan",
+                    data=csv_all,
+                    file_name="sequential_doe_complete.csv",
+                    mime="text/csv"
+                )
+            
+            # Workflow guide
+            st.subheader("📚 Sequential DOE Workflow")
+            
+            with st.expander("How to Use Your Sequential Design", expanded=True):
+                st.markdown(f"""
+                ### 🚀 Sequential Experimentation Workflow
+                
+                **Stage 1: Screening ({len(stage1_design)} experiments)**
+                1. Run all Stage 1 experiments
+                2. Record responses for each run
+                3. Analyze results to identify:
+                   - Important factors (large effects)
+                   - Unimportant factors (small effects)
+                   - Promising regions of the design space
+                
+                **Analysis After Stage 1:**
+                - Fit a linear model to identify main effects
+                - Use ANOVA to test factor significance
+                - Create main effects plots
+                - Decide which factors to focus on
+                
+                **Stage 2: Augmentation ({len(stage2_design)} experiments)**
+                1. Based on Stage 1 results, you may:
+                   - Focus on important factors
+                   - Explore promising regions
+                   - Add points for quadratic effects
+                2. Run Stage 2 experiments
+                3. Combine with Stage 1 data
+                
+                **Final Analysis:**
+                - Fit full quadratic model
+                - Test for curvature and interactions
+                - Optimize responses
+                - Validate optimal conditions
+                
+                ### 💡 Benefits of This Approach:
+                - **Efficiency**: {len(combined_design)} total runs vs. {seq_doe._count_parameters(2)} minimum for quadratic
+                - **Flexibility**: Can stop after Stage 1 if linear model sufficient
+                - **Learning**: Stage 2 design informed by Stage 1 results
+                - **Risk Reduction**: Smaller initial investment
+                
+                ### 📊 Model Comparison:
+                - **After Stage 1**: Can fit linear model with {n_factors + 1} parameters
+                - **After Stage 2**: Can fit full quadratic with {seq_doe._count_parameters(2)} parameters
+                """)
+            
+            # Recommendations
+            st.subheader("💡 Recommendations")
+            
+            # Simulate some responses for demonstration
+            np.random.seed(random_seed)
+            simulated_responses = np.random.randn(len(stage1_design))
+            
+            recommendations = seq_doe.recommend_next_stage(
+                stage1_design, 
+                simulated_responses,
+                target_efficiency=0.9
+            )
+            
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("Current D-Efficiency", f"{recommendations['current_efficiency']:.3f}")
+            with col_b:
+                st.metric("Target D-Efficiency", f"{recommendations['target_efficiency']:.3f}")
+            
+            if recommendations['efficiency_gap'] > 0:
+                st.info(f"Stage 2 will improve efficiency by approximately {recommendations['efficiency_gap']:.3f}")
+
+elif design_type == "Sequential Mixture DOE":
+    st.markdown('<h2 class="sub-header">🧬🔄 Sequential Mixture Design</h2>', unsafe_allow_html=True)
+    
+    st.info("**Sequential Mixture DOE** is specifically designed for mixture experiments where components must sum to 100%. It supports fixed components and ensures all values are non-negative.")
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("Mixture Sequential Setup")
+        
+        # Number of variable components
+        n_variable_components = st.number_input(
+            "Number of Variable Components", 
+            min_value=2, 
+            max_value=10, 
+            value=5, 
+            key="seq_mix_n_var_comp",
+            help="Components that will have variable proportions (with bounds)"
+        )
+        
+        # Parts mode selection FIRST (before fixed components)
+        use_parts_mode = st.checkbox(
+            "Use parts instead of proportions", 
+            value=True,
+            help="Parts mode: Specify ALL components in parts (e.g., 1, 0.3, 0.025) which will be normalized to proportions"
+        )
+        
+        # Fixed components setup
+        st.write("**Fixed Components (Optional):**")
+        st.info("Fixed components will be added to your variable components")
+        
+        use_fixed = st.checkbox("Use fixed components", value=False)
+        fixed_component_names = []
+        fixed_components = {}
+        fixed_parts = {}
+        
+        if use_fixed:
+            n_fixed_components = st.number_input(
+                "Number of Fixed Components", 
+                min_value=1, 
+                max_value=5, 
+                value=1, 
+                key="seq_mix_n_fixed_comp"
+            )
+            
+            st.write("**Fixed Component Details:**")
+            for i in range(n_fixed_components):
+                col_a, col_b = st.columns([2, 1])
+                with col_a:
+                    fixed_name = st.text_input(
+                        f"Fixed Component {i+1} Name", 
+                        value=f"Fixed_{i+1}", 
+                        key=f"seq_mix_fixed_name_{i}"
+                    )
+                    fixed_component_names.append(fixed_name)
+                with col_b:
+                    if use_parts_mode:
+                        fixed_val = st.number_input(
+                            f"Value (parts)", 
+                            value=0.05, 
+                            min_value=0.0,
+                            step=0.001,
+                            format="%.3f",
+                            key=f"seq_mix_fixed_parts_{i}"
+                        )
+                        fixed_parts[fixed_name] = fixed_val
+                    else:
+                        fixed_val = st.number_input(
+                            f"Value (proportion)", 
+                            value=0.02, 
+                            min_value=0.0, 
+                            max_value=1.0, 
+                            step=0.01,
+                            key=f"seq_mix_fixed_val_{i}"
+                        )
+                        fixed_components[fixed_name] = fixed_val
+            
+            # Validate fixed components
+            if use_parts_mode and fixed_parts:
+                # In parts mode, we need to estimate proportions
+                # This is approximate since we don't know variable parts yet
+                st.info("Fixed component proportions will be calculated based on total mixture")
+            else:
+                # In proportion mode, validate sum
+                fixed_sum = sum(fixed_components.values())
+                if fixed_sum >= 1.0:
+                    st.error(f"⚠️ Fixed components sum to {fixed_sum:.2f} - no room for variable components!")
+                else:
+                    st.success(f"✅ Fixed components sum to {fixed_sum:.2f}, leaving {1-fixed_sum:.2f} for variable components")
+        
+        # Calculate total number of components
+        n_components = n_variable_components + len(fixed_component_names)
+        
+        # Variable component setup
+        st.write("**Variable Component Details:**")
+        # Store all component names (fixed + variable)
+        all_component_names = fixed_component_names.copy()  # Start with fixed names
+        variable_component_names = []  # Track variable component names separately
+        component_bounds = []
+        component_bounds_parts = []  # Store original parts values
+        
+        # Add bounds for fixed components first (they have fixed bounds)
+        for fixed_name in fixed_component_names:
+            if use_parts_mode:
+                # Fixed components have their value as both min and max
+                fixed_val = fixed_parts.get(fixed_name, 0.0)
+                component_bounds_parts.append((fixed_val, fixed_val))
+                component_bounds.append((0.0, 1.0))  # Will be converted later
+            else:
+                fixed_val = fixed_components.get(fixed_name, 0.0)
+                component_bounds.append((fixed_val, fixed_val))
+        
+        # Now add variable components
+        for i in range(n_variable_components):
+            col_a, col_b, col_c = st.columns([2, 1, 1])
+            with col_a:
+                name = st.text_input(f"Variable Component {i+1} Name", value=f"Component_{i+1}", key=f"seq_mix_name_{i}")
+                all_component_names.append(name)
+                variable_component_names.append(name)
+            with col_b:
+                if use_parts_mode:
+                    min_val = st.number_input(
+                        f"Min (parts)", 
+                        value=0.0, 
+                        min_value=0.0,
+                        step=0.001,
+                        format="%.3f",
+                        key=f"seq_mix_min_parts_{i}"
+                    )
+                else:
+                    min_val = st.number_input(
+                        f"Min", 
+                        value=0.0, 
+                        min_value=0.0, 
+                        max_value=1.0, 
+                        step=0.01, 
+                        key=f"seq_mix_min_{i}"
+                    )
+            with col_c:
+                if use_parts_mode:
+                    max_val = st.number_input(
+                        f"Max (parts)", 
+                        value=1.0 if i < 2 else 0.1,  # Default higher for main components
+                        min_value=0.0,
+                        step=0.001,
+                        format="%.3f",
+                        key=f"seq_mix_max_parts_{i}"
+                    )
+                else:
+                    max_val = st.number_input(
+                        f"Max", 
+                        value=1.0, 
+                        min_value=0.0, 
+                        max_value=1.0, 
+                        step=0.01, 
+                        key=f"seq_mix_max_{i}"
+                    )
+            
+            if use_parts_mode:
+                component_bounds_parts.append((min_val, max_val))
+                # Will convert to proportions after getting all values
+                component_bounds.append((0.0, 1.0))  # Placeholder
+            else:
+                component_bounds.append((min_val, max_val))
+        
+        # Validate bounds for variable components only
+        if use_parts_mode:
+            # For parts mode, we need at least one valid combination
+            sum_min_parts = sum(bound[0] for bound in component_bounds_parts)
+            sum_max_parts = sum(bound[1] for bound in component_bounds_parts)
+            
+            if sum_min_parts == 0 and sum_max_parts == 0:
+                st.error("⚠️ All bounds are zero - impossible mixture!")
+            else:
+                st.success("✅ Variable component bounds are feasible")
+                
+                # Show conversion preview
+                with st.expander("Preview of proportion ranges for variable components"):
+                    st.write("**Estimated proportion ranges (variable components only):**")
+                    # Calculate bounds considering only variable components will sum to (1 - fixed_sum)
+                    available_for_variable = 1.0 - sum(fixed_components.values())
+                    
+                    min_props = []
+                    max_props = []
+                    
+                    # Get only variable component bounds (skip fixed components)
+                    variable_bounds_parts = component_bounds_parts[len(fixed_component_names):]
+                    
+                    # Calculate sum of variable component bounds only
+                    var_sum_min_parts = sum(bound[0] for bound in variable_bounds_parts)
+                    var_sum_max_parts = sum(bound[1] for bound in variable_bounds_parts)
+                    
+                    for i in range(n_variable_components):
+                        # Calculate proportions within the available space
+                        if var_sum_max_parts > 0:
+                            min_prop = (variable_bounds_parts[i][0] / var_sum_max_parts) * available_for_variable
+                            max_prop = (variable_bounds_parts[i][1] / var_sum_min_parts if var_sum_min_parts > 0 else 1.0) * available_for_variable
+                        else:
+                            min_prop = 0
+                            max_prop = 0
+                        
+                        min_props.append(min_prop)
+                        max_props.append(max_prop)
+                    
+                    # Only show variable components in preview
+                    # variable_component_names already contains only variable components
+                    
+                    preview_df = pd.DataFrame({
+                        'Component': variable_component_names,
+                        'Min Parts': [b[0] for b in variable_bounds_parts],
+                        'Max Parts': [b[1] for b in variable_bounds_parts],
+                        'Min %': [f"{p*100:.1f}%" for p in min_props],
+                        'Max %': [f"{p*100:.1f}%" for p in max_props]
+                    })
+                    st.dataframe(preview_df)
+                
+                # Convert parts bounds to proportion bounds for the algorithm
+                component_bounds = [(min_prop, max_prop) for min_prop, max_prop in zip(min_props, max_props)]
+        else:
+            # For proportion mode, variable components must sum to (1 - fixed_sum)
+            available_for_variable = 1.0 - sum(fixed_components.values())
+            sum_min = sum(bound[0] for bound in component_bounds)
+            sum_max = sum(bound[1] for bound in component_bounds)
+            
+            if sum_min > available_for_variable:
+                st.error(f"⚠️ Variable component minimums sum to {sum_min:.2f} but only {available_for_variable:.2f} is available!")
+            elif sum_max < available_for_variable:
+                st.error(f"⚠️ Variable component maximums sum to {sum_max:.2f} but need to fill {available_for_variable:.2f}!")
+            else:
+                st.success("✅ Variable component bounds are feasible")
+        
+        # Batch size input
+        st.write("**Batch Size:**")
+        batch_size = st.number_input(
+            "Batch Size (for quantity calculations)", 
+            value=100.0, 
+            min_value=1.0,
+            step=1.0,
+            help="Total batch size in your preferred units (kg, lb, etc.)",
+            key="batch_size"
+        )
+        
+        # Calculate number of variable components
+        n_variable = n_components - len(fixed_components)
+        
+        st.write("**Stage Configuration:**")
+        
+        # Create temporary object to get recommendations
+        try:
+            temp_seq_mix = SequentialMixtureDOE(
+                n_components, 
+                all_component_names, 
+                component_bounds if not use_parts_mode else component_bounds_parts,
+                fixed_components if fixed_components else None,
+                use_parts_mode=use_parts_mode
+            )
+            mix_recommendations = temp_seq_mix.get_mixture_recommendations(n_variable)
+            
+            # Quality level selection
+            quality_level_mix = st.selectbox(
+                "Experiment Quality Level",
+                ["minimum", "recommended", "excellent"],
+                index=1,
+                key="seq_mix_quality",
+                help="Minimum: 1x parameters | Recommended: 1.5x parameters | Excellent: 2x parameters"
+            )
+            
+            # Stage 1 settings
+            with st.expander("Stage 1: Screening", expanded=True):
+                st.write(f"**{mix_recommendations['stage1']['purpose']}**")
+                
+                col_min, col_rec, col_exc = st.columns(3)
+                with col_min:
+                    st.metric("Minimum", mix_recommendations['stage1']['minimum'])
+                with col_rec:
+                    st.metric("Recommended", mix_recommendations['stage1']['recommended'])
+                with col_exc:
+                    st.metric("Excellent", mix_recommendations['stage1']['excellent'])
+                
+                # Set default based on quality level
+                stage1_mix_default = {
+                    'minimum': mix_recommendations['stage1']['minimum'],
+                    'recommended': mix_recommendations['stage1']['recommended'],
+                    'excellent': mix_recommendations['stage1']['excellent']
+                }[quality_level_mix]
+                
+                stage1_mix_runs = st.number_input(
+                    "Stage 1 Runs", 
+                    min_value=mix_recommendations['stage1']['minimum'], 
+                    max_value=50, 
+                    value=stage1_mix_default,
+                    key="seq_mix_stage1_runs",
+                    help=mix_recommendations['stage1']['can_fit']
+                )
+                
+                st.info(f"✓ Can fit: {mix_recommendations['stage1']['can_fit']}")
+                st.warning(f"⚠️ {mix_recommendations['stage1']['note']}")
+            
+            # Stage 2 settings
+            with st.expander("Stage 2: Optimization", expanded=True):
+                st.write(f"**{mix_recommendations['stage2']['purpose']}**")
+                
+                stage2_mix_runs = st.number_input(
+                    "Stage 2 Additional Runs", 
+                    min_value=5, 
+                    max_value=50, 
+                    value=mix_recommendations['stage2']['recommended_additional'],
+                    key="seq_mix_stage2_runs",
+                    help=f"Additional runs for quadratic mixture model"
+                )
+                
+                # Focus components option
+                use_focus_mix = st.checkbox("Focus on specific components", value=True, key="seq_mix_focus")
+                focus_components = []
+                if use_focus_mix:
+                    # Only exclude components that are actually fixed (checked and have values)
+                    actually_fixed = []
+                    if use_fixed and fixed_component_names:
+                        actually_fixed = fixed_component_names
+                    
+                    variable_components = [c for c in all_component_names if c not in actually_fixed]
+                    focus_components = st.multiselect(
+                        "Components to focus on", 
+                        options=variable_components,
+                        default=variable_components[:2] if len(variable_components) >= 2 else variable_components,
+                        key="seq_mix_focus_comp"
+                    )
+                
+                # Show mixture-specific info
+                st.info(f"📊 Mixture Constraints:")
+                st.write(f"• Fixed components: {len(fixed_components)}")
+                st.write(f"• Variable components: {n_variable}")
+                st.write(f"• All components sum to 1")
+                st.write(f"• All values ≥ 0")
+        
+        except Exception as e:
+            st.error(f"Configuration error: {str(e)}")
+            temp_seq_mix = None
+            mix_recommendations = None
+        
+        random_seed_mix = st.number_input("Random Seed", value=42, key="seq_mix_seed")
+        
+        # Response names
+        n_responses_mix = st.number_input("Number of Responses", min_value=1, max_value=5, value=2, key="seq_mix_n_resp")
+        response_names_mix = []
+        for i in range(n_responses_mix):
+            resp_name = st.text_input(f"Response {i+1} Name", value=f"Property_{i+1}", key=f"seq_mix_resp_{i}")
+            response_names_mix.append(resp_name)
+        
+        generate_sequential_mix = st.button("🧬🔄 Generate Sequential Mixture Plan", type="primary")
+    
+    with col2:
+        # Check if bounds are valid based on mode
+        bounds_valid = False
+        if use_parts_mode:
+            # In parts mode, just need non-zero max parts
+            sum_max_parts = sum(bound[1] for bound in component_bounds_parts) if 'component_bounds_parts' in locals() else 0
+            bounds_valid = sum_max_parts > 0
+        else:
+            # In proportion mode, need feasible bounds
+            bounds_valid = sum_min <= 1 and sum_max >= 1
+        
+        if generate_sequential_mix and temp_seq_mix is not None and bounds_valid:
+            with st.spinner("Generating sequential mixture DOE plan..."):
+                try:
+                    # Create sequential mixture DOE generator
+                    # In parts mode, pass fixed_parts instead of fixed_components
+                    if use_parts_mode and fixed_parts:
+                        # The SequentialMixtureDOE will handle conversion from parts to proportions
+                        seq_mix_doe = SequentialMixtureDOE(
+                            n_components,
+                            all_component_names,
+                            component_bounds_parts,
+                            fixed_parts,  # Pass parts, not proportions
+                            use_parts_mode=True
+                        )
+                    else:
+                        seq_mix_doe = SequentialMixtureDOE(
+                            n_components,
+                            all_component_names,
+                            component_bounds,
+                            fixed_components if fixed_components else None,
+                            use_parts_mode=False
+                        )
+                    
+                    # Generate Stage 1 (screening)
+                    stage1_mix_design = seq_mix_doe.generate_d_optimal_mixture(
+                        n_runs=stage1_mix_runs,
+                        model_type="linear",
+                        random_seed=random_seed_mix
+                    )
+                    
+                    # Apply fixed components
+                    stage1_mix_design = seq_mix_doe._adjust_for_fixed_components(stage1_mix_design)
+                    
+                    # Generate Stage 2 (augmentation)
+                    stage2_mix_design = seq_mix_doe.augment_mixture_design(
+                        stage1_mix_design,
+                        n_additional_runs=stage2_mix_runs,
+                        model_type="quadratic",
+                        focus_components=focus_components if use_focus_mix else None,
+                        random_seed=random_seed_mix + 1
+                    )
+                    
+                    # Store in session state
+                    st.session_state.seq_mix_doe = seq_mix_doe
+                    st.session_state.stage1_mix_design = stage1_mix_design
+                    st.session_state.stage2_mix_design = stage2_mix_design
+                    st.session_state.seq_mix_component_names = all_component_names
+                    st.session_state.seq_mix_response_names = response_names_mix
+                    st.session_state.seq_mix_fixed_components = fixed_components
+                    st.session_state.seq_mix_use_parts_mode = use_parts_mode
+                    st.session_state.seq_mix_fixed_parts = fixed_parts if use_parts_mode else {}
+                    st.session_state.seq_mix_batch_size = batch_size
+                    
+                    st.success("✅ Sequential mixture DOE plan generated!")
+                    
+                except Exception as e:
+                    st.error(f"Error generating sequential mixture design: {str(e)}")
+        
+        # Display results if available
+        if 'seq_mix_doe' in st.session_state:
+            seq_mix_doe = st.session_state.seq_mix_doe
+            stage1_mix_design = st.session_state.stage1_mix_design
+            stage2_mix_design = st.session_state.stage2_mix_design
+            component_names = st.session_state.seq_mix_component_names if 'seq_mix_component_names' in st.session_state else all_component_names
+            response_names_mix = st.session_state.seq_mix_response_names
+            fixed_components = st.session_state.seq_mix_fixed_components
+            use_parts_mode = st.session_state.seq_mix_use_parts_mode
+            fixed_parts = st.session_state.seq_mix_fixed_parts
+            batch_size = st.session_state.seq_mix_batch_size
+            
+            # Verification
+            st.subheader("✅ Design Verification")
+            
+            all_designs = np.vstack([stage1_mix_design, stage2_mix_design])
+            
+            col_v1, col_v2, col_v3 = st.columns(3)
+            with col_v1:
+                sums_ok = np.allclose(all_designs.sum(axis=1), 1.0)
+                st.metric("Sum to 100%", "✓ Pass" if sums_ok else "✗ Fail")
+            with col_v2:
+                non_neg = np.all(all_designs >= 0)
+                st.metric("Non-negative", "✓ Pass" if non_neg else "✗ Fail")
+            with col_v3:
+                st.metric("Total Mixtures", len(all_designs))
+            
+            # Display fixed components
+            if fixed_components:
+                st.subheader("🔒 Fixed Components")
+                if use_parts_mode and fixed_parts:
+                    # Show parts and calculated proportions
+                    fixed_data = []
+                    for comp_name, parts in fixed_parts.items():
+                        fixed_data.append({
+                            'Component': comp_name,
+                            'Parts': parts,
+                            'Proportion': fixed_components.get(comp_name, 0),
+                            'Percentage': f"{fixed_components.get(comp_name, 0) * 100:.1f}%"
+                        })
+                    fixed_df = pd.DataFrame(fixed_data)
+                    st.dataframe(fixed_df)
+                else:
+                    fixed_df = pd.DataFrame.from_dict(fixed_components, orient='index', columns=['Fixed Value'])
+                    fixed_df['Percentage'] = (fixed_df['Fixed Value'] * 100).round(1).astype(str) + '%'
+                    st.dataframe(fixed_df)
+            
+            # Calculate and show batch quantities
+            st.subheader("📦 Batch Quantity Calculator")
+            col_calc1, col_calc2 = st.columns(2)
+            
+            with col_calc1:
+                show_stage = st.selectbox(
+                    "Show quantities for:",
+                    ["Stage 1", "Stage 2", "Combined"],
+                    key="batch_calc_stage"
+                )
+            
+            with col_calc2:
+                custom_batch = st.number_input(
+                    "Custom batch size:",
+                    value=batch_size,
+                    min_value=1.0,
+                    step=1.0,
+                    key="custom_batch"
+                )
+            
+            # Select design based on choice
+            if show_stage == "Stage 1":
+                selected_design = stage1_mix_design
+            elif show_stage == "Stage 2":
+                selected_design = stage2_mix_design
+            else:
+                selected_design = all_designs
+            
+            # Calculate quantities
+            quantities_df = seq_mix_doe.calculate_batch_quantities(selected_design, custom_batch)
+            
+            # Add run labels
+            if show_stage == "Stage 1":
+                quantities_df['Stage'] = 'Screening'
+            elif show_stage == "Stage 2":
+                quantities_df['Stage'] = 'Augmentation'
+                quantities_df['Mixture'] = quantities_df['Mixture'] + len(stage1_mix_design)
+            else:
+                quantities_df['Stage'] = ['Screening'] * len(stage1_mix_design) + ['Augmentation'] * len(stage2_mix_design)
+            
+            # Reorder columns
+            cols = ['Mixture', 'Stage'] + component_names + ['Total']
+            quantities_df = quantities_df[cols]
+            
+            st.dataframe(quantities_df.round(2))
+            
+            # Download quantities
+            csv_quantities = quantities_df.to_csv(index=False)
+            st.download_button(
+                label=f"📥 Download {show_stage} Quantities",
+                data=csv_quantities,
+                file_name=f"{show_stage.lower().replace(' ', '_')}_quantities_batch_{custom_batch}.csv",
+                mime="text/csv",
+                key=f"dl_quantities_{show_stage}"
+            )
+            
+            # Display designs
+            st.subheader("📋 Sequential Mixture Design Details")
+            
+            tab1, tab2, tab3 = st.tabs(["Stage 1: Screening", "Stage 2: Augmentation", "Combined Design"])
+            
+            with tab1:
+                st.write("**Stage 1: Linear Mixture Model**")
+                stage1_mix_df = pd.DataFrame(stage1_mix_design, columns=component_names)
+                stage1_mix_df.insert(0, 'Run', range(1, len(stage1_mix_df) + 1))
+                stage1_mix_df.insert(1, 'Stage', 'Screening')
+                
+                # Add percentage columns
+                for col in component_names:
+                    stage1_mix_df[f"{col} (%)"] = (stage1_mix_df[col] * 100).round(1)
+                
+                # Add response columns
+                for resp in response_names_mix:
+                    stage1_mix_df[resp] = np.nan
+                
+                st.dataframe(stage1_mix_df.round(3))
+                
+                # Download button
+                csv1 = stage1_mix_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Stage 1 Mixture Design",
+                    data=csv1,
+                    file_name="stage1_mixture_screening.csv",
+                    mime="text/csv",
+                    key="dl_mix_stage1"
+                )
+            
+            with tab2:
+                st.write("**Stage 2: Quadratic Mixture Model**")
+                stage2_mix_df = pd.DataFrame(stage2_mix_design, columns=component_names)
+                stage2_mix_df.insert(0, 'Run', range(len(stage1_mix_df) + 1, len(stage1_mix_df) + len(stage2_mix_df) + 1))
+                stage2_mix_df.insert(1, 'Stage', 'Augmentation')
+                
+                # Add percentage columns
+                for col in component_names:
+                    stage2_mix_df[f"{col} (%)"] = (stage2_mix_df[col] * 100).round(1)
+                
+                # Add response columns
+                for resp in response_names_mix:
+                    stage2_mix_df[resp] = np.nan
+                
+                st.dataframe(stage2_mix_df.round(3))
+                
+                # Download button
+                csv2 = stage2_mix_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Stage 2 Mixture Design",
+                    data=csv2,
+                    file_name="stage2_mixture_augmentation.csv",
+                    mime="text/csv",
+                    key="dl_mix_stage2"
+                )
+            
+            with tab3:
+                st.write("**Combined Mixture Design**")
+                combined_mix_df = pd.concat([stage1_mix_df, stage2_mix_df], ignore_index=True)
+                st.dataframe(combined_mix_df.round(3))
+                
+                # Download complete plan
+                csv_all = combined_mix_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Complete Sequential Mixture Plan",
+                    data=csv_all,
+                    file_name="sequential_mixture_complete.csv",
+                    mime="text/csv",
+                    key="dl_mix_all"
+                )
+            
+            # Ternary plot for 3 components (if no fixed components)
+            if n_components == 3 and len(fixed_components) == 0:
+                st.subheader("📊 Mixture Design Visualization")
+                
+                fig = go.Figure()
+                
+                # Stage 1 points
+                fig.add_trace(go.Scatterternary({
+                    'mode': 'markers+text',
+                    'a': stage1_mix_design[:, 0],
+                    'b': stage1_mix_design[:, 1], 
+                    'c': stage1_mix_design[:, 2],
+                    'text': [f"S1-{i+1}" for i in range(len(stage1_mix_design))],
+                    'textposition': "top center",
+                    'marker': {
+                        'symbol': 'circle',
+                        'size': 10,
+                        'color': 'blue',
+                        'line': {'width': 2, 'color': 'darkblue'}
+                    },
+                    'name': 'Stage 1'
+                }))
+                
+                # Stage 2 points
+                fig.add_trace(go.Scatterternary({
+                    'mode': 'markers+text',
+                    'a': stage2_mix_design[:, 0],
+                    'b': stage2_mix_design[:, 1], 
+                    'c': stage2_mix_design[:, 2],
+                    'text': [f"S2-{i+1}" for i in range(len(stage2_mix_design))],
+                    'textposition': "bottom center",
+                    'marker': {
+                        'symbol': 'square',
+                        'size': 10,
+                        'color': 'red',
+                        'line': {'width': 2, 'color': 'darkred'}
+                    },
+                    'name': 'Stage 2'
+                }))
+                
+                fig.update_layout({
+                    'ternary': {
+                        'sum': 1,
+                        'aaxis': {'title': component_names[0]},
+                        'baxis': {'title': component_names[1]},
+                        'caxis': {'title': component_names[2]}
+                    },
+                    'height': 500,
+                    'title': "Sequential Mixture Design",
+                    'showlegend': True
+                })
+                
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Workflow guide
+            st.subheader("📚 Sequential Mixture DOE Workflow")
+            
+            with st.expander("How to Use Your Sequential Mixture Design", expanded=True):
+                st.markdown(f"""
+                ### 🧬 Sequential Mixture Experimentation
+                
+                **Stage 1: Screening ({len(stage1_mix_design)} mixtures)**
+                1. Prepare all Stage 1 mixtures
+                2. Test each mixture and record properties
+                3. Analyze to identify:
+                   - Which components have largest effects
+                   - Promising composition regions
+                   - Component interactions
+                
+                **Special Considerations for Mixtures:**
+                - **Mixing Order**: May affect results - be consistent
+                - **Preparation Method**: Document thoroughly
+                - **Fixed Components**: Add at consistent point in process
+                - **Quality Control**: Verify actual compositions
+                
+                **Stage 2: Optimization ({len(stage2_mix_design)} mixtures)**
+                1. Based on Stage 1:
+                   - Focus on important components
+                   - Explore promising regions
+                   - Test for synergistic effects
+                2. Prepare and test Stage 2 mixtures
+                
+                **Analysis Approach:**
+                - Use Scheffé models (no intercept)
+                - Check for synergistic/antagonistic effects
+                - Consider practical constraints
+                - Validate optimal formulation
+                
+                ### 🔬 Mixture-Specific Benefits:
+                - **Efficiency**: {len(all_designs)} total mixtures
+                - **Constraints**: Handles fixed components
+                - **Learning**: Stage 2 focuses on key components
+                - **Practical**: All compositions are feasible
+                
+                ### 📊 Fixed Components:
+                {f"• {len(fixed_components)} components fixed" if fixed_components else "• No fixed components"}
+                {f"• {n_variable} components variable" if fixed_components else ""}
+                {f"• Fixed sum: {sum(fixed_components.values()):.2%}" if fixed_components else ""}
+                """)
 
 elif design_type == "Compare Designs":
     st.markdown('<h2 class="sub-header">⚖️ Design Comparison</h2>', unsafe_allow_html=True)

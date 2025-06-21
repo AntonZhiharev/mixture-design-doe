@@ -476,6 +476,110 @@ Minimizes average prediction variance over the design space.
 - Optimizes prediction accuracy
 - Best for response surface exploration
 
+## Understanding Runs vs. Replicates
+
+### Key Distinction: Runs ≠ Replicates
+
+**Runs**: Different experimental conditions (unique factor combinations)
+**Replicates**: Repeated experiments at the same conditions
+
+#### Example:
+```python
+# Generate 10 runs (10 different experimental conditions)
+d_optimal_design = doe.generate_d_optimal(n_runs=10, model_order=2)
+
+# This gives you a design like:
+# Run 1: Temperature=80°C, Pressure=2bar, pH=6
+# Run 2: Temperature=120°C, Pressure=2bar, pH=6  
+# Run 3: Temperature=80°C, Pressure=4bar, pH=6
+# ... (10 different conditions)
+
+# If you want replicates, run each condition multiple times:
+# Run 1a: Temperature=80°C, Pressure=2bar, pH=6 (1st replicate)
+# Run 1b: Temperature=80°C, Pressure=2bar, pH=6 (2nd replicate)
+# Run 1c: Temperature=80°C, Pressure=2bar, pH=6 (3rd replicate)
+```
+
+#### Total Experiments = Runs × Replicates
+- **10 runs, 1 replicate each** = 10 total experiments
+- **10 runs, 3 replicates each** = 30 total experiments  
+- **20 runs, 2 replicates each** = 40 total experiments
+
+### Why Use Replicates?
+
+#### 1. **Estimate Experimental Error**
+```python
+# With replicates, you can calculate pure error
+response_data = np.array([
+    [72.5, 73.1, 72.8],  # 3 replicates of Run 1
+    [78.2, 77.9, 78.5],  # 3 replicates of Run 2
+    # ...
+])
+
+pure_error = np.var(response_data, axis=1)  # Variance within each condition
+```
+
+#### 2. **Improve Precision**
+- More replicates → Lower standard errors
+- Better confidence in your results
+- More reliable optimization
+
+#### 3. **Detect Lack of Fit**
+- Compare pure error (from replicates) vs. model error
+- Determine if your model is adequate
+
+### Practical Guidelines:
+
+#### **Budget-Limited Studies:**
+```python
+# Option A: More runs, fewer replicates (better for screening)
+design_A = doe.generate_d_optimal(n_runs=20, model_order=2)  # 20 experiments
+# Run each condition once
+
+# Option B: Fewer runs, more replicates (better for precision)  
+design_B = doe.generate_d_optimal(n_runs=10, model_order=2)  # 30 experiments
+# Run each condition 3 times
+```
+
+#### **When to Prioritize Runs vs. Replicates:**
+
+**More Runs (fewer replicates):**
+- Screening experiments
+- Exploring wide design space
+- Limited resources
+- Initial studies
+
+**More Replicates (fewer runs):**
+- Optimization studies
+- Precise parameter estimation
+- Validation studies
+- High measurement error
+
+#### **Adding Replicates to Your Design:**
+```python
+# Generate base design
+base_design = doe.generate_d_optimal(n_runs=10, model_order=2)
+
+# Add replicates manually
+replicated_design = []
+for run in base_design:
+    for replicate in range(3):  # 3 replicates each
+        replicated_design.append(run)
+
+replicated_design = np.array(replicated_design)
+print(f"Total experiments: {len(replicated_design)}")  # 30 experiments
+```
+
+#### **Center Point Replicates:**
+```python
+# Common practice: Add multiple center points for pure error estimation
+center_point = np.zeros(n_factors)  # All factors at center (coded 0)
+design_with_centers = np.vstack([
+    base_design,
+    np.tile(center_point, (5, 1))  # 5 center point replicates
+])
+```
+
 ## Tips for Use
 
 1. **Choose criterion based on objective**:
@@ -486,9 +590,12 @@ Minimizes average prediction variance over the design space.
    - Linear (order=1): For screening experiments
    - Quadratic (order=2): For optimization studies
 
-3. **Number of runs**:
-   - Minimum: Number of model parameters
-   - Recommended: 1.5-2 times number of parameters
+3. **Number of runs vs. replicates**:
+   - **Runs**: Unique experimental conditions
+   - **Minimum runs**: Number of model parameters
+   - **Recommended runs**: 1.5-2 times number of parameters
+   - **Replicates**: Repeat experiments for error estimation
+   - **Typical**: 1-3 replicates per run (budget permitting)
 
 4. **Factor ranges**:
    - Use actual experimental ranges

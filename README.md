@@ -2,6 +2,101 @@
 
 This repository provides comprehensive implementations for generating optimal experimental designs for any number of factors (n) and analyzing multiple responses (m). The code includes both Python and R implementations with D-optimal and I-optimal design generation capabilities.
 
+## 🚀 How to Run the Project
+
+### Quick Start - Web Interface (Recommended)
+
+1. **Install Python Dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Launch the Streamlit Web App**
+   ```bash
+   streamlit run streamlit_app.py
+   ```
+
+3. **Open Your Browser**
+   - The app will automatically open at `http://localhost:8501`
+   - If not, click the link shown in your terminal
+
+### Alternative - Command Line Usage
+
+**Run Individual Python Scripts:**
+```bash
+# Basic example with 4 factors and 3 responses
+python example_usage.py
+
+# Advanced response analysis tutorial
+python tutorial_response_analysis.py
+
+# Run specific DOE components
+python optimal_doe_python.py
+```
+
+**R Implementation:**
+```bash
+# Run R version (requires R installation)
+Rscript optimal_doe_r.R
+```
+
+### System Requirements
+
+**Python Version:** 3.7 or higher
+
+**Required Packages:**
+- streamlit >= 1.28.0
+- pandas >= 1.5.0
+- numpy >= 1.23.0
+- plotly >= 5.17.0
+- scipy >= 1.9.0
+- scikit-learn >= 1.1.0
+- matplotlib >= 3.5.0
+
+**For R Implementation:**
+- R version 4.0 or higher
+- AlgDesign, rsm, DoE.base, ggplot2, gridExtra, dplyr packages
+
+### 🎯 What You Can Do
+
+**Web Interface Features:**
+- **Regular DOE**: Generate D-optimal and I-optimal designs for independent factors
+- **Mixture Design**: Create optimal mixture experiments for formulations
+- **Sequential DOE**: Multi-stage experimental planning
+- **Interactive Visualization**: 2D/3D plots and ternary diagrams
+- **Export Designs**: Download CSV files for your experiments
+- **Batch Calculations**: Get exact quantities for your formulations
+
+**Command Line Features:**
+- **Generate Optimal Designs**: Create D-optimal and I-optimal designs
+- **Evaluate Design Quality**: Check efficiency metrics
+- **Response Analysis**: Complete statistical analysis framework
+- **Multiple Response Optimization**: Handle multiple objectives simultaneously
+
+### 💡 First Time Users
+
+1. **Start with the Web Interface** - it's the easiest way to explore
+2. **Try the Regular DOE tab** with 3 factors and 15 runs
+3. **Export your design** and use it for real experiments
+4. **After collecting data** - use the response analysis features
+
+### 🔧 Installation Troubleshooting
+
+**If pip install fails:**
+```bash
+# Try upgrading pip first
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+# Or install packages individually
+pip install streamlit pandas numpy plotly scipy scikit-learn matplotlib
+```
+
+**For conda users:**
+```bash
+conda install streamlit pandas numpy plotly scipy scikit-learn matplotlib
+```
+
 ## Files Overview
 
 ### Core Implementation Files

@@ -210,74 +210,18 @@ class SequentialMixtureDOE(MixtureDesign):
     
     def _adjust_for_fixed_components(self, design: np.ndarray) -> np.ndarray:
         """
-        Adjust design matrix to account for fixed components
+        Adjust design matrix to account for fixed components using fixed space solution
+        This is now primarily handled by the parent class post-processing which implements
+        the exact algorithm from test_fixed_space_solution.py
         """
         if not self.fixed_components:
             return design
         
-        if self.use_parts_mode:
-            # In parts mode, we need to work differently
-            # First, convert design to parts
-            design_parts = np.zeros_like(design)
-            
-            # For each mixture (row)
-            for row_idx in range(design.shape[0]):
-                # Start with fixed components in parts
-                total_fixed_parts = 0
-                for comp_name, fixed_parts in self.original_fixed.items():
-                    comp_idx = self.component_names.index(comp_name)
-                    design_parts[row_idx, comp_idx] = fixed_parts
-                    total_fixed_parts += fixed_parts
-                
-                # For variable components, distribute the remaining proportion
-                # First, get the target sum for variable components
-                variable_indices = []
-                for i, name in enumerate(self.component_names):
-                    if name not in self.fixed_components:
-                        variable_indices.append(i)
-                
-                if variable_indices:
-                    # Get the original proportions for variable components
-                    var_props = design[row_idx, variable_indices]
-                    var_props = var_props / var_props.sum() if var_props.sum() > 0 else np.ones(len(variable_indices)) / len(variable_indices)
-                    
-                    # Assign parts to variable components based on their bounds
-                    # Try to maintain relative proportions while respecting bounds
-                    for i, idx in enumerate(variable_indices):
-                        min_parts, max_parts = self.original_bounds[idx]
-                        # Start with proportional allocation
-                        target_parts = var_props[i] * (max_parts - min_parts) + min_parts
-                        design_parts[row_idx, idx] = np.clip(target_parts, min_parts, max_parts)
-            
-            # Convert back to proportions
-            design = self._parts_to_proportions_design(design_parts)
-        else:
-            # Original proportion mode logic
-            # Get indices of fixed and variable components
-            fixed_indices = []
-            variable_indices = []
-            
-            for i, name in enumerate(self.component_names):
-                if name in self.fixed_components:
-                    fixed_indices.append(i)
-                else:
-                    variable_indices.append(i)
-            
-            # Set fixed component values
-            for idx, name in enumerate(self.component_names):
-                if name in self.fixed_components:
-                    design[:, idx] = self.fixed_components[name]
-            
-            # Rescale variable components to sum to (1 - fixed_sum)
-            fixed_sum = sum(self.fixed_components.values())
-            remaining_sum = 1.0 - fixed_sum
-            
-            if variable_indices:
-                variable_sum = design[:, variable_indices].sum(axis=1)
-                for idx in variable_indices:
-                    design[:, idx] = design[:, idx] / variable_sum * remaining_sum
-        
-        return design
+        # Apply the parent class post-processing method which implements 
+        # the fixed space solution from test_fixed_space_solution.py:
+        # - Step 6: Replace fixed components with original values 
+        # - Step 7: Final normalization to ensure sum = 1.0
+        return self._post_process_design_fixed_components(design)
     
     def augment_mixture_design(self, existing_design: np.ndarray, 
                               n_additional_runs: int, 
@@ -328,13 +272,32 @@ class SequentialMixtureDOE(MixtureDesign):
         # Select additional points using D-optimal criterion
         augmented_design = existing_design.copy()
         new_points = []
+        min_distance = 0.001  # Start with strict distance requirement
         
-        for _ in range(n_additional_runs):
+        for iteration in range(n_additional_runs):
             best_candidate = None
             best_d_eff = -np.inf
             
-            # Test each candidate
-            for candidate in candidates[:200]:  # Test subset for efficiency
+            # If we're running low on candidates, generate more
+            if len(candidates) < 50:
+                additional_candidates = self._generate_mixture_candidates(
+                    n_candidates * 2, focus_components
+                )
+                additional_candidates = self._adjust_for_fixed_components(additional_candidates)
+                additional_candidates = self._filter_mixture_candidates(
+                    additional_candidates, existing_design, min_distance
+                )
+                if avoid_region is not None:
+                    additional_candidates = self._remove_avoided_mixtures(
+                        additional_candidates, avoid_region
+                    )
+                candidates = np.vstack([candidates, additional_candidates]) if len(candidates) > 0 else additional_candidates
+            
+            # Test candidates for best D-efficiency
+            n_test = min(len(candidates), 200)
+            test_candidates = candidates[:n_test] if len(candidates) > n_test else candidates
+            
+            for candidate in test_candidates:
                 # Create temporary augmented design
                 temp_design = np.vstack([augmented_design, 
                                        np.array(new_points + [candidate])])
@@ -350,12 +313,385 @@ class SequentialMixtureDOE(MixtureDesign):
                 new_points.append(best_candidate)
                 # Remove selected point and nearby points
                 distances = np.sum((candidates - best_candidate)**2, axis=1)
-                candidates = candidates[distances > 0.001]
+                candidates = candidates[distances > min_distance]
             else:
-                print(f"Warning: Could only add {len(new_points)} mixture points")
-                break
+                # If no candidate found, try relaxing the distance constraint
+                if min_distance > 0.0001:
+                    min_distance *= 0.5  # Relax distance requirement
+                    print(f"Relaxing distance constraint to {min_distance:.6f}")
+                    # Re-filter candidates with new distance
+                    candidates = self._generate_mixture_candidates(n_candidates, focus_components)
+                    candidates = self._adjust_for_fixed_components(candidates)
+                    candidates = self._filter_mixture_candidates(
+                        candidates, np.vstack([existing_design] + new_points) if new_points else existing_design, 
+                        min_distance
+                    )
+                    if avoid_region is not None:
+                        candidates = self._remove_avoided_mixtures(candidates, avoid_region)
+                    continue  # Try again with relaxed constraints
+                else:
+                    # Last resort: generate a random valid mixture
+                    print(f"Warning: Using random generation for point {len(new_points) + 1}")
+                    random_candidate = self._generate_random_valid_mixture(
+                        existing_design, new_points, focus_components
+                    )
+                    if random_candidate is not None:
+                        new_points.append(random_candidate)
+                    else:
+                        print(f"Could not generate point {len(new_points) + 1}, stopping at {len(new_points)} points")
+                        break
         
-        return np.array(new_points)
+        return np.array(new_points) if new_points else np.array([]).reshape(0, self.n_components)
+    
+    def generate_simplex_lattice_mixture(self, degree: int = 3, random_seed: int = None) -> np.ndarray:
+        """
+        Generate Simplex Lattice mixture design
+        
+        Parameters:
+        -----------
+        degree : int
+            Lattice degree (higher = more points)
+        random_seed : int
+            Random seed for reproducibility
+            
+        Returns:
+        --------
+        np.ndarray
+            Design matrix with mixture proportions
+        """
+        if random_seed is not None:
+            np.random.seed(random_seed)
+        
+        # Use parent class method if available
+        if hasattr(super(), 'generate_simplex_lattice'):
+            design = super().generate_simplex_lattice(degree)
+        else:
+            # Implement simplex lattice for variable components
+            # Generate lattice points for variable components only
+            variable_indices = []
+            for i, name in enumerate(self.component_names):
+                if name not in self.fixed_components:
+                    variable_indices.append(i)
+            
+            n_variable = len(variable_indices)
+            if n_variable < 2:
+                raise ValueError("Need at least 2 variable components for lattice design")
+            
+            # Generate simplex lattice points
+            from itertools import combinations_with_replacement
+            
+            # Create lattice points
+            lattice_points = []
+            
+            # Generate all combinations of lattice fractions
+            for combo in combinations_with_replacement(range(degree + 1), n_variable):
+                if sum(combo) == degree:
+                    # Convert to proportions
+                    mixture = np.array(combo) / degree
+                    lattice_points.append(mixture)
+            
+            lattice_points = np.array(lattice_points)
+            
+            # Create full mixture design
+            design = np.zeros((len(lattice_points), self.n_components))
+            for i, var_idx in enumerate(variable_indices):
+                design[:, var_idx] = lattice_points[:, i]
+        
+        # Apply fixed components
+        design = self._adjust_for_fixed_components(design)
+        
+        return design
+    
+    def generate_simplex_centroid_mixture(self, random_seed: int = None) -> np.ndarray:
+        """
+        Generate Simplex Centroid mixture design
+        
+        Parameters:
+        -----------
+        random_seed : int
+            Random seed for reproducibility
+            
+        Returns:
+        --------
+        np.ndarray
+            Design matrix with mixture proportions
+        """
+        if random_seed is not None:
+            np.random.seed(random_seed)
+        
+        # Use parent class method if available
+        if hasattr(super(), 'generate_simplex_centroid'):
+            design = super().generate_simplex_centroid()
+        else:
+            # Implement simplex centroid for variable components
+            variable_indices = []
+            for i, name in enumerate(self.component_names):
+                if name not in self.fixed_components:
+                    variable_indices.append(i)
+            
+            n_variable = len(variable_indices)
+            if n_variable < 2:
+                raise ValueError("Need at least 2 variable components for centroid design")
+            
+            from itertools import combinations
+            
+            # Generate all possible subcombinations and their centroids
+            centroid_points = []
+            
+            # Pure components (vertices)
+            for i in range(n_variable):
+                mixture = np.zeros(n_variable)
+                mixture[i] = 1.0
+                centroid_points.append(mixture)
+            
+            # Binary centroids
+            for combo in combinations(range(n_variable), 2):
+                mixture = np.zeros(n_variable)
+                for idx in combo:
+                    mixture[idx] = 1.0 / len(combo)
+                centroid_points.append(mixture)
+            
+            # Ternary centroids (if enough components)
+            if n_variable >= 3:
+                for combo in combinations(range(n_variable), 3):
+                    mixture = np.zeros(n_variable)
+                    for idx in combo:
+                        mixture[idx] = 1.0 / len(combo)
+                    centroid_points.append(mixture)
+            
+            # Overall centroid (all components equal)
+            if n_variable >= 2:
+                mixture = np.ones(n_variable) / n_variable
+                centroid_points.append(mixture)
+            
+            centroid_points = np.array(centroid_points)
+            
+            # Create full mixture design
+            design = np.zeros((len(centroid_points), self.n_components))
+            for i, var_idx in enumerate(variable_indices):
+                design[:, var_idx] = centroid_points[:, i]
+        
+        # Apply fixed components
+        design = self._adjust_for_fixed_components(design)
+        
+        return design
+    
+    def generate_extreme_vertices_mixture(self, random_seed: int = None) -> np.ndarray:
+        """
+        Generate Extreme Vertices mixture design
+        
+        Parameters:
+        -----------
+        random_seed : int
+            Random seed for reproducibility
+            
+        Returns:
+        --------
+        np.ndarray
+            Design matrix with mixture proportions
+        """
+        if random_seed is not None:
+            np.random.seed(random_seed)
+        
+        # Use parent class method if available
+        if hasattr(super(), 'generate_extreme_vertices'):
+            design = super().generate_extreme_vertices()
+        else:
+            # Implement extreme vertices for variable components
+            variable_indices = []
+            for i, name in enumerate(self.component_names):
+                if name not in self.fixed_components:
+                    variable_indices.append(i)
+            
+            n_variable = len(variable_indices)
+            if n_variable < 2:
+                raise ValueError("Need at least 2 variable components for extreme vertices")
+            
+            # Get bounds for variable components
+            variable_bounds = []
+            for var_idx in variable_indices:
+                if self.use_parts_mode:
+                    min_parts, max_parts = self.original_bounds[var_idx]
+                    variable_bounds.append((min_parts, max_parts))
+                else:
+                    variable_bounds.append(self.component_bounds[var_idx])
+            
+            # Generate extreme vertices of the feasible region
+            vertices = []
+            
+            # Simple approach: generate combinations of min/max bounds
+            from itertools import product
+            
+            for bounds_combo in product(*[[(bound[0], 0), (bound[1], 1)] for bound in variable_bounds]):
+                # Extract values and indices
+                values = [bc[0] for bc in bounds_combo]
+                
+                if self.use_parts_mode:
+                    # Convert parts to proportions
+                    total_parts = sum(values)
+                    if total_parts > 0:
+                        mixture = np.array(values) / total_parts
+                    else:
+                        continue
+                else:
+                    # Check if proportions sum to reasonable value
+                    total_prop = sum(values)
+                    if total_prop <= 0 or total_prop > 1:
+                        continue
+                    # Normalize to sum to available proportion
+                    available = 1.0 - sum(self.fixed_components.values())
+                    mixture = np.array(values) / total_prop * available
+                
+                vertices.append(mixture)
+            
+            if not vertices:
+                # Fallback: use simplex vertices
+                vertices = []
+                for i in range(n_variable):
+                    mixture = np.zeros(n_variable)
+                    mixture[i] = 1.0
+                    vertices.append(mixture)
+            
+            vertices = np.array(vertices)
+            
+            # Remove duplicates
+            unique_vertices = []
+            for vertex in vertices:
+                is_duplicate = False
+                for existing in unique_vertices:
+                    if np.allclose(vertex, existing, atol=1e-6):
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_vertices.append(vertex)
+            
+            vertices = np.array(unique_vertices) if unique_vertices else vertices
+            
+            # Create full mixture design
+            design = np.zeros((len(vertices), self.n_components))
+            for i, var_idx in enumerate(variable_indices):
+                design[:, var_idx] = vertices[:, i]
+        
+        # Apply fixed components
+        design = self._adjust_for_fixed_components(design)
+        
+        return design
+    
+    def _generate_random_valid_mixture(self, existing_design: np.ndarray,
+                                     current_new_points: List, 
+                                     focus_components: List[str] = None) -> Optional[np.ndarray]:
+        """
+        Generate a random valid mixture as a last resort
+        
+        Parameters:
+        -----------
+        existing_design : np.ndarray
+            Existing design points
+        current_new_points : List
+            New points already selected
+        focus_components : List[str]
+            Components to focus on
+            
+        Returns:
+        --------
+        Optional[np.ndarray]
+            A valid mixture point or None if failed
+        """
+        max_attempts = 1000
+        
+        for _ in range(max_attempts):
+            if self.use_parts_mode:
+                # Generate random parts
+                candidate_parts = np.zeros(self.n_components)
+                
+                for j in range(self.n_components):
+                    if self.component_names[j] in self.fixed_components:
+                        candidate_parts[j] = self.original_fixed[self.component_names[j]]
+                    else:
+                        min_parts, max_parts = self.original_bounds[j]
+                        candidate_parts[j] = np.random.uniform(min_parts, max_parts)
+                
+                # Convert to proportions
+                candidate = self._parts_to_proportions_design(candidate_parts.reshape(1, -1))[0]
+            else:
+                # Generate random proportions
+                variable_indices = []
+                for i, name in enumerate(self.component_names):
+                    if name not in self.fixed_components:
+                        variable_indices.append(i)
+                
+                if not variable_indices:
+                    return None
+                
+                # Generate random mixture for variable components
+                n_variable = len(variable_indices)
+                alpha = np.ones(n_variable)
+                
+                if focus_components:
+                    for i, idx in enumerate(variable_indices):
+                        if self.component_names[idx] in focus_components:
+                            alpha[i] = 2.0  # Bias towards focus components
+                
+                variable_mixture = np.random.dirichlet(alpha)
+                
+                # Create full mixture
+                candidate = np.zeros(self.n_components)
+                for i, idx in enumerate(variable_indices):
+                    candidate[idx] = variable_mixture[i]
+                
+                # Apply fixed components
+                candidate = self._adjust_for_fixed_components(candidate.reshape(1, -1))[0]
+            
+            # Check if candidate is valid and sufficiently different
+            if self._is_valid_mixture_candidate(candidate, existing_design, current_new_points):
+                return candidate
+        
+        return None
+    
+    def _is_valid_mixture_candidate(self, candidate: np.ndarray, 
+                                   existing_design: np.ndarray,
+                                   current_new_points: List,
+                                   min_distance: float = 0.0001) -> bool:
+        """
+        Check if a mixture candidate is valid
+        
+        Parameters:
+        -----------
+        candidate : np.ndarray
+            Candidate mixture point
+        existing_design : np.ndarray
+            Existing design points
+        current_new_points : List
+            Current new points
+        min_distance : float
+            Minimum distance requirement
+            
+        Returns:
+        --------
+        bool
+            True if candidate is valid
+        """
+        # Check basic mixture constraints
+        if not np.isclose(candidate.sum(), 1.0, atol=1e-6):
+            return False
+        
+        if np.any(candidate < -1e-6):  # Allow small numerical errors
+            return False
+        
+        # Check distance to existing points
+        if len(existing_design) > 0:
+            distances = np.sqrt(np.sum((existing_design - candidate)**2, axis=1))
+            if np.min(distances) < min_distance:
+                return False
+        
+        # Check distance to current new points
+        if current_new_points:
+            new_points_array = np.array(current_new_points)
+            distances = np.sqrt(np.sum((new_points_array - candidate)**2, axis=1))
+            if np.min(distances) < min_distance:
+                return False
+        
+        return True
     
     def _generate_mixture_candidates(self, n_candidates: int, 
                                    focus_components: List[str] = None) -> np.ndarray:

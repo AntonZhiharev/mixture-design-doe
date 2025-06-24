@@ -3,6 +3,13 @@ User-Friendly Web Interface for Optimal Design of Experiments
 Includes regular DOE, mixture designs, and multiple response analysis
 """
 
+# Force reload of modules to ensure fresh code is used
+import sys
+modules_to_clear = ['enhanced_mixture_designs', 'mixture_designs', 'sequential_mixture_doe']
+for module_name in modules_to_clear:
+    if module_name in sys.modules:
+        del sys.modules[module_name]
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,10 +20,13 @@ from plotly.subplots import make_subplots
 import io
 import base64
 
+
+
 # Import our DOE classes
 try:
     from optimal_doe_python import OptimalDOE, multiple_response_analysis
-    from mixture_designs import MixtureDesign, mixture_response_analysis
+    from enhanced_mixture_designs import EnhancedMixtureDesign
+    from mixture_designs import mixture_response_analysis
     from sequential_doe import SequentialDOE, create_sequential_plan
     from sequential_mixture_doe import SequentialMixtureDOE
 except ImportError:
@@ -322,7 +332,7 @@ if design_type == "Regular DOE":
             # Response simulation
             st.subheader("Response Simulation")
             with st.expander("Simulate Responses"):
-                n_responses = st.number_input("Number of Responses", min_value=1, max_value=5, value=2)
+                n_responses = st.number_input("Number of Responses", min_value=1, max_value=20, value=2)
                 
                 if st.button("Simulate Responses"):
                     np.random.seed(random_seed)
@@ -357,47 +367,482 @@ elif design_type == "Mixture Design":
     with col1:
         st.subheader("Mixture Parameters")
         
-        # Number of components
-        n_components = st.number_input("Number of Components", min_value=2, max_value=8, value=3)
+        # Number of variable components
+        n_variable_components = st.number_input(
+            "Number of Variable Components", 
+            min_value=2, 
+            max_value=10, 
+            value=3, 
+            key="mix_n_var_comp",
+            help="Components that will have variable proportions (with bounds)"
+        )
         
-        # Component details
-        st.write("**Component Details:**")
-        component_names = []
+        # Parts mode selection FIRST (before fixed components)
+        use_parts_mode = st.checkbox(
+            "Use parts instead of proportions", 
+            value=True,
+            key="mix_parts_mode",
+            help="Parts mode: Specify ALL components in parts (e.g., 1, 0.3, 0.025) which will be normalized to proportions"
+        )
+        
+        # Fixed components setup
+        st.write("**Fixed Components (Optional):**")
+        st.info("Fixed components will be added to your variable components")
+        
+        use_fixed = st.checkbox("Use fixed components", value=False, key="mix_use_fixed")
+        fixed_component_names = []
+        fixed_components = {}
+        fixed_parts = {}
+        
+        if use_fixed:
+            n_fixed_components = st.number_input(
+                "Number of Fixed Components", 
+                min_value=1, 
+                max_value=5, 
+                value=1, 
+                key="mix_n_fixed_comp"
+            )
+            
+            st.write("**Fixed Component Details:**")
+            for i in range(n_fixed_components):
+                col_a, col_b = st.columns([2, 1])
+                with col_a:
+                    fixed_name = st.text_input(
+                        f"Fixed Component {i+1} Name", 
+                        value=f"Fixed_{i+1}", 
+                        key=f"mix_fixed_name_{i}"
+                    )
+                    fixed_component_names.append(fixed_name)
+                with col_b:
+                    if use_parts_mode:
+                        fixed_val = st.number_input(
+                            f"Value (parts)", 
+                            value=0.05, 
+                            min_value=0.0,
+                            step=0.001,
+                            format="%.3f",
+                            key=f"mix_fixed_parts_{i}"
+                        )
+                        fixed_parts[fixed_name] = fixed_val
+                    else:
+                        fixed_val = st.number_input(
+                            f"Value (proportion)", 
+                            value=0.02, 
+                            min_value=0.0, 
+                            max_value=1.0, 
+                            step=0.01,
+                            key=f"mix_fixed_val_{i}"
+                        )
+                        fixed_components[fixed_name] = fixed_val
+            
+            # Validate fixed components
+            if use_parts_mode and fixed_parts:
+                # In parts mode, we need to estimate proportions
+                # This is approximate since we don't know variable parts yet
+                st.info("Fixed component proportions will be calculated based on total mixture")
+            else:
+                # In proportion mode, validate sum
+                fixed_sum = sum(fixed_components.values())
+                if fixed_sum >= 1.0:
+                    st.error(f"⚠️ Fixed components sum to {fixed_sum:.2f} - no room for variable components!")
+                else:
+                    st.success(f"✅ Fixed components sum to {fixed_sum:.2f}, leaving {1-fixed_sum:.2f} for variable components")
+        
+        # Calculate total number of components
+        n_components = n_variable_components + len(fixed_component_names)
+        
+        # Variable component setup
+        st.write("**Variable Component Details:**")
+        
+        # Initialize lists to store all component data in the SAME order
+        all_component_names = []
+        variable_component_names = []
+        
+        # CRITICAL FIX: Build component_bounds to match all_component_names exactly
+        # We'll build this in the same order as we build all_component_names
         component_bounds = []
+        component_bounds_parts = []
         
-        for i in range(n_components):
+        # CRITICAL FIX: Build component_bounds and all_component_names in exactly the same order
+        # First, collect ALL data without building bounds yet
+        
+        # Collect fixed component data
+        fixed_data = []
+        for i, fixed_name in enumerate(fixed_component_names):
+            if use_parts_mode:
+                fixed_val = fixed_parts.get(fixed_name, 0.0)
+                fixed_data.append({
+                    'name': fixed_name,
+                    'bounds_parts': (fixed_val, fixed_val),
+                    'bounds_props': (fixed_val, fixed_val),  # Will be normalized later
+                    'is_fixed': True
+                })
+            else:
+                fixed_val = fixed_components.get(fixed_name, 0.0)
+                fixed_data.append({
+                    'name': fixed_name,
+                    'bounds_parts': (fixed_val, fixed_val),  # CRITICAL FIX: Always include bounds_parts for indexing consistency
+                    'bounds_props': (fixed_val, fixed_val),
+                    'is_fixed': True
+                })
+        
+        # Collect variable component data
+        variable_data = []
+        for i in range(n_variable_components):
             col_a, col_b, col_c = st.columns([2, 1, 1])
             with col_a:
-                name = st.text_input(f"Component {i+1} Name", value=f"Component_{i+1}", key=f"comp_name_{i}")
-                component_names.append(name)
+                name = st.text_input(f"Variable Component {i+1} Name", value=f"Component_{i+1}", key=f"mix_name_{i}")
+                variable_component_names.append(name)  # Track separately
             with col_b:
-                min_val = st.number_input(f"Min %", value=0.0, min_value=0.0, max_value=1.0, step=0.01, key=f"comp_min_{i}")
+                if use_parts_mode:
+                    min_val = st.number_input(
+                        f"Min (parts)", 
+                        value=0.0, 
+                        min_value=0.0,
+                        step=0.001,
+                        format="%.3f",
+                        key=f"mix_min_parts_{i}"
+                    )
+                else:
+                    min_val = st.number_input(
+                        f"Min", 
+                        value=0.0, 
+                        min_value=0.0, 
+                        max_value=1.0, 
+                        step=0.01, 
+                        key=f"mix_min_{i}"
+                    )
             with col_c:
-                max_val = st.number_input(f"Max %", value=1.0, min_value=0.0, max_value=1.0, step=0.01, key=f"comp_max_{i}")
-            component_bounds.append((min_val, max_val))
+                if use_parts_mode:
+                    max_val = st.number_input(
+                        f"Max (parts)", 
+                        value=1.0 if i < 2 else 0.1,  # Default higher for main components
+                        min_value=0.0,
+                        step=0.001,
+                        format="%.3f",
+                        key=f"mix_max_parts_{i}"
+                    )
+                else:
+                    max_val = st.number_input(
+                        f"Max", 
+                        value=1.0, 
+                        min_value=0.0, 
+                        max_value=1.0, 
+                        step=0.01, 
+                        key=f"mix_max_{i}"
+                    )
+            
+            # Store variable component data
+            if use_parts_mode:
+                variable_data.append({
+                    'name': name,
+                    'bounds_parts': (min_val, max_val),
+                    'bounds_props': (0.0, 1.0),  # Placeholder
+                    'is_fixed': False
+                })
+            else:
+                variable_data.append({
+                    'name': name,
+                    'bounds_parts': None,
+                    'bounds_props': (min_val, max_val),
+                    'is_fixed': False
+                })
         
-        # Validate bounds
-        sum_min = sum(bound[0] for bound in component_bounds)
-        sum_max = sum(bound[1] for bound in component_bounds)
+        # CRITICAL FIX: Build arrays in CORRECT order to match user expectations
+        # User expects: Variable components FIRST, then Fixed components
+        # This matches the visual order in the interface
         
-        if sum_min > 1:
-            st.error("⚠️ Sum of minimum bounds exceeds 100% - adjust bounds!")
-        elif sum_max < 1:
-            st.error("⚠️ Sum of maximum bounds less than 100% - adjust bounds!")
+        all_component_names = []
+        component_bounds = []
+        component_bounds_parts = []
+        
+        # Add variable components FIRST (this matches user's visual expectation)
+        for comp_data in variable_data:
+            all_component_names.append(comp_data['name'])
+            component_bounds.append(comp_data['bounds_props'])
+            if comp_data['bounds_parts'] is not None:
+                component_bounds_parts.append(comp_data['bounds_parts'])
+        
+        # Add fixed components SECOND
+        for comp_data in fixed_data:
+            all_component_names.append(comp_data['name'])
+            component_bounds.append(comp_data['bounds_props'])
+            if comp_data['bounds_parts'] is not None:
+                component_bounds_parts.append(comp_data['bounds_parts'])
+        
+        # Validate bounds arrays match component names
+        if len(component_bounds) != n_components:
+            st.error(f"Bounds mismatch: Expected {n_components} bounds but got {len(component_bounds)}")
+            st.stop()
+        
+        if len(component_bounds) != len(all_component_names):
+            st.error(f"Component bounds length mismatch: {len(component_bounds)} bounds vs {len(all_component_names)} names")
+            st.stop()
+        
+        # Validate bounds for variable components only
+        if use_parts_mode:
+            # Validate bounds arrays are consistent
+            expected_total_length = len(fixed_component_names) + n_variable_components
+            if len(component_bounds_parts) != expected_total_length:
+                st.error(f"Bounds mismatch: Expected {expected_total_length} bounds but got {len(component_bounds_parts)}")
+                st.stop()
+            
+            # For parts mode, we need at least one valid combination
+            sum_min_parts = sum(bound[0] for bound in component_bounds_parts)
+            sum_max_parts = sum(bound[1] for bound in component_bounds_parts)
+            
+            if sum_min_parts == 0 and sum_max_parts == 0:
+                st.error("⚠️ All bounds are zero - impossible mixture!")
+            else:
+                st.success("✅ Variable component bounds are feasible")
+                
+                # Show conversion preview
+                with st.expander("Preview of proportion ranges for variable components"):
+                    st.write("**Estimated proportion ranges (variable components only):**")
+                    # Calculate bounds considering only variable components will sum to (1 - fixed_sum)
+                    available_for_variable = 1.0 - sum(fixed_components.values())
+                    
+                    min_props = []
+                    max_props = []
+                    
+                # CRITICAL FIX: Extract variable bounds using the correct indices
+                # Don't assume order - use the actual variable_component_indices
+                variable_bounds_parts = []
+                
+                # Calculate variable_component_indices safely
+                variable_component_indices = []
+                for i, name in enumerate(all_component_names):
+                    if name not in fixed_component_names:
+                        variable_component_indices.append(i)
+                
+                
+                # Extract variable bounds using the calculated indices
+                for idx in variable_component_indices:
+                    if idx < len(component_bounds_parts):
+                        variable_bounds_parts.append(component_bounds_parts[idx])
+                    else:
+                        st.error(f"🚨 **INDEX {idx} OUT OF BOUNDS!**")
+                        st.error(f"component_bounds_parts has {len(component_bounds_parts)} elements but trying to access index {idx}")
+                        st.stop()
+                
+                # 🚨 VALIDATION 2: Check variable bounds length
+                if len(variable_bounds_parts) != n_variable_components:
+                    st.error(f"🚨 **VARIABLE BOUNDS MISMATCH!**")
+                    st.error(f"Expected {n_variable_components} variable bounds but got {len(variable_bounds_parts)}")
+                    st.write("**Debug Info:**")
+                    st.write(f"• variable_bounds_parts = {variable_bounds_parts}")
+                    st.write(f"• Length: {len(variable_bounds_parts)}")
+                    st.stop()
+                    
+                    # Calculate sum of variable component bounds only
+                    var_sum_min_parts = sum(bound[0] for bound in variable_bounds_parts)
+                    var_sum_max_parts = sum(bound[1] for bound in variable_bounds_parts)
+                    
+                    # 🔍 REAL-TIME DEBUGGING: Show variable bounds access
+                    st.write(f"🔍 **Variable Bounds Debug:**")
+                    st.write(f"• variable_bounds_parts length: {len(variable_bounds_parts)}")
+                    st.write(f"• n_variable_components: {n_variable_components}")
+                    st.write(f"• Loop will access indices: {list(range(n_variable_components))}")
+                    
+                    for i in range(n_variable_components):
+                        # 🚨 VALIDATION 3: Check index before access
+                        if i >= len(variable_bounds_parts):
+                            st.error(f"🚨 **INDEX OUT OF BOUNDS!**")
+                            st.error(f"Trying to access variable_bounds_parts[{i}] but length is {len(variable_bounds_parts)}")
+                            st.stop()
+                        
+                        # Calculate proportions within the available space
+                        if var_sum_max_parts > 0:
+                            # For min proportion: use this component's min over sum of all max parts
+                            min_prop = (variable_bounds_parts[i][0] / var_sum_max_parts) * available_for_variable
+                            # For max proportion: use this component's max over sum of all max parts
+                            max_prop = (variable_bounds_parts[i][1] / var_sum_max_parts) * available_for_variable
+                        else:
+                            min_prop = 0
+                            max_prop = 0
+                        
+                        min_props.append(min_prop)
+                        max_props.append(max_prop)
+                    
+                    # Only show variable components in preview
+                    
+                    preview_df = pd.DataFrame({
+                        'Component': variable_component_names,
+                        'Min Parts': [b[0] for b in variable_bounds_parts],
+                        'Max Parts': [b[1] for b in variable_bounds_parts],
+                        'Min %': [f"{p*100:.1f}%" for p in min_props],
+                        'Max %': [f"{p*100:.1f}%" for p in max_props]
+                    })
+                    st.dataframe(preview_df)
+                
+                # Convert parts bounds to proportion bounds for the algorithm
+                # This ensures the sum of all max bounds equals exactly 1.0
+                
+                # IMPLEMENT FIXED SPACE SOLUTION 
+                # Calculate free space as the difference between max and min of variable components
+                sum_min_variable = sum(bound[0] for bound in variable_bounds_parts)
+                sum_max_variable = sum(bound[1] for bound in variable_bounds_parts)
+                
+                # Free space is the flexibility of variable components
+                free_space = sum_max_variable - sum_min_variable
+                
+                # Space available for fixed components
+                space_when_var_at_min = 1.0 - sum_min_variable  # Max space for fixed
+                space_when_var_at_max = 1.0 - sum_max_variable  # Min space for fixed
+                
+                # Calculate total fixed components (original)
+                total_fixed_original = sum(fixed_parts.values())
+                
+                # Convert variable component bounds to proportions first
+                for i, comp_name in enumerate(all_component_names):
+                    if comp_name not in fixed_component_names:
+                        # This is a variable component - find its index in variable_bounds_parts
+                        var_index = 0
+                        for j, other_comp in enumerate(all_component_names[:i]):
+                            if other_comp not in fixed_component_names:
+                                var_index += 1
+                        
+                        # Get the parts bounds for this variable component
+                        if var_index < len(variable_bounds_parts):
+                            min_parts, max_parts = variable_bounds_parts[var_index]
+                            
+                            # Convert to proportions using the total max parts of ALL components
+                            total_parts = sum_max_variable + total_fixed_original
+                            if total_parts > 0:
+                                min_prop = min_parts / total_parts
+                                max_prop = max_parts / total_parts
+                            else:
+                                min_prop = 0.0
+                                max_prop = 0.0
+                            
+                            # Update the existing bounds
+                            component_bounds[i] = (min_prop, max_prop)
+                
+                # Now handle fixed components using the fixed space solution
+                for i, comp_name in enumerate(all_component_names):
+                    if comp_name in fixed_component_names:
+                        # Calculate proportion of this fixed component relative to all fixed
+                        fraction = fixed_parts.get(comp_name, 0.0) / total_fixed_original if total_fixed_original > 0 else 0.0
+                        
+                        # When variables are at MIN, fixed can be at MAX
+                        max_value = space_when_var_at_min * fraction
+                        # When variables are at MAX, fixed must be at MIN  
+                        min_value = space_when_var_at_max * fraction
+                        
+                        # Update bounds and fixed_components
+                        component_bounds[i] = (min_value, max_value)
+                        fixed_components[comp_name] = fixed_parts.get(comp_name, 0.0) / (sum_max_variable + total_fixed_original)
+                
+                st.success(f"✅ Successfully converted all component bounds to proportions")
+                
+                # Update min_props and max_props for display
+                min_props = [bound[0] for bound in component_bounds[len(fixed_component_names):]]
+                max_props = [bound[1] for bound in component_bounds[len(fixed_component_names):]]
+                
+                # Verify and fix sum of max bounds to equal exactly 1.0
+                sum_max_bounds = sum(bound[1] for bound in component_bounds)
+                
+                # Normalize to ensure exact sum of 1.0 (fix floating point precision)
+                if abs(sum_max_bounds - 1.0) > 1e-10:  # If not exactly 1.0
+                    # Normalize all bounds proportionally
+                    normalization_factor = 1.0 / sum_max_bounds
+                    component_bounds = [
+                        (bound[0] * normalization_factor, bound[1] * normalization_factor) 
+                        for bound in component_bounds
+                    ]
+                    
+                    # Update fixed_components dictionary as well
+                    for fixed_name in fixed_component_names:
+                        if fixed_name in fixed_components:
+                            fixed_components[fixed_name] *= normalization_factor
+                    
+                    # Recalculate sum after normalization
+                    sum_max_bounds_normalized = sum(bound[1] for bound in component_bounds)
+                    st.success(f"✅ Normalized sum of max bounds: {sum_max_bounds_normalized:.10f} (exactly 1.0)")
+                else:
+                    st.success(f"✅ Sum of max bounds: {sum_max_bounds:.10f} (exactly 1.0)")
         else:
-            st.success("✅ Bounds are feasible")
+            # For proportion mode, variable components must sum to (1 - fixed_sum)
+            available_for_variable = 1.0 - sum(fixed_components.values())
+            sum_min = sum(bound[0] for bound in component_bounds)
+            sum_max = sum(bound[1] for bound in component_bounds)
+            
+            if sum_min > available_for_variable:
+                st.error(f"⚠️ Variable component minimums sum to {sum_min:.2f} but only {available_for_variable:.2f} is available!")
+            elif sum_max < available_for_variable:
+                st.error(f"⚠️ Variable component maximums sum to {sum_max:.2f} but need to fill {available_for_variable:.2f}!")
+            else:
+                st.success("✅ Variable component bounds are feasible")
+        
+        # Batch size input
+        st.write("**Batch Size:**")
+        batch_size = st.number_input(
+            "Batch Size (for quantity calculations)", 
+            value=100.0, 
+            min_value=1.0,
+            step=1.0,
+            help="Total batch size in your preferred units (kg, lb, etc.)",
+            key="mix_batch_size"
+        )
+        
+        # Component names is now all_component_names
+        component_names = all_component_names
         
         # Design settings
         design_method = st.selectbox(
             "Design Method", 
-            ["D-optimal", "I-optimal", "Simplex Lattice", "Simplex Centroid", "Extreme Vertices"]
+            ["D-optimal", "I-optimal", "Simplex Lattice", "Simplex Centroid", "Extreme Vertices", "Space-Filling", "Custom"]
         )
         
-        if design_method in ["D-optimal", "I-optimal"]:
-            n_runs = st.number_input("Number of Runs", min_value=5, max_value=50, value=12)
+        # Initialize variables with defaults
+        n_runs = 12
+        model_type = "quadratic"
+        lattice_degree = 3
+        augment_strategy = "d-optimal"
+        
+        # Flexible run numbers for all design types
+        st.write("**Run Number Configuration:**")
+        use_custom_runs = st.checkbox(
+            "Use custom number of runs", 
+            value=design_method in ["D-optimal", "I-optimal", "Space-Filling", "Custom"],
+            help="Override default run numbers for any design type"
+        )
+        
+        if design_method in ["D-optimal", "I-optimal", "Space-Filling", "Custom"]:
+            n_runs = st.number_input("Number of Runs", min_value=5, max_value=100, value=15)
             model_type = st.selectbox("Model Type", ["linear", "quadratic", "cubic"], index=1)
         elif design_method == "Simplex Lattice":
             lattice_degree = st.number_input("Lattice Degree", min_value=2, max_value=5, value=3)
+            if use_custom_runs:
+                # Calculate default runs for this degree
+                from math import factorial
+                default_runs = factorial(n_variable_components + lattice_degree - 1) // (factorial(lattice_degree) * factorial(n_variable_components - 1))
+                st.info(f"Default for degree {lattice_degree}: {default_runs} runs")
+                n_runs = st.number_input("Custom Number of Runs", min_value=5, max_value=100, value=default_runs)
+                augment_strategy = st.selectbox(
+                    "Adjustment Strategy", 
+                    ["d-optimal", "centroid", "replicate", "space-filling"],
+                    help="How to adjust design to match custom run number"
+                )
+        elif design_method == "Simplex Centroid":
+            if use_custom_runs:
+                default_runs = 2**n_variable_components - 1
+                st.info(f"Default: {default_runs} runs")
+                n_runs = st.number_input("Custom Number of Runs", min_value=5, max_value=100, value=default_runs)
+                augment_strategy = st.selectbox(
+                    "Adjustment Strategy", 
+                    ["d-optimal", "centroid", "replicate", "space-filling"],
+                    help="How to adjust design to match custom run number"
+                )
+        elif design_method == "Extreme Vertices":
+            if use_custom_runs:
+                st.info("Extreme vertices typically generates variable number of runs based on constraints")
+                n_runs = st.number_input("Target Number of Runs", min_value=5, max_value=100, value=15)
+                augment_strategy = st.selectbox(
+                    "Adjustment Strategy", 
+                    ["d-optimal", "centroid", "replicate", "space-filling"],
+                    help="How to adjust design to match target run number"
+                )
         
         # Add replicates option for mixture designs
         st.write("**Replication Settings:**")
@@ -421,28 +866,182 @@ elif design_type == "Mixture Design":
         generate_mixture_button = st.button("🧬 Generate Mixture Design", type="primary")
     
     with col2:
-        if generate_mixture_button and sum_min <= 1 and sum_max >= 1:
+        # Check if bounds are valid based on mode
+        bounds_valid = False
+        if use_parts_mode:
+            # In parts mode, just need non-zero max parts
+            sum_max_parts = sum(bound[1] for bound in component_bounds_parts) if 'component_bounds_parts' in locals() else 0
+            bounds_valid = sum_max_parts > 0
+        else:
+            # In proportion mode, need feasible bounds
+            available_for_variable = 1.0 - sum(fixed_components.values())
+            sum_min = sum(bound[0] for bound in component_bounds)
+            sum_max = sum(bound[1] for bound in component_bounds)
+            bounds_valid = sum_min <= available_for_variable and sum_max >= available_for_variable
+        
+        if generate_mixture_button and bounds_valid:
             with st.spinner("Generating mixture design..."):
                 try:
-                    # Create mixture design generator
-                    mixture = MixtureDesign(n_components, component_names, component_bounds)
+                    
+                    # Validate inputs before creating mixture design
+                    if len(component_names) != n_components:
+                        raise ValueError(f"Component names length ({len(component_names)}) doesn't match n_components ({n_components})")
+                    
+                    if len(component_bounds) != n_components:
+                        raise ValueError(f"Component bounds length ({len(component_bounds)}) doesn't match n_components ({n_components})")
+                    
+                    # Ensure bounds sum to exactly 1.0
+                    current_sum = sum(bound[1] for bound in component_bounds)
+                    if abs(current_sum - 1.0) > 1e-10:
+                        normalization_factor = 1.0 / current_sum
+                        component_bounds = [
+                            (bound[0] * normalization_factor, bound[1] * normalization_factor) 
+                            for bound in component_bounds
+                        ]
+                        
+                        # Update fixed_components dictionary
+                        for fixed_name in fixed_component_names:
+                            if fixed_name in fixed_components:
+                                fixed_components[fixed_name] *= normalization_factor
+                    
+                    # FIXED: Create EnhancedMixtureDesign with ALL components and let it handle fixed components internally
+                    if use_parts_mode:
+                        mixture = EnhancedMixtureDesign(
+                            n_components, 
+                            all_component_names, 
+                            component_bounds_parts, 
+                            use_parts_mode=True,
+                            fixed_components=fixed_parts if fixed_parts else None
+                        )
+                    else:
+                        mixture = EnhancedMixtureDesign(
+                            n_components, 
+                            all_component_names, 
+                            component_bounds, 
+                            use_parts_mode=False,
+                            fixed_components=fixed_components if fixed_components else None
+                        )
+                    
+                    if use_fixed and (fixed_components or fixed_parts):
+                        st.info(f"ℹ️ Using MixtureDesign with built-in fixed components support")
                     
                     # Generate design based on method
-                    if design_method == "D-optimal":
-                        design = mixture.generate_d_optimal_mixture(n_runs, model_type, random_seed=random_seed)
-                        results = mixture.evaluate_mixture_design(design, model_type)
-                    elif design_method == "I-optimal":
-                        design = mixture.generate_i_optimal_mixture(n_runs, model_type, random_seed=random_seed)
-                        results = mixture.evaluate_mixture_design(design, model_type)
-                    elif design_method == "Simplex Lattice":
-                        design = mixture.generate_simplex_lattice(lattice_degree)
-                        results = mixture.evaluate_mixture_design(design, "quadratic")
-                    elif design_method == "Simplex Centroid":
-                        design = mixture.generate_simplex_centroid()
-                        results = mixture.evaluate_mixture_design(design, "quadratic")
-                    elif design_method == "Extreme Vertices":
-                        design = mixture.generate_extreme_vertices()
-                        results = mixture.evaluate_mixture_design(design, "quadratic")
+                    try:
+                        # Validate bounds elements
+                        for i, bounds_element in enumerate(mixture.component_bounds):
+                            if not isinstance(bounds_element, (tuple, list)) or len(bounds_element) != 2:
+                                st.error(f"Invalid bounds element {i}: Expected tuple/list with 2 elements, got: {bounds_element}")
+                                st.stop()
+                        
+                        # Use enhanced methods when custom runs are requested
+                        if use_custom_runs and design_method in ["Simplex Lattice", "Simplex Centroid", "Extreme Vertices"]:
+                            # Use the unified interface for flexible run numbers
+                            variable_design = mixture.generate_mixture_design(
+                                design_type=design_method.lower().replace(" ", "-"),
+                                n_runs=n_runs,
+                                model_type=model_type if design_method in ["D-optimal", "I-optimal"] else "quadratic",
+                                augment_strategy=augment_strategy,
+                                random_seed=random_seed
+                            )
+                            variable_results = mixture.evaluate_mixture_design(variable_design, model_type)
+                        else:
+                            # Use standard methods
+                            if design_method == "D-optimal":
+                                variable_design = mixture.generate_d_optimal_mixture(n_runs, model_type, random_seed=random_seed)
+                                variable_results = mixture.evaluate_mixture_design(variable_design, model_type)
+                                
+                            elif design_method == "I-optimal":
+                                variable_design = mixture.generate_i_optimal_mixture(n_runs, model_type, random_seed=random_seed)
+                                variable_results = mixture.evaluate_mixture_design(variable_design, model_type)
+                                
+                            elif design_method == "Simplex Lattice":
+                                try:
+                                    variable_design = mixture.generate_simplex_lattice(lattice_degree)
+                                    variable_results = mixture.evaluate_mixture_design(variable_design, "quadratic")
+                                    
+                                except Exception as lattice_error:
+                                    st.error(f"Error in Simplex Lattice generation: {str(lattice_error)}")
+                                    raise lattice_error
+                                
+                            elif design_method == "Simplex Centroid":
+                                variable_design = mixture.generate_simplex_centroid()
+                                variable_results = mixture.evaluate_mixture_design(variable_design, "quadratic")
+                                
+                            elif design_method == "Extreme Vertices":
+                                variable_design = mixture.generate_extreme_vertices()
+                                variable_results = mixture.evaluate_mixture_design(variable_design, "quadratic")
+                            
+                            elif design_method == "Space-Filling":
+                                variable_design = mixture.generate_mixture_design(
+                                    design_type="space-filling",
+                                    n_runs=n_runs,
+                                    model_type=model_type,
+                                    random_seed=random_seed
+                                )
+                                variable_results = mixture.evaluate_mixture_design(variable_design, model_type)
+                            
+                            elif design_method == "Custom":
+                                variable_design = mixture.generate_mixture_design(
+                                    design_type="custom",
+                                    n_runs=n_runs,
+                                    model_type=model_type,
+                                    random_seed=random_seed
+                                )
+                                variable_results = mixture.evaluate_mixture_design(variable_design, model_type)
+                        
+                        # Check if design is valid before proceeding
+                        if variable_design.size == 0:
+                            st.error("Empty design generated - bounds may be too restrictive for the design method.")
+                            st.write("Try D-optimal or I-optimal methods, or relax component bounds slightly.")
+                            st.stop()
+                        
+                        elif variable_design.ndim == 1:
+                            # Try to reshape if it's a single point
+                            if variable_design.size == mixture.n_components:
+                                variable_design = variable_design.reshape(1, -1)
+                            else:
+                                st.error("Invalid design array dimensions")
+                                st.stop()
+                        
+                        elif variable_design.shape[1] != mixture.n_components:
+                            st.error(f"Design has {variable_design.shape[1]} columns but expected {mixture.n_components} components")
+                            st.stop()
+                        
+                    except Exception as design_error:
+                        st.error(f"🚨 **ERROR IN DESIGN GENERATION!**")
+                        st.error(f"Method: {design_method}")
+                        st.error(f"Error: {str(design_error)}")
+                        
+                        # Debug info at time of error
+                        st.write(f"**Debug Info at Design Generation Error:**")
+                        st.write(f"• Design method: {design_method}")
+                        if design_method in ["D-optimal", "I-optimal"]:
+                            st.write(f"• n_runs: {n_runs}")
+                            st.write(f"• model_type: {model_type}")
+                        elif design_method == "Simplex Lattice":
+                            st.write(f"• lattice_degree: {lattice_degree}")
+                        st.write(f"• MixtureDesign object details:")
+                        st.write(f"  - n_components: {len(variable_component_names)}")
+                        st.write(f"  - component_names: {variable_component_names}")
+                        st.write(f"  - use_parts_mode: {use_parts_mode}")
+                        
+                        # Show the actual bounds being used
+                        st.write(f"  - all_component_names: {all_component_names}")
+                        st.write(f"  - component_bounds length: {len(component_bounds)}")
+                        if use_parts_mode:
+                            st.write(f"  - component_bounds_parts length: {len(component_bounds_parts) if 'component_bounds_parts' in locals() else 'N/A'}")
+                        
+                        raise design_error
+                    
+                    # DON'T reconstruct design manually - the mixture generator already handles fixed components correctly
+                    # Our fixed space solution algorithm ensures fixed components vary properly
+                    design = variable_design
+                    results = variable_results
+                    
+                    if use_fixed and fixed_components:
+                        st.success(f"✅ Design generated with {len(variable_component_names)} variable + {len(fixed_components)} fixed components using fixed space solution")
+                    else:
+                        st.success(f"✅ Design generated with {len(component_names)} components")
                     
                     # Generate replicated mixture design if requested
                     if n_mixture_replicates > 1:
@@ -476,7 +1075,9 @@ elif design_type == "Mixture Design":
         if 'mixture_design' in st.session_state:
             design = st.session_state.mixture_design
             results = st.session_state.mixture_results
-            component_names = st.session_state.mixture_component_names
+            # CRITICAL FIX: Use the exact component names order from the algorithm
+            mixture_generator = st.session_state.mixture_generator
+            component_names = mixture_generator.component_names
             
             st.subheader("Design Metrics")
             col_a, col_b, col_c = st.columns(3)
@@ -575,7 +1176,102 @@ elif design_type == "Mixture Design":
             for col in component_names:
                 mixture_df[f"{col} (%)"] = (mixture_df[col] * 100).round(1)
             
-            st.dataframe(mixture_df.round(4))
+            # Add quantity columns based on batch size
+            st.write(f"**Proportions and Quantities (Batch Size: {batch_size} units)**")
+            
+            # Calculate quantities for each component with adjustment to ensure exact batch size
+            # First, calculate raw quantities
+            for col in component_names:
+                mixture_df[f"{col} (qty)_raw"] = mixture_df[col] * batch_size
+            
+            # Round all but the last component
+            quantity_cols = [f"{col} (qty)" for col in component_names]
+            for i, col in enumerate(component_names[:-1]):
+                mixture_df[f"{col} (qty)"] = mixture_df[f"{col} (qty)_raw"].round(2)
+            
+            # For the last component, calculate to ensure exact total
+            partial_sum_cols = [f"{col} (qty)" for col in component_names[:-1]]
+            if partial_sum_cols:
+                partial_sum = mixture_df[partial_sum_cols].sum(axis=1)
+                mixture_df[f"{component_names[-1]} (qty)"] = (batch_size - partial_sum).round(2)
+            else:
+                # Single component case
+                mixture_df[f"{component_names[-1]} (qty)"] = batch_size
+            
+            # Drop raw columns
+            for col in component_names:
+                if f"{col} (qty)_raw" in mixture_df.columns:
+                    mixture_df.drop(f"{col} (qty)_raw", axis=1, inplace=True)
+            
+            # Add total column to verify (should always equal batch_size)
+            mixture_df['Total (qty)'] = mixture_df[quantity_cols].sum(axis=1).round(2)
+            
+            # Display options
+            display_mode = st.radio(
+                "Display format:",
+                ["Full (Proportions + % + Quantities)", "Quantities Only", "Proportions Only"],
+                horizontal=True,
+                key="mixture_display_mode"
+            )
+            
+            if display_mode == "Quantities Only":
+                # Show only Run number and quantity columns
+                display_cols = [f"{col} (qty)" for col in component_names] + ['Total (qty)']
+                display_df = mixture_df[display_cols].round(2)
+                st.dataframe(display_df)
+                
+                # Add info about batch size
+                st.info(f"📦 Quantities shown for batch size: **{batch_size} units**")
+                
+            elif display_mode == "Proportions Only":
+                # Show proportions and percentages
+                prop_cols = component_names + [f"{col} (%)" for col in component_names]
+                display_df = mixture_df[prop_cols].round(4)
+                st.dataframe(display_df)
+                
+            else:  # Full display
+                st.dataframe(mixture_df.round(4))
+            
+            # Quick batch size calculator
+            with st.expander("🧮 Quick Batch Calculator"):
+                col_calc1, col_calc2 = st.columns(2)
+                
+                with col_calc1:
+                    selected_run = st.selectbox(
+                        "Select mixture run:",
+                        options=mixture_df.index,
+                        key="quick_calc_run"
+                    )
+                
+                with col_calc2:
+                    custom_batch_size = st.number_input(
+                        "Custom batch size:",
+                        value=batch_size,
+                        min_value=1.0,
+                        step=1.0,
+                        key="quick_calc_batch"
+                    )
+                
+                # Calculate for selected run
+                if selected_run:
+                    run_data = mixture_df.loc[selected_run]
+                    
+                    st.write(f"**Quantities for {selected_run} with batch size {custom_batch_size}:**")
+                    
+                    calc_data = []
+                    for comp in component_names:
+                        calc_data.append({
+                            'Component': comp,
+                            'Proportion': f"{run_data[comp]:.4f}",
+                            'Percentage': f"{run_data[comp] * 100:.1f}%",
+                            'Quantity': f"{run_data[comp] * custom_batch_size:.2f}"
+                        })
+                    
+                    calc_df = pd.DataFrame(calc_data)
+                    st.dataframe(calc_df)
+                    
+                    total_qty = sum(float(row['Quantity']) for row in calc_data)
+                    st.success(f"**Total quantity: {total_qty:.2f} units** ✓")
             
             # Verify sum to 1
             sums = np.sum(design, axis=1)
@@ -584,12 +1280,31 @@ elif design_type == "Mixture Design":
             else:
                 st.warning("⚠️ Some mixtures don't sum exactly to 100% (rounding)")
             
-            # Download button
-            csv = mixture_df.to_csv()
+            # Download button - match the display format
+            if display_mode == "Quantities Only":
+                # Export only quantity columns
+                download_cols = [f"{col} (qty)" for col in component_names] + ['Total (qty)']
+                download_df = mixture_df[download_cols].copy()
+                # Add the Run index as a column
+                download_df.insert(0, 'Run', download_df.index)
+                download_df = download_df.reset_index(drop=True)
+                csv = download_df.to_csv(index=False)
+                filename = f"mixture_design_quantities_batch_{batch_size}.csv"
+            elif display_mode == "Proportions Only":
+                # Export proportions and percentages
+                download_cols = component_names + [f"{col} (%)" for col in component_names]
+                download_df = mixture_df[download_cols].copy()
+                csv = download_df.to_csv()
+                filename = "mixture_design_proportions.csv"
+            else:  # Full display
+                # Export everything
+                csv = mixture_df.to_csv()
+                filename = "mixture_design_full.csv"
+            
             st.download_button(
-                label="📥 Download Mixture Design",
+                label=f"📥 Download Mixture Design ({display_mode})",
                 data=csv,
-                file_name="mixture_design.csv",
+                file_name=filename,
                 mime="text/csv"
             )
             
@@ -745,6 +1460,26 @@ elif design_type == "Sequential DOE":
         with st.expander("Stage 1: Screening", expanded=True):
             st.write(f"**{seq_recommendations['stage1']['purpose']}**")
             
+            # Stage 1 method and model selection
+            col_method, col_model = st.columns(2)
+            with col_method:
+                stage1_method = st.selectbox(
+                    "Stage 1 Method",
+                    ["D-optimal", "I-optimal", "A-optimal", "G-optimal", "Central Composite", "Box-Behnken", "Full Factorial", "Fractional Factorial", "Simplex Lattice", "Simplex Centroid", "Extreme Vertices"],
+                    index=0,
+                    key="seq_stage1_method",
+                    help="Design generation method for Stage 1"
+                )
+            with col_model:
+                stage1_model_order = st.selectbox(
+                    "Stage 1 Model",
+                    [1, 2],
+                    index=0,  # Default to linear for screening
+                    format_func=lambda x: f"{'Linear' if x==1 else 'Quadratic'}",
+                    key="seq_stage1_model",
+                    help="Model complexity for Stage 1"
+                )
+            
             col_min, col_rec, col_exc = st.columns(3)
             with col_min:
                 st.metric("Minimum", seq_recommendations['stage1']['minimum'])
@@ -768,36 +1503,87 @@ elif design_type == "Sequential DOE":
                 help=seq_recommendations['stage1']['can_fit']
             )
             
-            # Show what can be fitted
-            st.info(f"✓ Can fit: {seq_recommendations['stage1']['can_fit']}")
+            # Show what can be fitted based on selected model
+            model_name = "Linear" if stage1_model_order == 1 else "Quadratic"
+            st.info(f"✓ Can fit: {model_name} model with {stage1_model_order} order")
             
-            # Show expected efficiency
-            stage1_rec_details = temp_seq_doe.get_recommended_runs(1, quality_level)
-            st.success(f"Expected D-efficiency: {stage1_rec_details['efficiency_expected']}")
+            # Show method info
+            method_info = {
+                "D-optimal": "Maximizes parameter estimation accuracy",
+                "I-optimal": "Minimizes average prediction variance",
+                "A-optimal": "Minimizes average parameter variance",
+                "G-optimal": "Minimizes maximum prediction variance",
+                "Central Composite": "Traditional response surface methodology",
+                "Box-Behnken": "Three-level factorial design",
+                "Full Factorial": "Complete factor combinations",
+                "Fractional Factorial": "Efficient screening design",
+                "Simplex Lattice": "Systematic lattice coverage",
+                "Simplex Centroid": "Centroid-based exploration",
+                "Extreme Vertices": "Constraint boundary exploration"
+            }
+            st.success(f"✓ {stage1_method}: {method_info[stage1_method]}")
         
         # Stage 2 settings
         with st.expander("Stage 2: Optimization", expanded=True):
             st.write(f"**{seq_recommendations['stage2']['purpose']}**")
             
-            # Calculate recommended additional runs
-            quad_params = temp_seq_doe._count_parameters(2)
-            total_recommended = int(np.ceil(quad_params * {'minimum': 1.0, 'recommended': 1.5, 'excellent': 2.0}[quality_level]))
+            # Stage 2 method and model selection
+            col_method2, col_model2 = st.columns(2)
+            with col_method2:
+                stage2_method = st.selectbox(
+                    "Stage 2 Method",
+                    ["D-optimal", "I-optimal", "A-optimal", "G-optimal", "Central Composite", "Box-Behnken", "Full Factorial", "Fractional Factorial"],
+                    index=0,
+                    key="seq_stage2_method",
+                    help="Design generation method for Stage 2"
+                )
+            with col_model2:
+                stage2_model_order = st.selectbox(
+                    "Stage 2 Model",
+                    [1, 2, 3],
+                    index=1,  # Default to quadratic for optimization
+                    format_func=lambda x: f"{'Linear' if x==1 else 'Quadratic' if x==2 else 'Cubic'}",
+                    key="seq_stage2_model",
+                    help="Model complexity for Stage 2"
+                )
+            
+            # Calculate parameters based on selected model order
+            stage2_params = temp_seq_doe._count_parameters(stage2_model_order)
+            total_recommended = int(np.ceil(stage2_params * {'minimum': 1.0, 'recommended': 1.5, 'excellent': 2.0}[quality_level]))
             stage2_recommended = max(total_recommended - stage1_runs, 5)
             
+            # Show info based on selected model
+            model_name2 = "Linear" if stage2_model_order == 1 else "Quadratic" if stage2_model_order == 2 else "Cubic"
             st.info(f"Based on Stage 1 ({stage1_runs} runs), recommended additional: **{stage2_recommended}** runs")
-            st.info(f"Total experiments: {stage1_runs + stage2_recommended} to fit quadratic model with {quad_params} parameters")
+            st.info(f"Total experiments: {stage1_runs + stage2_recommended} to fit {model_name2.lower()} model with {stage2_params} parameters")
             
             stage2_runs = st.number_input(
                 "Stage 2 Additional Runs", 
                 min_value=5, 
                 max_value=50, 
                 value=stage2_recommended,
-                help=f"Additional runs for quadratic model ({quad_params} parameters total)"
+                help=f"Additional runs for {model_name2.lower()} model ({stage2_params} parameters total)"
             )
+            
+            # Show method info for Stage 2
+            method_info2 = {
+                "D-optimal": "Maximizes parameter estimation accuracy",
+                "I-optimal": "Minimizes average prediction variance",
+                "A-optimal": "Minimizes average parameter variance",
+                "G-optimal": "Minimizes maximum prediction variance",
+                "Central Composite": "Traditional response surface methodology",
+                "Box-Behnken": "Three-level factorial design",
+                "Full Factorial": "Complete factor combinations",
+                "Fractional Factorial": "Efficient screening design",
+                "Simplex Lattice": "Systematic lattice coverage",
+                "Simplex Centroid": "Centroid-based exploration",
+                "Extreme Vertices": "Constraint boundary exploration"
+            }
+            st.success(f"✓ {stage2_method}: {method_info2[stage2_method]} for {model_name2.lower()} model")
             
             # Show total and efficiency
             total_runs = stage1_runs + stage2_runs
-            run_to_param_ratio = total_runs / quad_params
+            run_to_param_ratio = total_runs / stage2_params
             
             col_total, col_ratio = st.columns(2)
             with col_total:
@@ -833,7 +1619,7 @@ elif design_type == "Sequential DOE":
         random_seed = st.number_input("Random Seed", value=42, key="seq_seed")
         
         # Response names
-        n_responses = st.number_input("Number of Responses", min_value=1, max_value=5, value=3, key="seq_n_resp")
+        n_responses = st.number_input("Number of Responses", min_value=1, max_value=20, value=3, key="seq_n_resp")
         response_names = []
         for i in range(n_responses):
             resp_name = st.text_input(f"Response {i+1} Name", value=f"Response_{i+1}", key=f"seq_resp_{i}")
@@ -1299,8 +2085,10 @@ elif design_type == "Sequential Mixture DOE":
                     for i in range(n_variable_components):
                         # Calculate proportions within the available space
                         if var_sum_max_parts > 0:
+                            # For min proportion: use this component's min over sum of all max parts
                             min_prop = (variable_bounds_parts[i][0] / var_sum_max_parts) * available_for_variable
-                            max_prop = (variable_bounds_parts[i][1] / var_sum_min_parts if var_sum_min_parts > 0 else 1.0) * available_for_variable
+                            # For max proportion: use this component's max over sum of all max parts
+                            max_prop = (variable_bounds_parts[i][1] / var_sum_max_parts) * available_for_variable
                         else:
                             min_prop = 0
                             max_prop = 0
@@ -1373,46 +2161,252 @@ elif design_type == "Sequential Mixture DOE":
             
             # Stage 1 settings
             with st.expander("Stage 1: Screening", expanded=True):
-                st.write(f"**{mix_recommendations['stage1']['purpose']}**")
-                
-                col_min, col_rec, col_exc = st.columns(3)
-                with col_min:
-                    st.metric("Minimum", mix_recommendations['stage1']['minimum'])
-                with col_rec:
-                    st.metric("Recommended", mix_recommendations['stage1']['recommended'])
-                with col_exc:
-                    st.metric("Excellent", mix_recommendations['stage1']['excellent'])
-                
-                # Set default based on quality level
-                stage1_mix_default = {
-                    'minimum': mix_recommendations['stage1']['minimum'],
-                    'recommended': mix_recommendations['stage1']['recommended'],
-                    'excellent': mix_recommendations['stage1']['excellent']
-                }[quality_level_mix]
-                
-                stage1_mix_runs = st.number_input(
-                    "Stage 1 Runs", 
-                    min_value=mix_recommendations['stage1']['minimum'], 
-                    max_value=50, 
-                    value=stage1_mix_default,
-                    key="seq_mix_stage1_runs",
-                    help=mix_recommendations['stage1']['can_fit']
+                # Stage 1 method selection FIRST
+                stage1_method = st.selectbox(
+                    "Stage 1 Design Method", 
+                    ["D-optimal", "I-optimal", "Simplex Lattice", "Simplex Centroid", "Extreme Vertices"],
+                    index=0,  # Default to D-optimal
+                    key="seq_mix_stage1_method",
+                    help="Choose design generation method for screening stage"
                 )
                 
-                st.info(f"✓ Can fit: {mix_recommendations['stage1']['can_fit']}")
-                st.warning(f"⚠️ {mix_recommendations['stage1']['note']}")
+                # Method-specific parameters - get lattice degree FIRST if needed
+                stage1_lattice_degree = 3  # Default value for non-lattice methods
+                if stage1_method == "Simplex Lattice":
+                    # Get lattice degree input BEFORE calculating metrics
+                    stage1_lattice_degree = st.number_input(
+                        "Lattice Degree", 
+                        min_value=2, 
+                        max_value=5, 
+                        value=3,
+                        key="seq_mix_stage1_lattice_pre",
+                        help="Controls spacing resolution of experimental points in mixture space"
+                    )
+                
+                # Calculate method-specific parameters and update recommendations AFTER getting degree
+                if stage1_method in ["D-optimal", "I-optimal"]:
+                    # Keep original recommendations for optimal methods
+                    stage1_runs_min = mix_recommendations['stage1']['minimum']
+                    stage1_runs_rec = mix_recommendations['stage1']['recommended']
+                    stage1_runs_exc = mix_recommendations['stage1']['excellent']
+                    
+                elif stage1_method == "Simplex Lattice":
+                    # Calculate number of runs for lattice design using ACTUAL selected degree
+                    # For q variable components and degree d: C(q + d - 1, d)
+                    import math
+                    q_variable = n_variable  # Number of variable components
+                    calculated_runs = math.comb(q_variable + stage1_lattice_degree - 1, stage1_lattice_degree)
+                    
+                    # Update all metrics to the calculated value
+                    stage1_runs_min = calculated_runs
+                    stage1_runs_rec = calculated_runs
+                    stage1_runs_exc = calculated_runs
+                    
+                elif stage1_method == "Simplex Centroid":
+                    # Calculate number of runs for centroid design
+                    # For q components: 2^q - 1 total subcombinations
+                    q_variable = n_variable
+                    calculated_runs = 2**q_variable - 1  # All non-empty subsets
+                    
+                    # Update all metrics to the calculated value
+                    stage1_runs_min = calculated_runs
+                    stage1_runs_rec = calculated_runs
+                    stage1_runs_exc = calculated_runs
+                    
+                elif stage1_method == "Extreme Vertices":
+                    # Estimate number of runs for extreme vertices (depends on bounds)
+                    q_variable = n_variable
+                    calculated_runs = min(2**q_variable, 20)  # Conservative estimate
+                    
+                    # Update all metrics to the calculated value
+                    stage1_runs_min = calculated_runs
+                    stage1_runs_rec = calculated_runs
+                    stage1_runs_exc = calculated_runs
+                
+                # Dynamic purpose based on selected method
+                method_purposes = {
+                    "D-optimal": "Screening with D-optimal (Linear Mixture Model)",
+                    "I-optimal": "Screening with I-optimal (Linear Mixture Model)", 
+                    "Simplex Lattice": "Systematic Coverage (Lattice Pattern)",
+                    "Simplex Centroid": "Centroid-based Exploration (Quadratic Model)",
+                    "Extreme Vertices": "Boundary Exploration (Constraint-based)"
+                }
+                
+                current_purpose = method_purposes.get(stage1_method, mix_recommendations['stage1']['purpose'])
+                st.write(f"**{current_purpose}**")
+                
+                # Display updated metrics
+                col_min, col_rec, col_exc = st.columns(3)
+                with col_min:
+                    st.metric("Minimum", stage1_runs_min)
+                with col_rec:
+                    st.metric("Recommended", stage1_runs_rec)
+                with col_exc:
+                    st.metric("Excellent", stage1_runs_exc)
+                
+                # Method-specific parameters for Stage 1
+                if stage1_method in ["D-optimal", "I-optimal"]:
+                    # Set default based on quality level
+                    stage1_mix_default = {
+                        'minimum': stage1_runs_min,
+                        'recommended': stage1_runs_rec,
+                        'excellent': stage1_runs_exc
+                    }[quality_level_mix]
+                    
+                    stage1_mix_runs = st.number_input(
+                        "Stage 1 Runs", 
+                        min_value=stage1_runs_min, 
+                        max_value=50, 
+                        value=stage1_mix_default,
+                        key="seq_mix_stage1_runs",
+                        help=f"{stage1_method} mixture design"
+                    )
+                    
+                    stage1_model_type = st.selectbox(
+                        "Stage 1 Model Type", 
+                        ["linear", "quadratic", "cubic"], 
+                        index=0,  # Default to linear for screening
+                        key="seq_mix_stage1_model",
+                        help="Model complexity for Stage 1"
+                    )
+                    
+                elif stage1_method == "Simplex Lattice":
+                    # Use the lattice degree already obtained earlier
+                    pass
+                    
+                    # Add explanation about lattice degree (using info boxes instead of nested expander)
+                    st.info("💡 **Lattice Degree** controls spacing resolution of experimental points (NOT equation complexity)")
+                    
+                    with st.container():
+                        st.markdown(f"""
+                        **🎯 Lattice Degree {stage1_lattice_degree} creates points at:** {', '.join([f'{i}/{stage1_lattice_degree}' for i in range(stage1_lattice_degree + 1)])}
+                        
+                        **📊 Key Facts:**
+                        - **Resolution**: {stage1_lattice_degree + 1} levels per component (finer = more points)
+                        - **Total points**: Will generate **{math.comb(n_variable + stage1_lattice_degree - 1, stage1_lattice_degree)}** experimental mixtures
+                        - **Model flexibility**: Can fit linear, quadratic, OR cubic equations to this data
+                        - **Higher degree**: More comprehensive coverage, higher cost
+                        """)
+                    # Recalculate with actual selected degree
+                    q_variable = n_variable  # Number of variable components
+                    stage1_mix_runs = math.comb(q_variable + stage1_lattice_degree - 1, stage1_lattice_degree)
+                    
+                    # UPDATE THE DISPLAYED METRICS with the new calculation
+                    stage1_runs_min = stage1_mix_runs
+                    stage1_runs_rec = stage1_mix_runs
+                    stage1_runs_exc = stage1_mix_runs
+                    
+                    st.success(f"✅ Lattice design will generate exactly {stage1_mix_runs} runs")
+                    stage1_model_type = "quadratic"  # Default for lattice
+                    
+                elif stage1_method == "Simplex Centroid":
+                    # Use the calculated value
+                    stage1_mix_runs = stage1_runs_rec  # All are the same for fixed methods
+                    
+                    st.success(f"✅ Centroid design will generate exactly {stage1_mix_runs} runs")
+                    stage1_model_type = "quadratic"  # Default
+                    
+                elif stage1_method == "Extreme Vertices":
+                    # Use the calculated value
+                    stage1_mix_runs = stage1_runs_rec  # All are the same for fixed methods
+                    
+                    st.success(f"✅ Extreme vertices design will generate approximately {stage1_mix_runs} runs")
+                    stage1_model_type = "quadratic"  # Default
+                
+                # Show method information with efficiency explanation
+                method_info = {
+                    "D-optimal": "Optimized for parameter estimation accuracy",
+                    "I-optimal": "Optimized for prediction accuracy",
+                    "Simplex Lattice": "Systematic coverage of mixture space",
+                    "Simplex Centroid": "Focus on centroids and center points",
+                    "Extreme Vertices": "Based on constraint boundaries"
+                }
+                
+                st.info(f"✓ **{stage1_method}**: {method_info[stage1_method]}")
+                
+                # Add efficiency explanation for lattice methods
+                if stage1_method == "Simplex Lattice":
+                    st.success("🎯 **Why Lattice Generates More Runs:**")
+                    st.markdown(f"""
+                    **Mathematical Formula**: For {n_variable} components and degree {stage1_lattice_degree if 'stage1_lattice_degree' in locals() else 3}:
+                    - **Lattice runs**: C({n_variable} + {stage1_lattice_degree if 'stage1_lattice_degree' in locals() else 3} - 1, {stage1_lattice_degree if 'stage1_lattice_degree' in locals() else 3}) = {stage1_mix_runs} runs
+                    - **Quadratic parameters**: {n_variable} + C({n_variable}, 2) = {n_variable + (n_variable * (n_variable - 1)) // 2} parameters
+                    
+                    **Trade-offs**: Lattice = Complete coverage vs. D-optimal = Efficiency
+                    """)
+                
+                elif stage1_method in ["Simplex Centroid", "Extreme Vertices"]:
+                    st.info(f"💡 **{stage1_method} Philosophy**: Systematic pattern based on mathematical structure")
+                    st.markdown(f"""
+                    **Design Approach:**
+                    - 🎯 **Systematic Pattern**: Mathematical structure, not optimization
+                    - 📊 **Coverage**: Specific points (centroids or vertices) 
+                    - 🔬 **Traditional**: Well-established in literature
+                    """)
+                
+                if stage1_method in ["D-optimal", "I-optimal"]:
+                    st.info(f"✓ Can fit: {mix_recommendations['stage1']['can_fit']}")
+                    st.warning(f"⚠️ {mix_recommendations['stage1']['note']}")
             
             # Stage 2 settings
             with st.expander("Stage 2: Optimization", expanded=True):
                 st.write(f"**{mix_recommendations['stage2']['purpose']}**")
                 
+                # Model type selection for Stage 2
+                stage2_model_type = st.selectbox(
+                    "Stage 2 Model Type", 
+                    ["linear", "quadratic", "cubic"], 
+                    index=1,  # Default to quadratic
+                    key="seq_mix_stage2_model",
+                    help="Linear: main effects only | Quadratic: adds binary interactions | Cubic: adds ternary interactions"
+                )
+                
+                # Calculate dynamic recommendations based on selected model type
+                # Calculate parameters based on model type (mixture models have no intercept)
+                if stage2_model_type == "linear":
+                    stage2_params = n_variable  # Linear mixture model
+                elif stage2_model_type == "quadratic":
+                    stage2_params = n_variable + (n_variable * (n_variable - 1)) // 2  # Linear + interactions
+                elif stage2_model_type == "cubic":
+                    # Linear + binary interactions + ternary interactions
+                    binary_interactions = (n_variable * (n_variable - 1)) // 2
+                    if n_variable >= 3:
+                        ternary_interactions = (n_variable * (n_variable - 1) * (n_variable - 2)) // 6
+                    else:
+                        ternary_interactions = 0
+                    stage2_params = n_variable + binary_interactions + ternary_interactions
+                else:
+                    stage2_params = n_variable  # Default to linear
+                stage2_total_recommended = int(np.ceil(stage2_params * {'minimum': 1.0, 'recommended': 1.5, 'excellent': 2.0}[quality_level_mix]))
+                stage2_additional_recommended = max(stage2_total_recommended - stage1_mix_runs, 5)
+                
+                # Show dynamic info based on model type
+                col_params, col_rec = st.columns(2)
+                with col_params:
+                    st.metric(f"{stage2_model_type.title()} Parameters", stage2_params)
+                with col_rec:
+                    st.metric("Recommended Additional", stage2_additional_recommended)
+                
+                st.info(f"📊 **{stage2_model_type.title()} Model Requirements:**")
+                st.write(f"• Parameters to estimate: {stage2_params}")
+                st.write(f"• Total runs needed: {stage2_total_recommended} ({quality_level_mix} quality)")
+                st.write(f"• Additional runs: {stage2_additional_recommended} (after Stage 1: {stage1_mix_runs})")
+                
+                # Model complexity explanation
+                model_explanations = {
+                    "linear": "Main component effects only - simplest model",
+                    "quadratic": "Main effects + binary interactions - most common choice", 
+                    "cubic": "Main effects + binary + ternary interactions - most complex"
+                }
+                st.success(f"✓ {model_explanations[stage2_model_type]}")
+                
                 stage2_mix_runs = st.number_input(
                     "Stage 2 Additional Runs", 
                     min_value=5, 
-                    max_value=50, 
-                    value=mix_recommendations['stage2']['recommended_additional'],
+                    max_value=100,  # Increased max to accommodate larger designs
+                    value=min(stage2_additional_recommended, 100),  # Use dynamic recommendation
                     key="seq_mix_stage2_runs",
-                    help=f"Additional runs for quadratic mixture model"
+                    help=f"Additional runs for {stage2_model_type} mixture model with {stage2_params} parameters"
                 )
                 
                 # Focus components option
@@ -1447,7 +2441,7 @@ elif design_type == "Sequential Mixture DOE":
         random_seed_mix = st.number_input("Random Seed", value=42, key="seq_mix_seed")
         
         # Response names
-        n_responses_mix = st.number_input("Number of Responses", min_value=1, max_value=5, value=2, key="seq_mix_n_resp")
+        n_responses_mix = st.number_input("Number of Responses", min_value=1, max_value=20, value=2, key="seq_mix_n_resp")
         response_names_mix = []
         for i in range(n_responses_mix):
             resp_name = st.text_input(f"Response {i+1} Name", value=f"Property_{i+1}", key=f"seq_mix_resp_{i}")
@@ -1503,7 +2497,7 @@ elif design_type == "Sequential Mixture DOE":
                     stage2_mix_design = seq_mix_doe.augment_mixture_design(
                         stage1_mix_design,
                         n_additional_runs=stage2_mix_runs,
-                        model_type="quadratic",
+                        model_type=stage2_model_type,  # Use selected model type
                         focus_components=focus_components if use_focus_mix else None,
                         random_seed=random_seed_mix + 1
                     )
@@ -1699,59 +2693,546 @@ elif design_type == "Sequential Mixture DOE":
                     key="dl_mix_all"
                 )
             
-            # Ternary plot for 3 components (if no fixed components)
-            if n_components == 3 and len(fixed_components) == 0:
-                st.subheader("📊 Mixture Design Visualization")
+            # Multiple Visualization Options
+            st.subheader("📊 Mixture Design Visualizations")
+            
+            # Combine all designs for visualization
+            all_mix_designs = np.vstack([stage1_mix_design, stage2_mix_design])
+            stage_labels = ['Stage 1'] * len(stage1_mix_design) + ['Stage 2'] * len(stage2_mix_design)
+            stage_colors = ['blue'] * len(stage1_mix_design) + ['red'] * len(stage2_mix_design)
+            
+            # Create tabs for different visualization types
+            viz_tabs = st.tabs([
+                "📈 Component Ranges", 
+                "🔗 Pairwise Plots", 
+                "📊 Sequential Comparison",
+                "🎯 Ternary Plot",
+                "📋 Component Matrix"
+            ])
+            
+            with viz_tabs[0]:  # Component Ranges
+                st.write("**Component Proportion Ranges and Distribution**")
                 
-                fig = go.Figure()
+                # Calculate component statistics
+                comp_stats = []
+                for i, comp_name in enumerate(component_names):
+                    stage1_vals = stage1_mix_design[:, i]
+                    stage2_vals = stage2_mix_design[:, i]
+                    all_vals = all_mix_designs[:, i]
+                    
+                    comp_stats.append({
+                        'Component': comp_name,
+                        'Overall_Min': all_vals.min(),
+                        'Overall_Max': all_vals.max(),
+                        'Overall_Mean': all_vals.mean(),
+                        'Stage1_Mean': stage1_vals.mean(),
+                        'Stage2_Mean': stage2_vals.mean(),
+                        'Range': all_vals.max() - all_vals.min()
+                    })
                 
-                # Stage 1 points
-                fig.add_trace(go.Scatterternary({
-                    'mode': 'markers+text',
-                    'a': stage1_mix_design[:, 0],
-                    'b': stage1_mix_design[:, 1], 
-                    'c': stage1_mix_design[:, 2],
-                    'text': [f"S1-{i+1}" for i in range(len(stage1_mix_design))],
-                    'textposition': "top center",
-                    'marker': {
-                        'symbol': 'circle',
-                        'size': 10,
-                        'color': 'blue',
-                        'line': {'width': 2, 'color': 'darkblue'}
-                    },
-                    'name': 'Stage 1'
-                }))
+                stats_df = pd.DataFrame(comp_stats)
                 
-                # Stage 2 points
-                fig.add_trace(go.Scatterternary({
-                    'mode': 'markers+text',
-                    'a': stage2_mix_design[:, 0],
-                    'b': stage2_mix_design[:, 1], 
-                    'c': stage2_mix_design[:, 2],
-                    'text': [f"S2-{i+1}" for i in range(len(stage2_mix_design))],
-                    'textposition': "bottom center",
-                    'marker': {
-                        'symbol': 'square',
-                        'size': 10,
-                        'color': 'red',
-                        'line': {'width': 2, 'color': 'darkred'}
-                    },
-                    'name': 'Stage 2'
-                }))
+                # Component range visualization
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    subplot_titles=['Component Proportion Ranges', 'Component Distributions'],
+                    specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
+                )
                 
-                fig.update_layout({
-                    'ternary': {
-                        'sum': 1,
-                        'aaxis': {'title': component_names[0]},
-                        'baxis': {'title': component_names[1]},
-                        'caxis': {'title': component_names[2]}
-                    },
-                    'height': 500,
-                    'title': "Sequential Mixture Design",
-                    'showlegend': True
-                })
+                # Box plot for ranges
+                for i, comp_name in enumerate(component_names):
+                    fig.add_trace(
+                        go.Box(
+                            y=all_mix_designs[:, i],
+                            name=comp_name,
+                            boxpoints='all',
+                            jitter=0.3,
+                            pointpos=-1.8,
+                            marker_color=px.colors.qualitative.Set1[i % len(px.colors.qualitative.Set1)]
+                        ),
+                        row=1, col=1
+                    )
+                
+                # Histogram for each component
+                for i, comp_name in enumerate(component_names):
+                    fig.add_trace(
+                        go.Histogram(
+                            x=all_mix_designs[:, i],
+                            name=f"{comp_name} Hist",
+                            opacity=0.7,
+                            nbinsx=20,
+                            histnorm='probability density'
+                        ),
+                        row=2, col=1
+                    )
+                
+                fig.update_layout(height=800, title_text="Component Analysis")
+                fig.update_xaxes(title_text="Components", row=1, col=1)
+                fig.update_yaxes(title_text="Proportion", row=1, col=1)
+                fig.update_xaxes(title_text="Proportion", row=2, col=1)
+                fig.update_yaxes(title_text="Density", row=2, col=1)
                 
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # Statistics table
+                st.write("**Component Statistics:**")
+                st.dataframe(stats_df.round(4))
+            
+            with viz_tabs[1]:  # Pairwise Plots
+                st.write("**Pairwise Component Relationships**")
+                
+                # Select components to plot
+                available_components = [comp for comp in component_names if comp not in fixed_components]
+                
+                if len(available_components) >= 2:
+                    col_sel1, col_sel2 = st.columns(2)
+                    with col_sel1:
+                        comp1 = st.selectbox("X-axis component:", available_components, key="pair_x")
+                    with col_sel2:
+                        comp2 = st.selectbox("Y-axis component:", available_components, 
+                                           index=1 if len(available_components) > 1 else 0, key="pair_y")
+                    
+                    if comp1 != comp2:
+                        # Create pairwise scatter plot
+                        comp1_idx = component_names.index(comp1)
+                        comp2_idx = component_names.index(comp2)
+                        
+                        fig = go.Figure()
+                        
+                        # Stage 1 points
+                        fig.add_trace(go.Scatter(
+                            x=stage1_mix_design[:, comp1_idx],
+                            y=stage1_mix_design[:, comp2_idx],
+                            mode='markers+text',
+                            text=[f"S1-{i+1}" for i in range(len(stage1_mix_design))],
+                            textposition="top center",
+                            marker=dict(size=12, color='blue', symbol='circle'),
+                            name='Stage 1',
+                            hovertemplate=f'{comp1}: %{{x:.3f}}<br>{comp2}: %{{y:.3f}}<br>Run: %{{text}}<extra></extra>'
+                        ))
+                        
+                        # Stage 2 points
+                        fig.add_trace(go.Scatter(
+                            x=stage2_mix_design[:, comp1_idx],
+                            y=stage2_mix_design[:, comp2_idx],
+                            mode='markers+text',
+                            text=[f"S2-{i+1}" for i in range(len(stage2_mix_design))],
+                            textposition="bottom center",
+                            marker=dict(size=12, color='red', symbol='square'),
+                            name='Stage 2',
+                            hovertemplate=f'{comp1}: %{{x:.3f}}<br>{comp2}: %{{y:.3f}}<br>Run: %{{text}}<extra></extra>'
+                        ))
+                        
+                        fig.update_layout(
+                            title=f"{comp1} vs {comp2}",
+                            xaxis_title=f"{comp1} (proportion)",
+                            yaxis_title=f"{comp2} (proportion)",
+                            height=500,
+                            showlegend=True
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Correlation analysis
+                        corr_coef = np.corrcoef(all_mix_designs[:, comp1_idx], all_mix_designs[:, comp2_idx])[0, 1]
+                        st.metric(f"Correlation between {comp1} and {comp2}", f"{corr_coef:.3f}")
+                
+                # Correlation matrix for all variable components
+                if len(available_components) > 2:
+                    st.write("**Correlation Matrix (Variable Components)**")
+                    
+                    var_indices = [component_names.index(comp) for comp in available_components]
+                    var_data = all_mix_designs[:, var_indices]
+                    corr_matrix = np.corrcoef(var_data.T)
+                    
+                    fig = go.Figure(data=go.Heatmap(
+                        z=corr_matrix,
+                        x=available_components,
+                        y=available_components,
+                        colorscale='RdBu',
+                        zmid=0,
+                        text=np.round(corr_matrix, 3),
+                        texttemplate="%{text}",
+                        textfont={"size": 10},
+                        hovertemplate='%{x} vs %{y}<br>Correlation: %{z:.3f}<extra></extra>'
+                    ))
+                    
+                    fig.update_layout(
+                        title="Component Correlation Matrix",
+                        height=400
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with viz_tabs[2]:  # Sequential Comparison
+                st.write("**Stage 1 vs Stage 2 Comparison**")
+                
+                # Component comparison
+                n_cols = min(3, len(component_names))
+                cols = st.columns(n_cols)
+                
+                for i, comp_name in enumerate(component_names):
+                    with cols[i % n_cols]:
+                        stage1_vals = stage1_mix_design[:, i]
+                        stage2_vals = stage2_mix_design[:, i]
+                        
+                        fig = go.Figure()
+                        
+                        fig.add_trace(go.Box(
+                            y=stage1_vals,
+                            name='Stage 1',
+                            marker_color='blue',
+                            boxpoints='all'
+                        ))
+                        
+                        fig.add_trace(go.Box(
+                            y=stage2_vals,
+                            name='Stage 2',
+                            marker_color='red',
+                            boxpoints='all'
+                        ))
+                        
+                        fig.update_layout(
+                            title=f"{comp_name}",
+                            yaxis_title="Proportion",
+                            height=300,
+                            showlegend=True if i == 0 else False
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Stage statistics
+                        stage1_mean = stage1_vals.mean()
+                        stage2_mean = stage2_vals.mean()
+                        change = ((stage2_mean - stage1_mean) / stage1_mean * 100) if stage1_mean > 0 else 0
+                        
+                        if abs(change) > 5:  # Significant change
+                            if change > 0:
+                                st.success(f"↗️ +{change:.1f}% focus")
+                            else:
+                                st.info(f"↘️ {change:.1f}% reduced")
+                        else:
+                            st.info("📊 Similar levels")
+                
+                # Overall design space exploration
+                st.write("**Design Space Exploration**")
+                
+                exploration_metrics = {
+                    'Stage': ['Stage 1', 'Stage 2', 'Combined'],
+                    'Runs': [len(stage1_mix_design), len(stage2_mix_design), len(all_mix_designs)],
+                    'Avg Distance': [
+                        np.mean([np.min(np.sqrt(np.sum((stage1_mix_design[i] - stage1_mix_design)**2, axis=1)[np.arange(len(stage1_mix_design)) != i])) for i in range(len(stage1_mix_design))]),
+                        np.mean([np.min(np.sqrt(np.sum((stage2_mix_design[i] - stage2_mix_design)**2, axis=1)[np.arange(len(stage2_mix_design)) != i])) for i in range(len(stage2_mix_design))]),
+                        np.mean([np.min(np.sqrt(np.sum((all_mix_designs[i] - all_mix_designs)**2, axis=1)[np.arange(len(all_mix_designs)) != i])) for i in range(len(all_mix_designs))])
+                    ]
+                }
+                
+                exploration_df = pd.DataFrame(exploration_metrics)
+                st.dataframe(exploration_df.round(4))
+            
+            with viz_tabs[3]:  # Ternary Plot
+                st.write("**Ternary Plot (3 Components)**")
+                
+                if len(component_names) >= 3:
+                    # Controls for ternary plot
+                    col_comp, col_scale = st.columns([2, 1])
+                    
+                    with col_comp:
+                        # Let user select 3 components for ternary plot
+                        ternary_components = st.multiselect(
+                            "Select 3 components for ternary plot:",
+                            component_names,
+                            default=component_names[:3],
+                            max_selections=3
+                        )
+                    
+                    with col_scale:
+                        # Scale selection
+                        scale_type = st.selectbox(
+                            "Scale Type:",
+                            ["Linear", "Pseudo-Components", "Zoomed View"],
+                            help="Pseudo-components: Transform to use full ternary space | Zoomed: Focus on actual data region"
+                        )
+                    
+                    if len(ternary_components) == 3:
+                        # Get indices
+                        tern_indices = [component_names.index(comp) for comp in ternary_components]
+                        
+                        # Extract the 3 components
+                        stage1_tern = stage1_mix_design[:, tern_indices]
+                        stage2_tern = stage2_mix_design[:, tern_indices]
+                        
+                        # Apply scaling transformation
+                        if scale_type == "Pseudo-Components":
+                            # Pseudo-component transformation: rescale to use full ternary space
+                            all_tern_data = np.vstack([stage1_tern, stage2_tern])
+                            
+                            # Calculate actual min/max for each component
+                            comp_mins = np.min(all_tern_data, axis=0)
+                            comp_maxs = np.max(all_tern_data, axis=0)
+                            comp_ranges = comp_maxs - comp_mins
+                            
+                            # Transform to pseudo-components (0 to 1 range based on actual data)
+                            stage1_pseudo = (stage1_tern - comp_mins) / comp_ranges
+                            stage2_pseudo = (stage2_tern - comp_mins) / comp_ranges
+                            
+                            # Handle division by zero (constant components)
+                            stage1_pseudo = np.nan_to_num(stage1_pseudo)
+                            stage2_pseudo = np.nan_to_num(stage2_pseudo)
+                            
+                            # Renormalize to sum to 1 for ternary plot
+                            stage1_tern_plot = stage1_pseudo / stage1_pseudo.sum(axis=1)[:, np.newaxis]
+                            stage2_tern_plot = stage2_pseudo / stage2_pseudo.sum(axis=1)[:, np.newaxis]
+                            
+                            scale_note = "Pseudo-components: rescaled to use full ternary space based on actual data ranges"
+                            title_suffix = " (Pseudo-Components)"
+                            
+                            # Show transformation info
+                            transform_info = []
+                            for i, comp in enumerate(ternary_components):
+                                transform_info.append({
+                                    'Component': comp,
+                                    'Original Min': f"{comp_mins[i]:.4f}",
+                                    'Original Max': f"{comp_maxs[i]:.4f}",
+                                    'Original Range': f"{comp_ranges[i]:.4f}",
+                                    'Pseudo Range': "0.000 - 1.000"
+                                })
+                        
+                        elif scale_type == "Zoomed View":
+                            # Zoomed view: focus on actual data region
+                            all_tern_data = np.vstack([stage1_tern, stage2_tern])
+                            
+                            # Calculate data bounds with small padding
+                            comp_mins = np.min(all_tern_data, axis=0)
+                            comp_maxs = np.max(all_tern_data, axis=0)
+                            comp_ranges = comp_maxs - comp_mins
+                            
+                            # Add 10% padding to each side
+                            padding = 0.1
+                            comp_mins_padded = np.maximum(0, comp_mins - padding * comp_ranges)
+                            comp_maxs_padded = np.minimum(1, comp_maxs + padding * comp_ranges)
+                            
+                            # For zoomed view, we keep original proportions but will adjust ternary plot limits
+                            stage1_tern_plot = stage1_tern / stage1_tern.sum(axis=1)[:, np.newaxis]
+                            stage2_tern_plot = stage2_tern / stage2_tern.sum(axis=1)[:, np.newaxis]
+                            
+                            scale_note = "Zoomed view: focused on actual data region with padding"
+                            title_suffix = " (Zoomed View)"
+                            
+                            # Store zoom info for plot customization
+                            zoom_info = {
+                                'mins': comp_mins_padded,
+                                'maxs': comp_maxs_padded,
+                                'center': (comp_mins + comp_maxs) / 2
+                            }
+                        
+                        else:  # Linear
+                            # Linear scale - normalize to sum to 1 (for proper ternary plot)
+                            stage1_tern_plot = stage1_tern / stage1_tern.sum(axis=1)[:, np.newaxis]
+                            stage2_tern_plot = stage2_tern / stage2_tern.sum(axis=1)[:, np.newaxis]
+                            
+                            scale_note = "Linear scale - shows actual relative proportions"
+                            title_suffix = " (Linear)"
+                        
+                        # Create ternary plot
+                        fig = go.Figure()
+                        
+                        # Stage 1 points
+                        fig.add_trace(go.Scatterternary({
+                            'mode': 'markers+text',
+                            'a': stage1_tern_plot[:, 0],
+                            'b': stage1_tern_plot[:, 1], 
+                            'c': stage1_tern_plot[:, 2],
+                            'text': [f"S1-{i+1}" for i in range(len(stage1_tern_plot))],
+                            'textposition': "top center",
+                            'marker': {
+                                'symbol': 'circle',
+                                'size': 10,
+                                'color': 'blue',
+                                'line': {'width': 2, 'color': 'darkblue'}
+                            },
+                            'name': 'Stage 1',
+                            'hovertemplate': '<b>Stage 1 - Run %{text}</b><br>' + 
+                                           f'{ternary_components[0]}: %{{a:.3f}}<br>' +
+                                           f'{ternary_components[1]}: %{{b:.3f}}<br>' +
+                                           f'{ternary_components[2]}: %{{c:.3f}}<extra></extra>'
+                        }))
+                        
+                        # Stage 2 points
+                        fig.add_trace(go.Scatterternary({
+                            'mode': 'markers+text',
+                            'a': stage2_tern_plot[:, 0],
+                            'b': stage2_tern_plot[:, 1], 
+                            'c': stage2_tern_plot[:, 2],
+                            'text': [f"S2-{i+1}" for i in range(len(stage2_tern_plot))],
+                            'textposition': "bottom center",
+                            'marker': {
+                                'symbol': 'square',
+                                'size': 10,
+                                'color': 'red',
+                                'line': {'width': 2, 'color': 'darkred'}
+                            },
+                            'name': 'Stage 2',
+                            'hovertemplate': '<b>Stage 2 - Run %{text}</b><br>' + 
+                                           f'{ternary_components[0]}: %{{a:.3f}}<br>' +
+                                           f'{ternary_components[1]}: %{{b:.3f}}<br>' +
+                                           f'{ternary_components[2]}: %{{c:.3f}}<extra></extra>'
+                        }))
+                        
+                        fig.update_layout({
+                            'ternary': {
+                                'sum': 1,
+                                'aaxis': {'title': ternary_components[0]},
+                                'baxis': {'title': ternary_components[1]},
+                                'caxis': {'title': ternary_components[2]}
+                            },
+                            'height': 500,
+                            'title': f"Ternary Plot: {', '.join(ternary_components)}{title_suffix}",
+                            'showlegend': True
+                        })
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Information about the scaling
+                        if scale_type == "Pseudo-Components":
+                            st.info(f"💡 **Pseudo-Components**: {scale_note}")
+                            st.success("✅ **How it works**: Rescales each component from [actual_min, actual_max] to [0, 1], then normalizes for ternary display")
+                            
+                            # Show transformation table
+                            st.write("**Transformation Details:**")
+                            transform_df = pd.DataFrame(transform_info)
+                            st.dataframe(transform_df)
+                            
+                            # Show comparison of first few points
+                            st.write("**Original vs Pseudo-Component Proportions (first 3 mixtures):**")
+                            
+                            n_show = min(3, len(stage1_tern), len(stage2_tern))
+                            comparison_data = []
+                            
+                            for i in range(n_show):
+                                # Stage 1
+                                comparison_data.append({
+                                    'Run': f'S1-{i+1}',
+                                    'Type': 'Original',
+                                    ternary_components[0]: f"{stage1_tern[i, 0]:.3f}",
+                                    ternary_components[1]: f"{stage1_tern[i, 1]:.3f}",
+                                    ternary_components[2]: f"{stage1_tern[i, 2]:.3f}"
+                                })
+                                comparison_data.append({
+                                    'Run': f'S1-{i+1}',
+                                    'Type': 'Pseudo-Comp',
+                                    ternary_components[0]: f"{stage1_tern_plot[i, 0]:.3f}",
+                                    ternary_components[1]: f"{stage1_tern_plot[i, 1]:.3f}",
+                                    ternary_components[2]: f"{stage1_tern_plot[i, 2]:.3f}"
+                                })
+                            
+                            comparison_df = pd.DataFrame(comparison_data)
+                            st.dataframe(comparison_df)
+                            
+                        elif scale_type == "Zoomed View":
+                            st.info(f"💡 **Zoomed View**: {scale_note}")
+                            st.success("✅ **How it works**: Focuses the plot on the actual data region with padding")
+                            
+                            # Show zoom information
+                            st.write("**Zoom Region Details:**")
+                            zoom_df = pd.DataFrame({
+                                'Component': ternary_components,
+                                'Data Min': [f"{comp_mins[i]:.4f}" for i in range(3)],
+                                'Data Max': [f"{comp_maxs[i]:.4f}" for i in range(3)],
+                                'Zoom Min': [f"{zoom_info['mins'][i]:.4f}" for i in range(3)],
+                                'Zoom Max': [f"{zoom_info['maxs'][i]:.4f}" for i in range(3)]
+                            })
+                            st.dataframe(zoom_df)
+                            
+                        else:  # Linear
+                            st.info(f"💡 **Linear Scale**: {scale_note}")
+                        
+                        # Analysis of component ranges
+                        st.write("**Component Range Analysis:**")
+                        range_analysis = []
+                        
+                        all_tern_data = np.vstack([stage1_tern, stage2_tern])
+                        
+                        for i, comp in enumerate(ternary_components):
+                            comp_values = all_tern_data[:, i]
+                            range_analysis.append({
+                                'Component': comp,
+                                'Min': f"{comp_values.min():.4f}",
+                                'Max': f"{comp_values.max():.4f}",
+                                'Range': f"{comp_values.max() - comp_values.min():.4f}",
+                                'Dominance': 'High' if comp_values.max() > 0.5 else 'Low'
+                            })
+                        
+                        range_df = pd.DataFrame(range_analysis)
+                        st.dataframe(range_df)
+                        
+                        # Recommendation for scale choice
+                        max_proportion = all_tern_data.max()
+                        min_range = min([float(row['Range']) for row in range_analysis])
+                        
+                        if max_proportion > 0.7 and min_range < 0.1:
+                            st.warning("🔍 **Recommendation**: Consider using **Log Scale** - " +
+                                     "one component dominates (>70%) while others have small variation (<10%)")
+                        else:
+                            st.success("✅ **Recommendation**: **Linear Scale** works well - " +
+                                     "components have reasonable balance and variation")
+                        
+                    else:
+                        st.warning("Please select exactly 3 components for the ternary plot")
+                else:
+                    st.warning("Need at least 3 components for ternary plot")
+            
+            with viz_tabs[4]:  # Component Matrix
+                st.write("**Complete Component Matrix View**")
+                
+                # Create a comprehensive view of all design points
+                matrix_data = []
+                
+                for i, design_point in enumerate(stage1_mix_design):
+                    row = {'Run': f'S1-{i+1}', 'Stage': 'Stage 1'}
+                    for j, comp_name in enumerate(component_names):
+                        row[comp_name] = design_point[j]
+                        row[f'{comp_name}_pct'] = f"{design_point[j]*100:.1f}%"
+                    matrix_data.append(row)
+                
+                for i, design_point in enumerate(stage2_mix_design):
+                    row = {'Run': f'S2-{i+1}', 'Stage': 'Stage 2'}
+                    for j, comp_name in enumerate(component_names):
+                        row[comp_name] = design_point[j]
+                        row[f'{comp_name}_pct'] = f"{design_point[j]*100:.1f}%"
+                    matrix_data.append(row)
+                
+                matrix_df = pd.DataFrame(matrix_data)
+                
+                # Interactive scatter matrix
+                if len(component_names) <= 6:  # Limit for readability
+                    fig = px.scatter_matrix(
+                        matrix_df,
+                        dimensions=component_names,
+                        color='Stage',
+                        title="Component Scatter Matrix",
+                        hover_data=['Run'],
+                        height=600
+                    )
+                    fig.update_traces(diagonal_visible=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Too many components for scatter matrix. Showing first 6 components:")
+                    fig = px.scatter_matrix(
+                        matrix_df,
+                        dimensions=component_names[:6],
+                        color='Stage',
+                        title="Component Scatter Matrix (First 6 Components)",
+                        hover_data=['Run'],
+                        height=600
+                    )
+                    fig.update_traces(diagonal_visible=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Detailed matrix table
+                st.write("**Detailed Design Matrix:**")
+                display_cols = ['Run', 'Stage'] + [f'{comp}_pct' for comp in component_names]
+                st.dataframe(matrix_df[display_cols])
             
             # Workflow guide
             st.subheader("📚 Sequential Mixture DOE Workflow")

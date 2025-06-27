@@ -1,9 +1,19 @@
-# Python
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+*_env/
+*_venv/
+
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Distribution / packaging
 build/
 develop-eggs/
 dist/
@@ -19,40 +29,44 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
-# Virtual environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
+# PyInstaller
+*.manifest
+*.spec
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Streamlit
-.streamlit/
-
-# OS
-.DS_Store
-Thumbs.db
+# Unit test / coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
 
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Data files (optional - remove if you want to include data)
-*.csv
-*.xlsx
-*.xls
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-# R
-.Rproj.user/
-.Rhistory
-.RData
-.Ruserdata
-*.Rproj
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+*.csv
+output/
+results/
+temp/
+data/

@@ -223,622 +223,132 @@ class SimplexCentroidDesign(MixtureDesignBase):
 
 
 class DOptimalMixtureDesign(MixtureDesignBase):
-    """D-Optimal Design for mixture experiments"""
+    """D-Optimal Design for mixture experiments using OptimalDesignGenerator"""
     
     def __init__(self, n_components: int, component_names: Optional[List[str]] = None,
                  use_parts_mode: bool = False, component_bounds: Optional[List[Tuple[float, float]]] = None,
                  fixed_components: Optional[Dict[str, float]] = None):
         super().__init__(n_components, component_names, use_parts_mode, component_bounds, fixed_components)
-        self.model_matrix = None
         
-    def generate_design(self, n_runs: int, include_interior: bool = True) -> pd.DataFrame:
+        # Import the OptimalDesignGenerator
+        from .optimal_design_generator import OptimalDesignGenerator
+        self.OptimalDesignGenerator = OptimalDesignGenerator
+        
+    def generate_design(self, n_runs: int, include_interior: bool = True, model_type: str = "linear") -> pd.DataFrame:
         """
-        Generate D-Optimal design
+        Generate D-Optimal design using the superior OptimalDesignGenerator approach
         
         Parameters:
         -----------
         n_runs : int
             Number of experimental runs
         include_interior : bool
-            Whether to include interior points (not just vertices)
+            Whether to include interior points (not just vertices) - always True for OptimalDesignGenerator
+        model_type : str
+            Model type ("linear", "quadratic", "cubic")
             
         Returns:
         --------
         pd.DataFrame
             D-optimal design matrix
         """
-        # Generate candidate set
-        candidates = self._generate_candidates(include_interior, n_runs)
+        print(f"\n🚀 Using OptimalDesignGenerator for superior D-optimal design")
+        print(f"   Model: {model_type}, Runs: {n_runs}, Components: {self.n_components}")
         
-        # Select D-optimal subset
-        selected_indices = self._select_doptimal_subset(candidates, n_runs)
+        # Prepare component ranges - should be passed whenever component bounds are provided
+        # This enables the proportional parts mixture functionality in OptimalDesignGenerator
+        component_ranges = None
+        if hasattr(self, 'component_bounds') and self.component_bounds:
+            # Use original bounds if available (for parts mode), otherwise use current bounds
+            if hasattr(self, 'original_bounds') and self.original_bounds:
+                component_ranges = self.original_bounds
+                print(f"   Parts mode with original bounds: {component_ranges}")
+            else:
+                component_ranges = self.component_bounds
+                print(f"   Component bounds: {component_ranges}")
         
-        design_array = candidates[selected_indices]
+        # Create OptimalDesignGenerator for mixture design
+        generator = self.OptimalDesignGenerator(
+            num_variables=self.n_components,
+            num_runs=n_runs,
+            design_type="mixture",  # This is crucial - tells it to work in simplex space!
+            model_type=model_type,
+            component_ranges=component_ranges
+        )
+        
+        # Generate optimal design using new enhanced API
+        final_det = generator.generate_optimal_design(method="d_optimal")
+        
+        # Store the generator instance for accessing determinant and other metrics
+        self._last_generator = generator
+        
+        print(f"✅ Generated design with determinant: {final_det:.6f}")
+        
+        # Get design points
+        design_points = generator.design_points
+        
+        # ALWAYS use the optimal design points directly from OptimalDesignGenerator
+        # These are the mathematically optimal points in mixture space
+        design_array = np.array(design_points)
+        
+        print(f"✅ Using optimal design points directly from OptimalDesignGenerator")
+        print(f"   First few points: {design_array[:3] if len(design_array) > 0 else 'none'}")
+        
+        # Verify they sum to 1
+        if len(design_array) > 0:
+            sums = np.sum(design_array, axis=1)
+            print(f"   Point sums: {sums[:5] if len(sums) > 5 else sums}")
+            if not np.allclose(sums, 1.0, atol=1e-10):
+                print(f"   ⚠️ Warning: Points don't sum to 1, normalizing...")
+                # Normalize just in case
+                for i in range(len(design_array)):
+                    total = np.sum(design_array[i])
+                    if total > 1e-10:
+                        design_array[i] = design_array[i] / total
+            else:
+                print(f"   ✅ All points correctly sum to 1.0")
+        
+        # Convert to parts ONLY for display/reference purposes (don't change the design!)
+        if component_ranges:
+            print(f"✅ Converting to parts for display purposes (design points remain unchanged)")
+            try:
+                design_points_parts, _ = generator.convert_to_parts(component_ranges)
+                # Store parts design for reference/display only
+                self.parts_design = np.array(design_points_parts)
+                print(f"✅ Parts conversion available for display")
+            except Exception as e:
+                print(f"⚠️ Parts conversion failed: {e}")
+                self.parts_design = None
+        
+        # Calculate D-efficiency for verification
+        d_efficiency = self._calculate_d_efficiency(design_array, model_type)
+        print(f"✅ Final D-efficiency: {d_efficiency:.6f}")
         
         return self._to_dataframe(design_array)
     
-    def _generate_candidates(self, include_interior: bool, n_runs: int = None) -> np.ndarray:
-        """Generate candidate points - work in parts space first, then normalize"""
-        candidates = []
-        
-        if self.use_parts_mode and hasattr(self, 'original_bounds'):
-            # Work in parts space directly!
-            print(f"Generating candidates in parts space with bounds: {self.original_bounds}")
-            parts_candidates = self._generate_parts_candidates(include_interior, n_runs)
-            
-            # Normalize each parts candidate to proportions
-            for parts_point in parts_candidates:
-                total_parts = np.sum(parts_point)
-                if total_parts > 0:
-                    normalized_point = parts_point / total_parts
-                    candidates.append(normalized_point)
-        else:
-            # Work in proportion space (standard case)
-            candidates = self._generate_proportion_candidates(include_interior, n_runs)
-        
-        candidates = np.array(candidates) if candidates else np.array([]).reshape(0, self.n_components)
-        
-        print(f"Generated {len(candidates)} candidates")
-        return candidates
-    
-    def _generate_parts_candidates(self, include_interior: bool, n_runs: int = None) -> List[np.ndarray]:
-        """Generate candidates directly in parts space"""
-        parts_candidates = []
-        
-        if not hasattr(self, 'original_bounds'):
-            return parts_candidates
-        
-        lower_parts = [bound[0] for bound in self.original_bounds]
-        upper_parts = [bound[1] for bound in self.original_bounds]
-        
-        print(f"Parts bounds: min={lower_parts}, max={upper_parts}")
-        
-        # Generate parts vertices (each component at max, others at min)
-        for i in range(self.n_components):
-            vertex_parts = np.array(lower_parts, dtype=float)
-            vertex_parts[i] = upper_parts[i]
-            parts_candidates.append(vertex_parts)
-        
-        # Generate edge points in parts space
-        from itertools import combinations
-        for i, j in combinations(range(self.n_components), 2):
-            for ratio in [0.3, 0.5, 0.7]:
-                edge_parts = np.array(lower_parts, dtype=float)
-                # Use ratio to distribute between components i and j
-                total_available = (upper_parts[i] - lower_parts[i]) + (upper_parts[j] - lower_parts[j])
-                comp_i_add = total_available * ratio
-                comp_j_add = total_available * (1 - ratio)
-                
-                # Check bounds
-                if (lower_parts[i] + comp_i_add <= upper_parts[i] and 
-                    lower_parts[j] + comp_j_add <= upper_parts[j]):
-                    edge_parts[i] = lower_parts[i] + comp_i_add
-                    edge_parts[j] = lower_parts[j] + comp_j_add
-                    parts_candidates.append(edge_parts)
-        
-        if include_interior:
-            # Generate random interior points in parts space
-            target_candidates = max(n_runs * 2 if n_runs else 20, 10)
-            additional_needed = max(0, target_candidates - len(parts_candidates))
-            
-            np.random.seed(42)
-            for _ in range(additional_needed):
-                # Generate random point within parts bounds
-                random_parts = np.random.uniform(lower_parts, upper_parts)
-                parts_candidates.append(random_parts)
-        
-        print(f"Generated {len(parts_candidates)} parts candidates")
-        return parts_candidates
-    
-    def _generate_proportion_candidates(self, include_interior: bool, n_runs: int = None) -> List[np.ndarray]:
-        """Generate candidates in standard proportion space"""
-        candidates = []
-        
-        # Standard vertices (pure components)
-        for i in range(self.n_components):
-            vertex = np.zeros(self.n_components)
-            vertex[i] = 1.0
-            candidates.append(vertex)
-        
-        # Standard centroid
-        if include_interior:
-            centroid = np.ones(self.n_components) / self.n_components
-            candidates.append(centroid)
-        
-        # Edge points
-        from itertools import combinations
-        for i, j in combinations(range(self.n_components), 2):
-            for ratio in [0.2, 0.5, 0.8]:
-                edge_point = np.zeros(self.n_components)
-                edge_point[i] = ratio
-                edge_point[j] = 1.0 - ratio
-                candidates.append(edge_point)
-        
-        # Random interior points
-        if include_interior and n_runs:
-            additional_needed = max(0, n_runs * 2 - len(candidates))
-            np.random.seed(42)
-            for _ in range(additional_needed):
-                random_point = np.random.dirichlet([1.2] * self.n_components)
-                candidates.append(random_point)
-        
-        return candidates
-    
-    def _get_effective_bounds(self) -> Tuple[List[float], List[float]]:
-        """Get effective lower and upper bounds"""
-        if hasattr(self, 'component_bounds') and self.component_bounds:
-            lower_bounds = [bound[0] for bound in self.component_bounds]
-            upper_bounds = [bound[1] for bound in self.component_bounds]
-        else:
-            lower_bounds = [0.0] * self.n_components
-            upper_bounds = [1.0] * self.n_components
-        
-        return lower_bounds, upper_bounds
-    
-    def _is_feasible_point(self, point: np.ndarray) -> bool:
-        """Check if a point satisfies all constraints"""
-        # Check sum constraint
-        if not np.isclose(np.sum(point), 1.0, atol=1e-10):
-            return False
-        
-        # Check non-negativity
-        if np.any(point < -1e-10):
-            return False
-        
-        # Check bounds if they exist
-        if hasattr(self, 'component_bounds') and self.component_bounds:
-            lower_bounds, upper_bounds = self._get_effective_bounds()
-            for i in range(self.n_components):
-                if point[i] < lower_bounds[i] - 1e-10 or point[i] > upper_bounds[i] + 1e-10:
-                    return False
-        
-        return True
-    
-    def _generate_random_feasible_point(self) -> Optional[np.ndarray]:
-        """Generate a single random point that satisfies constraints"""
-        lower_bounds, upper_bounds = self._get_effective_bounds()
-        
-        max_attempts = 100
-        for attempt in range(max_attempts):
-            # Generate random point using rejection sampling
-            if hasattr(self, 'component_bounds') and self.component_bounds:
-                # Use uniform sampling within bounds, then project to simplex
-                point = np.random.uniform(lower_bounds, upper_bounds)
-                point = point / np.sum(point)  # Project to simplex
-                
-                # Check if still within bounds after normalization
-                if self._is_feasible_point(point):
-                    return point
-            else:
-                # Use Dirichlet for unconstrained case
-                point = np.random.dirichlet([1.2] * self.n_components)
-                if self._is_feasible_point(point):
-                    return point
-        
-        return None
-    
-    def _select_doptimal_subset(self, candidates: np.ndarray, n_runs: int) -> np.ndarray:
-        """Select D-optimal subset from candidates using exchange algorithm"""
-        n_candidates = len(candidates)
-        
-        if n_runs >= n_candidates:
-            return np.arange(n_candidates)
-        
-        # Start with random selection
-        selected = np.random.choice(n_candidates, n_runs, replace=False)
-        
-        # Build model matrix
-        X = self._build_model_matrix(candidates[selected])
-        
-        # Exchange algorithm
-        improved = True
-        max_iterations = 100
-        iteration = 0
-        
-        while improved and iteration < max_iterations:
-            improved = False
-            current_det = np.linalg.det(X.T @ X)
-            
-            for i in range(n_runs):
-                for j in range(n_candidates):
-                    if j not in selected:
-                        # Try exchange
-                        trial_selected = selected.copy()
-                        trial_selected[i] = j
-                        
-                        trial_X = self._build_model_matrix(candidates[trial_selected])
-                        trial_det = np.linalg.det(trial_X.T @ trial_X)
-                        
-                        if trial_det > current_det * 1.001:  # Small improvement threshold
-                            selected = trial_selected
-                            X = trial_X
-                            current_det = trial_det
-                            improved = True
-                            break
-                
-                if improved:
-                    break
-            
-            iteration += 1
-        
-        return selected
-    
-    def _build_model_matrix(self, design: np.ndarray) -> np.ndarray:
-        """Build model matrix for linear model"""
-        n_runs = len(design)
-        
-        # For mixture model: includes main effects only (no intercept due to constraint)
-        X = design.copy()
-        
-        return X
-
-
-class IOptimalMixtureDesign(MixtureDesignBase):
-    """I-Optimal Design for mixture experiments (minimizes average prediction variance)"""
-    
-    def __init__(self, n_components: int, component_names: Optional[List[str]] = None,
-                 use_parts_mode: bool = False, component_bounds: Optional[List[Tuple[float, float]]] = None,
-                 fixed_components: Optional[Dict[str, float]] = None):
-        super().__init__(n_components, component_names, use_parts_mode, component_bounds, fixed_components)
-        self.model_matrix = None
-        
-    def generate_design(self, n_runs: int, include_interior: bool = True, model_type: str = "linear") -> pd.DataFrame:
-        """
-        Generate I-Optimal design
-        
-        Parameters:
-        -----------
-        n_runs : int
-            Number of experimental runs
-        include_interior : bool
-            Whether to include interior points (not just vertices)
-        model_type : str
-            Model type for optimization ("linear", "quadratic", "cubic")
-            
-        Returns:
-        --------
-        pd.DataFrame
-            I-optimal design matrix
-        """
-        # Generate candidate set
-        candidates = self._generate_candidates(include_interior, n_runs)
-        
-        # Select I-optimal subset
-        selected_indices = self._select_ioptimal_subset(candidates, n_runs, model_type)
-        
-        design_array = candidates[selected_indices]
-        
-        return self._to_dataframe(design_array)
-    
-    def _generate_candidates(self, include_interior: bool, n_runs: int = None) -> np.ndarray:
-        """Generate candidate points - work in parts space first, then normalize"""
-        candidates = []
-        
-        if self.use_parts_mode and hasattr(self, 'original_bounds'):
-            # Work in parts space directly!
-            print(f"I-optimal: Generating candidates in parts space with bounds: {self.original_bounds}")
-            parts_candidates = self._generate_parts_candidates(include_interior, n_runs)
-            
-            # Normalize each parts candidate to proportions
-            for parts_point in parts_candidates:
-                total_parts = np.sum(parts_point)
-                if total_parts > 0:
-                    normalized_point = parts_point / total_parts
-                    candidates.append(normalized_point)
-        else:
-            # Work in proportion space (standard case)
-            candidates = self._generate_proportion_candidates_ioptimal(include_interior, n_runs)
-        
-        candidates = np.array(candidates) if candidates else np.array([]).reshape(0, self.n_components)
-        
-        print(f"I-optimal: Generated {len(candidates)} candidates")
-        return candidates
-    
-    def _generate_parts_candidates(self, include_interior: bool, n_runs: int = None) -> List[np.ndarray]:
-        """Generate candidates directly in parts space (same as D-optimal)"""
-        parts_candidates = []
-        
-        if not hasattr(self, 'original_bounds'):
-            return parts_candidates
-        
-        lower_parts = [bound[0] for bound in self.original_bounds]
-        upper_parts = [bound[1] for bound in self.original_bounds]
-        
-        print(f"I-optimal parts bounds: min={lower_parts}, max={upper_parts}")
-        
-        # Generate parts vertices (each component at max, others at min)
-        for i in range(self.n_components):
-            vertex_parts = np.array(lower_parts, dtype=float)
-            vertex_parts[i] = upper_parts[i]
-            parts_candidates.append(vertex_parts)
-        
-        # Generate edge points in parts space
-        from itertools import combinations
-        for i, j in combinations(range(self.n_components), 2):
-            for ratio in [0.3, 0.5, 0.7]:
-                edge_parts = np.array(lower_parts, dtype=float)
-                # Use ratio to distribute between components i and j
-                total_available = (upper_parts[i] - lower_parts[i]) + (upper_parts[j] - lower_parts[j])
-                comp_i_add = total_available * ratio
-                comp_j_add = total_available * (1 - ratio)
-                
-                # Check bounds
-                if (lower_parts[i] + comp_i_add <= upper_parts[i] and 
-                    lower_parts[j] + comp_j_add <= upper_parts[j]):
-                    edge_parts[i] = lower_parts[i] + comp_i_add
-                    edge_parts[j] = lower_parts[j] + comp_j_add
-                    parts_candidates.append(edge_parts)
-        
-        if include_interior:
-            # Generate more random interior points for I-optimal (needs more diversity)
-            target_candidates = max(n_runs * 3 if n_runs else 30, 15)
-            additional_needed = max(0, target_candidates - len(parts_candidates))
-            
-            np.random.seed(42)
-            for _ in range(additional_needed):
-                # Generate random point within parts bounds
-                random_parts = np.random.uniform(lower_parts, upper_parts)
-                parts_candidates.append(random_parts)
-        
-        print(f"I-optimal: Generated {len(parts_candidates)} parts candidates")
-        return parts_candidates
-    
-    def _generate_proportion_candidates_ioptimal(self, include_interior: bool, n_runs: int = None) -> List[np.ndarray]:
-        """Generate candidates in standard proportion space for I-optimal"""
-        candidates = []
-        
-        # Standard vertices (pure components)
-        for i in range(self.n_components):
-            vertex = np.zeros(self.n_components)
-            vertex[i] = 1.0
-            candidates.append(vertex)
-        
-        # Standard centroid
-        centroid = np.ones(self.n_components) / self.n_components
-        candidates.append(centroid)
-        
-        # Edge points
-        from itertools import combinations
-        for i, j in combinations(range(self.n_components), 2):
-            for ratio in [0.2, 0.35, 0.5, 0.65, 0.8]:  # More ratios for I-optimal
-                edge_point = np.zeros(self.n_components)
-                edge_point[i] = ratio
-                edge_point[j] = 1.0 - ratio
-                candidates.append(edge_point)
-        
-        # Additional interior points for better I-optimality
-        if include_interior and self.n_components == 3:
-            # Add systematic interior points
-            interior_points = [
-                [0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6],
-                [0.5, 0.3, 0.2], [0.3, 0.5, 0.2], [0.2, 0.5, 0.3],
-                [0.5, 0.2, 0.3], [0.3, 0.2, 0.5], [0.2, 0.3, 0.5],
-                [0.4, 0.4, 0.2], [0.4, 0.2, 0.4], [0.2, 0.4, 0.4]
-            ]
-            for point in interior_points:
-                candidates.append(point)
-        
-        # Random interior points for I-optimal (needs more diversity)
-        if include_interior and n_runs:
-            additional_needed = max(0, n_runs * 3 - len(candidates))
-            np.random.seed(42)
-            for _ in range(additional_needed):
-                if self.n_components == 3:
-                    random_point = np.random.dirichlet([1.5, 1.5, 1.5])  # Slightly favor interior
-                else:
-                    random_point = np.random.dirichlet([1.2] * self.n_components)
-                candidates.append(random_point)
-        
-        return candidates
-    
-    def _get_effective_bounds(self) -> Tuple[List[float], List[float]]:
-        """Get effective lower and upper bounds"""
-        if hasattr(self, 'component_bounds') and self.component_bounds:
-            lower_bounds = [bound[0] for bound in self.component_bounds]
-            upper_bounds = [bound[1] for bound in self.component_bounds]
-        else:
-            lower_bounds = [0.0] * self.n_components
-            upper_bounds = [1.0] * self.n_components
-        
-        return lower_bounds, upper_bounds
-    
-    def _is_feasible_point(self, point: np.ndarray) -> bool:
-        """Check if a point satisfies all constraints"""
-        # Check sum constraint
-        if not np.isclose(np.sum(point), 1.0, atol=1e-10):
-            return False
-        
-        # Check non-negativity
-        if np.any(point < -1e-10):
-            return False
-        
-        # Check bounds if they exist
-        if hasattr(self, 'component_bounds') and self.component_bounds:
-            lower_bounds, upper_bounds = self._get_effective_bounds()
-            for i in range(self.n_components):
-                if point[i] < lower_bounds[i] - 1e-10 or point[i] > upper_bounds[i] + 1e-10:
-                    return False
-        
-        return True
-    
-    def _generate_random_feasible_point(self) -> Optional[np.ndarray]:
-        """Generate a single random point that satisfies constraints"""
-        lower_bounds, upper_bounds = self._get_effective_bounds()
-        
-        max_attempts = 100
-        for attempt in range(max_attempts):
-            # Generate random point using rejection sampling
-            if hasattr(self, 'component_bounds') and self.component_bounds:
-                # Use uniform sampling within bounds, then project to simplex
-                point = np.random.uniform(lower_bounds, upper_bounds)
-                point = point / np.sum(point)  # Project to simplex
-                
-                # Check if still within bounds after normalization
-                if self._is_feasible_point(point):
-                    return point
-            else:
-                # Use Dirichlet for unconstrained case
-                if self.n_components == 3:
-                    point = np.random.dirichlet([1.5, 1.5, 1.5])  # Slightly favor interior
-                else:
-                    point = np.random.dirichlet([1.2] * self.n_components)
-                
-                if self._is_feasible_point(point):
-                    return point
-        
-        return None
-    
-    def _select_ioptimal_subset(self, candidates: np.ndarray, n_runs: int, model_type: str) -> np.ndarray:
-        """Select I-optimal subset from candidates using exchange algorithm"""
-        n_candidates = len(candidates)
-        
-        if n_runs >= n_candidates:
-            return np.arange(n_candidates)
-        
-        # Start with random selection
-        selected = np.random.choice(n_candidates, n_runs, replace=False)
-        
-        # Build model matrix
-        X = self._build_model_matrix(candidates[selected], model_type)
-        
-        # Generate prediction points for I-optimality (average prediction variance)
-        prediction_points = self._generate_prediction_points()
-        
-        # Exchange algorithm for I-optimality
-        improved = True
-        max_iterations = 150  # More iterations for I-optimal
-        iteration = 0
-        
-        while improved and iteration < max_iterations:
-            improved = False
-            current_i_criterion = self._calculate_i_criterion(X, prediction_points, model_type)
-            
-            for i in range(n_runs):
-                for j in range(n_candidates):
-                    if j not in selected:
-                        # Try exchange
-                        trial_selected = selected.copy()
-                        trial_selected[i] = j
-                        
-                        trial_X = self._build_model_matrix(candidates[trial_selected], model_type)
-                        trial_i_criterion = self._calculate_i_criterion(trial_X, prediction_points, model_type)
-                        
-                        # For I-optimality, we want to minimize average prediction variance
-                        if trial_i_criterion < current_i_criterion * 0.999:  # Small improvement threshold
-                            selected = trial_selected
-                            X = trial_X
-                            current_i_criterion = trial_i_criterion
-                            improved = True
-                            break
-                
-                if improved:
-                    break
-            
-            iteration += 1
-        
-        return selected
-    
-    def _generate_prediction_points(self) -> np.ndarray:
-        """Generate points for I-optimality calculation (where we want good predictions)"""
-        prediction_points = []
-        
-        # Include vertices
-        for i in range(self.n_components):
-            vertex = np.zeros(self.n_components)
-            vertex[i] = 1.0
-            prediction_points.append(vertex)
-        
-        # Include centroid
-        centroid = np.ones(self.n_components) / self.n_components
-        prediction_points.append(centroid)
-        
-        # Include systematic grid points
-        if self.n_components == 3:
-            # Create a systematic grid in the simplex
-            for i in range(5, 10):  # Different levels
-                for j in range(i):
-                    for k in range(i - j):
-                        if i - j - k >= 0:
-                            point = np.array([j, k, i - j - k]) / i
-                            if np.all(point >= 0.05):  # Avoid boundary issues
-                                prediction_points.append(point)
-        else:
-            # For other dimensions, use random points
-            np.random.seed(123)  # Fixed seed for consistency
-            for _ in range(50):
-                random_point = np.random.dirichlet([1] * self.n_components)
-                if np.all(random_point >= 0.05):
-                    prediction_points.append(random_point)
-        
-        return np.array(prediction_points)
-    
-    def _calculate_i_criterion(self, X: np.ndarray, prediction_points: np.ndarray, model_type: str) -> float:
-        """Calculate I-optimality criterion (average prediction variance)"""
+    def _calculate_d_efficiency(self, design_matrix: np.ndarray, model_type: str = "linear") -> float:
+        """Calculate D-efficiency of the design using proper gram matrix approach"""
         try:
-            # Information matrix
-            info_matrix = X.T @ X
+            # Import the proper mathematical functions from optimal_design_generator
+            from .optimal_design_generator import gram_matrix, calculate_determinant
             
-            # Check if matrix is invertible
-            if np.linalg.det(info_matrix) < 1e-12:
-                return float('inf')  # Bad design
+            X = self._build_model_matrix(design_matrix, model_type)
             
-            inv_info = np.linalg.inv(info_matrix)
+            # Use gram matrix approach for triangular/constrained matrices
+            info_matrix = gram_matrix(X.tolist())
+            det_value = calculate_determinant(info_matrix)
             
-            # Calculate average prediction variance over prediction points
-            total_variance = 0.0
-            valid_points = 0
+            n_runs, n_params = X.shape
+            d_efficiency = (det_value / n_runs) ** (1/n_params) if det_value > 0 else 0.0
             
-            for pred_point in prediction_points:
-                # Build model vector for this prediction point
-                pred_vector = self._build_model_vector(pred_point, model_type)
-                
-                # Prediction variance
-                pred_variance = pred_vector.T @ inv_info @ pred_vector
-                total_variance += pred_variance
-                valid_points += 1
-            
-            if valid_points == 0:
-                return float('inf')
-            
-            # Return average prediction variance
-            return total_variance / valid_points
-            
-        except np.linalg.LinAlgError:
-            return float('inf')
-    
-    def _build_model_vector(self, point: np.ndarray, model_type: str) -> np.ndarray:
-        """Build model vector for a single point"""
-        if model_type == "linear":
-            return point
-        elif model_type == "quadratic":
-            # Linear terms + interactions
-            terms = list(point)
-            for i in range(len(point)):
-                for j in range(i+1, len(point)):
-                    terms.append(point[i] * point[j])
-            return np.array(terms)
-        elif model_type == "cubic":
-            # Linear + quadratic + cubic terms
-            terms = list(point)
-            # Quadratic interactions
-            for i in range(len(point)):
-                for j in range(i+1, len(point)):
-                    terms.append(point[i] * point[j])
-            # Cubic interactions
-            for i in range(len(point)):
-                for j in range(i+1, len(point)):
-                    for k in range(j+1, len(point)):
-                        terms.append(point[i] * point[j] * point[k])
-            return np.array(terms)
-        else:
-            return point
+            return d_efficiency
+        except Exception:
+            return 0.0
     
     def _build_model_matrix(self, design: np.ndarray, model_type: str = "linear") -> np.ndarray:
         """Build model matrix for given model type"""
-        n_runs = len(design)
-        
         if model_type == "linear":
-            X = design.copy()
+            return design.copy()
         elif model_type == "quadratic":
             # Linear terms + interactions
             model_terms = []
@@ -849,7 +359,7 @@ class IOptimalMixtureDesign(MixtureDesignBase):
             for i in range(self.n_components):
                 for j in range(i+1, self.n_components):
                     model_terms.append(design[:, i] * design[:, j])
-            X = np.column_stack(model_terms)
+            return np.column_stack(model_terms)
         elif model_type == "cubic":
             # All terms up to cubic
             model_terms = []
@@ -865,11 +375,169 @@ class IOptimalMixtureDesign(MixtureDesignBase):
                 for j in range(i+1, self.n_components):
                     for k in range(j+1, self.n_components):
                         model_terms.append(design[:, i] * design[:, j] * design[:, k])
-            X = np.column_stack(model_terms)
+            return np.column_stack(model_terms)
         else:
-            X = design.copy()
+            return design.copy()
+
+
+class IOptimalMixtureDesign(MixtureDesignBase):
+    """I-Optimal Design for mixture experiments using OptimalDesignGenerator"""
+    
+    def __init__(self, n_components: int, component_names: Optional[List[str]] = None,
+                 use_parts_mode: bool = False, component_bounds: Optional[List[Tuple[float, float]]] = None,
+                 fixed_components: Optional[Dict[str, float]] = None):
+        super().__init__(n_components, component_names, use_parts_mode, component_bounds, fixed_components)
         
-        return X
+        # Import the OptimalDesignGenerator
+        from .optimal_design_generator import OptimalDesignGenerator
+        self.OptimalDesignGenerator = OptimalDesignGenerator
+        
+    def generate_design(self, n_runs: int, include_interior: bool = True, model_type: str = "linear") -> pd.DataFrame:
+        """
+        Generate I-Optimal design using the superior OptimalDesignGenerator approach
+        
+        Parameters:
+        -----------
+        n_runs : int
+            Number of experimental runs
+        include_interior : bool
+            Whether to include interior points (not just vertices) - always True for OptimalDesignGenerator
+        model_type : str
+            Model type ("linear", "quadratic", "cubic")
+            
+        Returns:
+        --------
+        pd.DataFrame
+            I-optimal design matrix
+        """
+        print(f"\n🚀 Using OptimalDesignGenerator for superior I-optimal design")
+        print(f"   Model: {model_type}, Runs: {n_runs}, Components: {self.n_components}")
+        
+        # Prepare component ranges - should be passed whenever component bounds are provided
+        # This enables the proportional parts mixture functionality in OptimalDesignGenerator
+        component_ranges = None
+        if hasattr(self, 'component_bounds') and self.component_bounds:
+            # Use original bounds if available (for parts mode), otherwise use current bounds
+            if hasattr(self, 'original_bounds') and self.original_bounds:
+                component_ranges = self.original_bounds
+                print(f"   Parts mode with original bounds: {component_ranges}")
+            else:
+                component_ranges = self.component_bounds
+                print(f"   Component bounds: {component_ranges}")
+        
+        # Create OptimalDesignGenerator for mixture design
+        generator = self.OptimalDesignGenerator(
+            num_variables=self.n_components,
+            num_runs=n_runs,
+            design_type="mixture",  # This is crucial - tells it to work in simplex space!
+            model_type=model_type,
+            component_ranges=component_ranges
+        )
+        
+        # Generate optimal design using new enhanced I-optimal API
+        final_det = generator.generate_optimal_design(method="i_optimal")
+        
+        # Store the generator instance for accessing determinant and other metrics
+        self._last_generator = generator
+        
+        print(f"✅ Generated I-optimal design with determinant: {final_det:.6f}")
+        
+        # Get design points
+        design_points = generator.design_points
+        
+        # Convert to parts if needed, then normalize to proportions
+        if component_ranges:
+            # Convert from simplex space to parts, then normalize
+            design_points_parts, design_points_normalized = generator.convert_to_parts(component_ranges)
+            design_array = np.array(design_points_normalized)
+            
+            # Store parts design for reference
+            self.parts_design = np.array(design_points_parts)
+            print(f"✅ Converted to parts and normalized to proportions")
+        else:
+            # OptimalDesignGenerator for mixture designs already returns points in simplex space (sum=1)!
+            # No conversion needed - just use the points directly
+            design_array = np.array(design_points)
+            
+            print(f"✅ Using optimal design points directly from OptimalDesignGenerator")
+            print(f"   First few points: {design_array[:3] if len(design_array) > 0 else 'none'}")
+            
+            # Verify they sum to 1
+            if len(design_array) > 0:
+                sums = np.sum(design_array, axis=1)
+                print(f"   Point sums: {sums[:5] if len(sums) > 5 else sums}")
+                if not np.allclose(sums, 1.0, atol=1e-10):
+                    print(f"   ⚠️ Warning: Points don't sum to 1, normalizing...")
+                    # Normalize just in case
+                    for i in range(len(design_array)):
+                        total = np.sum(design_array[i])
+                        if total > 1e-10:
+                            design_array[i] = design_array[i] / total
+                else:
+                    print(f"   ✅ All points correctly sum to 1.0")
+        
+        # Calculate I-efficiency for verification
+        i_efficiency = self._calculate_i_efficiency(design_array, model_type)
+        print(f"✅ Final I-efficiency: {i_efficiency:.6f}")
+        
+        return self._to_dataframe(design_array)
+    
+    def _calculate_i_efficiency(self, design_matrix: np.ndarray, model_type: str = "linear") -> float:
+        """Calculate I-efficiency of the design using proper gram matrix approach"""
+        try:
+            # Import the proper mathematical functions from optimal_design_generator
+            from .optimal_design_generator import gram_matrix, calculate_determinant, matrix_inverse, matrix_trace
+            
+            X = self._build_model_matrix(design_matrix, model_type)
+            
+            # Use gram matrix approach for triangular/constrained matrices
+            info_matrix = gram_matrix(X.tolist())
+            
+            # Calculate I-efficiency (1 / trace of inverse)
+            try:
+                inverse_matrix = matrix_inverse(info_matrix)
+                trace_value = matrix_trace(inverse_matrix)
+                i_efficiency = 1.0 / trace_value if trace_value > 1e-10 else 0.0
+                return i_efficiency
+            except:
+                return 0.0
+        except Exception:
+            return 0.0
+    
+    def _build_model_matrix(self, design: np.ndarray, model_type: str = "linear") -> np.ndarray:
+        """Build model matrix for given model type"""
+        if model_type == "linear":
+            return design.copy()
+        elif model_type == "quadratic":
+            # Linear terms + interactions
+            model_terms = []
+            # Linear terms
+            for i in range(self.n_components):
+                model_terms.append(design[:, i])
+            # Interaction terms
+            for i in range(self.n_components):
+                for j in range(i+1, self.n_components):
+                    model_terms.append(design[:, i] * design[:, j])
+            return np.column_stack(model_terms)
+        elif model_type == "cubic":
+            # All terms up to cubic
+            model_terms = []
+            # Linear terms
+            for i in range(self.n_components):
+                model_terms.append(design[:, i])
+            # Quadratic interactions
+            for i in range(self.n_components):
+                for j in range(i+1, self.n_components):
+                    model_terms.append(design[:, i] * design[:, j])
+            # Cubic interactions
+            for i in range(self.n_components):
+                for j in range(i+1, self.n_components):
+                    for k in range(j+1, self.n_components):
+                        model_terms.append(design[:, i] * design[:, j] * design[:, k])
+            return np.column_stack(model_terms)
+        else:
+            return design.copy()
+    
 
 
 class AugmentedDesign(MixtureDesignBase):

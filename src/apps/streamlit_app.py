@@ -326,9 +326,14 @@ if design_type == "Mixture Design":
                         # Convert component_bounds to variable_bounds for non-fixed components
                         variable_bounds = {}
                         if component_bounds:
-                            for i, comp_name in enumerate(component_names):
+                            # component_bounds only contains bounds for non-fixed components
+                            # so we need to map them correctly
+                            bounds_index = 0
+                            for comp_name in component_names:
                                 if comp_name not in fixed_components:
-                                    variable_bounds[comp_name] = component_bounds[i]
+                                    if bounds_index < len(component_bounds):
+                                        variable_bounds[comp_name] = component_bounds[bounds_index]
+                                        bounds_index += 1
                         
                         # Create the NEW correct fixed components designer
                         fixed_designer = FixedPartsMixtureDesign(
@@ -348,46 +353,35 @@ if design_type == "Mixture Design":
                         # Store the correct designer
                         st.session_state.fixed_designer = fixed_designer
                         st.session_state.d_optimal_designer = fixed_designer  # For backward compatibility
-                    # Insert in treing to solve problem with Error generating design: name 'fixed_designer' is not defined
-                    else:
-                        variable_bounds = {}
-                        if component_bounds:
-                            for i, comp_name in enumerate(component_names):
-                                if comp_name not in fixed_components:
-                                    variable_bounds[comp_name] = component_bounds[i]
-                        fixed_designer = FixedPartsMixtureDesign(
-                            component_names=component_names,
-                            fixed_parts=fixed_components,
-                            variable_bounds=variable_bounds)
                         
-                    # Extract just the parts columns for the parts design
-                    full_design = fixed_designer.get_parts_design()
-                    
-                    # Check if it's a DataFrame or numpy array
-                    if hasattr(full_design, 'columns'):
-                        # It's a DataFrame
-                        parts_cols = [col for col in full_design.columns if '_Parts' in col]
-                        if parts_cols:  # Only proceed if we found parts columns
-                            parts_design = full_design[parts_cols].values  # Extract as numpy array
-                        else:
-                            st.error("No parts columns found in design!")
-                            parts_design = None
-                    else:
-                        # It's already a numpy array - use directly
-                        if full_design.size > 0:  # Only proceed if array has data
-                            parts_design = full_design
-                        else:
-                            st.error("Empty design array received!")
-                            parts_design = None
-                    
-                    # Additional safety check for array dimensions
-                    if parts_design.shape[1] != len(component_names):
-                        st.warning(f"Design shape mismatch: {parts_design.shape[1]} columns vs {len(component_names)} components")
-                        # Adjust component names to match design shape
-                        component_names = component_names[:parts_design.shape[1]]
+                        # Extract just the parts columns for the parts design
+                        full_design = fixed_designer.get_parts_design()
                         
-                    if parts_design is not None:
-                        st.session_state.correct_parts_design = parts_design
+                        # Check if it's a DataFrame or numpy array
+                        if hasattr(full_design, 'columns'):
+                            # It's a DataFrame
+                            parts_cols = [col for col in full_design.columns if '_Parts' in col]
+                            if parts_cols:  # Only proceed if we found parts columns
+                                parts_design = full_design[parts_cols].values  # Extract as numpy array
+                            else:
+                                st.error("No parts columns found in design!")
+                                parts_design = None
+                        else:
+                            # It's already a numpy array - use directly
+                            if full_design.size > 0:  # Only proceed if array has data
+                                parts_design = full_design
+                            else:
+                                st.error("Empty design array received!")
+                                parts_design = None
+                        
+                        # Additional safety check for array dimensions
+                        if parts_design is not None and parts_design.shape[1] != len(component_names):
+                            st.warning(f"Design shape mismatch: {parts_design.shape[1]} columns vs {len(component_names)} components")
+                            # Adjust component names to match design shape
+                            component_names = component_names[:parts_design.shape[1]]
+                            
+                        if parts_design is not None:
+                            st.session_state.correct_parts_design = parts_design
                     
                     # For D-optimal method WITHOUT fixed components, use old implementation
                     elif design_method == 'd-optimal':
@@ -780,7 +774,7 @@ if design_type == "Mixture Design":
                 # This ensures batch size scaling works correctly: actual_quantities = parts_design * batch_size / 100.0
                 parts_design = design_array * 100.0
                 
-                if use_parts_mode and component_bounds is not None:
+                if use_parts_mode and 'component_bounds' in locals() and component_bounds is not None:
                     # Display component bounds info for reference
                     total_parts_budget = sum(max_val for _, max_val in component_bounds)
                     conversion_method = f"Parts Mode: 100-part scaling (component bounds reference: {total_parts_budget} total)"

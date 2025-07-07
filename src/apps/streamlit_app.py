@@ -169,6 +169,13 @@ if design_type == "Mixture Design":
                     )
                     fixed_components[comp_name] = fixed_value
         
+        # Model type for evaluation (moved earlier to use in method-specific parameters)
+        model_type = st.selectbox(
+            "Model Type (for efficiency calculation)",
+            ["linear", "quadratic", "cubic"],
+            index=1
+        )
+        
         # Component bounds (for parts mode or extreme vertices)
         component_bounds = None
         if use_parts_mode or design_method == "extreme-vertices":
@@ -240,13 +247,47 @@ if design_type == "Mixture Design":
         
         # Method-specific parameters
         if design_method == "simplex-lattice":
+            # Dynamic degree limits based on model type for evaluation
+            if model_type == "cubic":
+                max_degree = 10
+                default_degree = 6
+                help_text = "Degree of the simplex lattice (higher degree needed for cubic models)"
+            elif model_type == "quadratic":
+                max_degree = 7
+                default_degree = 4
+                help_text = "Degree of the simplex lattice (moderate degree for quadratic models)"
+            else:  # linear
+                max_degree = 5
+                default_degree = 3
+                help_text = "Degree of the simplex lattice"
+            
             degree = st.number_input(
                 "Lattice Degree",
                 min_value=2,
-                max_value=5,
-                value=3,
-                help="Degree of the simplex lattice"
+                max_value=max_degree,
+                value=default_degree,
+                help=help_text
             )
+            
+            # Add warning for insufficient points
+            from math import comb
+            expected_points = comb(n_components + degree - 1, degree)
+            if model_type == "cubic":
+                linear_terms = n_components
+                quad_interactions = (n_components * (n_components - 1)) // 2
+                cubic_interactions = (n_components * (n_components - 1) * (n_components - 2)) // 6
+                min_params = linear_terms + quad_interactions + cubic_interactions
+                
+                if expected_points < min_params:
+                    st.warning(f"⚠️ Lattice degree {degree} will generate ~{expected_points} points, but cubic model needs ≥{min_params} points. Consider degree ≥{6}")
+            elif model_type == "quadratic":
+                linear_terms = n_components
+                quad_interactions = (n_components * (n_components - 1)) // 2
+                min_params = linear_terms + quad_interactions
+                
+                if expected_points < min_params:
+                    st.warning(f"⚠️ Lattice degree {degree} will generate ~{expected_points} points, but quadratic model needs ≥{min_params} points. Consider degree ≥{4}")
+            
             additional_params = {"degree": degree}
             
         elif design_method in ["d-optimal", "i-optimal"]:
@@ -282,13 +323,6 @@ if design_type == "Mixture Design":
             }
         else:
             additional_params = {}
-        
-        # Model type for evaluation
-        model_type = st.selectbox(
-            "Model Type (for efficiency calculation)",
-            ["linear", "quadratic", "cubic"],
-            index=1
-        )
         
         # Generate button
         generate_button = st.button("🚀 Generate Design", type="primary")

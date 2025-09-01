@@ -300,8 +300,20 @@ class OptimalDesignGenerator:
                 # Three-way interactions: xi*xj*xk for i < j < k
                 three_way_terms = n * (n - 1) * (n - 2) // 6
                 return linear_terms + interaction_terms + three_way_terms
+            elif self.model_type == "quartic":
+                # Mixture quartic: includes all mixture terms up to degree 4
+                linear_terms = n
+                interaction_terms = n * (n - 1) // 2
+                three_way_terms = n * (n - 1) * (n - 2) // 6
+                four_way_terms = n * (n - 1) * (n - 2) * (n - 3) // 24
+                return linear_terms + interaction_terms + three_way_terms + four_way_terms
+            elif self.model_type == "custom":
+                # For custom models, use quadratic as default (will be overridden by UI logic)
+                linear_terms = n
+                interaction_terms = n * (n - 1) // 2
+                return linear_terms + interaction_terms
             else:
-                raise ValueError("model_type must be 'linear', 'quadratic', or 'cubic'")
+                raise ValueError("model_type must be 'linear', 'quadratic', 'cubic', 'quartic', or 'custom'")
                 
         else:  # standard
             if self.model_type == "linear":

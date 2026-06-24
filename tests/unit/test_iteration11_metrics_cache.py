@@ -129,7 +129,38 @@ def test_plan_coords_and_blocks_in_metrics(tmp_path):
     json.dumps(m)
 
 
+def test_rehydrate_results_after_load(tmp_path):
+    """После загрузки проекта M1/M2/M4/M5 показываются сразу — без пересчёта.
+
+    Закрывает UX-замечание: переключаясь между выполненными этапами, видишь
+    сохранённые данные, а кнопка не «слепой пересчёт».
+    """
+    r = _runner(tmp_path)
+    r.run_m5()                       # добавим M5 (план) в проект
+    r.save_project()
+
+    r2 = PipelineRunner.from_project(str(tmp_path), "m11")
+    # лёгкие results восстановлены для немедленного отображения
+    for s in ("M1", "M2", "M4", "M5"):
+        assert s in r2.results, f"{s} не регидрирован после загрузки"
+
+    # M1 — вершины области доступны для таблицы
+    assert r2.results["M1"]["vertices"] is not None
+    # M2 — план/отклики на месте (таблица M2 отрисуется)
+    assert r2.results["M2"]["design"] is not None
+    assert r2.results["M2"]["Y"] is not None
+    assert r2.results["M2"]["d_efficiency"] is not None
+    # M4 — сводка режимов есть, но BIC-кривая НЕ персистится (лёгкий вариант)
+    m4_primary = r2.results["M4"]["per_property"]["A"]
+    assert "n_regimes" in m4_primary
+    assert "bic_table" not in m4_primary
+    # M5 — координаты предложенного плана восстановлены
+    assert r2.results["M5"]["design"] is not None
+    assert r2.results["M5"]["applied"] is False
+
+
 def test_recompute_overrides_cached_metric(tmp_path):
+
 
     """Пересчёт стадии в сессии перекрывает кэш с диска (свежие числа)."""
     r = _runner(tmp_path)

@@ -429,10 +429,22 @@ def render_project_saver(runner: PipelineRunner):
 # ----------------------------------------------------------------------
 def render_stage(runner: PipelineRunner, key: str, title: str):
     st.subheader(title)
-    cols = st.columns([1, 1, 3])
-    run = cols[0].button(f"▶ Выполнить {key}", key=f"run_{key}")
+    # этап уже выполнен (есть данные в сессии или восстановлены с диска)?
+    _completed = set(ai.completed_stages(runner))
+    is_done = key in _completed or f"{key}_fit" in _completed
+    cols = st.columns([1, 2, 2])
+    label = (f"♻️ Пересчитать {key} (заново)" if is_done
+             else f"▶ Выполнить {key}")
+    run = cols[0].button(label, key=f"run_{key}")
+    if is_done:
+        cols[1].caption("✓ Результаты загружены/посчитаны и показаны ниже. "
+                        "Кнопка **пересчитывает этап заново** (данные с диска "
+                        "при этом не нужны).")
+    else:
+        cols[1].caption("Этап ещё не выполнен — нажмите, чтобы рассчитать.")
 
     if run:
+
         with st.spinner(f"Выполняется {key}…"):
             try:
                 if key == "M1":
@@ -593,8 +605,14 @@ def _render_m4_property(info: dict, prop: str):
                  "рецептур. Границы режимов у разных свойств могут не "
                  "совпадать. Прообраз режима в рецептурах — через модель "
                  "(gating), не по близости точек.")
-    bt = info["bic_table"].set_index("K")[["bic"]]
-    st.line_chart(bt)
+    bt = info.get("bic_table")
+    if bt is not None:
+        st.line_chart(bt.set_index("K")[["bic"]])
+    else:
+        st.caption("ℹ️ BIC-кривая не сохраняется на диск (лёгкий режим) — "
+                   "видны центры/баланс режимов из кэша. Нажмите «♻️ Пересчитать "
+                   "M4», чтобы построить кривую BIC заново.")
+
     means = np.asarray(info["means"], float).ravel()
     K = len(means)
     counts = np.asarray(info.get("counts", np.zeros(K)), int).ravel()

@@ -265,6 +265,60 @@ class PipelineRunner:
         if self.moe is None and self.property_names[0] in self.surrogates:
             self.moe = self.surrogates[self.property_names[0]]
 
+    def rehydrate_results(self) -> None:
+        """Восстановить лёгкие ``results`` завершённых стадий ПОСЛЕ загрузки —
+        чтобы UI сразу показывал сохранённые данные, БЕЗ пересчёта.
+
+        Источник — ``cached_metrics`` (с диска) + восстановленные ``design/Y``.
+        Тяжёлые артефакты (таблицы Шеффе/ANOVA в M3, BIC-кривая M4) в лёгком
+        варианте персистентности НЕ сохраняются и здесь не воспроизводятся:
+        для них UI показывает сводку и предлагает пересчёт ради деталей.
+        Идемпотентно: уже посчитанные в сессии стадии не перетирает.
+        """
+        cm = self.cached_metrics or {}
+        primary = self.property_names[0]
+
+        # M1 — геометрия области детерминирована, вершины считаем напрямую (дёшево)
+        if "M1" in cm and "M1" not in self.results:
+            try:
+                self.results["M1"] = {**cm["M1"],
+                                      "vertices": self.region.extreme_vertices(),
+                                      "centroid": self.region.centroid()}
+            except Exception:  # noqa: BLE001 — геометрия не критична для load
+                pass
+
+        # M2 — план/отклики восстановлены из state (design/Y/blocks)
+        if "M2" in cm and self.design is not None and "M2" not in self.results:
+            m2 = dict(cm["M2"])
+            self.results["M2"] = {
+                "n": int(m2.get("n", len(self.design))),
+                "p": int(m2.get("p", self.p)),
+                "d_efficiency": m2.get("d_efficiency"),
+                "n_blocks": int(m2.get("n_blocks", 1)),
+                "design": self.design, "Y": self.Y, "y": self.y,
+                "blocks": self.blocks,
+                "property_names": list(self.property_names)}
+
+        # M4 — сводка режимов по свойствам (без BIC-кривой: она не персистится)
+        if "M4" in cm and "M4" not in self.results:
+            per = {name: {"property": name, **dict(vals)}
+                   for name, vals in cm["M4"].items()}
+            top = dict(per.get(primary, {}))
+            self.results["M4"] = {"per_property": per,
+                                  "property_names": list(self.property_names),
+                                  **top}
+
+        # M5 — I-оптимальный план предложен; координаты восстановлены из кэша
+        if "M5" in cm and "M5" not in self.results:
+            m5 = dict(cm["M5"])
+            d5 = m5.get("design")
+            self.results["M5"] = {
+                "i_optimal": m5.get("i_optimal"),
+                "i_of_d_design": m5.get("i_of_d_design"),
+                "n_runs": m5.get("n_runs"),
+                "applied": bool(m5.get("applied", False)),
+                "design": (np.asarray(d5, float) if d5 is not None else None)}
+
     @classmethod
     def from_project(cls, root: str | Path, name: str) -> "PipelineRunner":
         """Загрузить проект по имени из каталога `root` (например project_ui)."""
@@ -273,7 +327,10 @@ class PipelineRunner:
         cfg = PipelineConfig.from_snapshot(ps.name or name, ps.config)
         runner = cls(cfg, project_dir)
         runner._restore_from_state(ps)
+        # сразу восстановить лёгкие результаты завершённых стадий для отображения
+        runner.rehydrate_results()
         return runner
+
 
 
     # ------------------------------------------------------------------

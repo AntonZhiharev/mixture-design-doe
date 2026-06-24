@@ -693,12 +693,18 @@ def _render_result(runner: PipelineRunner, key: str):
 
     elif key == "M5" and "M5" in runner.results:
         r = runner.results["M5"]
+        design5 = r.get("design")
+        n_runs5 = r.get("n_runs")
+        if n_runs5 is None and design5 is not None:
+            n_runs5 = len(design5)
         c = st.columns(3)
-        c[0].metric("I-score (I-opt)", f"{r['i_optimal']:.4f}")
-        if r["i_of_d_design"] is not None:
+        if r.get("i_optimal") is not None:
+            c[0].metric("I-score (I-opt)", f"{r['i_optimal']:.4f}")
+        if r.get("i_of_d_design") is not None and r.get("i_optimal") is not None:
             c[1].metric("I-score (D-opt дизайн)", f"{r['i_of_d_design']:.4f}",
                         delta=f"{r['i_of_d_design'] - r['i_optimal']:+.4f}")
-        c[2].metric("Опытов в плане", r.get("n_runs", len(r["design"])))
+        if n_runs5 is not None:
+            c[2].metric("Опытов в плане", n_runs5)
         st.info(
             "ℹ️ Это **рассчитанный** I-оптимальный план: точки пока только "
             "предложены. Эксперименты по ним НЕ поставлены и в общую базу "
@@ -706,10 +712,17 @@ def _render_result(runner: PipelineRunner, key: str):
             "(пока только «M2») не меняются. Сбор откликов по этим точкам и "
             "дозапись в базу выполняются на этапе active learning / раундов "
             "веток.")
-        render_design_table(_df_design(r["design"], names), list(names[: runner.q]),
-                            "I-оптимальный дизайн (точнее прогноз):",
-                            "M5_design.xlsx", "dl_m5", batch, unit, height=300,
-                            with_totals=True)
+        if design5 is not None:
+            render_design_table(_df_design(np.asarray(design5), names),
+                                list(names[: runner.q]),
+                                "I-оптимальный дизайн (точнее прогноз):",
+                                "M5_design.xlsx", "dl_m5", batch, unit, height=300,
+                                with_totals=True)
+        else:
+            st.caption("ℹ️ Координаты плана не сохранены в этом проекте (старый "
+                       "формат). Нажмите «♻️ Пересчитать M5», чтобы построить "
+                       "I-оптимальный план заново.")
+
 
 
     elif key == "M6" and "M6" in runner.results:

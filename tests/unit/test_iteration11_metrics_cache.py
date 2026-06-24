@@ -95,7 +95,42 @@ def test_invalidate_metrics_on_response_change(tmp_path):
     assert {"M1", "M2", "M5"} <= after
 
 
+def test_plan_coords_and_blocks_in_metrics(tmp_path):
+    """M2/M5 метрики содержат координаты плана и разбиение по блокам.
+
+    Закрывает замечание ассистента: «состав/координаты точек нового плана,
+    число добавляемых runs и разбиение по блокам в контексте отсутствуют».
+    """
+    cfg = PipelineConfig(name="m11b", q=3, model="linear",
+                         property_names=["A"], seed=2, n_restarts=2,
+                         noise_sd=0.1, n_blocks=3)
+    r = PipelineRunner(cfg, tmp_path / "m11b")
+    r.run_m1()
+    r.run_m2(simulate=True)
+    r.run_m5()
+    m = r.stage_metrics()
+
+    # M2: координаты плана + имена компонентов + разбиение по блокам
+    n2 = m["M2"]["n"]
+    assert len(m["M2"]["design"]) == n2
+    assert len(m["M2"]["design"][0]) == 3            # q=3 доли на точку
+    assert m["M2"]["component_names"] == list(r.names)
+    assert sum(m["M2"]["block_sizes"].values()) == n2
+    assert set(m["M2"]["block_sizes"]) == {1, 2, 3}  # n_blocks=3
+
+    # M5: координаты предлагаемого плана + n_runs + разбиение по блокам
+    n5 = m["M5"]["n_runs"]
+    assert len(m["M5"]["design"]) == n5
+    assert m["M5"]["applied"] is False
+    assert sum(m["M5"]["block_sizes"].values()) == n5
+
+    # сериализуемо для ассистента/MCP (numpy → стандартные типы)
+    import json
+    json.dumps(m)
+
+
 def test_recompute_overrides_cached_metric(tmp_path):
+
     """Пересчёт стадии в сессии перекрывает кэш с диска (свежие числа)."""
     r = _runner(tmp_path)
     r.save_project()

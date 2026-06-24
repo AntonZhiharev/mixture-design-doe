@@ -861,8 +861,22 @@ class PipelineRunner:
             out["M1"] = {k: r["M1"].get(k)
                          for k in ("n_vertices", "q", "p", "n_runs")}
         if "M2" in r:
-            out["M2"] = {k: r["M2"].get(k)
+            m2 = r["M2"]
+            out["M2"] = {k: m2.get(k)
                          for k in ("n", "p", "d_efficiency", "n_blocks")}
+            # координаты точек плана (доли компонентов) — план небольшой
+            if m2.get("design") is not None:
+                out["M2"]["design"] = np.round(
+                    np.asarray(m2["design"], float), 4).tolist()
+            out["M2"]["component_names"] = list(self.names)
+            # разбиение опытов по блокам (партиям/дням): {блок → число опытов}
+            if m2.get("blocks") is not None:
+                bl = np.asarray(m2["blocks"]).astype(int).ravel()
+                uniq, cnt = np.unique(bl, return_counts=True)
+                out["M2"]["block_sizes"] = {int(u): int(c)
+                                            for u, c in zip(uniq, cnt)}
+                out["M2"]["blocks"] = bl.tolist()
+
         if "M3_fit" in r:
             per = r["M3_fit"].get("per_property", {})
             out["M3_fit"] = {n: {"r2": v.get("r2"), "adj_r2": v.get("adj_r2"),
@@ -883,10 +897,27 @@ class PipelineRunner:
                                  "stds": np.asarray(v.get("stds")).tolist()}
                              for n, v in per.items()}
         if "M5" in r:
-            out["M5"] = {"i_optimal": r["M5"].get("i_optimal"),
-                         "i_of_d_design": r["M5"].get("i_of_d_design"),
-                         "n_runs": r["M5"].get("n_runs"),
-                         "applied": r["M5"].get("applied", False)}
+            m5 = r["M5"]
+            out["M5"] = {"i_optimal": m5.get("i_optimal"),
+                         "i_of_d_design": m5.get("i_of_d_design"),
+                         "n_runs": m5.get("n_runs"),
+                         "applied": m5.get("applied", False)}
+            # координаты предлагаемого I-оптимального плана (доли компонентов)
+            if m5.get("design") is not None:
+                d5 = np.asarray(m5["design"], float)
+                out["M5"]["design"] = np.round(d5, 4).tolist()
+                out["M5"]["component_names"] = list(self.names)
+                # как этот план разложился бы по блокам проекта (round-robin):
+                # сам план пока «не применён» (точки не измерены), но разбиение
+                # показывает, как его поставить партиями при сборе откликов
+                nb = max(1, int(self.cfg.n_blocks))
+                if nb > 1:
+                    bl5 = self._assign_blocks(len(d5), nb)
+                    uniq, cnt = np.unique(bl5, return_counts=True)
+                    out["M5"]["block_sizes"] = {int(u): int(c)
+                                                for u, c in zip(uniq, cnt)}
+                    out["M5"]["blocks"] = bl5.tolist()
+
         if "M6" in r:
             per = r["M6"].get("per_property", {})
             out["M6"] = {n: {"n_regimes": v.get("n_regimes"),

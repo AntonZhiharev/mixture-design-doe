@@ -86,7 +86,31 @@ macOS/Linux: `command` → `<REPO>/.venv/bin/python`, пути в POSIX-форм
 al_progression / diff_rounds / get_benchmark` (см. `src/mcp/introspect_server.py`,
 логика — `src/mcp/queries.py`).
 
-## 6. Где продолжать по плану
+## 6. Встроенный ИИ-ассистент в Streamlit + мост в trace
+В приложении (`src/apps/streamlit_app.py`) есть вкладка **«💬 Ассистент»**
+(модуль `src/apps/assistant.py`). Это гибрид:
+
+* **Чат прямо в приложении.** Ассистент видит «живой» контекст страниц
+  (метрики стадий M1…M8, конфиг, ветки, benchmark из `runner`) и отвечает через
+  OpenRouter. Включается переменной окружения **`OPENROUTER_API_KEY`**; модель
+  переопределяется `DOE_ASSISTANT_MODEL` (по умолчанию `anthropic/claude-3.5-sonnet`).
+  Сетевой вызов — на stdlib `urllib`, новых зависимостей нет.
+* **Мост к Cline в VS Code.** Кнопка «🔄 Опубликовать снапшот для Cline» (и
+  автоматически — на каждый вопрос в чате) пишет тот же снимок в каталог
+  `DOE_TRACE_ROOT` как обычный прогон `PipelineTrace` с `run_id = ui_<проект>`.
+  После этого Cline наблюдает ровно те же данные через MCP `doe-introspect`
+  (`list_runs` → найти `ui_*`, затем `run_overview` / `get_stage` / `get_design`).
+
+Запуск с ключом (PowerShell):
+```powershell
+$env:OPENROUTER_API_KEY = "sk-or-..."          # ключ OpenRouter
+$env:DOE_TRACE_ROOT = "<REPO>\project_demo\trace"  # тот же, что у MCP-сервера
+.venv\Scripts\python.exe run_streamlit_app.py
+```
+Без ключа чат отключён, но кнопка публикации снапшота в trace работает —
+наблюдение через Cline доступно и без LLM.
+
+## 7. Где продолжать по плану
 - `docs/REBUILD_SPEC.md` — спецификация (канон §5/§12).
 - `docs/FinalCheckList.md` + `docs/FinalCheckList_audit.md` — чек-лист и статус по блокам.
 - `.clinerules` — правила работы и синхронизации с git в каждой сессии.

@@ -6,6 +6,13 @@ env/
 *_env/
 *_venv/
 
+# Local secrets — НИКОГДА не коммитить (ключи API и т.п.)
+.env
+.env.*
+!.env.example
+*.env
+
+
 # Python cache
 __pycache__/
 *.py[cod]

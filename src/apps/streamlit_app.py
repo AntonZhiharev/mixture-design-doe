@@ -32,6 +32,7 @@ from src.models.moe import MixtureOfExperts  # noqa: E402
 from src.apps.pipeline_runner import (PipelineConfig, PipelineRunner,  # noqa: E402
                                        list_projects)
 from src.optimize.desirability import DesirabilitySpec  # noqa: E402
+from src.apps import assistant as ai  # noqa: E402
 
 
 STAGES = [
@@ -113,21 +114,35 @@ def _totals(df: pd.DataFrame, comp_cols, batch: float, unit: str):
 
 def render_design_table(df: pd.DataFrame, comp_cols, title: str,
                         fname: str, key: str, batch: float, unit: str,
-                        height: int | None = None):
-    """Показать таблицу-план + (опц.) количества сырья + кнопку Excel."""
+                        height: int | None = None, with_totals: bool = False):
+    """Показать таблицу-план + (опц.) количества сырья + кнопку Excel.
+
+    ``with_totals``: добавить таблицу «Итого по компонентам на весь план»
+    (как на M2) — полезно для планов из многих опытов (M5).
+    """
     show = df.copy()
     show.index = np.arange(1, len(show) + 1)
     show.index.name = "Опыт"
+    # Streamlit >=1.30 запрещает height=None: передаём только валидное значение.
+    _h = {"height": height} if isinstance(height, int) and height > 0 else {}
     st.caption(title)
-    st.dataframe(show, use_container_width=True, height=height)
+    st.dataframe(show, use_container_width=True, **_h)
     sheets = {"Доли": show}
     if batch and batch > 0:
         amt = _amounts(show, comp_cols, batch, unit)
         st.caption(f"📦 Количество сырья на пробу {batch:g} {unit} "
                    f"(доля × размер пробы):")
-        st.dataframe(amt, use_container_width=True, height=height)
+        st.dataframe(amt, use_container_width=True, **_h)
+
         sheets[(f"Количество ({unit})" if unit else "Количество")] = amt
+        if with_totals:
+            tot = _totals(show, comp_cols, batch, unit)
+            st.caption(f"⚖️ Итого сырья на ВЕСЬ план — {len(show)} опытов × "
+                       f"{batch:g} {unit} (сколько всего закупить/взвесить):")
+            st.dataframe(tot, use_container_width=True)
+            sheets["Итого по плану"] = tot
     _download(sheets, fname, key)
+
 
 
 # ----------------------------------------------------------------------
@@ -156,11 +171,14 @@ def _composition_bounds(d: dict, v: int, q: int, names: list):
     """
     d_lo = d.get("lower") or []
     d_hi = d.get("upper") or []
+    d_pmin = d.get("parts_min") or []
+    d_pmax = d.get("parts_max") or []
+    saved_mode_idx = 1 if d.get("comp_mode") == "parts" else 0
     with st.sidebar.expander("📐 Ограничения состава (опц.)"):
         mode = st.radio(
             "Способ ввода",
             ["Доли (0…1)", "Массовые части (база = 100)"],
-            index=0, key=f"bmode_{v}",
+            index=saved_mode_idx, key=f"bmode_{v}",
             help="«Массовые части»: одна база = 100 частей, остальные задаются "
                  "диапазоном частей; доли (и плавающий диапазон доли базы) "
                  "рассчитываются автоматически.")
@@ -181,12 +199,16 @@ def _composition_bounds(d: dict, v: int, q: int, names: list):
                     step=0.01, format="%.4f", key=f"hi_{v}_{q}_{i}")
                 lower.append(float(lo_i)); upper.append(float(hi_i))
             nontrivial = any(l > 0 for l in lower) or any(u < 1 for u in upper)
-            return (lower, upper) if nontrivial else (None, None)
+            meta = {"comp_mode": "fractions", "base_index": None,
+                    "parts_min": None, "parts_max": None}
+            return (lower, upper, meta) if nontrivial else (None, None, meta)
 
         # --- режим массовых частей ---
+        _sb = d.get("base_index")
+        base_default = int(_sb) if isinstance(_sb, int) and _sb < q else 0
         base_i = st.selectbox(
             "Базовый компонент (= 100 частей)", list(range(q)),
-            index=int(d.get("base_index", 0)) if d.get("base_index", 0) < q else 0,
+            index=base_default,
             format_func=lambda i: names[i], key=f"base_{v}_{q}")
         st.caption("Диапазон массовых частей для остальных компонентов "
                    "(база фиксирована = 100 частей):")
@@ -199,23 +221,28 @@ def _composition_bounds(d: dict, v: int, q: int, names: list):
                 continue
             cc = st.columns(2)
             pmin[i] = cc[0].number_input(
-                f"min частей · {names[i]}", min_value=0.0, value=0.0,
+                f"min частей · {names[i]}", min_value=0.0,
+                value=float(d_pmin[i]) if i < len(d_pmin) else 0.0,
                 step=1.0, key=f"pmin_{v}_{q}_{i}")
             pmax[i] = cc[1].number_input(
-                f"max частей · {names[i]}", min_value=0.0, value=10.0,
+                f"max частей · {names[i]}", min_value=0.0,
+                value=float(d_pmax[i]) if i < len(d_pmax) else 10.0,
                 step=1.0, key=f"pmax_{v}_{q}_{i}")
         try:
             lo_arr, hi_arr = parts_ranges_to_fraction_bounds(pmin, pmax)
         except Exception as exc:  # noqa: BLE001
             st.error(f"Не удалось пересчитать части в доли: {exc}")
-            return None, None
+            return None, None, {"comp_mode": "parts", "base_index": int(base_i),
+                                "parts_min": list(pmin), "parts_max": list(pmax)}
         tbl = pd.DataFrame(
             {"min частей": pmin, "max частей": pmax,
              "доля L": np.round(lo_arr, 4), "доля U": np.round(hi_arr, 4)},
             index=names[:q])
         st.caption("Рассчитанные диапазоны долей для алгоритма:")
         st.dataframe(tbl, use_container_width=True)
-        return lo_arr.tolist(), hi_arr.tolist()
+        meta = {"comp_mode": "parts", "base_index": int(base_i),
+                "parts_min": list(pmin), "parts_max": list(pmax)}
+        return lo_arr.tolist(), hi_arr.tolist(), meta
 
 
 def sidebar_config():
@@ -272,16 +299,19 @@ def sidebar_config():
 
 
     # --- Ограничения состава: доли (0..1) ИЛИ массовые части (база=100) ---
-    lower, upper = _composition_bounds(d, v, q, names)
+    lower, upper, comp_meta = _composition_bounds(d, v, q, names)
 
 
     # --- Стоимость компонентов: одна единица для всех + поле на компонент ---
     d_cost = d.get("cost_coeffs") or []
+    cost_opts = ["— не учитывать", "₽/кг", "₽/л", "$/кг", "$/л", "у.е./ед."]
+    cost_unit_default = d.get("cost_unit")
+    cost_unit_idx = (cost_opts.index(cost_unit_default)
+                     if cost_unit_default in cost_opts else 0)
     with st.sidebar.expander("💰 Стоимость компонентов (опц.)"):
         cost_unit = st.selectbox(
             "Единица цены (одна для всех компонентов)",
-            ["— не учитывать", "₽/кг", "₽/л", "$/кг", "$/л", "у.е./ед."],
-            index=0, key=f"cost_unit_{v}",
+            cost_opts, index=cost_unit_idx, key=f"cost_unit_{v}",
             help="Все цены задаются в ОДНОЙ единице измерения. Стоимость "
                  "рецепта = Σ(цена_i · доля_i) и учитывается в M8 как "
                  "критерий «дешевле — лучше».")
@@ -298,13 +328,17 @@ def sidebar_config():
     # --- Размер пробы → пересчёт долей в количество сырья ---
     st.sidebar.header("📦 Размер пробы")
     bs = st.sidebar.number_input(
-        "Размер партии/пробы", min_value=0.0, value=100.0, step=10.0,
+        "Размер партии/пробы", min_value=0.0,
+        value=float(d.get("batch_size") or 100.0), step=10.0,
         key=f"batch_{v}",
         help="Доли компонентов умножаются на этот размер и показываются как "
              "количество сырья на пробу (в таблицах планов и в рецепте).")
-    bu = st.sidebar.selectbox("Единица количества",
-                              ["г", "кг", "мг", "т", "л", "мл", "ед."],
-                              index=0, key=f"batch_unit_{v}")
+    batch_opts = ["г", "кг", "мг", "т", "л", "мл", "ед."]
+    batch_unit_default = d.get("batch_unit")
+    batch_unit_idx = (batch_opts.index(batch_unit_default)
+                      if batch_unit_default in batch_opts else 0)
+    bu = st.sidebar.selectbox("Единица количества", batch_opts,
+                              index=batch_unit_idx, key=f"batch_unit_{v}")
     st.session_state["batch_size"] = bs
     st.session_state["batch_unit"] = bu
 
@@ -313,7 +347,13 @@ def sidebar_config():
                          n_restarts=n_restarts, n_blocks=int(n_blocks),
                          lower=lower, upper=upper,
                          names=names, cost_coeffs=cost,
-                         property_names=property_names)
+                         cost_unit=(None if cost_unit.startswith("—") else cost_unit),
+                         property_names=property_names,
+                         batch_size=float(bs), batch_unit=bu,
+                         comp_mode=comp_meta["comp_mode"],
+                         base_index=comp_meta["base_index"],
+                         parts_min=comp_meta["parts_min"],
+                         parts_max=comp_meta["parts_max"])
 
     project_dir = os.path.join(_REPO, "project_ui", name)
     return cfg, project_dir
@@ -405,7 +445,11 @@ def render_stage(runner: PipelineRunner, key: str, title: str):
                 elif key == "M4":
                     runner.run_m4()
                 elif key == "M5":
-                    runner.run_m5()
+                    bar = st.progress(0.0, text="M5: подготовка…")
+                    runner.run_m5(progress=lambda m, f: bar.progress(
+                        min(max(f, 0.0), 1.0), text=f"M5: {m}"))
+                    bar.empty()
+
                 elif key == "M6":
                     runner.run_m6()
                 elif key == "M7":
@@ -433,33 +477,54 @@ def _render_m2(runner: PipelineRunner, names, batch: float, unit: str):
     has_blocks = r.get("n_blocks", 1) > 1 and r.get("blocks") is not None
     if has_blocks:
         df["Блок"] = np.asarray(r["blocks"])
-    # отклики, ПРИВЯЗАННЫЕ к плану M2 (не к «живому» runner.y, растущему в M7)
-    yv = np.asarray(r.get("y"), dtype=float)
-    if yv.shape[0] != len(df):
-        yv = np.full(len(df), np.nan)
-    df["y (lab)"] = np.round(yv, 4)
+    # отклики ВСЕХ целевых свойств (мультиотклик, §12), ПРИВЯЗАННЫЕ к плану M2:
+    # по столбцу на каждое свойство из матрицы Y (n×P), а не один y[:,0].
+    props = list(runner.property_names)
+    P = len(props)
+    Ymat = np.asarray(r.get("Y"), dtype=float)
+    if Ymat.ndim != 2 or Ymat.shape != (len(df), P):
+        # fallback: собрать из первичного y, остальное — NaN
+        Ymat = np.full((len(df), P), np.nan)
+        yv = np.asarray(r.get("y"), dtype=float)
+        if yv.ndim == 1 and yv.shape[0] == len(df) and P >= 1:
+            Ymat[:, 0] = yv
+    prop_cols = []
+    for i, prop in enumerate(props):
+        col = f"{prop} (lab)"
+        df[col] = np.round(Ymat[:, i], 4)
+        prop_cols.append(col)
 
     st.info(
-        "ℹ️ **y (lab)** — измеренное свойство продукта (целевой отклик) для "
-        "каждого опыта. Столбец НЕ заполняется автоматически: впишите значения "
-        "вручную и нажмите «Сохранить отклики», либо нажмите «🧪 Заполнить "
+        "ℹ️ Столбцы вида **«свойство (lab)»** — измеренные целевые свойства "
+        "продукта для каждого опыта (по столбцу на каждое свойство проекта; "
+        f"сейчас их {P}: {', '.join(props)}). Первое свойство — первичное "
+        "(для M7/M8/benchmark). Столбцы НЕ заполняются автоматически: впишите "
+        "значения вручную и нажмите «💾 Сохранить отклики», либо «🧪 Заполнить "
         "тестовыми» — данные сгенерирует симулятор. Стадии M3–M8 используют "
         "именно эти значения.")
-    st.caption("План эксперимента (доли компонентов; редактируется только "
-               "столбец y (lab)):")
+    st.caption("План эксперимента (доли компонентов; редактируются только "
+               "столбцы «свойство (lab)»):")
     locked = comp_cols + (["Блок"] if has_blocks else [])
     edited = st.data_editor(df, use_container_width=True, height=320,
                             disabled=locked, key="m2_editor")
     bcols = st.columns(2)
-    if bcols[0].button("💾 Сохранить отклики (y)", key="save_y"):
+    if bcols[0].button("💾 Сохранить отклики", key="save_y"):
         try:
-            yvals = np.asarray(edited["y (lab)"], dtype=float)
-            runner.y = yvals
-            runner.state.put("responses", yvals)
-            runner.results["M2"]["y"] = yvals
-            st.success("Отклики сохранены — теперь выполняйте M3–M8.")
+            Ynew = np.column_stack(
+                [np.asarray(edited[c], dtype=float) for c in prop_cols])
+            runner.Y = Ynew
+            runner.y = Ynew[:, 0]
+            runner.state.put("responses", runner.y)
+            runner.state.put("responses_multi", runner.Y)
+            runner.results["M2"]["Y"] = runner.Y
+            runner.results["M2"]["y"] = runner.y
+            # отклики изменились → метрики M3–M8 на старых y устарели
+            runner.invalidate_metrics()
+            st.success(f"Отклики сохранены ({P} свойств) — выполняйте M3–M8.")
+
         except Exception as exc:  # noqa: BLE001
             st.error(f"Не удалось сохранить отклики: {exc}")
+
     if bcols[1].button("🧪 Заполнить тестовыми (симулятор)", key="fill_sim"):
         try:
             runner.design = np.asarray(r["design"])
@@ -488,9 +553,75 @@ def _render_m2(runner: PipelineRunner, names, batch: float, unit: str):
     _download(sheets, "M2_design.xlsx", "dl_m2")
 
 
+def _render_m3_property(runner: PipelineRunner, names, prop: str, idx: int):
+    """Анализ M3 (Scheffé + ARD) для ОДНОГО свойства — вкладка страницы M3.
+
+    Данные уже посчитаны для всех свойств (`per_property`), поэтому вкладки
+    лишь раскладывают готовые результаты. `idx` нужен для уникальных ключей
+    виджетов (иначе кнопки скачивания конфликтуют между вкладками).
+    """
+    if "M3_fit" in runner.results:
+        res = runner.results["M3_fit"]
+        r = res.get("per_property", {}).get(prop, res)
+        c = st.columns(3)
+        c[0].metric("R²", f"{r['r2']:.4f}")
+        c[1].metric("Adj-R²", f"{r['adj_r2']:.4f}")
+        c[2].metric("RMSE", f"{r['rmse']:.4f}")
+        st.caption(f"Коэффициенты Scheffé для «{prop}» "
+                   "(интерпретация значимости термов):")
+        st.dataframe(r["coef_table"], use_container_width=True)
+        _download({"Коэффициенты": r["coef_table"], "ANOVA": r["anova"]},
+                  f"M3_{prop}.xlsx", f"dl_m3_{idx}")
+        st.caption("ANOVA:")
+        st.dataframe(r["anova"], use_container_width=True)
+    if "M3_ard" in runner.results:
+        res = runner.results["M3_ard"]
+        a = res.get("per_property", {}).get(prop, res)
+        st.info(f"ARD-GP «{prop}»: q_eff = {a['q_eff']} · активные: "
+                f"{', '.join(a['active'])} · logLik={a['gp_loglik']:.2f} "
+                f"· noise={a['noise_level']:.4f}")
+        imp = pd.DataFrame({"importance": a["importance"]},
+                           index=names[: len(a["importance"])])
+        st.bar_chart(imp)
+
+
+def _render_m4_property(info: dict, prop: str):
+    """Режимы M4 для ОДНОГО свойства: BIC-кривая + баланс кластеров."""
+    c = st.columns([1, 3])
+    c[0].metric("Число режимов K (BIC)", info["n_regimes"])
+    c[1].caption(f"Кластеризация в пространстве свойства **{prop}**, не "
+                 "рецептур. Границы режимов у разных свойств могут не "
+                 "совпадать. Прообраз режима в рецептурах — через модель "
+                 "(gating), не по близости точек.")
+    bt = info["bic_table"].set_index("K")[["bic"]]
+    st.line_chart(bt)
+    means = np.asarray(info["means"], float).ravel()
+    K = len(means)
+    counts = np.asarray(info.get("counts", np.zeros(K)), int).ravel()
+    weights = np.asarray(info.get("weights", np.zeros(K)), float).ravel()
+    stds = np.asarray(info.get("stds", np.zeros(K)), float).ravel()
+    tbl = pd.DataFrame({
+        f"среднее «{prop}»": np.round(means, 4),
+        "вес (доля точек)": np.round(weights, 3),
+        "точек": counts,
+        "σ внутри режима": np.round(stds, 4),
+    }, index=[f"Режим {k + 1}" for k in range(K)])
+    st.caption("Состав режимов — баланс кластеров:")
+    st.dataframe(tbl, use_container_width=True)
+    marg = [k + 1 for k in range(K) if counts[k] < 3]
+    if marg and K > 1:
+        st.warning(
+            f"⚠️ Маргинальные режимы (< 3 точек): "
+            f"{', '.join('Режим ' + str(m) for m in marg)}. "
+            "Такой кластер может быть артефактом BIC — оцените, нужен ли он, "
+            "или доберите точки в этой области (якорные точки вне кластеров).")
+
+
 def _render_result(runner: PipelineRunner, key: str):
     names = runner.names
     batch, unit = _batch()
+
+
 
     if key == "M1" and "M1" in runner.results:
         r = runner.results["M1"]
@@ -510,53 +641,58 @@ def _render_result(runner: PipelineRunner, key: str):
         _render_m2(runner, names, batch, unit)
 
     elif key == "M3":
-        # мультиотклик (§12): скрининг строится на каждое свойство; выбираем,
-        # какое показать. Для одного свойства селектор не нужен.
+        # мультиотклик (§12): анализ строится на ВСЕ свойства сразу; результаты
+        # раскладываем по вкладкам (по свойству) внутри страницы M3 — удобнее,
+        # чем переключать одно свойство селектором.
         props = list(runner.property_names)
-        prop = props[0]
-        if len(props) > 1:
-            prop = st.selectbox("Свойство (отклик)", props, key="m3_prop")
-        if "M3_fit" in runner.results:
-            res = runner.results["M3_fit"]
-            r = res.get("per_property", {}).get(prop, res)
-            c = st.columns(3)
-            c[0].metric("R²", f"{r['r2']:.4f}")
-            c[1].metric("Adj-R²", f"{r['adj_r2']:.4f}")
-            c[2].metric("RMSE", f"{r['rmse']:.4f}")
-            st.caption(f"Коэффициенты Scheffé для «{prop}» "
-                       "(интерпретация значимости термов):")
-            st.dataframe(r["coef_table"], use_container_width=True)
-            _download({"Коэффициенты": r["coef_table"], "ANOVA": r["anova"]},
-                      "M3_analysis.xlsx", "dl_m3")
-            st.caption("ANOVA:")
-            st.dataframe(r["anova"], use_container_width=True)
-        if "M3_ard" in runner.results:
-            res = runner.results["M3_ard"]
-            a = res.get("per_property", {}).get(prop, res)
-            st.info(f"ARD-GP «{prop}»: q_eff = {a['q_eff']} · активные: "
-                    f"{', '.join(a['active'])} · logLik={a['gp_loglik']:.2f} "
-                    f"· noise={a['noise_level']:.4f}")
-            imp = pd.DataFrame({"importance": a["importance"]},
-                               index=names[: len(a["importance"])])
-            st.bar_chart(imp)
+        if not (("M3_fit" in runner.results) or ("M3_ard" in runner.results)):
+            st.info("Выполните M3 — анализ Scheffé и ARD-скрининг построятся "
+                    "сразу по всем свойствам и разложатся по вкладкам.")
+        elif len(props) == 1:
+            _render_m3_property(runner, names, props[0], 0)
+        else:
+            for i, tab in enumerate(st.tabs([f"📊 {p}" for p in props])):
+                with tab:
+                    _render_m3_property(runner, names, props[i], i)
+
 
     elif key == "M4" and "M4" in runner.results:
+        # мультиотклик (§12): режимы оцениваются для КАЖДОГО свойства (границы
+        # режимов могут не совпадать) — раскладываем по вкладкам, как M3/M6.
         r = runner.results["M4"]
-        st.metric("Число режимов K (BIC)", r["n_regimes"])
-        bt = r["bic_table"].set_index("K")[["bic"]]
-        st.line_chart(bt)
-        st.caption(f"Средние свойства по режимам: {np.round(r['means'], 3).tolist()}")
+        per = r.get("per_property", {})
+        if not per:                       # старый одно-откликовый результат
+            per = {r.get("property", runner.property_names[0]): r}
+        props = [p for p in runner.property_names if p in per] or list(per)
+        if len(props) == 1:
+            _render_m4_property(per[props[0]], props[0])
+        else:
+            for i, tab in enumerate(st.tabs([f"🧩 {p}" for p in props])):
+                with tab:
+                    _render_m4_property(per[props[i]], props[i])
+
+
 
     elif key == "M5" and "M5" in runner.results:
         r = runner.results["M5"]
-        c = st.columns(2)
+        c = st.columns(3)
         c[0].metric("I-score (I-opt)", f"{r['i_optimal']:.4f}")
         if r["i_of_d_design"] is not None:
             c[1].metric("I-score (D-opt дизайн)", f"{r['i_of_d_design']:.4f}",
                         delta=f"{r['i_of_d_design'] - r['i_optimal']:+.4f}")
+        c[2].metric("Опытов в плане", r.get("n_runs", len(r["design"])))
+        st.info(
+            "ℹ️ Это **рассчитанный** I-оптимальный план: точки пока только "
+            "предложены. Эксперименты по ним НЕ поставлены и в общую базу "
+            "проекта НЕ добавлены — поэтому число точек проекта и origin "
+            "(пока только «M2») не меняются. Сбор откликов по этим точкам и "
+            "дозапись в базу выполняются на этапе active learning / раундов "
+            "веток.")
         render_design_table(_df_design(r["design"], names), list(names[: runner.q]),
                             "I-оптимальный дизайн (точнее прогноз):",
-                            "M5_design.xlsx", "dl_m5", batch, unit, height=300)
+                            "M5_design.xlsx", "dl_m5", batch, unit, height=300,
+                            with_totals=True)
+
 
     elif key == "M6" and "M6" in runner.results:
         # мультиотклик (§12): общий на проект суррогат на каждое свойство.
@@ -771,9 +907,126 @@ def render_branches(runner: PipelineRunner):
 
 
 # ----------------------------------------------------------------------
+def render_assistant(runner: PipelineRunner):
+    """💬 Встроенный ИИ-ассистент: видит контекст страниц + мост в trace.
+
+    Ассистент читает живое состояние `runner` из session_state (метрики всех
+    стадий, ветки, benchmark) и отвечает через OpenRouter. Тот же снимок
+    пишется в trace, чтобы Cline в VS Code наблюдал данные через MCP
+    `doe-introspect`.
+    """
+    st.subheader("💬 Ассистент: интерпретация результатов и подсказки по шагам")
+
+    # --- настройки подключения (ключ/модель вводятся прямо здесь) -------
+    with st.expander("⚙️ Подключение: API-ключ и модель",
+                     expanded=not ai.llm_available()):
+        st.caption("Ключ OpenRouter (sk-or-…) и имя модели. Кнопка «💾 Сохранить» "
+                   "пишет ОБА значения (ключ + модель) в локальный файл `.env` в "
+                   "корне репозитория — он занесён в `.gitignore`, поэтому НЕ "
+                   "попадёт на GitHub и подхватится автоматически при следующих "
+                   "запусках. Без сохранения они живут только в текущей сессии.")
+        key_in = st.text_input("OpenRouter API key", type="password",
+                               value=os.environ.get("OPENROUTER_API_KEY", ""),
+                               key="ai_key")
+        model_in = st.text_input("Модель", value=ai.model_name(), key="ai_model")
+        if key_in:
+            os.environ["OPENROUTER_API_KEY"] = key_in.strip()
+        if model_in:
+            os.environ["DOE_ASSISTANT_MODEL"] = model_in.strip()
+
+        ckey = st.columns([2, 3])
+        if ckey[0].button("💾 Сохранить ключ и модель в .env", key="ai_save_key"):
+            try:
+                path = ai.save_api_key(key_in, model=model_in)
+                st.success(f"Ключ и модель (`{model_in}`) сохранены в `{path}` "
+                           "(файл в .gitignore — на GitHub не уйдёт). Подхватятся "
+                           "при следующем запуске.")
+            except ValueError as exc:
+                st.error(str(exc))
+            except OSError as exc:  # noqa: BLE001
+                st.error(f"Не удалось записать .env: {exc}")
+        if ai.api_key_persisted():
+            ckey[1].caption(f"🔐 Сохранённые ключ и модель найдены: "
+                            f"`{ai.env_file_path()}`")
+        else:
+            ckey[1].caption("Ключ и модель пока не сохранены в .env.")
+
+
+
+    # --- статус backend и мост в trace ---------------------------------
+    cstat = st.columns([2, 2, 3])
+    if ai.llm_available():
+        cstat[0].success("LLM подключён")
+    else:
+        cstat[0].warning("Нет OPENROUTER_API_KEY")
+    cstat[1].caption(f"Модель: `{ai.model_name()}`")
+    if cstat[2].button("🔄 Опубликовать снапшот для Cline (VS Code)",
+                       key="ai_snapshot", use_container_width=True):
+        try:
+            info = ai.write_live_snapshot(
+                runner, chat_history=st.session_state.get("ai_history", []))
+            st.session_state["ai_snapshot_msg"] = (
+                f"Снапшот записан в trace: run_id=`{info['run_id']}` "
+                f"(сообщений в чате: {info.get('n_messages', 0)}; каталог: "
+                f"{info['root']}). Cline видит его через MCP `doe-introspect` "
+                f"(run_overview / get_stage `assistant_chat`).")
+
+        except Exception as exc:  # noqa: BLE001
+            st.session_state["ai_snapshot_msg"] = f"Не удалось записать снапшот: {exc}"
+    if st.session_state.get("ai_snapshot_msg"):
+        st.info(st.session_state.pop("ai_snapshot_msg"))
+
+    with st.expander("👁️ Что сейчас «видит» ассистент (контекст страниц)"):
+        st.json(ai.build_context(runner))
+
+    if not ai.llm_available():
+        st.caption("Чтобы включить чат, задайте переменную окружения "
+                   "`OPENROUTER_API_KEY` перед запуском приложения. Кнопка выше "
+                   "и так публикует контекст в trace — это работает без ключа.")
+
+    # --- история диалога ----------------------------------------------
+    history = st.session_state.setdefault("ai_history", [])
+    cc = st.columns([1, 5])
+    if cc[0].button("🗑️ Очистить", key="ai_clear"):
+        st.session_state["ai_history"] = []
+        st.rerun()
+
+    for m in history:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    prompt = st.chat_input("Спросите про результаты, метрики или следующий шаг…",
+                           key="ai_input", disabled=not ai.llm_available())
+    if prompt:
+        history.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("Думаю над контекстом…"):
+                try:
+                    reply = ai.assistant_reply(runner, history[:-1], prompt)
+                except Exception as exc:  # noqa: BLE001
+                    reply = f"⚠️ Ошибка обращения к модели: {exc}"
+                st.markdown(reply)
+        history.append({"role": "assistant", "content": reply})
+        st.session_state["ai_history"] = history
+        # мост: фиксируем для Cline полный диалог (включая последний ответ),
+        # чтобы переписку было видно через MCP get_stage `assistant_chat`.
+        try:
+            ai.write_live_snapshot(runner, chat_history=history)
+        except Exception:  # noqa: BLE001 — мост не должен ломать чат
+            pass
+
+
+
+# ----------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="DOE Pipeline M1–M8", layout="wide")
+    # Подхватываем сохранённый ключ/модель из локального .env (если есть).
+    # Внешние переменные окружения имеют приоритет (override=False).
+    ai.load_env_file()
     st.title("🧪 MoE/GP Pipeline для Mixture DOE — M1…M8")
+
     st.caption("Пошаговый конвейер пересборки (REBUILD_SPEC). «Лаборатория» — "
                "синтетический полигон Scheffé; на каждой стадии сохраняется чекпоинт.")
 
@@ -788,21 +1041,28 @@ def main():
     render_project_saver(runner)           # 💾 сохранить проект целиком
     render_checkpoints(runner, cfg, project_dir)
 
-    # индикатор пройденных стадий
-    done = [k for k, _ in STAGES if k in runner.results or f"{k}_fit" in runner.results]
+    # индикатор пройденных стадий — по долговечному состоянию проекта
+    # (учитывает загруженные проекты и кэш метрик, не только in-memory results)
+    _completed = set(ai.completed_stages(runner))
+    done = [k for k, _ in STAGES
+            if k in _completed or f"{k}_fit" in _completed]
+
 
     st.progress(len(done) / len(STAGES),
                 text=f"Пройдено стадий: {len(done)}/{len(STAGES)}  "
                      f"(текущая: {runner.state.stage})")
 
-    tabs = st.tabs([t for _, t in STAGES] + ["🌿 Ветки", "🎯 Benchmark"])
+    tabs = st.tabs([t for _, t in STAGES]
+                   + ["🌿 Ветки", "🎯 Benchmark", "💬 Ассистент"])
     for tab, (k, title) in zip(tabs, STAGES):
         with tab:
             render_stage(runner, k, title)
-    with tabs[-2]:
+    with tabs[-3]:
         render_branches(runner)
-    with tabs[-1]:
+    with tabs[-2]:
         render_benchmark(runner)
+    with tabs[-1]:
+        render_assistant(runner)
 
 
 if __name__ == "__main__":

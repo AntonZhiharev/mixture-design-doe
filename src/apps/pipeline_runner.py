@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
 
 import numpy as np
 
@@ -52,7 +53,16 @@ class PipelineConfig:
     n_restarts: int = 8
     n_blocks: int = 1                   # число блоков (партий/дней) для плана
     cost_coeffs: Optional[Sequence[float]] = None   # per-component unit cost
+    cost_unit: Optional[str] = None                 # единица цены (одна на проект)
     property_names: Optional[Sequence[str]] = None  # имена целевых свойств (P)
+    batch_size: Optional[float] = None              # размер пробы (для пересчёта)
+    batch_unit: Optional[str] = None                # единица количества пробы
+    # исходная форма ввода ограничений состава (чтобы отображать как задал user)
+    comp_mode: Optional[str] = None                 # "fractions" | "parts"
+    base_index: Optional[int] = None                # база (=100 частей) в режиме parts
+    parts_min: Optional[Sequence[float]] = None     # min частей по компонентам
+    parts_max: Optional[Sequence[float]] = None     # max частей по компонентам
+
 
 
 
@@ -82,7 +92,14 @@ class PipelineConfig:
             n_restarts=int(d.get("n_restarts", 8)),
             n_blocks=int(d.get("n_blocks", 1)),
             cost_coeffs=d.get("cost_coeffs"),
+            cost_unit=d.get("cost_unit"),
             property_names=d.get("property_names"),
+            batch_size=d.get("batch_size"),
+            batch_unit=d.get("batch_unit"),
+            comp_mode=d.get("comp_mode"),
+            base_index=d.get("base_index"),
+            parts_min=d.get("parts_min"),
+            parts_max=d.get("parts_max"),
         )
 
 
@@ -125,7 +142,11 @@ class PipelineRunner:
 
 
         self.results: Dict[str, Dict[str, Any]] = {}
+        # кэш компактных метрик стадий, переживающий перезагрузку проекта
+        # (лёгкая персистентность: скаляры/мелкие массивы, без тяжёлых таблиц)
+        self.cached_metrics: Dict[str, Any] = {}
         self.p = len(scheffe_term_indices(self.q, config.model))
+
         self.n_runs = int(np.ceil(config.n_runs_factor * self.p))
         # полный снимок конфигурации — чтобы проект восстанавливался целиком
         self.state = ProjectState(name=config.name,
@@ -154,7 +175,16 @@ class PipelineRunner:
             "n_restarts": int(self.cfg.n_restarts),
             "n_blocks": int(self.cfg.n_blocks),
             "cost_coeffs": self.cost_coeffs.tolist(),
+            "cost_unit": self.cfg.cost_unit,
             "property_names": list(self.property_names),
+            "batch_size": self.cfg.batch_size,
+            "batch_unit": self.cfg.batch_unit,
+            "comp_mode": self.cfg.comp_mode,
+            "base_index": self.cfg.base_index,
+            "parts_min": (list(self.cfg.parts_min)
+                          if self.cfg.parts_min is not None else None),
+            "parts_max": (list(self.cfg.parts_max)
+                          if self.cfg.parts_max is not None else None),
         }
 
 
@@ -165,8 +195,12 @@ class PipelineRunner:
         которое потом подхватывает :meth:`from_project`.
         """
         self.state.config = self.config_snapshot()
+        # лёгкий кэш метрик стадий: накапливаем (кэш с диска ∪ свежие из сессии)
+        self.cached_metrics = self.stage_metrics()
+        self.state.put("stage_metrics", self.cached_metrics)
         if self.design is not None:
             self.state.put("design", self.design)
+
         if self.y is not None:
             self.state.put("responses", self.y)
         if self.blocks is not None:
@@ -182,7 +216,12 @@ class PipelineRunner:
     def _restore_from_state(self, ps: ProjectState) -> None:
         """Подтянуть рабочие объекты (design/y/blocks/MoE) из ProjectState."""
         self.state = ps
+        # лёгкий кэш метрик стадий — чтобы ассистент/MCP/индикатор видели
+        # пройденные стадии и их цифры без дорогого пересчёта (см. save_project)
+        cached = ps.get("stage_metrics")
+        self.cached_metrics = dict(cached) if cached else {}
         design = ps.get("design")
+
         y = ps.get("responses")
         Y = ps.get("responses_multi")
         blocks = ps.get("blocks")
@@ -381,27 +420,93 @@ class PipelineRunner:
         return out
 
     # ===================== M4: GMM regimes ===========================
+    @staticmethod
+    def _regime_summary(reg, yv: np.ndarray, name: str) -> Dict[str, Any]:
+        """Сводка по режимам одного свойства: means/weights/counts/stds.
+
+        `weights` — доля точек на режим (средние responsibilities, mixing
+        proportions); `counts` — точки по жёстким меткам; `stds` — разброс
+        свойства внутри режима. Нужны, чтобы судить о балансе кластеров
+        (см. чек-лист Блок 4/7), а не только о центрах.
+        """
+        K = int(reg.n_regimes)
+        labels = np.asarray(reg.labels).ravel()
+        resp = np.asarray(reg.responsibilities, dtype=float)
+        yv = np.asarray(yv, dtype=float).ravel()
+        counts = np.bincount(labels, minlength=K).astype(int)
+        if resp.ndim == 2 and resp.shape[1] == K:
+            weights = resp.mean(axis=0)               # мягкие доли (mixing prop.)
+        else:
+            weights = counts / max(len(labels), 1)
+        stds = np.array([float(np.std(yv[labels == k])) if counts[k] > 0 else 0.0
+                         for k in range(K)])
+        return {"property": name, "n_regimes": K, "bic_table": reg.bic_table,
+                "means": np.asarray(reg.means).ravel(),
+                "weights": np.asarray(weights, dtype=float).ravel(),
+                "counts": counts, "stds": stds}
+
     def run_m4(self) -> Dict[str, Any]:
-        self._require_data()
-        reg = GMMRegimes(k_range=range(1, 6), seed=self.cfg.seed).fit(self.y)
+        """Кластеризация режимов GMM в пространстве свойств — на КАЖДОЕ свойство.
+
+        По канону мультиотклика (§12, как M3/M6) режимность оценивается для
+        каждого свойства отдельно: границы режимов у разных свойств могут не
+        совпадать. `per_property[name]` хранит сводку по свойству (число
+        режимов, центры, баланс кластеров). Верхний уровень дублирует первичное
+        свойство (столбец 0) — для обратной совместимости со старым UI/тестами.
+        """
+        cols = self._property_columns()
         self.state.set_stage("M4_clustering")
-        self.state.models["m4_regimes"] = reg.to_state()
-        out = {"n_regimes": int(reg.n_regimes), "bic_table": reg.bic_table,
-               "means": np.asarray(reg.means).ravel(),
-               "checkpoint": self._ckpt("after_M4")}
+        per: Dict[str, Dict[str, Any]] = {}
+        primary: Optional[Dict[str, Any]] = None
+        for i, name in enumerate(self.property_names):
+            if name not in cols:
+                continue
+            reg = GMMRegimes(k_range=range(1, 6), seed=self.cfg.seed).fit(
+                cols[name])
+            self.state.models[f"m4_regimes__{i}"] = reg.to_state()
+            info = self._regime_summary(reg, cols[name], name)
+            per[name] = info
+            if primary is None:
+                primary = info
+        if "m4_regimes__0" in self.state.models:
+            self.state.models["m4_regimes"] = self.state.models["m4_regimes__0"]
+        out = dict(primary or {})
+        out["per_property"] = per
+        out["property_names"] = list(self.property_names)
+        out["checkpoint"] = self._ckpt("after_M4")
         self.results["M4"] = out
         return out
 
+
+
     # ===================== M5: I-optimal design ======================
-    def run_m5(self) -> Dict[str, Any]:
+    def run_m5(self, progress: Optional[Callable[[str, float], None]] = None
+               ) -> Dict[str, Any]:
+        """I-оптимальный план (минимизация средней дисперсии прогноза).
+
+        Это РАСЧЁТ плана: точки лишь предлагаются, эксперименты по ним не
+        ставятся и в общую базу не дописываются (поэтому origin/число точек
+        проекта не меняются — это делает сбор откликов/раунды веток).
+
+        ``progress(msg, frac)`` — опциональный коллбэк прогресса (0..1) для UI:
+        стадия делится на тяжёлые шаги (моменты области, оптимизация плана).
+        """
+        def _pg(msg: str, frac: float) -> None:
+            if progress is not None:
+                progress(msg, frac)
+
+        _pg("Пул кандидатов", 0.05)
         pool = build_candidate_pool(self.region, n_random=self.cfg.n_random,
                                     seed=self.cfg.seed)
+        _pg("Матрица моментов области (Монте-Карло)", 0.2)
         W = region_moment_matrix(self.region, self.cfg.model, n_mc=6000,
                                  seed=self.cfg.seed)
+        _pg("Поиск I-оптимального плана", 0.5)
         i_res = i_optimal_design(pool, n_runs=self.n_runs, moments=W,
                                  model=self.cfg.model,
                                  n_restarts=self.cfg.n_restarts,
                                  seed=self.cfg.seed)
+        _pg("Сравнение с D-оптимальным планом", 0.9)
         i_of_i = float(i_res.i_score)
         i_of_d = None
         if self.design is not None:
@@ -411,9 +516,14 @@ class PipelineRunner:
         self.state.set_stage("M5_local_design")
         self.state.models["m5_i_optimal"] = i_res.to_state()
         out = {"i_optimal": i_of_i, "i_of_d_design": i_of_d,
-               "design": i_res.design, "checkpoint": self._ckpt("after_M5")}
+               "design": i_res.design,
+               "n_runs": int(np.asarray(i_res.design).shape[0]),
+               "applied": False,   # план рассчитан, но точки ещё не измерены
+               "checkpoint": self._ckpt("after_M5")}
         self.results["M5"] = out
+        _pg("Готово", 1.0)
         return out
+
 
     # ===================== M6: MoE surrogate =========================
     def run_m6(self) -> Dict[str, Any]:
@@ -579,7 +689,10 @@ class PipelineRunner:
         if "M2" in self.results:
             self.results["M2"]["y"] = self.y
             self.results["M2"]["Y"] = self.Y
+        # отклики изменились → метрики M3–M8 на старых y больше не валидны
+        self.invalidate_metrics()
         return self.Y
+
 
     # ===================== Ветки (3c, REBUILD_SPEC §5/§12) ===========
     def add_branch(self, name: str, goal: Dict[str, DesirabilitySpec],
@@ -728,6 +841,99 @@ class PipelineRunner:
         for o in self.origin:
             out[o] = out.get(o, 0) + 1
         return out
+
+    # ===================== Кэш метрик стадий (лёгкая персистентность) ==
+    # Порядок зависимостей стадий: всё правее зависит от откликов/данных.
+    _STAGE_ORDER = ["M1", "M2", "M3_fit", "M3_ard", "M4", "M5", "M6", "M7",
+                    "M8", "benchmark"]
+    # Стадии, НЕ зависящие от откликов (геометрия области и план/его критерий).
+    _DATA_INDEPENDENT = ("M1", "M2", "M5")
+
+    def stage_metrics_compact(self) -> Dict[str, Any]:
+        """Компактные метрики пройденных стадий ИЗ ``self.results``.
+
+        Только скаляры и мелкие массивы — без тяжёлых таблиц (coef_table/anova/
+        bic_table) и матриц дизайна. Используется и ассистентом, и кэшем на диск.
+        """
+        r = self.results or {}
+        out: Dict[str, Any] = {}
+        if "M1" in r:
+            out["M1"] = {k: r["M1"].get(k)
+                         for k in ("n_vertices", "q", "p", "n_runs")}
+        if "M2" in r:
+            out["M2"] = {k: r["M2"].get(k)
+                         for k in ("n", "p", "d_efficiency", "n_blocks")}
+        if "M3_fit" in r:
+            per = r["M3_fit"].get("per_property", {})
+            out["M3_fit"] = {n: {"r2": v.get("r2"), "adj_r2": v.get("adj_r2"),
+                                 "rmse": v.get("rmse")}
+                             for n, v in per.items()}
+        if "M3_ard" in r:
+            per = r["M3_ard"].get("per_property", {})
+            out["M3_ard"] = {n: {"q_eff": v.get("q_eff"),
+                                 "active": v.get("active")}
+                             for n, v in per.items()}
+        if "M4" in r:
+            per = r["M4"].get("per_property", {})
+            if per:
+                out["M4"] = {n: {"n_regimes": v.get("n_regimes"),
+                                 "means": np.asarray(v.get("means")).tolist(),
+                                 "weights": np.asarray(v.get("weights")).tolist(),
+                                 "counts": np.asarray(v.get("counts")).tolist(),
+                                 "stds": np.asarray(v.get("stds")).tolist()}
+                             for n, v in per.items()}
+        if "M5" in r:
+            out["M5"] = {"i_optimal": r["M5"].get("i_optimal"),
+                         "i_of_d_design": r["M5"].get("i_of_d_design"),
+                         "n_runs": r["M5"].get("n_runs"),
+                         "applied": r["M5"].get("applied", False)}
+        if "M6" in r:
+            per = r["M6"].get("per_property", {})
+            out["M6"] = {n: {"n_regimes": v.get("n_regimes"),
+                             "test_rmse": v.get("test_rmse"),
+                             "within": v.get("within"),
+                             "between": v.get("between")}
+                         for n, v in per.items()}
+        if "M7" in r:
+            out["M7"] = {k: r["M7"].get(k)
+                         for k in ("n_start", "n_final", "y_best",
+                                   "stopped_early")}
+        if "M8" in r:
+            out["M8"] = {"d_overall": r["M8"].get("d_overall"),
+                         "recipe": np.asarray(r["M8"].get("recipe")).tolist()
+                         if r["M8"].get("recipe") is not None else None,
+                         "properties": r["M8"].get("properties"),
+                         "d_individual": r["M8"].get("d_individual")}
+        if "benchmark" in r:
+            b = r["benchmark"]
+            out["benchmark"] = {k: b.get(k) for k in
+                                ("y_true", "y_pipeline_true", "recipe_dist",
+                                 "value_gap_pct")}
+        return out
+
+    def stage_metrics(self) -> Dict[str, Any]:
+        """Метрики стадий: кэш с диска, перекрытый свежими из текущей сессии.
+
+        Свежие результаты (``stage_metrics_compact``) приоритетнее кэша — если
+        стадию пересчитали в этой сессии, отдаём новые числа.
+        """
+        out = dict(getattr(self, "cached_metrics", {}) or {})
+        out.update(self.stage_metrics_compact())
+        return out
+
+    def invalidate_metrics(self, *, keep: Sequence[str] = _DATA_INDEPENDENT
+                           ) -> None:
+        """Сбросить метрики/результаты стадий, ЗАВИСЯЩИХ от откликов.
+
+        Вызывается при изменении откликов (ручной ввод/симуляция): прежние M3–M8
+        построены на старых ``y`` и больше не валидны. Геометрия/план (M1/M2/M5)
+        от откликов не зависят и сохраняются. ``keep`` — стадии, которые остаются.
+        """
+        keep = set(keep)
+        self.cached_metrics = {k: v for k, v in
+                               (self.cached_metrics or {}).items() if k in keep}
+        self.results = {k: v for k, v in self.results.items() if k in keep}
+
 
     # ===================== Misspecification (FinalCheckList Блок 7) ===
     def diagnose_base(self, X: Optional[np.ndarray] = None, tau: float = 0.6,

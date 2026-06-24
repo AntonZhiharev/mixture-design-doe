@@ -704,21 +704,41 @@ def render_branches(runner: PipelineRunner):
         except (KeyError, ValueError) as exc:
             st.error(f"Не удалось добавить ветку: {exc}")
 
-    if not runner.branches:
-        st.info("Веток пока нет — заведите первую выше.")
-        st.session_state["runner"] = runner
-        return
-
-    # --- список веток ---------------------------------------------------
-    for b in runner.branches.values():
-        b.refresh_status()
-    rows = [{"id": b.id, "ветка": b.name,
-             "цель": ", ".join(f"{k}:{v.kind}" for k, v in b.goal.items()),
-             "бюджет": b.budget, "истрачено": b.spent, "остаток": b.remaining(),
-             "d_best": round(b.d_best, 3), "статус": b.status}
-            for b in runner.branches.values()]
-    st.caption("Ветки проекта:")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    # --- диагностика misspecification (FinalCheckList Блок 7, §12) -------
+    # (всегда доступна после M2 — это диагностика ОБЩЕЙ модели проекта, а не ветки)
+    with st.expander("🔬 Диагностика модели (misspecification, §12)"):
+        st.caption("Замечает, когда общей модели проекта перестаёт хватать: "
+                   "точки «вне всех режимов» (малые gₖ), экстраполяция (novelty) "
+                   "и триггер переразбиения K+1 (BIC-оптимальное число режимов ≠ "
+                   "текущему). Read-only — состояние проекта не меняется.")
+        if st.button("🔬 Проверить модель проекта", key="diagnose_base"):
+            try:
+                rep = runner.diagnose_base()
+                drows = []
+                for name, info in rep["per_property"].items():
+                    drows.append({
+                        "свойство": name,
+                        "вне режимов, %": round(100 * info["frac_out_of_regime"], 1),
+                        "экстраполяция, %": round(100 * info["frac_extrapolation"], 1),
+                        "K текущее": info["current_K"],
+                        "K по BIC": info["recommended_K"],
+                        "переразбить?": "⚠️ да" if info["needs_recluster"] else "ок",
+                    })
+                st.dataframe(pd.DataFrame(drows).set_index("свойство"),
+                             use_container_width=True)
+                flags = [n for n, i in rep["per_property"].items()
+                         if i["needs_recluster"]]
+                if flags:
+                    st.warning("Рекомендуется переразбиение (K+1) для свойств: "
+                               + ", ".join(flags) + " — добавьте точки/перестройте M6.")
+                else:
+                    st.success("Число режимов адекватно текущим данным.")
+            except RuntimeError as exc:
+                st.error(str(exc))
+        stagn = [b.name for b in runner.branches.values() if b.is_stagnating()]
+        if stagn:
+            st.warning("Застрявшие ветки (d_best не растёт): " + ", ".join(stagn)
+                       + ". Стоит сменить цель/зону или закрыть ветку.")
 
     # --- портфельный раунд (арбитр бюджета) -----------------------------
     st.markdown("**▶ Портфельный раунд** — арбитр делит слоты между активными "

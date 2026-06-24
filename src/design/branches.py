@@ -55,6 +55,25 @@ class Branch:
             self.status = "active"
         return self.status
 
+    def is_stagnating(self, patience: int = 2, min_delta: float = 1e-3) -> bool:
+        """Детектор стагнации ветки (FinalCheckList Блок 7, §12).
+
+        Ветка считается «застрявшей», если её лучшая измеренная desirability
+        ``d_best`` не выросла более чем на ``min_delta`` за последние
+        ``patience`` раундов (по записям ``history``). Достигшая цели
+        (``satisfied``) ветка стагнацией НЕ считается — она просто готова.
+        Требуется минимум ``patience + 1`` раундов истории.
+        """
+        if self.status == "satisfied":
+            return False
+        hist = [h for h in self.history if "d_best" in h]
+        if len(hist) < int(patience) + 1:
+            return False
+        window = hist[-(int(patience) + 1):]
+        improvement = float(window[-1]["d_best"]) - float(window[0]["d_best"])
+        return improvement < float(min_delta)
+
+
     # -- (de)serialisation --------------------------------------------
     def to_state(self) -> dict:
         return {

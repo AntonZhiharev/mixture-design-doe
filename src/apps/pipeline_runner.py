@@ -28,6 +28,7 @@ from src.models.scheffe import ScheffeModel
 from src.models.screening import ARDScreening
 from src.models.clustering import GMMRegimes
 from src.models.moe import MixtureOfExperts
+from src.models.diagnostics import diagnose, needs_recluster
 from src.design.active_learning import active_learning_loop
 from src.design.branches import (Branch, branch_scores, propose_by_score,
                                   allocate_budget)
@@ -695,6 +696,7 @@ class PipelineRunner:
                 "x_new": np.asarray(newX), "y_new": np.asarray(Ynew),
                 "status": br.status, "remaining": br.remaining(),
                 "d_best": br.d_best, "x_best": br.x_best,
+                "stagnating": bool(br.is_stagnating()),
                 "n_base": int(len(self.design))}
 
     def run_portfolio_round(self, total_slots: int, explore_frac: float = 0.3,
@@ -726,6 +728,39 @@ class PipelineRunner:
         for o in self.origin:
             out[o] = out.get(o, 0) + 1
         return out
+
+    # ===================== Misspecification (FinalCheckList Блок 7) ===
+    def diagnose_base(self, X: Optional[np.ndarray] = None, tau: float = 0.6,
+                      novelty_factor: float = 3.0) -> Dict[str, Any]:
+        """Диагностика misspecification общей модели проекта (§12, Блок 7).
+
+        Для КАЖДОГО свойства считает по набору точек ``X`` (по умолчанию — вся
+        общая база) долю точек «вне всех режимов» (малые gₖ) и экстраполяции
+        (novelty), а также сравнивает текущее число режимов с BIC-оптимальным
+        на текущих откликах (триггер переразбиения K+1).
+
+        Возвращает ``{"per_property": {name: {...summary, current_K,
+        recommended_K, needs_recluster}}, "n_query", "tau"}``. Не меняет
+        состояние проекта (read-only).
+        """
+        self._require_data()
+        if not self.surrogates:
+            self.run_m6()
+        ref = np.asarray(self.design, float)
+        Xq = ref if X is None else np.atleast_2d(np.asarray(X, float))
+        cols = self._property_columns()
+        per: Dict[str, Any] = {}
+        for name, moe in self.surrogates.items():
+            rep = diagnose(moe, Xq, ref=ref, tau=tau,
+                           novelty_factor=novelty_factor)
+            need, rec_k = needs_recluster(moe, cols[name], seed=self.cfg.seed)
+            info = dict(rep.summary)
+            info.update({"current_K": int(getattr(moe, "K_", 1)),
+                         "recommended_K": int(rec_k),
+                         "needs_recluster": bool(need)})
+            per[name] = info
+        return {"per_property": per, "n_query": int(len(Xq)),
+                "tau": float(tau), "novelty_factor": float(novelty_factor)}
 
 
 

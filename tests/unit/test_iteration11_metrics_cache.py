@@ -81,18 +81,25 @@ def test_loaded_context_marks_stages_done_with_metrics(tmp_path):
 
 
 def test_invalidate_metrics_on_response_change(tmp_path):
-    """Смена откликов сбрасывает зависящие от y стадии, оставляя M1/M2/M5."""
+
+    """Смена откликов сбрасывает зависящие от y стадии, оставляя M1/M2.
+
+    M5 теперь зависит от M3-ARD (q_eff строится на y, FinalCheckList §5.5.1),
+    поэтому при смене откликов он инвалидируется вместе с M3–M8; «сырьём не
+    зависящими» остаются только геометрия M1 и базовый D-план M2.
+    """
     r = _runner(tmp_path)
-    r.run_m5()                       # план, не зависит от откликов
+    r.run_m5()                       # добор; размерность берётся из M3-ARD (q_eff)
     before = set(r.stage_metrics())
     assert {"M3_fit", "M4", "M6", "M5"} <= before
 
     r.simulate_responses()           # отклики изменились → инвалидация
     after = set(r.stage_metrics())
-    # зависящие от откликов стадии сброшены
-    assert {"M3_fit", "M3_ard", "M4", "M6"}.isdisjoint(after)
-    # независимые от откликов (геометрия/план) сохранены
-    assert {"M1", "M2", "M5"} <= after
+    # зависящие от откликов стадии сброшены (теперь включая M5)
+    assert {"M3_fit", "M3_ard", "M4", "M6", "M5"}.isdisjoint(after)
+    # независимыми от откликов остаются только геометрия и базовый план
+    assert {"M1", "M2"} <= after
+
 
 
 def test_plan_coords_and_blocks_in_metrics(tmp_path):

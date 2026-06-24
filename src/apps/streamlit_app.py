@@ -114,15 +114,19 @@ def _totals(df: pd.DataFrame, comp_cols, batch: float, unit: str):
 
 def render_design_table(df: pd.DataFrame, comp_cols, title: str,
                         fname: str, key: str, batch: float, unit: str,
-                        height: int | None = None, with_totals: bool = False):
+                        height: int | None = None, with_totals: bool = False,
+                        start_index: int = 1):
     """Показать таблицу-план + (опц.) количества сырья + кнопку Excel.
 
     ``with_totals``: добавить таблицу «Итого по компонентам на весь план»
     (как на M2) — полезно для планов из многих опытов (M5).
+    ``start_index``: с какого номера нумеровать опыты (для сквозной нумерации
+    добора M5, продолжающего опыты M2 — напр. 31, 32, …).
     """
     show = df.copy()
-    show.index = np.arange(1, len(show) + 1)
+    show.index = np.arange(start_index, start_index + len(show))
     show.index.name = "Опыт"
+
     # Streamlit >=1.30 запрещает height=None: передаём только валидное значение.
     _h = {"height": height} if isinstance(height, int) and height > 0 else {}
     st.caption(title)
@@ -697,31 +701,85 @@ def _render_result(runner: PipelineRunner, key: str):
         n_runs5 = r.get("n_runs")
         if n_runs5 is None and design5 is not None:
             n_runs5 = len(design5)
+        n_runs5 = int(n_runs5 or 0)
+        existing_n = int(r.get("existing_n", 0))
         c = st.columns(3)
         if r.get("i_optimal") is not None:
-            c[0].metric("I-score (I-opt)", f"{r['i_optimal']:.4f}")
+            c[0].metric("I-score (M2 + добор)", f"{r['i_optimal']:.4f}")
         if r.get("i_of_d_design") is not None and r.get("i_optimal") is not None:
-            c[1].metric("I-score (D-opt дизайн)", f"{r['i_of_d_design']:.4f}",
-                        delta=f"{r['i_of_d_design'] - r['i_optimal']:+.4f}")
-        if n_runs5 is not None:
-            c[2].metric("Опытов в плане", n_runs5)
-        st.info(
-            "ℹ️ Это **рассчитанный** I-оптимальный план: точки пока только "
-            "предложены. Эксперименты по ним НЕ поставлены и в общую базу "
-            "проекта НЕ добавлены — поэтому число точек проекта и origin "
-            "(пока только «M2») не меняются. Сбор откликов по этим точкам и "
-            "дозапись в базу выполняются на этапе active learning / раундов "
-            "веток.")
-        if design5 is not None:
+            # ниже — лучше: добор снижает среднюю дисперсию прогноза
+            c[1].metric("I-score (только база M2)", f"{r['i_of_d_design']:.4f}",
+                        delta=f"{r['i_optimal'] - r['i_of_d_design']:+.4f}",
+                        delta_color="inverse")
+        c[2].metric("Новых опытов (добор)", n_runs5)
+
+        # --- диагностика объёма/остановки базового I-дизайна (§5.5) ---
+        q_full = r.get("q_full"); q_eff = r.get("q_eff")
+        p_quad = r.get("p_quad"); n_total = r.get("n_total")
+        stop_reason = r.get("stop_reason"); cond = r.get("cond_number")
+        if q_eff is not None and p_quad is not None:
+            d = st.columns(4)
+            reduced = bool(r.get("reduced"))
+            d[0].metric("q_eff / q",
+                        f"{q_eff} / {q_full}" if q_full else f"{q_eff}",
+                        help="M5 строит модель на активных компонентах (q_eff "
+                             "после M3-ARD), а не на полном q (§5.5.1).")
+            d[1].metric("p_quad (на q_eff)", p_quad)
+            if n_total is not None:
+                d[2].metric("n итог / p_quad",
+                            f"{n_total} / {p_quad}",
+                            help="Достаточность: n ≥ p_quad + запас (§5.5.3).")
+            _stop_ru = {"sufficiency": "достаточно n", "rel_gain": "выигрыш мал",
+                        "budget": "бюджет N_max", "pool_exhausted": "пул исчерпан"}
+            d[3].metric("Стоп-критерий", _stop_ru.get(stop_reason, stop_reason or "—"),
+                        help="Почему добор остановлен (§5.5.3): любое из — "
+                             "достаточность n / затухание ΔI/I / бюджет.")
+            if isinstance(cond, (int, float)) and np.isfinite(cond):
+                msg = (f"🔢 cond(XᵀX) итогового плана ≈ {cond:,.0f}"
+                       if cond < 1e8 else
+                       f"⚠️ cond(XᵀX) ≈ {cond:,.0f} — высокая обусловленность "
+                       f"(возможна коллинеарность/вырожденность, §5.5.2)")
+                st.caption(msg)
+            if reduced and r.get("active"):
+                st.caption(f"Активные компоненты (q_eff): {', '.join(r['active'])} "
+                           f"— термы Шеффе по остальным исключены (heredity).")
+
+        if n_runs5 == 0:
+            # достаточность уже выполнена базой M2 → добор не нужен (§5.5.4)
+            st.success(
+                f"✅ Добор НЕ требуется: базы M2 ({existing_n} опытов) уже "
+                f"достаточно для квадратичной модели на q_eff "
+                f"(n ≥ p_quad+запас = {r.get('min_total')}). Это и есть здоровое "
+                f"поведение M5 — «фундамент», а не гонка I в пол (§5.5.4). "
+                f"Прицельную точность под цели добирает M7/раунды веток.")
+        elif existing_n:
+            st.info(
+                f"ℹ️ Это **I-оптимальный ДОБОР**: {n_runs5} **новых** точек к "
+                f"уже имеющимся {existing_n} опытам плана M2. Это новые рецептуры "
+                f"(отличные от измеренных) — в таблице они идут со **сквозными "
+                f"номерами {existing_n + 1}…{existing_n + n_runs5}**, продолжая "
+                f"нумерацию M2. Добор останавливается по затуханию выигрыша / "
+                f"достаточности / бюджету (§5.5.3) — без гонки I в пол. Точки пока "
+                f"**только предложены**: в общую базу проекта не дописаны.")
+        else:
+            st.info(
+                "ℹ️ M2 ещё не выполнен, поэтому построен самостоятельный "
+                "I-оптимальный план «с нуля». Точки только предложены (в базу "
+                "не дописаны).")
+
+        if design5 is not None and n_runs5 > 0:
             render_design_table(_df_design(np.asarray(design5), names),
                                 list(names[: runner.q]),
-                                "I-оптимальный дизайн (точнее прогноз):",
+                                f"I-оптимальный добор — {n_runs5} новых опытов "
+                                f"(точнее прогноз):",
                                 "M5_design.xlsx", "dl_m5", batch, unit, height=300,
-                                with_totals=True)
-        else:
+                                with_totals=True, start_index=existing_n + 1)
+        elif design5 is None and n_runs5 > 0:
             st.caption("ℹ️ Координаты плана не сохранены в этом проекте (старый "
                        "формат). Нажмите «♻️ Пересчитать M5», чтобы построить "
-                       "I-оптимальный план заново.")
+                       "I-оптимальный добор заново.")
+
+
 
 
 

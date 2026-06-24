@@ -21,10 +21,15 @@ from src.core.simplex import SimplexRegion
 from src.core.synthetic import SyntheticScheffe, MultiSyntheticScheffe
 
 from src.core.state import ProjectState
-from src.core.linalg import scheffe_term_indices, scheffe_matrix
+from src.core.linalg import (scheffe_term_indices, scheffe_matrix,
+                             scheffe_active_terms)
 from src.design.d_optimal import (build_candidate_pool, d_optimal_design,
                                   d_optimal_for_region)
-from src.design.i_optimal import region_moment_matrix, i_optimal_design
+from src.design.i_optimal import (region_moment_matrix, i_optimal_design,
+                                   i_optimal_augment,
+                                   i_optimal_augment_sequential)
+
+
 from src.models.scheffe import ScheffeModel
 from src.models.screening import ARDScreening
 from src.models.clustering import GMMRegimes
@@ -308,16 +313,25 @@ class PipelineRunner:
                                   "property_names": list(self.property_names),
                                   **top}
 
-        # M5 — I-оптимальный план предложен; координаты восстановлены из кэша
+        # M5 — I-оптимальный добор предложен; координаты + диагностика из кэша
         if "M5" in cm and "M5" not in self.results:
             m5 = dict(cm["M5"])
             d5 = m5.get("design")
-            self.results["M5"] = {
+            res5 = {
                 "i_optimal": m5.get("i_optimal"),
                 "i_of_d_design": m5.get("i_of_d_design"),
                 "n_runs": m5.get("n_runs"),
+                "existing_n": int(m5.get("existing_n", 0)),
                 "applied": bool(m5.get("applied", False)),
                 "design": (np.asarray(d5, float) if d5 is not None else None)}
+            for k in ("q_full", "q_eff", "reduced", "active", "p_quad",
+                      "n_total", "n_over_p", "min_total", "n_max", "rel_tol",
+                      "stop_reason", "cond_number"):
+                if k in m5:
+                    res5[k] = m5[k]
+            self.results["M5"] = res5
+
+
 
     @classmethod
     def from_project(cls, root: str | Path, name: str) -> "PipelineRunner":
@@ -537,49 +551,136 @@ class PipelineRunner:
 
 
     # ===================== M5: I-optimal design ======================
-    def run_m5(self, progress: Optional[Callable[[str, float], None]] = None
+    # Критерий остановки добора (FinalCheckList §5.5.3): добор прекращается по
+    # ЛЮБОМУ из условий — затухание выигрыша / достаточность n / бюджет.
+    M5_REL_TOL = 0.03          # ΔI/I < ε ⇒ выигрыш на точку затух (5.5.3)
+    M5_MARGIN = 12             # запас над p_quad для достаточности (5.5.3, 10–15)
+
+    def _active_indices(self) -> tuple[list[int], int, bool]:
+        """Индексы АКТИВНЫХ компонентов (q_eff) из M3-ARD (объединение по свойствам).
+
+        Возвращает ``(indices, q_eff, reduced)``. Если M3-ARD не выполнен —
+        ``(все компоненты, q, False)`` (фолбэк на полный q). Берём ОБЪЕДИНЕНИЕ
+        активных по всем свойствам: компонент, важный хотя бы для одного
+        свойства, остаётся в локальной модели M5 (FinalCheckList §5.5.1).
+        """
+        src = self.results.get("M3_ard") or (self.cached_metrics or {}).get("M3_ard")
+        per = None
+        if isinstance(src, dict):
+            per = src.get("per_property", src)
+        active_names: set = set()
+        if isinstance(per, dict):
+            for info in per.values():
+                if isinstance(info, dict):
+                    for a in info.get("active", []) or []:
+                        active_names.add(a)
+        idx = [i for i, nm in enumerate(self.names) if nm in active_names]
+        if not idx:
+            return list(range(self.q)), self.q, False
+        return idx, len(idx), len(idx) < self.q
+
+    def run_m5(self, n_add: Optional[int] = None,
+               progress: Optional[Callable[[str, float], None]] = None
                ) -> Dict[str, Any]:
-        """I-оптимальный план (минимизация средней дисперсии прогноза).
+        """I-оптимальный ДОБОР точек к плану M2 с критерием остановки (§5.5).
 
-        Это РАСЧЁТ плана: точки лишь предлагаются, эксперименты по ним не
-        ставятся и в общую базу не дописываются (поэтому origin/число точек
-        проекта не меняются — это делает сбор откликов/раунды веток).
+        Канон FinalCheckList §5.5:
+        - **Размерность (5.5.1).** Локальная квадратичная модель строится на
+          ``q_eff`` АКТИВНЫХ компонентах (по M3-ARD), а не на полном ``q`` —
+          число параметров ``p_quad`` считается на ``q_eff``. Точки добора —
+          полноценные рецептуры (все ``q`` компонентов), но термы Шеффе берутся
+          только по активным (с heredity).
+        - **Координаты/обусловленность (5.5.2).** I считается через каноническую
+          форму Шеффе (без интерсепта); матрица моментов — по ОГРАНИЧЕННОЙ
+          области; логируется ``cond(XᵀX)`` итогового плана.
+        - **Остановка (5.5.3).** Добор прекращается по ЛЮБОМУ из: относительный
+          выигрыш ``ΔI/I < ε``; достаточность ``n ≥ p_quad + запас``; бюджет
+          ``N_max``. Никакого абсолютного порога на I.
+        - **Роль (5.5.4).** M5 = разумный фундамент (``n ≳ p + запас``), а не
+          финальная точность — её добирает M7 под цели веток.
 
-        ``progress(msg, frac)`` — опциональный коллбэк прогресса (0..1) для UI:
-        стадия делится на тяжёлые шаги (моменты области, оптимизация плана).
+        Точки добора отличны от уже измеренных M2 (исключены из пула) и
+        нумеруются сквозным образом (``existing_n + 1, …``). Это РАСЧЁТ плана:
+        точки лишь предлагаются, в общую базу пока не дописываются.
+
+        ``n_add`` — необязательный ЖЁСТКИЙ override числа добираемых точек
+        (отключает авто-остановку и бюджет). ``progress(msg, frac)`` — коллбэк UI.
         """
         def _pg(msg: str, frac: float) -> None:
             if progress is not None:
                 progress(msg, frac)
 
+        existing = (np.asarray(self.design, float)
+                    if self.design is not None and len(self.design) else None)
+        existing_n = 0 if existing is None else int(len(existing))
+
+        # --- 5.5.1: размерность по q_eff (после M3-ARD) ---
+        active_idx, q_eff, reduced = self._active_indices()
+        terms = scheffe_active_terms(self.q, active_idx, self.cfg.model)
+        p_quad = len(terms)
+
         _pg("Пул кандидатов", 0.05)
         pool = build_candidate_pool(self.region, n_random=self.cfg.n_random,
                                     seed=self.cfg.seed)
+        if existing is not None:
+            pool = self._exclude_points(pool, existing)
         _pg("Матрица моментов области (Монте-Карло)", 0.2)
+        # 5.5.2: моменты по ОГРАНИЧЕННОЙ области, на q_eff-редуцированном базисе
         W = region_moment_matrix(self.region, self.cfg.model, n_mc=6000,
-                                 seed=self.cfg.seed)
-        _pg("Поиск I-оптимального плана", 0.5)
-        i_res = i_optimal_design(pool, n_runs=self.n_runs, moments=W,
-                                 model=self.cfg.model,
-                                 n_restarts=self.cfg.n_restarts,
-                                 seed=self.cfg.seed)
-        _pg("Сравнение с D-оптимальным планом", 0.9)
-        i_of_i = float(i_res.i_score)
-        i_of_d = None
-        if self.design is not None:
-            M = scheffe_matrix(self.design, self.cfg.model)
-            inv = np.linalg.inv(M.T @ M + 1e-8 * np.eye(M.shape[1]))
-            i_of_d = float(np.trace(inv @ W))
+                                 seed=self.cfg.seed, terms=terms)
+
+        min_total = p_quad + self.M5_MARGIN
+        # бюджет N_max: жёсткий потолок добора (5.5.3); override n_add отключает
+        n_max = int(n_add) if n_add is not None else max(2 * p_quad, 1)
+        rel_tol = 0.0 if n_add is not None else self.M5_REL_TOL
+        min_total_eff = (existing_n + int(n_add)) if n_add is not None else min_total
+
+        _pg("I-оптимальный добор с критерием остановки", 0.5)
+        aug = i_optimal_augment_sequential(
+            existing, pool, W, model=self.cfg.model, terms=terms,
+            n_max=n_max, min_total=min_total_eff, margin=self.M5_MARGIN,
+            rel_tol=rel_tol, seed=self.cfg.seed)
+
+        _pg("Диагностика", 0.95)
         self.state.set_stage("M5_local_design")
-        self.state.models["m5_i_optimal"] = i_res.to_state()
-        out = {"i_optimal": i_of_i, "i_of_d_design": i_of_d,
-               "design": i_res.design,
-               "n_runs": int(np.asarray(i_res.design).shape[0]),
-               "applied": False,   # план рассчитан, но точки ещё не измерены
-               "checkpoint": self._ckpt("after_M5")}
+        new_design = np.asarray(aug.new_points)
+        n_total = existing_n + aug.n_added
+        out = {
+            "i_optimal": float(aug.i_final),       # I объединённого плана (M2+добор)
+            "i_of_d_design": float(aug.i_base),    # I только базы M2
+            "design": new_design,
+            "n_runs": int(aug.n_added),
+            "existing_n": existing_n,
+            # --- диагностика §5.5 ---
+            "q_full": int(self.q), "q_eff": int(q_eff), "reduced": bool(reduced),
+            "active": [self.names[i] for i in active_idx],
+            "p_quad": int(p_quad), "n_total": int(n_total),
+            "n_over_p": float(n_total / p_quad) if p_quad else float("nan"),
+            "min_total": int(min_total), "n_max": int(n_max),
+            "rel_tol": float(rel_tol), "stop_reason": aug.stop_reason,
+            "cond_number": float(aug.cond_number),
+            "i_history": [float(v) for v in aug.i_history],
+            "applied": False,
+            "checkpoint": self._ckpt("after_M5")}
         self.results["M5"] = out
         _pg("Готово", 1.0)
         return out
+
+    @staticmethod
+    def _exclude_points(pool: np.ndarray, used: np.ndarray,
+                        atol: float = 1e-7) -> np.ndarray:
+        """Убрать из ``pool`` строки, совпадающие с любой точкой ``used``.
+
+        Нужно для I-оптимального добора (M5): новые точки не должны повторять
+        уже измеренные точки базы (M2).
+        """
+        pool = np.atleast_2d(np.asarray(pool, float))
+        used = np.atleast_2d(np.asarray(used, float))
+        keep = [p for p in pool
+                if not np.any(np.all(np.isclose(used, p, atol=atol), axis=1))]
+        return np.array(keep) if keep else pool[:0]
+
+
 
 
     # ===================== M6: MoE surrogate =========================
@@ -903,8 +1004,12 @@ class PipelineRunner:
     # Порядок зависимостей стадий: всё правее зависит от откликов/данных.
     _STAGE_ORDER = ["M1", "M2", "M3_fit", "M3_ard", "M4", "M5", "M6", "M7",
                     "M8", "benchmark"]
-    # Стадии, НЕ зависящие от откликов (геометрия области и план/его критерий).
-    _DATA_INDEPENDENT = ("M1", "M2", "M5")
+    # Стадии, НЕ зависящие от откликов (только геометрия области и базовый план).
+    # M5 теперь ЗАВИСИТ от откликов: его размерность берётся из q_eff (M3-ARD),
+    # а M3-ARD строится на y (FinalCheckList §5.5.1) — поэтому при смене откликов
+    # M5 инвалидируется вместе с M3–M8.
+    _DATA_INDEPENDENT = ("M1", "M2")
+
 
     def stage_metrics_compact(self) -> Dict[str, Any]:
         """Компактные метрики пройденных стадий ИЗ ``self.results``.
@@ -958,8 +1063,20 @@ class PipelineRunner:
             out["M5"] = {"i_optimal": m5.get("i_optimal"),
                          "i_of_d_design": m5.get("i_of_d_design"),
                          "n_runs": m5.get("n_runs"),
-                         "applied": m5.get("applied", False)}
+                         "existing_n": int(m5.get("existing_n", 0)),
+                         "applied": m5.get("applied", False),
+                         # диагностика §5.5 (объём/остановка базового I-дизайна)
+                         "q_full": m5.get("q_full"), "q_eff": m5.get("q_eff"),
+                         "reduced": m5.get("reduced"), "active": m5.get("active"),
+                         "p_quad": m5.get("p_quad"), "n_total": m5.get("n_total"),
+                         "n_over_p": m5.get("n_over_p"),
+                         "min_total": m5.get("min_total"),
+                         "n_max": m5.get("n_max"), "rel_tol": m5.get("rel_tol"),
+                         "stop_reason": m5.get("stop_reason"),
+                         "cond_number": m5.get("cond_number")}
+
             # координаты предлагаемого I-оптимального плана (доли компонентов)
+
             if m5.get("design") is not None:
                 d5 = np.asarray(m5["design"], float)
                 out["M5"]["design"] = np.round(d5, 4).tolist()

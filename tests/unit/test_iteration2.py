@@ -15,7 +15,9 @@ from src.models.scheffe import ScheffeModel
 from src.design.d_optimal import build_candidate_pool, d_optimal_design
 from src.design.i_optimal import (
     region_moment_matrix, i_optimal_design, i_optimal_for_region,
+    i_optimal_augment,
 )
+
 
 
 def _dominant_A_coefficients(q=5):
@@ -110,6 +112,50 @@ def test_i_optimal_beats_random_subset_on_i_score():
     assert res.i_score <= rand_i + 1e-9
 
 
+# ----------------------------------------------------------------------
+# I-optimal AUGMENTATION (M5 добор к существующему плану)
+# ----------------------------------------------------------------------
+def test_i_optimal_augment_returns_n_add_new_points():
+    """Добор возвращает ровно n_add НОВЫХ точек, отличных от existing."""
+    region = SimplexRegion(q=4)
+    pool = build_candidate_pool(region, n_random=250, seed=0)
+    W = region_moment_matrix(region, "quadratic", n_mc=3000, seed=0)
+    base = i_optimal_design(pool, n_runs=16, moments=W, model="quadratic",
+                            n_restarts=4, seed=0)
+    # пул для добора без уже выбранных точек базы
+    used = base.design
+    cand = np.array([p for p in pool
+                     if not np.any(np.all(np.isclose(used, p, atol=1e-7),
+                                          axis=1))])
+    aug = i_optimal_augment(used, cand, n_add=6, moments=W, model="quadratic",
+                            n_restarts=4, seed=1)
+    assert aug.design.shape == (6, 4)
+    # новые точки не совпадают ни с одной точкой базы
+    for p in aug.design:
+        assert not np.any(np.all(np.isclose(used, p, atol=1e-7), axis=1))
+
+
+def test_i_optimal_augment_improves_combined_i_score():
+    """I-критерий объединённого плана (base+добор) не хуже базы в одиночку."""
+    from src.core.linalg import scheffe_matrix
+    region = SimplexRegion(q=4)
+    pool = build_candidate_pool(region, n_random=250, seed=0)
+    W = region_moment_matrix(region, "quadratic", n_mc=3000, seed=0)
+    base = i_optimal_design(pool, n_runs=16, moments=W, model="quadratic",
+                            n_restarts=4, seed=0)
+    Mb = scheffe_matrix(base.design, "quadratic")
+    i_base = float(np.trace(
+        np.linalg.inv(Mb.T @ Mb + 1e-8 * np.eye(Mb.shape[1])) @ W))
+    cand = np.array([p for p in pool
+                     if not np.any(np.all(np.isclose(base.design, p, atol=1e-7),
+                                          axis=1))])
+    aug = i_optimal_augment(base.design, cand, n_add=8, moments=W,
+                            model="quadratic", n_restarts=4, seed=1)
+    # добор точек снижает (не увеличивает) среднюю дисперсию прогноза
+    assert aug.i_score <= i_base + 1e-9
+
+
 if __name__ == "__main__":
+
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

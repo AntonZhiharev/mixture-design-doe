@@ -70,9 +70,18 @@ def test_m4_regimes(runner):
 
 
 def test_m5_i_optimal(runner):
+    # база M2 уже посчитана (модульный фикстур, порядок тестов) → M5 это ДОБОР
+    base = np.asarray(runner.design)
     r = runner.run_m5()
     assert r["i_optimal"] > 0
     assert r["design"].shape[1] == 3
+    # добор пронумерован сквозным образом от числа опытов M2
+    assert r["existing_n"] == len(base)
+    assert r["applied"] is False
+    # точки добора — НОВЫЕ (не совпадают ни с одной точкой базы M2)
+    for p in np.asarray(r["design"]):
+        assert not np.any(np.all(np.isclose(base, p, atol=1e-7), axis=1))
+
 
 
 def test_m6_moe(runner):

@@ -143,6 +143,39 @@ def n_scheffe_params(q: int, model: Union[str, int]) -> int:
     return len(scheffe_term_indices(q, model))
 
 
+def scheffe_active_terms(q: int, active: Sequence[int],
+                         model: Union[str, int]) -> List[Tuple[int, ...]]:
+    """Scheffe terms restricted to the ACTIVE components (q_eff reduction).
+
+    Heredity-consistent: keep only terms whose component indices are ALL in
+    ``active`` (linear ``(i,)`` if ``i`` active; interaction ``(i,j,...)`` only
+    if every index is active). Inactive components drop out of the model — this
+    is how M5 works on ``q_eff`` instead of full ``q`` (FinalCheckList §5.5.1),
+    while the design points themselves stay full-``q`` mixtures.
+    """
+    aset = {int(a) for a in active}
+    return [idx for idx in scheffe_term_indices(q, model)
+            if all(i in aset for i in idx)]
+
+
+def scheffe_matrix_terms(X: ArrayLike,
+                         terms: Sequence[Tuple[int, ...]]) -> np.ndarray:
+    """Scheffe model matrix from an EXPLICIT term list (e.g. q_eff-reduced).
+
+    Each column is the product of component values for the term's indices.
+    """
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    n = X.shape[0]
+    cols = []
+    for idx in terms:
+        col = np.ones(n)
+        for i in idx:
+            col = col * X[:, i]
+        cols.append(col)
+    return np.column_stack(cols) if cols else np.empty((n, 0))
+
+
+
 # ---------------------------------------------------------------------------
 # Standard (factorial) polynomial model matrix  (WITH intercept)
 # ---------------------------------------------------------------------------

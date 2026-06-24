@@ -65,8 +65,16 @@ Thumbs.db
 *.jpg
 *.jpeg
 *.xlsx
+*.xls
+*.ods
 *.csv
 output/
 results/
 temp/
 data/
+
+# Generated runtime project state (UI/demo runs, checkpoints, models, traces)
+project_ui/
+project_demo/
+
+

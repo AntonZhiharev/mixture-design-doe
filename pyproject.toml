@@ -55,6 +55,10 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+# importlib mode avoids walking up the broken legacy root __init__.py;
+# pythonpath makes the new `src` package importable from the repo root.
+addopts = "--import-mode=importlib"
+pythonpath = ["."]
 
 [tool.mypy]
 python_version = "3.8"

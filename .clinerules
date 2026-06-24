@@ -1,0 +1,44 @@
+# Cline Rules — mixture-design-doe
+
+Правила для Cline по работе с этим репозиторием. Соблюдай их в каждой сессии.
+
+## Репозиторий и синхронизация (GitHub)
+- Remote: `origin` → https://github.com/AntonZhiharev/mixture-design-doe.git
+- Основная ветка: `main`.
+- Перед изменениями: `git pull --rebase origin main` (если нет локальных незакоммиченных правок).
+- Держи проект синхронизированным: после завершённого, проверенного изменения —
+  `git add -A` → `git commit` → `git push origin main`.
+- Коммить только исходники/тесты/доки. НЕ коммить артефакты выполнения и бинарники
+  (см. `.gitignore`): `.venv/`, `__pycache__/`, `project_ui/`, `project_demo/`,
+  `*.xls/*.xlsx/*.ods/*.csv`, изображения, `output/ results/ temp/ data/`.
+- Никогда не делай `git push --force` в `main` без явной просьбы пользователя.
+- Шелл по умолчанию — PowerShell: разделяй команды через `;`, НЕ через `&&`.
+
+## Сообщения коммитов
+- Формат: короткая строка-заголовок в повелительном наклонении (рус/eng — по контексту),
+  при необходимости тело с деталями.
+- Для шагов спецификации указывай контекст, например:
+  `iter9/3d: budget arbiter + branch UI (REBUILD_SPEC §5/§12)`.
+
+## Тесты (обязательны перед push)
+- Окружение: `.venv\Scripts\python.exe`.
+- Гонять профильные тесты перед коммитом, например:
+  `.venv\Scripts\python.exe -m pytest tests/unit/test_iteration9_branches.py tests/unit/test_iteration9_branches_ui.py -q -W ignore`
+- Известная заноза: `tests/unit/test_precision.py` падает на сборке
+  (`ModuleNotFoundError: No module named 'core'`) — это давняя несвязанная проблема.
+  НЕ запускай `pytest tests/unit` целиком; перечисляй нужные файлы явно
+  (cmd/PowerShell не разворачивают glob `test_iteration9_*.py`).
+
+## Архитектурный канон (REBUILD_SPEC §5/§12)
+- ОДНА модель физики на проект: `runner.surrogates: property → MoE` (общий словарь).
+  У веток (`Branch`) НЕТ своей модели — это контейнер намерения
+  (цель/бюджет/история/статус/рецепт).
+- Единая общая база точек с origin-тегами (`runner.origin`: `"M2"` / `"branch:{id}"`),
+  без копий. Новая точка меряется по ВСЕМ P свойствам и дописывается в общую базу.
+- Мультиотклик: `runner.Y (n×P)`, `y = Y[:,0]`; M3/M6 строятся на КАЖДОЕ свойство.
+- Сначала логика + тест, потом UI.
+
+## Стиль кода
+- Python, рабочий код в `src/`, тесты в `tests/unit/` (имена `test_iteration{N}_*.py`).
+- Сохраняй существующий стиль (docstrings рус., Apache-заголовки в тестовых файлах).
+- Не добавляй тяжёлых зависимостей без необходимости.

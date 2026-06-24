@@ -1,0 +1,312 @@
+"""
+optimize/desirability.py — M8: product optimisation on the simplex.
+
+Derringer–Suich desirability (REBUILD_SPEC M8, §3):
+
+  * per-property desirability d_i(y) in [0, 1]:
+      - "max"    (larger-is-better):  ramps 0 -> 1 as y goes low -> high;
+      - "min"    (smaller-is-better): ramps 1 -> 0 as y goes low -> high;
+      - "target" (target-is-best):    two-sided peak at the target value;
+    each with a shape exponent `s` (s>1 = stricter, s<1 = lenient).
+
+  * overall (weighted geometric mean):
+        d_overall = (Π_i d_i^{w_i})^{1/Σ w_i}
+    if any d_i == 0  ->  d_overall == 0 (a hard veto, by construction).
+
+Cost is handled as just another property with a "min" spec (grab: cost is a
+real objective, not a hack) — see `optimize_desirability(cost_fn=..., cost_spec=...)`.
+
+Optimisation is performed OVER THE CONSTRAINED SIMPLEX (grab #10: no free-R^q
+gradient).  We score a feasible candidate set, then locally refine the best
+point with feasibility-preserving random perturbations.
+
+R reference: ``desirability::dOverall``.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Mapping, Optional, Sequence
+
+import numpy as np
+
+from ..core.simplex import SimplexRegion
+
+Predictor = Callable[[np.ndarray], np.ndarray]
+
+
+# ----------------------------------------------------------------------
+# Per-property desirability specification
+# ----------------------------------------------------------------------
+@dataclass
+class DesirabilitySpec:
+    """One Derringer–Suich desirability transform for a single property.
+
+    Parameters
+    ----------
+    kind   : "max" | "min" | "target".
+    low    : lower bound of the active range.
+    high   : upper bound of the active range.
+    target : peak location (required for kind="target"; must satisfy low<target<high).
+    s      : shape exponent for the (lower) ramp  (s>0).
+    s2     : shape exponent for the upper ramp of a "target" spec (defaults to s).
+    weight : importance exponent in the weighted geometric mean (w_i > 0).
+    """
+
+    kind: str
+    low: float
+    high: float
+    target: Optional[float] = None
+    s: float = 1.0
+    s2: Optional[float] = None
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("max", "min", "target"):
+            raise ValueError(f"Unknown kind '{self.kind}' (use max|min|target).")
+        if self.high <= self.low:
+            raise ValueError("Require high > low.")
+        if self.s <= 0 or (self.s2 is not None and self.s2 <= 0):
+            raise ValueError("Shape exponents s, s2 must be > 0.")
+        if self.weight <= 0:
+            raise ValueError("weight must be > 0.")
+        if self.kind == "target":
+            if self.target is None:
+                raise ValueError("kind='target' requires a `target` value.")
+            if not (self.low < self.target < self.high):
+                raise ValueError("Require low < target < high for kind='target'.")
+        if self.s2 is None:
+            self.s2 = self.s
+
+
+# ----------------------------------------------------------------------
+# Vectorised desirability transform
+# ----------------------------------------------------------------------
+def desirability_value(y, spec: DesirabilitySpec) -> np.ndarray:
+    """Map property values ``y`` to desirabilities in [0, 1] for ``spec``."""
+    y = np.asarray(y, dtype=float)
+    lo, hi = spec.low, spec.high
+    d = np.zeros_like(y, dtype=float)
+
+    if spec.kind == "max":
+        d = np.where(y <= lo, 0.0,
+                     np.where(y >= hi, 1.0,
+                              ((y - lo) / (hi - lo)) ** spec.s))
+    elif spec.kind == "min":
+        d = np.where(y <= lo, 1.0,
+                     np.where(y >= hi, 0.0,
+                              ((hi - y) / (hi - lo)) ** spec.s))
+    else:  # target
+        t = spec.target
+        lower = ((y - lo) / (t - lo))
+        upper = ((hi - y) / (hi - t))
+        d = np.where((y < lo) | (y > hi), 0.0,
+                     np.where(y <= t,
+                              np.clip(lower, 0.0, 1.0) ** spec.s,
+                              np.clip(upper, 0.0, 1.0) ** spec.s2))
+    return np.clip(d, 0.0, 1.0)
+
+
+# ----------------------------------------------------------------------
+# Weighted geometric-mean aggregation
+# ----------------------------------------------------------------------
+def overall_desirability(d_individual: Mapping[str, np.ndarray],
+                         weights: Optional[Mapping[str, float]] = None
+                         ) -> np.ndarray:
+    """Weighted geometric mean of per-property desirabilities.
+
+    ``d_individual`` maps name -> array of d_i values (broadcastable shapes).
+    Any zero desirability forces the overall to zero (hard veto).
+    """
+    names = list(d_individual.keys())
+    if not names:
+        raise ValueError("No desirabilities to aggregate.")
+    D = np.vstack([np.atleast_1d(np.asarray(d_individual[n], float)) for n in names])
+    if weights is None:
+        w = np.ones(len(names))
+    else:
+        w = np.array([float(weights.get(n, 1.0)) for n in names])
+    w = w / w.sum()
+
+    out = np.zeros(D.shape[1], dtype=float)
+    veto = np.any(D <= 0.0, axis=0)
+    safe = ~veto
+    if np.any(safe):
+        log_d = (w[:, None] * np.log(np.clip(D[:, safe], 1e-300, 1.0))).sum(axis=0)
+        out[safe] = np.exp(log_d)
+    return out
+
+
+# ----------------------------------------------------------------------
+# Aggregator object (specs + weights bundled together)
+# ----------------------------------------------------------------------
+class Desirability:
+    """Bundle of named :class:`DesirabilitySpec` objects."""
+
+    def __init__(self, specs: Mapping[str, DesirabilitySpec]):
+        if not specs:
+            raise ValueError("Provide at least one desirability spec.")
+        self.specs: Dict[str, DesirabilitySpec] = dict(specs)
+        self.weights: Dict[str, float] = {n: s.weight for n, s in self.specs.items()}
+
+    @property
+    def names(self):
+        return list(self.specs.keys())
+
+    def individual(self, properties: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """d_i for every spec, given predicted property values."""
+        missing = set(self.specs) - set(properties)
+        if missing:
+            raise KeyError(f"Missing predicted properties: {sorted(missing)}")
+        return {n: desirability_value(properties[n], s) for n, s in self.specs.items()}
+
+    def overall(self, properties: Mapping[str, np.ndarray]) -> np.ndarray:
+        return overall_desirability(self.individual(properties), self.weights)
+
+
+# ----------------------------------------------------------------------
+# Optimisation result
+# ----------------------------------------------------------------------
+@dataclass
+class DesirabilityResult:
+    x: np.ndarray                       # best recipe (q parts, sums to 1)
+    d_overall: float                    # overall desirability at x
+    d_individual: Dict[str, float]      # per-property desirability at x
+    properties: Dict[str, float]        # predicted property values at x
+    n_evaluated: int = 0                # candidates scored
+    refined: bool = False               # whether local refinement improved x
+    n_starts: int = 1                   # number of multi-start refinements run
+    history: list = field(default_factory=list)
+
+    def summary(self) -> str:
+        props = ", ".join(f"{k}={v:.4g}" for k, v in self.properties.items())
+        dind = ", ".join(f"d[{k}]={v:.3f}" for k, v in self.d_individual.items())
+        return (f"d_overall={self.d_overall:.4f}\n"
+                f"  recipe   = {np.round(self.x, 4).tolist()}\n"
+                f"  props    = {props}\n"
+                f"  desir.   = {dind}")
+
+
+# ----------------------------------------------------------------------
+# Optimisation over the constrained simplex
+# ----------------------------------------------------------------------
+def optimize_desirability(region: SimplexRegion,
+                          predictors: Mapping[str, Predictor],
+                          specs: Mapping[str, DesirabilitySpec],
+                          cost_fn: Optional[Predictor] = None,
+                          cost_spec: Optional[DesirabilitySpec] = None,
+                          cost_name: str = "cost",
+                          n_candidates: int = 4000,
+                          refine_iters: int = 400,
+                          refine_scale: float = 0.05,
+                          n_starts: int = 5,
+                          seed: Optional[int] = None) -> DesirabilityResult:
+    """Maximise the overall desirability over the constrained mixture simplex.
+
+    Parameters
+    ----------
+    region      : feasible mixture region (M1).
+    predictors  : name -> callable(X)->y giving the predicted property mean.
+                  Wrap a MoE as ``lambda X: moe.predict(X).mean``.
+    specs       : name -> DesirabilitySpec (must match `predictors` keys).
+    cost_fn     : optional callable(X)->cost; folded in as a "min" property.
+    cost_spec   : DesirabilitySpec for cost (defaults to plain "min" over the
+                  observed cost range of the candidate set).
+    n_candidates: feasible candidates to score (global stage).
+    refine_iters: local random-search steps around the incumbent (0 disables).
+    refine_scale: std of the (pseudocomponent) perturbation during refinement.
+
+    Returns a :class:`DesirabilityResult` with the best feasible recipe.
+    """
+    # ---- assemble the full set of named objectives -------------------
+    specs = dict(specs)
+    predictors = dict(predictors)
+    # the cost spec (if any) is served by `cost_fn`, not by `predictors`
+    required = set(specs)
+    if cost_fn is not None:
+        required.discard(cost_name)
+    missing = required - set(predictors)
+    if missing:
+        raise KeyError(f"Specs without a predictor: {sorted(missing)}")
+
+    def evaluate_props(X: np.ndarray) -> Dict[str, np.ndarray]:
+        props = {n: np.asarray(f(X), float).ravel() for n, f in predictors.items()}
+        if cost_fn is not None:
+            props[cost_name] = np.asarray(cost_fn(X), float).ravel()
+        return props
+
+    # ---- global stage: score a feasible candidate set ----------------
+    rng = np.random.default_rng(seed)
+    cand = region.random_points(n_candidates, seed=seed)
+    verts = region.extreme_vertices()
+    cent = region.centroid().reshape(1, -1)
+    candidates = np.vstack([cand, verts, cent]) if len(verts) else np.vstack([cand, cent])
+
+    props = evaluate_props(candidates)
+
+    # cost spec defaults to "min" over the observed candidate cost range
+    if cost_fn is not None and cost_name not in specs:
+        c = props[cost_name]
+        lo, hi = float(np.min(c)), float(np.max(c))
+        if hi <= lo:
+            hi = lo + 1.0
+        specs[cost_name] = cost_spec or DesirabilitySpec("min", low=lo, high=hi)
+
+    desir = Desirability(specs)
+    d_all = desir.overall(props)
+    n_eval = len(candidates)
+
+    # MULTI-START: refine from the top `n_starts` distinct global candidates
+    # (grab: a single incumbent can sit in a poor basin; restart from several).
+    n_starts = max(1, int(n_starts))
+    order = np.argsort(-d_all)
+    start_indices = [int(i) for i in order[:n_starts]]
+
+    d_global_best = float(d_all[order[0]])
+    x_best = candidates[order[0]].copy()
+    d_best = d_global_best
+
+    history = [{"stage": "global", "n": n_eval, "d_overall": d_global_best,
+                "n_starts": len(start_indices)}]
+
+    # ---- local stage: feasibility-preserving random refinement -------
+    for s_no, gi in enumerate(start_indices):
+        x_cur = candidates[gi].copy()
+        d_cur = float(d_all[gi])
+        w_cur = region.to_pseudo(x_cur)          # work in pseudocomponents
+        improved = False
+        for it in range(int(refine_iters)):
+            step = rng.normal(0.0, refine_scale, size=region.q)
+            w_try = np.clip(w_cur + step, 0.0, None)
+            s = w_try.sum()
+            if s <= 0:
+                continue
+            w_try = w_try / s
+            x_try = region.from_pseudo(w_try)
+            if not region.is_feasible(x_try):
+                x_try = region.clip(x_try)
+                if not region.is_feasible(x_try):
+                    continue
+            p_try = evaluate_props(x_try.reshape(1, -1))
+            d_try = float(desir.overall(p_try)[0])
+            n_eval += 1
+            if d_try > d_cur:
+                d_cur, x_cur = d_try, x_try.copy()
+                w_cur = region.to_pseudo(x_cur)
+                improved = True
+        history.append({"stage": "start", "start": s_no, "from_global": gi,
+                        "d_overall": d_cur, "improved": improved})
+        if d_cur > d_best:
+            d_best, x_best = d_cur, x_cur.copy()
+
+    refined = d_best > d_global_best + 1e-15
+
+    # ---- package the winner -----------------------------------------
+    props_best = evaluate_props(x_best.reshape(1, -1))
+    d_ind = {n: float(v[0]) for n, v in desir.individual(props_best).items()}
+    props_scalar = {n: float(v[0]) for n, v in props_best.items()}
+
+    return DesirabilityResult(
+        x=x_best, d_overall=d_best, d_individual=d_ind,
+        properties=props_scalar, n_evaluated=n_eval,
+        refined=refined, n_starts=len(start_indices), history=history,
+    )

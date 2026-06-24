@@ -1,0 +1,741 @@
+"""Оркестратор pipeline M1–M8 для UI (REBUILD_SPEC §8/§9).
+
+Чистая логика без зависимости от Streamlit — управляет стадиями M1…M8 поверх
+готовых модулей `src/`, ведёт `ProjectState` и сохраняет чекпоинты `after_M*`.
+Используется Streamlit-приложением (`streamlit_app.py`) и юнит-тестами.
+
+«Лаборатория» эмулируется синтетическим полигоном (`SyntheticScheffe`, §5): это
+позволяет UI прогонять весь конвейер без реального эксперимента и сравнивать
+найденный рецепт с известным оптимумом (benchmark).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+import numpy as np
+
+from src.core.simplex import SimplexRegion
+from src.core.synthetic import SyntheticScheffe, MultiSyntheticScheffe
+
+from src.core.state import ProjectState
+from src.core.linalg import scheffe_term_indices, scheffe_matrix
+from src.design.d_optimal import (build_candidate_pool, d_optimal_design,
+                                  d_optimal_for_region)
+from src.design.i_optimal import region_moment_matrix, i_optimal_design
+from src.models.scheffe import ScheffeModel
+from src.models.screening import ARDScreening
+from src.models.clustering import GMMRegimes
+from src.models.moe import MixtureOfExperts
+from src.design.active_learning import active_learning_loop
+from src.design.branches import (Branch, branch_scores, propose_by_score,
+                                  allocate_budget)
+from src.optimize.desirability import (DesirabilitySpec, Desirability,
+                                       optimize_desirability)
+
+
+# ----------------------------------------------------------------------
+@dataclass
+class PipelineConfig:
+    name: str = "ui_project"
+    q: int = 5
+    lower: Optional[Sequence[float]] = None
+    upper: Optional[Sequence[float]] = None
+    names: Optional[Sequence[str]] = None
+    model: str = "quadratic"
+    noise_sd: float = 0.2
+    seed: int = 42
+    n_runs_factor: float = 2.0          # n_runs = ceil(factor * p)
+    n_random: int = 600                 # candidate pool size
+    n_restarts: int = 8
+    n_blocks: int = 1                   # число блоков (партий/дней) для плана
+    cost_coeffs: Optional[Sequence[float]] = None   # per-component unit cost
+    property_names: Optional[Sequence[str]] = None  # имена целевых свойств (P)
+
+
+
+    def region(self) -> SimplexRegion:
+        if self.lower is not None or self.upper is not None:
+            return SimplexRegion(lower=self.lower, upper=self.upper,
+                                 names=self.names)
+        return SimplexRegion(q=self.q, names=self.names)
+
+    @classmethod
+    def from_snapshot(cls, name: str, d: Dict[str, Any]) -> "PipelineConfig":
+        """Rebuild a config from a saved ``state.config`` snapshot (see
+        :meth:`PipelineRunner.config_snapshot`). Unknown keys fall back to
+        dataclass defaults so older snapshots keep loading."""
+        d = dict(d or {})
+        return cls(
+            name=name,
+            q=int(d.get("q", 5)),
+            lower=d.get("lower"),
+            upper=d.get("upper"),
+            names=d.get("names"),
+            model=str(d.get("model", "quadratic")),
+            noise_sd=float(d.get("noise_sd", 0.2)),
+            seed=int(d.get("seed", 42)),
+            n_runs_factor=float(d.get("n_runs_factor", 2.0)),
+            n_random=int(d.get("n_random", 600)),
+            n_restarts=int(d.get("n_restarts", 8)),
+            n_blocks=int(d.get("n_blocks", 1)),
+            cost_coeffs=d.get("cost_coeffs"),
+            property_names=d.get("property_names"),
+        )
+
+
+
+
+# ----------------------------------------------------------------------
+class PipelineRunner:
+    """Хранит состояние конвейера и выполняет стадии M1…M8 по одной."""
+
+    def __init__(self, config: PipelineConfig, project_dir: str | Path):
+        self.cfg = config
+        self.project_dir = Path(project_dir)
+        self.region = config.region()
+        self.q = self.region.q
+        self.names = self.region.names
+        # целевые свойства (P): мультиотклик (REBUILD_SPEC §12)
+        self.property_names = (list(config.property_names)
+                               if config.property_names else ["y"])
+        # синтетическая «лаборатория»: P независимых истин, мерит все свойства
+        self.truth_multi = MultiSyntheticScheffe(
+            self.q, self.property_names, model=config.model,
+            noise_sd=config.noise_sd, seed=config.seed)
+        # первичная истина (свойство 0) — для M6/M7/benchmark (1D, совместимость)
+        self.truth = self.truth_multi.truths[0]
+        self.cost_coeffs = (np.asarray(config.cost_coeffs, float)
+                            if config.cost_coeffs is not None
+                            else np.linspace(1.0, 3.0, self.q))
+        # рабочие объекты в памяти
+        self.design: Optional[np.ndarray] = None
+        self.Y: Optional[np.ndarray] = None      # отклики всех свойств (n×P)
+        self.y: Optional[np.ndarray] = None      # первичное свойство (n,) = Y[:,0]
+        self.blocks: Optional[np.ndarray] = None
+        self.moe: Optional[MixtureOfExperts] = None
+        # M6: общие на проект суррогаты — по одному MoE на свойство
+        # (REBUILD_SPEC §12: общая модель проекта, мультиотклик).
+        self.surrogates: Dict[str, MixtureOfExperts] = {}
+        # 3c: единая база точек с origin-тегами + ветки без своих моделей (§5/§12)
+        self.origin: List[str] = []
+        self.branches: Dict[str, Branch] = {}
+
+
+        self.results: Dict[str, Dict[str, Any]] = {}
+        self.p = len(scheffe_term_indices(self.q, config.model))
+        self.n_runs = int(np.ceil(config.n_runs_factor * self.p))
+        # полный снимок конфигурации — чтобы проект восстанавливался целиком
+        self.state = ProjectState(name=config.name,
+                                  config=self.config_snapshot())
+
+    # ------------------------------------------------------------------
+    # Сохранение/загрузка ПРОЕКТА целиком (не только чекпоинт стадии)
+    # ------------------------------------------------------------------
+    def config_snapshot(self) -> Dict[str, Any]:
+        """Полный сериализуемый снимок конфигурации проекта.
+
+        Достаточен, чтобы восстановить идентичный `PipelineConfig`
+        (см. :meth:`PipelineConfig.from_snapshot`) — включая границы долей,
+        имена, стоимость и параметры алгоритма.
+        """
+        return {
+            "q": int(self.q),
+            "model": self.cfg.model,
+            "noise_sd": float(self.cfg.noise_sd),
+            "seed": int(self.cfg.seed),
+            "names": list(self.names),
+            "lower": self.region.lower.tolist(),
+            "upper": self.region.upper.tolist(),
+            "n_runs_factor": float(self.cfg.n_runs_factor),
+            "n_random": int(self.cfg.n_random),
+            "n_restarts": int(self.cfg.n_restarts),
+            "n_blocks": int(self.cfg.n_blocks),
+            "cost_coeffs": self.cost_coeffs.tolist(),
+            "property_names": list(self.property_names),
+        }
+
+
+    def save_project(self) -> str:
+        """Сохранить весь проект (state.json + data/models) в `project_dir`.
+
+        В отличие от чекпоинтов стадий, это «главное» сохранение проекта,
+        которое потом подхватывает :meth:`from_project`.
+        """
+        self.state.config = self.config_snapshot()
+        if self.design is not None:
+            self.state.put("design", self.design)
+        if self.y is not None:
+            self.state.put("responses", self.y)
+        if self.blocks is not None:
+            self.state.put("blocks", self.blocks)
+        if self.origin:
+            self.state.put("origin", list(self.origin))
+        if self.branches:
+            self.state.put("branches",
+                           {bid: b.to_state() for bid, b in self.branches.items()})
+        path = self.state.save(self.project_dir)
+        return str(path)
+
+    def _restore_from_state(self, ps: ProjectState) -> None:
+        """Подтянуть рабочие объекты (design/y/blocks/MoE) из ProjectState."""
+        self.state = ps
+        design = ps.get("design")
+        y = ps.get("responses")
+        Y = ps.get("responses_multi")
+        blocks = ps.get("blocks")
+        if design is not None:
+            self.design = np.asarray(design)
+        if y is not None:
+            self.y = np.asarray(y)
+        if Y is not None:
+            self.Y = np.asarray(Y)
+        if blocks is not None:
+            self.blocks = np.asarray(blocks)
+        origin = ps.get("origin")
+        if origin is not None:
+            self.origin = [str(o) for o in origin]
+        elif self.design is not None:
+            self.origin = ["M2"] * len(self.design)
+        branches = ps.get("branches")
+        if branches:
+            self.branches = {bid: Branch.from_state(b)
+                             for bid, b in dict(branches).items()}
+
+        # суррогаты per-property (M6, §12): m6_moe__{i} → property_names[i]
+        self.surrogates = {}
+        for i, name in enumerate(self.property_names):
+            key = f"m6_moe__{i}"
+            if key in ps.models:
+                try:
+                    self.surrogates[name] = MixtureOfExperts.from_state(
+                        ps.models[key])
+                except Exception:  # noqa: BLE001 — модель опциональна
+                    pass
+
+        for mkey in ("m7_final_moe", "m6_moe"):
+            if mkey in ps.models:
+                try:
+                    self.moe = MixtureOfExperts.from_state(ps.models[mkey])
+                    break
+                except Exception:  # noqa: BLE001 — модель опциональна
+                    pass
+        # если первичный суррогат не восстановился из алиаса — берём из словаря
+        if self.moe is None and self.property_names[0] in self.surrogates:
+            self.moe = self.surrogates[self.property_names[0]]
+
+    @classmethod
+    def from_project(cls, root: str | Path, name: str) -> "PipelineRunner":
+        """Загрузить проект по имени из каталога `root` (например project_ui)."""
+        project_dir = Path(root) / name
+        ps = ProjectState.load(project_dir)
+        cfg = PipelineConfig.from_snapshot(ps.name or name, ps.config)
+        runner = cls(cfg, project_dir)
+        runner._restore_from_state(ps)
+        return runner
+
+
+    # ------------------------------------------------------------------
+    def cost_fn(self, X) -> np.ndarray:
+        X = np.atleast_2d(np.asarray(X, float))
+        return X @ self.cost_coeffs
+
+    def _ckpt(self, label: str) -> str:
+        self.state.checkpoint(self.project_dir, label=label)
+        return str(self.project_dir / "checkpoints" / f"{label}.json")
+
+    # ===================== M1: геометрия ==============================
+    def run_m1(self) -> Dict[str, Any]:
+        V = self.region.extreme_vertices()
+        centroid = self.region.centroid()
+        self.state.set_stage("M1_geometry")
+        self.state.put("vertices", V)
+        self.state.put("centroid", centroid)
+        res = {"n_vertices": int(len(V)), "vertices": V, "centroid": centroid,
+               "q": self.q, "p": self.p, "n_runs": self.n_runs,
+               "checkpoint": self._ckpt("after_M1")}
+        self.results["M1"] = res
+        return res
+
+    # ===================== M2: D-optimal design ======================
+    def run_m2(self, simulate: bool = True) -> Dict[str, Any]:
+        """Построить D-оптимальный план. ``simulate``: заполнить ли отклики
+        синтетической «лабораторией» сразу (True — для тестов/демо) или оставить
+        пустыми (NaN) под ручной ввод/кнопку заполнения в UI."""
+        res = d_optimal_for_region(self.region, n_runs=self.n_runs,
+                                   model=self.cfg.model,
+                                   n_random=self.cfg.n_random,
+                                   n_restarts=self.cfg.n_restarts,
+                                   seed=self.cfg.seed)
+        self.design = res.design
+        n = self.design.shape[0]
+        P = len(self.property_names)
+        self.Y = (self.truth_multi.evaluate(self.design) if simulate
+                  else np.full((n, P), np.nan))
+        self.y = self.Y[:, 0]                       # первичное свойство
+        self.origin = ["M2"] * n                    # origin-тег каждой точки
+        self.blocks = self._assign_blocks(n, max(1, int(self.cfg.n_blocks)))
+
+        self.state.set_stage("M2_screening_design")
+        self.state.put("design", self.design)
+        self.state.put("responses", self.y)
+        self.state.put("responses_multi", self.Y)
+        self.state.put("blocks", self.blocks)
+        self.state.put("d_efficiency", float(res.d_efficiency))
+        out = {"n": int(n), "p": self.p,
+               "d_efficiency": float(res.d_efficiency),
+               "logdet": float(res.logdet), "design": self.design,
+               "y": self.y, "Y": self.Y,
+               "property_names": list(self.property_names),
+               "blocks": self.blocks,
+               "n_blocks": int(max(1, self.cfg.n_blocks)),
+               "checkpoint": self._ckpt("after_M2")}
+
+        self.results["M2"] = out
+        return out
+
+    @staticmethod
+    def _assign_blocks(n: int, n_blocks: int) -> np.ndarray:
+        """Сбалансированно распределить n опытов по блокам (партиям/дням).
+
+        Опыты раскладываются «по кругу» (round-robin), чтобы каждый блок
+        получил близкое число прогонов и покрывал разные точки дизайна.
+        Возвращает массив меток блоков 1..n_blocks длиной n.
+        """
+        if n_blocks <= 1:
+            return np.ones(n, dtype=int)
+        return (np.arange(n) % n_blocks).astype(int) + 1
+
+
+    # ===================== M3a: Scheffe fit ==========================
+    def run_m3_fit(self) -> Dict[str, Any]:
+        """Scheffe-аппроксимация на КАЖДОЕ свойство (REBUILD_SPEC §12).
+
+        Для каждого свойства строится своя модель Шеффе; `per_property[name]`
+        хранит её диагностику. Верхний уровень результата дублирует первичное
+        свойство (столбец 0) — для обратной совместимости со старым UI/тестами.
+        """
+        cols = self._property_columns()
+        self.state.set_stage("M3_screening_analysis")
+        per: Dict[str, Dict[str, Any]] = {}
+        primary: Optional[Dict[str, Any]] = None
+        for i, name in enumerate(self.property_names):
+            if name not in cols:
+                continue
+            fit = ScheffeModel(model=self.cfg.model, names=self.names).fit(
+                self.design, cols[name])
+            self.state.models[f"m3_scheffe__{i}"] = fit.to_state()
+            info = {"property": name, "r2": float(fit.r2),
+                    "adj_r2": float(fit.adj_r2), "rmse": float(fit.rmse),
+                    "coef_table": fit.coefficient_table(), "anova": fit.anova(),
+                    "term_names": fit.term_names,
+                    "coefficients": fit.coefficients}
+            per[name] = info
+            if primary is None:
+                primary = info
+        # alias первичного свойства — совместимость
+        if "m3_scheffe__0" in self.state.models:
+            self.state.models["m3_scheffe"] = self.state.models["m3_scheffe__0"]
+        out = dict(primary or {})
+        out["per_property"] = per
+        out["property_names"] = list(self.property_names)
+        out["checkpoint"] = self._ckpt("after_M3")
+        self.results["M3_fit"] = out
+        return out
+
+    # ===================== M3b: ARD-GP screening =====================
+    def run_m3_ard(self) -> Dict[str, Any]:
+        """ARD-GP скрининг на КАЖДОЕ свойство (REBUILD_SPEC §12).
+
+        Активные компоненты могут отличаться от свойства к свойству;
+        `per_property[name]` хранит результат скрининга для каждого.
+        """
+        cols = self._property_columns()
+        per: Dict[str, Dict[str, Any]] = {}
+        primary: Optional[Dict[str, Any]] = None
+        for i, name in enumerate(self.property_names):
+            if name not in cols:
+                continue
+            scr = ARDScreening(seed=self.cfg.seed,
+                               n_restarts=self.cfg.n_restarts,
+                               rel_threshold=0.15).fit(self.design, cols[name])
+            self.state.models[f"m3_ard_screening__{i}"] = scr.to_state()
+            active = [scr.component_names[j] for j in scr.active_indices()]
+            info = {"property": name, "q_eff": int(scr.q_eff),
+                    "active": active, "table": scr.table,
+                    "gp_loglik": float(scr.gp_loglik),
+                    "noise_level": float(scr.noise_level),
+                    "importance": np.asarray(scr.importance)}
+            per[name] = info
+            if primary is None:
+                primary = info
+        if "m3_ard_screening__0" in self.state.models:
+            self.state.models["m3_ard_screening"] = \
+                self.state.models["m3_ard_screening__0"]
+        out = dict(primary or {})
+        out["per_property"] = per
+        out["property_names"] = list(self.property_names)
+        self.results["M3_ard"] = out
+        return out
+
+    # ===================== M4: GMM regimes ===========================
+    def run_m4(self) -> Dict[str, Any]:
+        self._require_data()
+        reg = GMMRegimes(k_range=range(1, 6), seed=self.cfg.seed).fit(self.y)
+        self.state.set_stage("M4_clustering")
+        self.state.models["m4_regimes"] = reg.to_state()
+        out = {"n_regimes": int(reg.n_regimes), "bic_table": reg.bic_table,
+               "means": np.asarray(reg.means).ravel(),
+               "checkpoint": self._ckpt("after_M4")}
+        self.results["M4"] = out
+        return out
+
+    # ===================== M5: I-optimal design ======================
+    def run_m5(self) -> Dict[str, Any]:
+        pool = build_candidate_pool(self.region, n_random=self.cfg.n_random,
+                                    seed=self.cfg.seed)
+        W = region_moment_matrix(self.region, self.cfg.model, n_mc=6000,
+                                 seed=self.cfg.seed)
+        i_res = i_optimal_design(pool, n_runs=self.n_runs, moments=W,
+                                 model=self.cfg.model,
+                                 n_restarts=self.cfg.n_restarts,
+                                 seed=self.cfg.seed)
+        i_of_i = float(i_res.i_score)
+        i_of_d = None
+        if self.design is not None:
+            M = scheffe_matrix(self.design, self.cfg.model)
+            inv = np.linalg.inv(M.T @ M + 1e-8 * np.eye(M.shape[1]))
+            i_of_d = float(np.trace(inv @ W))
+        self.state.set_stage("M5_local_design")
+        self.state.models["m5_i_optimal"] = i_res.to_state()
+        out = {"i_optimal": i_of_i, "i_of_d_design": i_of_d,
+               "design": i_res.design, "checkpoint": self._ckpt("after_M5")}
+        self.results["M5"] = out
+        return out
+
+    # ===================== M6: MoE surrogate =========================
+    def run_m6(self) -> Dict[str, Any]:
+        """Суррогат MoE на КАЖДОЕ свойство — общая модель проекта (§12).
+
+        Строит словарь :attr:`surrogates` ``{property → MixtureOfExperts}``;
+        `self.moe` — алиас первичного свойства (столбец 0) для M7/M8/benchmark.
+        `per_property[name]` хранит диагностику суррогата каждого свойства.
+        """
+        cols = self._property_columns()
+        Xt = self.region.random_points(200, seed=self.cfg.seed + 2)
+        self.state.set_stage("M6_moe")
+        self.surrogates = {}
+        per: Dict[str, Dict[str, Any]] = {}
+        primary: Optional[Dict[str, Any]] = None
+        for i, name in enumerate(self.property_names):
+            if name not in cols:
+                continue
+            moe = MixtureOfExperts(k_range=range(1, 5), seed=self.cfg.seed,
+                                   n_restarts=self.cfg.n_restarts).fit(
+                self.design, cols[name])
+            self.surrogates[name] = moe
+            self.state.models[f"m6_moe__{i}"] = moe.to_state()
+            pred = moe.predict(Xt)
+            truth_i = self.truth_multi.truths[i].true(Xt)
+            rmse = float(np.sqrt(np.mean((pred.mean - truth_i) ** 2)))
+            info = {"property": name, "n_regimes": int(moe.n_regimes),
+                    "test_rmse": rmse,
+                    "within": float(pred.uncertainty.mean()),
+                    "between": float(pred.disagreement.mean())}
+            per[name] = info
+            if primary is None:
+                primary = info
+        # первичный суррогат — для совместимости (M7/M8/benchmark)
+        self.moe = self.surrogates.get(self.property_names[0])
+        if "m6_moe__0" in self.state.models:
+            self.state.models["m6_moe"] = self.state.models["m6_moe__0"]
+        out = dict(primary or {})
+        out["per_property"] = per
+        out["property_names"] = list(self.property_names)
+        out["checkpoint"] = self._ckpt("after_M6")
+        self.results["M6"] = out
+        return out
+
+    # ===================== M7: active learning =======================
+    def run_m7(self, n_iter_refine: int = 6, n_iter_search: int = 8
+               ) -> Dict[str, Any]:
+        self._require_data()
+        oracle = lambda X: self.truth.evaluate(X)
+        X0, y0 = self.design, self.y
+        grid = self.region.random_points(500, seed=self.cfg.seed + 99)
+
+        resA = active_learning_loop(self.region, oracle, X0, y0,
+                                    n_iter=n_iter_refine, acquisition="max_std",
+                                    batch=2, n_candidates=400, seed=self.cfg.seed,
+                                    model_kwargs={"n_restarts": self.cfg.n_restarts})
+        resB = active_learning_loop(self.region, oracle, resA.X, resA.y,
+                                    n_iter=n_iter_search, acquisition="ei",
+                                    batch=1, n_candidates=600, maximize=True,
+                                    acq_tol=1e-4, seed=self.cfg.seed + 1,
+                                    model_kwargs={"n_restarts": self.cfg.n_restarts})
+        self.moe = resB.model
+        self.design, self.y = resB.X, resB.y
+        x_best, y_best = resB.best(maximize=True)
+        self.state.set_stage("M7_active_learning")
+        self.state.models["m7_final_moe"] = resB.model.to_state()
+        self.state.put("design", self.design)
+        self.state.put("responses", self.y)
+        out = {"n_start": int(len(y0)), "n_final": int(len(resB.y)),
+               "y_best": float(y_best), "x_best": np.asarray(x_best),
+               "stopped_early": bool(resB.stopped_early),
+               "historyA": resA.history, "historyB": resB.history,
+               "checkpoint": self._ckpt("after_M7")}
+        self.results["M7"] = out
+        return out
+
+    # ===================== M8: product optimisation ==================
+    def run_m8(self, prop_weight: float = 1.0, cost_weight: float = 1.0
+               ) -> Dict[str, Any]:
+        if self.moe is None:
+            self.run_m6()
+        y = self.y if self.y is not None else np.array([0.0, 1.0])
+        lo, hi = float(np.min(y)), float(np.max(y))
+        if hi <= lo:
+            hi = lo + 1.0
+        specs = {"property": DesirabilitySpec("max", low=lo, high=hi,
+                                              weight=prop_weight)}
+        cost_spec = DesirabilitySpec("min",
+                                     low=float(self.cost_coeffs.min()),
+                                     high=float(self.cost_coeffs.max()),
+                                     weight=cost_weight)
+        predictors = {"property": lambda X: self.moe.predict(X).mean}
+        res = optimize_desirability(self.region, predictors, specs,
+                                    cost_fn=self.cost_fn, cost_spec=cost_spec,
+                                    cost_name="cost", n_candidates=4000,
+                                    refine_iters=400, seed=self.cfg.seed)
+        self.state.set_stage("M8_optimization")
+        self.state.put("m8_recipe", res.x)
+        self.state.put("m8_d_overall", float(res.d_overall))
+        out = {"recipe": np.asarray(res.x), "d_overall": float(res.d_overall),
+               "d_individual": res.d_individual, "properties": res.properties,
+               "checkpoint": self._ckpt("after_M8")}
+        self.results["M8"] = out
+        return out
+
+    # ===================== Benchmark vs аналитический оптимум =========
+    def benchmark(self, n_scan: int = 20000) -> Dict[str, Any]:
+        scan = self.region.random_points(n_scan, seed=self.cfg.seed + 7)
+        truth_vals = self.truth.true(scan)
+        best = int(np.argmax(truth_vals))
+        x_true = scan[best]
+        m8 = self.results.get("M8", {})
+        x_pipe = m8.get("recipe")
+        out = {"x_true": x_true, "y_true": float(truth_vals[best])}
+        if x_pipe is not None:
+            x_pipe = np.asarray(x_pipe)
+            out["x_pipeline"] = x_pipe
+            out["y_pipeline_true"] = float(self.truth.true(x_pipe.reshape(1, -1))[0])
+            out["recipe_dist"] = float(np.linalg.norm(x_true - x_pipe))
+            denom = abs(out["y_true"]) if abs(out["y_true"]) > 1e-9 else 1.0
+            out["value_gap_pct"] = 100.0 * (out["y_true"] - out["y_pipeline_true"]) / denom
+        self.results["benchmark"] = out
+        return out
+
+    # ------------------------------------------------------------------
+    def checkpoints(self) -> List[str]:
+        return self.state.list_checkpoints(self.project_dir)
+
+    def _require_data(self) -> None:
+        if self.design is None or self.y is None:
+            raise RuntimeError("Сначала выполните M2 (нет дизайна/откликов).")
+        if np.any(np.isnan(np.asarray(self.y, dtype=float))):
+            raise RuntimeError("Отклики y не заполнены: впишите значения в "
+                               "столбец «y (lab)» или нажмите «Заполнить "
+                               "тестовыми (симулятор)» на стадии M2.")
+
+    def _property_columns(self) -> Dict[str, np.ndarray]:
+        """Столбцы откликов по свойствам ``{property → y_vec}`` (REBUILD_SPEC §12).
+
+        Источник — общая матрица откликов проекта ``Y (n×P)``. Для старых
+        одно-откликовых проектов (без ``Y``) возвращает единственный столбец
+        первичного свойства из ``self.y``. Проверяет, что отклики заполнены.
+        """
+        self._require_data()
+        if self.Y is None:
+            return {self.property_names[0]: np.asarray(self.y, dtype=float)}
+        Y = np.asarray(self.Y, dtype=float)
+        if np.any(np.isnan(Y)):
+            raise RuntimeError("Отклики свойств не заполнены: впишите значения "
+                               "или нажмите «Заполнить тестовыми (симулятор)» "
+                               "на стадии M2.")
+        return {name: Y[:, i] for i, name in enumerate(self.property_names)
+                if i < Y.shape[1]}
+
+    def simulate_responses(self) -> np.ndarray:
+        """Заполнить отклики ВСЕХ свойств синтетической «лабораторией»."""
+        if self.design is None:
+            raise RuntimeError("Сначала выполните M2 (нет дизайна).")
+        self.Y = self.truth_multi.evaluate(self.design)
+        self.y = self.Y[:, 0]
+        self.state.put("responses", self.y)
+        self.state.put("responses_multi", self.Y)
+        if "M2" in self.results:
+            self.results["M2"]["y"] = self.y
+            self.results["M2"]["Y"] = self.Y
+        return self.Y
+
+    # ===================== Ветки (3c, REBUILD_SPEC §5/§12) ===========
+    def add_branch(self, name: str, goal: Dict[str, DesirabilitySpec],
+                   budget: int = 10, satisfy_at: float = 0.9,
+                   branch_id: Optional[str] = None) -> Branch:
+        """Завести ветку: цель (desirability по свойствам) + бюджет, без модели.
+
+        Ветка читает общие суррогаты проекта и пишет точки в общую базу —
+        собственной модели у неё нет (канон §5/§12). Цель ``goal`` —
+        словарь ``{property → DesirabilitySpec}``; все свойства должны входить
+        в ``property_names`` проекта.
+        """
+        unknown = set(goal) - set(self.property_names)
+        if unknown:
+            raise KeyError(f"Цель ветки ссылается на неизвестные свойства: "
+                           f"{sorted(unknown)} (есть: {self.property_names}).")
+        bid = branch_id or f"b{len(self.branches) + 1}"
+        if bid in self.branches:
+            raise ValueError(f"Ветка '{bid}' уже существует.")
+        br = Branch(id=bid, name=name, goal=dict(goal),
+                    budget=int(budget), satisfy_at=float(satisfy_at))
+        self.branches[bid] = br
+        return br
+
+    def _ensure_origin(self) -> None:
+        """Гарантировать, что origin-теги синхронны с числом точек базы."""
+        n = 0 if self.design is None else len(self.design)
+        if len(self.origin) != n:
+            # старые проекты/после M7 — доразметить недостающие как 'M2'
+            self.origin = (list(self.origin) + ["M2"] * n)[:n] if self.origin \
+                else ["M2"] * n
+
+    def _refit_surrogates(self) -> None:
+        """Переобучить общие суррогаты проекта на ТЕКУЩЕЙ общей базе (§12).
+
+        Точки всех веток лежат в одной базе ``design/Y`` — модель одна на проект,
+        поэтому после добавления точек любой веткой суррогаты обновляются для
+        всех. Обновляет ``surrogates``/``moe`` и их снимки в state.
+        """
+        cols = self._property_columns()
+        self.surrogates = {}
+        for i, name in enumerate(self.property_names):
+            if name not in cols:
+                continue
+            moe = MixtureOfExperts(k_range=range(1, 5), seed=self.cfg.seed,
+                                   n_restarts=self.cfg.n_restarts).fit(
+                self.design, cols[name])
+            self.surrogates[name] = moe
+            self.state.models[f"m6_moe__{i}"] = moe.to_state()
+        self.moe = self.surrogates.get(self.property_names[0])
+        if "m6_moe__0" in self.state.models:
+            self.state.models["m6_moe"] = self.state.models["m6_moe__0"]
+
+    def run_branch_round(self, branch_id: str, n_points: int = 1,
+                         explore_frac: float = 0.3, n_candidates: int = 600,
+                         refit: bool = True) -> Dict[str, Any]:
+        """Один раунд активного сбора точек ВЕТКИ (M7 для ветки, §12).
+
+        Шаги: (1) суррогаты проекта (обучить при отсутствии); (2) acquisition
+        ветки по её desirability-цели + exploration; (3) выбрать ≤``n_points``
+        точек в рамках бюджета; (4) ИЗМЕРИТЬ все P свойств; (5) дописать в общую
+        базу с origin-тегом ``branch:{id}``; (6) дообучить общие суррогаты.
+        """
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        self._require_data()
+        if not self.surrogates:
+            self.run_m6()
+        self._ensure_origin()
+        br = self.branches[branch_id]
+        n_take = min(int(n_points), br.remaining())
+        if n_take <= 0:
+            br.refresh_status()
+            return {"branch": branch_id, "added": 0, "status": br.status,
+                    "remaining": br.remaining(), "d_best": br.d_best,
+                    "x_best": br.x_best, "note": "бюджет исчерпан"}
+
+        seed = self.cfg.seed + 1000 + br.spent
+        cands = self.region.random_points(n_candidates, seed=seed)
+        acq, d_pred, sigma = branch_scores(self.surrogates, br.goal, cands,
+                                           explore_frac=explore_frac)
+        newX = propose_by_score(cands, acq, n_take, min_dist=0.03)
+
+        # ИЗМЕРЕНИЕ ВСЕХ P СВОЙСТВ (новая точка меряется целиком, §12)
+        Ynew = self.truth_multi.evaluate(newX)
+        self.design = np.vstack([self.design, newX])
+        self.Y = np.vstack([self.Y, Ynew])
+        self.y = self.Y[:, 0]
+        self.origin += [f"branch:{branch_id}"] * len(newX)
+        br.spent += len(newX)
+
+        # лучший по ИЗМЕРЕННОЙ desirability цели ветки
+        desir = Desirability(dict(br.goal))
+        meas = {name: Ynew[:, self.property_names.index(name)] for name in br.goal}
+        d_meas = desir.overall(meas)
+        bi = int(np.argmax(d_meas))
+        if float(d_meas[bi]) > br.d_best:
+            br.d_best = float(d_meas[bi])
+            br.x_best = newX[bi].tolist()
+        br.refresh_status()
+        br.history.append({"round": len(br.history) + 1, "added": int(len(newX)),
+                           "d_round": float(np.max(d_meas)), "d_best": br.d_best,
+                           "spent": br.spent, "status": br.status})
+
+        if refit:
+            self._refit_surrogates()
+
+        # обновить общую базу в state
+        self.state.put("design", self.design)
+        self.state.put("responses", self.y)
+        self.state.put("responses_multi", self.Y)
+        self.state.put("origin", list(self.origin))
+        return {"branch": branch_id, "added": int(len(newX)),
+                "x_new": np.asarray(newX), "y_new": np.asarray(Ynew),
+                "status": br.status, "remaining": br.remaining(),
+                "d_best": br.d_best, "x_best": br.x_best,
+                "n_base": int(len(self.design))}
+
+    def run_portfolio_round(self, total_slots: int, explore_frac: float = 0.3,
+                            n_candidates: int = 600) -> Dict[str, Any]:
+        """Портфельный раунд: арбитр делит бюджет между ветками и гоняет их (3d).
+
+        Слоты распределяются :func:`allocate_budget` (дальше от цели → больше
+        слотов; satisfied/exhausted пропускаются), затем для каждой ветки
+        выполняется :meth:`run_branch_round`. Возвращает распределение, итоги
+        раундов и обновлённую сводку origin.
+        """
+        for b in self.branches.values():
+            b.refresh_status()
+        alloc = allocate_budget(self.branches, total_slots)
+        rounds: Dict[str, Any] = {}
+        for bid, n in alloc.items():
+            rounds[bid] = self.run_branch_round(
+                bid, n_points=n, explore_frac=explore_frac,
+                n_candidates=n_candidates)
+        return {"allocation": alloc, "rounds": rounds,
+                "n_base": int(0 if self.design is None else len(self.design)),
+                "origin_counts": self.origin_counts(),
+                "statuses": {bid: b.status for bid, b in self.branches.items()}}
+
+    def origin_counts(self) -> Dict[str, int]:
+        """Сводка происхождения точек общей базы ``{origin → count}``."""
+        self._ensure_origin()
+        out: Dict[str, int] = {}
+        for o in self.origin:
+            out[o] = out.get(o, 0) + 1
+        return out
+
+
+
+# ----------------------------------------------------------------------
+def list_projects(root: str | Path) -> List[str]:
+    """Имена сохранённых проектов в каталоге `root` (где есть state.json)."""
+    root = Path(root)
+    if not root.exists():
+        return []
+    return sorted(p.name for p in root.iterdir()
+                  if p.is_dir() and (p / "state.json").exists())
+
+

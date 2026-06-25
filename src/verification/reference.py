@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from itertools import combinations
+from math import gamma
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -183,3 +184,45 @@ def gp_posterior(X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray,
     var = (const + noise) - np.sum(v ** 2, axis=0)
     var = np.clip(var, 0.0, None)
     return {"mean": mean, "std": np.sqrt(var)}
+
+
+# ======================================================================
+# Моменты на произведении области (эталон для design.block_moments, §13.5)
+# Независимый путь: через Γ-функцию (vs factorial в продакшене).
+#   симплекс S^{q-1}, Дирихле(1):  E[∏x_i^{a_i}] = Γ(q)∏Γ(a_i+1)/Γ(q+Σa)
+#   куб [0,1]^d, равномерно:        E[∏z_k^{b_k}] = ∏ 1/(b_k+1)
+#   произведение области ⇒ множители независимы.
+# ======================================================================
+def ref_simplex_moment(a: Sequence[int], q: int) -> float:
+    """E[∏ x_i^{a_i}] на стандартном симплексе S^{q-1} (Дирихле(1,…,1))."""
+    if q == 0:
+        return 1.0
+    num = gamma(q)
+    for ai in a:
+        num *= gamma(ai + 1)
+    return num / gamma(q + sum(a))
+
+
+def ref_cube_moment(b: Sequence[int]) -> float:
+    """E[∏ z_k^{b_k}] на [0,1]^d (равномерно). d==0 → 1."""
+    v = 1.0
+    for bk in b:
+        v *= 1.0 / (bk + 1.0)
+    return v
+
+
+def ref_product_moment_matrix(term_exponents: Sequence[Tuple[Sequence[int],
+                                                              Sequence[int]]],
+                              q: int, d: int) -> np.ndarray:
+    """Матрица моментов M[r,s]=E[f_r f_s] по списку (a,b)-степеней термов.
+
+    ``term_exponents[r] = (a_r, b_r)`` — степени r-го терма по x (len q) и z (len d).
+    """
+    p = len(term_exponents)
+    M = np.zeros((p, p))
+    for r, (ar, br) in enumerate(term_exponents):
+        for s, (as_, bs) in enumerate(term_exponents):
+            a = [ar[i] + as_[i] for i in range(q)]
+            b = [br[k] + bs[k] for k in range(d)]
+            M[r, s] = ref_simplex_moment(a, q) * ref_cube_moment(b)
+    return M

@@ -163,6 +163,19 @@ def test_battle_branches_converge_to_analytic_optimum():
         xb = np.round(np.asarray(runner.branches[bid].x_best, float), 3)
         xo = np.round(np.asarray(opt[bid]["x"], float), 3)
         print(f"  {bid:<9} pipeline={xb.tolist()}  analytic={xo.tolist()}")
+    print("свойства (истина) pipeline vs аналитика; Δ ЦЕНА — отклонение по цене:")
+    for bid in goals:
+        xb = np.asarray(runner.branches[bid].x_best, float).reshape(1, -1)
+        yp = {p: float(truth.truths[p].true(xb)[0]) for p in truth.property_names}
+        ya = {p: float(opt[bid]["y"][p]) for p in truth.property_names}
+        dpa = yp["price"] - ya["price"]
+        dpp = 100.0 * dpa / abs(ya["price"]) if abs(ya["price"]) > 1e-9 else 0.0
+        print(f"  {bid:<9} ЦЕНА pipe={yp['price']:.2f} vs anal={ya['price']:.2f} "
+              f"Δ={dpa:+.2f} ({dpp:+.0f}%) | "
+              f"strength {yp['strength']:.1f}/{ya['strength']:.1f} "
+              f"gloss {yp['gloss']:.1f}/{ya['gloss']:.1f} "
+              f"dry {yp['dry_time']:.1f}/{ya['dry_time']:.1f}")
+
 
     # фазовый «потолок» (best-achievable под маской) — потенциал каждой фазы
     baseline = [1/3, 1/3, 1/3, 0.5, 0.5]

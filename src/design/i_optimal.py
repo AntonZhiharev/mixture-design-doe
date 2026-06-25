@@ -17,7 +17,7 @@ R reference: ``AlgDesign::optFederov(criterion="I")``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import numpy as np
 
@@ -174,6 +174,7 @@ class IAugmentResult:
 def i_optimal_augment_sequential(
         existing: np.ndarray, candidates: np.ndarray, moments: np.ndarray, *,
         model: Union[str, int] = "quadratic", terms: Optional[List] = None,
+        model_matrix_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
         n_max: int = 50, min_total: Optional[int] = None,
         margin: int = 12, rel_tol: float = 0.03, ridge: float = 1e-8,
         seed: Optional[int] = None) -> IAugmentResult:
@@ -192,21 +193,33 @@ def i_optimal_augment_sequential(
 
     Никакого абсолютного порога вида ``while I > thr`` — он «протекает», т.к.
     ``I ∝ 1/n`` и в ноль не упрётся (§5.5.3).
+
+    ``model_matrix_fn`` (§13.6): опц. построитель модельной матрицы ``f(X)`` для
+    mixture-process. ``None`` ⇒ mixture-only поведение бит-в-бит (Scheffé). Гейт
+    достаточности использует ``p = C.shape[1]`` (число столбцов модели), поэтому
+    блочная модель не вызывает преждевременной остановки. Геометрия в M5 НЕ
+    передаётся — pool/moments готовит блочный слой снаружи (§13.4/§13.5).
     """
     existing = (np.atleast_2d(np.asarray(existing, dtype=float))
                 if existing is not None and len(np.asarray(existing)) else None)
     candidates = np.atleast_2d(np.asarray(candidates, dtype=float))
     q = candidates.shape[1]
-    C = _model_matrix(candidates, model, terms)
+    # §13.6: инъекция построителя модельной матрицы. None → текущее mixture-only
+    # поведение (Scheffé) бит-в-бит; блочный augment передаёт сюда composite-модель.
+    mm = (model_matrix_fn if model_matrix_fn is not None
+          else (lambda X: _model_matrix(X, model, terms)))
+    C = mm(candidates)
     n_cand, p = C.shape
     W = np.asarray(moments, dtype=float)
+    # Условие согласованности §13.6-A: модель и моменты — из одного block_model
+    # (одни термы) ⇒ число столбцов C обязано совпасть с размером W.
     if W.shape != (p, p):
         raise ValueError(f"moments must be {p}x{p}, got {W.shape}.")
     if min_total is None:
         min_total = p + int(margin)
     n_existing = 0 if existing is None else int(existing.shape[0])
 
-    E = (_model_matrix(existing, model, terms) if existing is not None
+    E = (mm(existing) if existing is not None
          else np.empty((0, p)))
     eye_p = np.eye(p) * ridge
     M_acc = E.T @ E                     # информация уже зафиксированной части

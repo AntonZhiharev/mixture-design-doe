@@ -1,0 +1,191 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+"""Iteration 12 / §13.7: эволюция схемы + миграция точек (прогрессия 3 стадий).
+
+Прогрессия (как просил архитектурный обзор):
+  Стадия 1 — mixture-only;
+  Стадия 2 — + PROCESS-блок (mixture-process), старые точки мигрируют по политике;
+  Стадия 3 — + новый PARAMETER (process-переменная) + новый ОТКЛИК (target),
+             старые точки: unknown → отбрасываются, known-constant → переиспользуются,
+             новый отклик → Y[y_new]=MISSING.
+
+Проверяем канон §13.7: версионирование, явные политики (никаких молчаливых 0/средних),
+асимметрия «новый ЧЛЕН из старых переменных (бесплатно) vs новая ПЕРЕМЕННАЯ (политика)».
+"""
+import numpy as np
+import pytest
+
+from src.core.schema import (MIXTURE, PROCESS, MISSING, is_missing,
+                             VariableBlock, ModelSpec, ResponseSpec,
+                             ProjectSchema, DataPoint)
+from src.core.schema_evolution import (
+    SchemaHistory, evolve_schema, migrate_point, select_fixed_rows,
+    known_constant, unknown, recompute)
+from src.design.block_model import build_model_terms
+from src.design.augmented import augmented_design
+
+
+# ----------------------------------------------------------------------
+# Фикстуры прогрессии
+# ----------------------------------------------------------------------
+def _stage1():
+    return ProjectSchema.mixture_only(
+        ["A", "B", "C"], responses=[ResponseSpec("y1", "max")])
+
+
+def _v1_points(s1, n=6):
+    rng = np.random.default_rng(0)
+    pts = []
+    for _ in range(n):
+        x = rng.dirichlet(np.ones(3))
+        pts.append(DataPoint(schema_version=s1.version,
+                             X={MIXTURE: list(x)}, Y={"y1": float(rng.random())}))
+    return pts
+
+
+# ----------------------------------------------------------------------
+# evolve_schema — версии, рост блока/модели
+# ----------------------------------------------------------------------
+def test_evolve_bumps_version_and_grows_process():
+    s1 = _stage1()
+    s2 = evolve_schema(s1, add_process=[("T", 100, 200), ("t", 10, 20)],
+                       migration={"T": known_constant(150), "t": known_constant(15)})
+    assert s2.version == 2
+    assert s2.process_names == ("T", "t")
+    assert build_model_terms(s1).p == 6           # mixture quad
+    assert build_model_terms(s2).p == 11          # + process quad(5), cross-main main=∅ → 0
+    s3 = evolve_schema(s2, add_process=[("pH", 3, 9)],
+                       add_responses=[ResponseSpec("y2", "max")],
+                       migration={"pH": unknown()})
+    assert s3.version == 3
+    assert s3.process_names == ("T", "t", "pH")
+    assert s3.response_names == ("y1", "y2")
+    assert build_model_terms(s3).p == 15          # mixture 6 + process quad(d=3 → 9)
+
+
+def test_schema_history_immutable():
+    s1 = _stage1()
+    h = SchemaHistory.start(s1)
+    s2 = h.add(evolve_schema(s1, add_process=[("T", 100, 200), ("t", 10, 20)]))
+    assert h.get(1) is s1 and h.get(2) is s2 and h.latest() is s2
+    with pytest.raises(ValueError):
+        h.add(s1)                                  # повторная версия запрещена
+
+
+# ----------------------------------------------------------------------
+# Стадия 1 → 2: миграция known-constant
+# ----------------------------------------------------------------------
+def test_stage2_migrate_known_constant():
+    s1 = _stage1()
+    s2 = evolve_schema(s1, add_process=[("T", 100, 200), ("t", 10, 20)],
+                       migration={"T": known_constant(150), "t": known_constant(15)})
+    hist = SchemaHistory.start(s1)
+    hist.add(s2)
+    pts = _v1_points(s1)
+    used, skipped = select_fixed_rows(pts, s2, hist)
+    assert len(used) == len(pts) and skipped == []
+    mp = used[0]
+    assert mp.schema_version == 2 and mp.fixed_in_augment
+    assert np.allclose(mp.X[PROCESS], [0.5, 0.5])   # (150-100)/100, (15-10)/10
+    assert mp.X[MIXTURE] == pts[0].X[MIXTURE]       # рецепт сохранён
+    assert mp.Y["y1"] == pts[0].Y["y1"]             # измеренный отклик сохранён
+    mp.validate(s2)                                  # Σx=1 на mixture, z∈[0,1]
+
+
+# ----------------------------------------------------------------------
+# Стадия 2 → 3: новый параметр (unknown→drop / known→reuse) + новый отклик→MISSING
+# ----------------------------------------------------------------------
+def _stage2_points(s1, s2, hist):
+    used, _ = select_fixed_rows(_v1_points(s1), s2, hist)
+    return used
+
+
+def test_stage3_unknown_parameter_drops_points():
+    s1 = _stage1()
+    s2 = evolve_schema(s1, add_process=[("T", 100, 200), ("t", 10, 20)],
+                       migration={"T": known_constant(150), "t": known_constant(15)})
+    hist = SchemaHistory.start(s1); hist.add(s2)
+    v2 = _stage2_points(s1, s2, hist)
+    s3 = evolve_schema(s2, add_process=[("pH", 3, 9)],
+                       add_responses=[ResponseSpec("y2", "max")],
+                       migration={"pH": unknown()})
+    hist.add(s3)
+    used, skipped = select_fixed_rows(v2, s3, hist)
+    assert used == [] and len(skipped) == len(v2)   # unknown → не в fixed
+
+
+def test_stage3_known_parameter_reuses_and_new_response_missing():
+    s1 = _stage1()
+    s2 = evolve_schema(s1, add_process=[("T", 100, 200), ("t", 10, 20)],
+                       migration={"T": known_constant(150), "t": known_constant(15)})
+    hist = SchemaHistory.start(s1); hist.add(s2)
+    v2 = _stage2_points(s1, s2, hist)
+    s3 = evolve_schema(s2, add_process=[("pH", 3, 9)],
+                       add_responses=[ResponseSpec("y2", "max")],
+                       migration={"pH": known_constant(6.0)})
+    hist.add(s3)
+    used, skipped = select_fixed_rows(v2, s3, hist)
+    assert len(used) == len(v2) and skipped == []
+    mp = used[0]
+    assert np.allclose(mp.X[PROCESS], [0.5, 0.5, 0.5])   # pH: (6-3)/(9-3)=0.5
+    assert mp.Y["y1"] == v2[0].Y["y1"]                   # старый отклик сохранён
+    assert is_missing(mp.Y["y2"])                        # новый отклик → MISSING (не 0!)
+    mp.validate(s3)
+
+
+def test_recompute_policy():
+    s1 = _stage1()
+    s2 = evolve_schema(s1, add_process=[("T", 0, 10)],
+                       migration={"T": recompute("from_first")})
+    hist = SchemaHistory.start(s1); hist.add(s2)
+    pts = _v1_points(s1, n=2)
+    # recompute: код берём как первая mixture-доля (демонстрация вычислимости из X)
+    fns = {"from_first": lambda pt: pt.X[MIXTURE][0]}
+    used, skipped = select_fixed_rows(pts, s2, hist, recompute_fns=fns)
+    assert len(used) == 2 and skipped == []
+    assert np.isclose(used[0].X[PROCESS][0], pts[0].X[MIXTURE][0])
+
+
+# ----------------------------------------------------------------------
+# Асимметрия §13.7: новый ЧЛЕН из старых переменных → миграция НЕ нужна
+# ----------------------------------------------------------------------
+def test_model_only_evolution_reuses_points_free():
+    s1 = _stage1()
+    s2 = evolve_schema(s1, add_process=[("T", 100, 200), ("t", 10, 20)],
+                       migration={"T": known_constant(150), "t": known_constant(15)})
+    hist = SchemaHistory.start(s1); hist.add(s2)
+    v2 = _stage2_points(s1, s2, hist)
+    # эволюция ТОЛЬКО модели (full-cross): новые ЧЛЕНЫ из тех же x,z — не переменные
+    s2b = evolve_schema(s2, model=ModelSpec(cross_level="full-cross",
+                                            main_components=()))
+    hist.add(s2b)
+    used, skipped = select_fixed_rows(v2, s2b, hist)
+    assert len(used) == len(v2) and skipped == []         # переиспользуются бесплатно
+    assert np.allclose(used[0].X[PROCESS], v2[0].X[PROCESS])
+    assert build_model_terms(s2b).p > build_model_terms(s2).p   # модель выросла
+
+
+# ----------------------------------------------------------------------
+# Связка с §13.6: добор поверх мигрированных точек (общий механизм)
+# ----------------------------------------------------------------------
+def test_augmented_design_on_migrated_points():
+    s1 = _stage1()
+    s2 = evolve_schema(s1, add_process=[("T", 100, 200), ("t", 10, 20)],
+                       migration={"T": known_constant(150), "t": known_constant(15)})
+    hist = SchemaHistory.start(s1); hist.add(s2)
+    v2 = _stage2_points(s1, s2, hist)
+    res, used, skipped = augmented_design(
+        s2, v2, n_max=6, margin=4, n_random=80, n_mc=1500, seed=1)
+    assert len(used) == len(v2) and skipped == []
+    assert res.p == build_model_terms(s2).p
+    if len(res.new_points):
+        assert np.allclose(res.new_points[:, :3].sum(axis=1), 1.0)   # mixture
+        assert np.all(res.new_points[:, 3:] >= -1e-9)
+        assert np.all(res.new_points[:, 3:] <= 1.0 + 1e-9)

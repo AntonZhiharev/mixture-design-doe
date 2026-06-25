@@ -261,6 +261,9 @@ class ProjectSchema:
     blocks: Tuple[VariableBlock, ...]
     responses: Tuple[ResponseSpec, ...] = ()
     model: ModelSpec = field(default_factory=ModelSpec)
+    # §13.7: политика миграции на ИМЯ переменной → {"policy": ..., "value": ...}.
+    # JSON-native (known-constant/unknown/recompute), сериализуема, без классов.
+    migration: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
@@ -322,6 +325,7 @@ class ProjectSchema:
             "blocks": [b.to_dict() for b in self.blocks],
             "responses": [r.to_dict() for r in self.responses],
             "model": self.model.to_dict(),
+            "migration": {k: dict(v) for k, v in self.migration.items()},
         }
 
     @classmethod
@@ -331,6 +335,7 @@ class ProjectSchema:
             blocks=tuple(VariableBlock.from_dict(b) for b in d.get("blocks", [])),
             responses=tuple(ResponseSpec.from_dict(r) for r in d.get("responses", [])),
             model=ModelSpec.from_dict(d.get("model", {})),
+            migration={k: dict(v) for k, v in d.get("migration", {}).items()},
         )
 
     # -- удобные конструкторы (частные случаи общего механизма) --------

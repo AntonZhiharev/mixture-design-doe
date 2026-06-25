@@ -861,7 +861,7 @@ def select_fixed_rows(points, target_schema) -> list[DataPoint]:
 **Фундамент (общий для §13 и §14) — строить ПЕРВЫМ**
 - [x] Точка = составной объект `{X: {block: [...]}, Y: {resp: val|MISSING}}` + `schema_version` + `origin_tag`. **Не плоский массив.** *(schema.DataPoint)*
 - [x] `MISSING` — явный сентинел, допустим **только в `Y`**, не в `X`. *(DataPoint.validate)*
-- [~] Схема версионируется: `schema_history` неизменяема, точки разных версий сосуществуют. *(version/schema_version/with_changes есть; контейнер `schema_history` ещё не реализован)*
+- [x] Схема версионируется: `schema_history` неизменяема, точки разных версий сосуществуют. *(schema_evolution.SchemaHistory + evolve_schema)*
 - [x] Запрет «оба блока пустые»; ≤1 MIXTURE, ≤1 PROCESS. *(ProjectSchema.__post_init__)*
 - [ ] `config_snapshot`: seeds, гиперпараметры, версии — воспроизводимость.
 
@@ -876,10 +876,10 @@ def select_fixed_rows(points, target_schema) -> list[DataPoint]:
 - [x] M по произведению области (симплекс × норм. куб); кросс-моменты = произведение интегралов. *(block_moments.block_moment_matrix)*
 
 **Schema Evolution + Augmented Design (§14)**
-- [ ] Политики `known-constant` / `unknown→MISSING` / `recompute` — явные, в логе.
-- [~] **Никаких молчаливых 0/средних** в X или Y. *(select_fixed_rows ничего не подставляет — непригодные точки исключаются; явные политики ещё не введены)*
-- [ ] Новый отклик → старые точки `Y[y_new]=MISSING`, суррогат учится только на измеренных.
-- [~] `select_fixed_rows` отбирает валидные старые точки для целевой модели. *(augmented.select_fixed_rows: годна точка с координатами всех целевых блоков; резолв по версии + политики миграции — не реализованы)*
+- [x] Политики `known-constant` / `unknown→MISSING` / `recompute` — явные, в логе. *(schema_evolution; решение — в origin_tag.migrated_from)*
+- [x] **Никаких молчаливых 0/средних** в X или Y. *(migrate_point: unknown→точка исключается; новый отклик→MISSING)*
+- [x] Новый отклик → старые точки `Y[y_new]=MISSING`, суррогат учится только на измеренных. *(migrate_point)*
+- [x] `select_fixed_rows` отбирает валидные старые точки для целевой модели. *(schema_evolution.select_fixed_rows: резолв старой схемы по версии + политики; augmented.* — частный случай без истории)*
 - [x] Coordinate-exchange учитывает X_fixedᵀ·X_fixed как стартовую инфо-матрицу (не ноль). *(i_optimal_augment_sequential: M_acc=EᵀE)*
 - [x] Старые fixed-точки **не двигаются**, добираются только новые. *(forward-selection по пулу)*
 - [x] `schema_diff_vars` различает новые ПЕРЕМЕННЫЕ vs новые ЧЛЕНЫ из старых переменных. *(schema.schema_diff_vars)*
@@ -890,7 +890,7 @@ def select_fixed_rows(points, target_schema) -> list[DataPoint]:
 **Регресс (доказательство сохранности базы)**
 - [~] **mixture-only бит-в-бит** со старым golden (дизайн по I/det ±1%, Scheffé atol 1e-8, GP μ/σ atol 1e-6). *(model_matrix==scheffe и W==region_moment_matrix бит-в-бит; полный GP μ/σ golden не прогонялся)*
 - [x] **augment без смены схемы** == старое поведение §5.5: инъекция `model_matrix_fn` для mixture-only бит-в-бит совпала с legacy Scheffé-путём (indices/i_history/stop_reason). *(test_iteration12_augment)*
-- [ ] golden-группа A (значение I vs R) проходит на mixture, process, mixture-process.
+- [x] golden-группа A (значение I vs R) проходит на mixture, process, mixture-process. *(аналитические моменты vs независимый эталон, atol 1e-8; test_golden_product_moments)*
 
 > **Топ-3 «протекающих» места этой итерации:**
 > 1. **Формат точки** — составной версионированный объект. Если плоский массив — обе фичи сломаются при первом расширении схемы.
@@ -913,13 +913,14 @@ def select_fixed_rows(points, target_schema) -> list[DataPoint]:
 - §13.3/§13.4: единый генератор термов (`design/block_model.py`) + поблочная геометрия (`core/block_geometry.py`).
 - §13.5: моменты на произведении области + `i_value` (`design/block_moments.py`); mixture-only `W` бит-в-бит == `i_optimal.region_moment_matrix`.
 - §13.6: блочный добор (`design/augmented.py`) переиспользует критерий §5.5 через неинвазивную инъекцию `model_matrix_fn` в `i_optimal_augment_sequential` (дефолт=None ⇒ mixture-only Scheffé бит-в-бит).
+- §13.5/golden-A: аналитические моменты `analytic_moment_matrix` (закрытая форма) vs независимый эталон `reference.ref_product_moment_matrix` (atol 1e-8) на mixture/process/mixture-process; `i_value`==`ref_i_criterion` (`tests/golden/test_golden_product_moments.py`, коммит `ee39ab1`).
+- §13.7 schema-evolution: `core/schema_evolution.py` (SchemaHistory + evolve_schema + migrate_point + select_fixed_rows; политики known-constant/unknown/recompute; новый отклик→MISSING) + поле `ProjectSchema.migration`; прогрессия mixture→mixture+process→+параметр+отклик под тестом (`test_iteration12_evolution.py`).
 
-**Остаток (порядок: спека → сверка чек-листа → golden-R → код):**
-1. **Golden-группа A** (§13.5, шаг 3 §13.10): значение I против R 4.6.0 на mixture / process / mixture-process, atol 1e-8 (R-эталоны генерируются офлайн, кладутся в `tests/golden/`). **Гейт фундамента.**
-2. **Schema evolution (§13.7) — полный контракт:** `schema_history` (неизменяемый реестр версий) + `evolve_schema(old, …)→new(version+1)`; `MigrationPolicy` (`known-constant(v)` / `unknown` / `recompute(fn)`) + поле `migration` в схеме; `resolve_added_vars`; апгрейд `select_fixed_rows` до резолва старой схемы по версии и применения политик (обратносовместимо: без `schema_history`/`migration` — текущий частный случай); лог решений миграции.
-3. **Y-сторона:** при добавлении отклика `Y[y_new]=MISSING` у старых точек; суррогат M6 учится только на измеренных.
-4. **`config_snapshot`** (§13.1): seeds/гиперпараметры/версии + `code↔real` process-блока — в снимок (воспроизводимость).
-5. **Персистентность:** интеграция версионирования в сохранение проекта — отдельным шагом, чтобы не дестабилизировать текущий `core/state.py` (persistence M1–M8).
+**Остаток:**
+1. **`config_snapshot`** (§13.1): seeds/гиперпараметры/версии + `code↔real` process-блока — в снимок (воспроизводимость).
+2. **Персистентность:** интеграция версионирования (`schema_history`/points) в сохранение проекта — отдельным шагом, чтобы не дестабилизировать текущий `core/state.py` (persistence M1–M8).
+3. **Полный GP-golden μ/σ** для mixture-process (сейчас регресс mixture-only — через бит-в-бит инъекцию и моменты, но не через GP-постериор на составных координатах).
+4. **Неравномерность `SimplexRegion.random_points`** (найдено golden-A): MC-моменты (`block_moment_matrix`) и существующий M5 `region_moment_matrix` НЕ равны равномерному интегралу §13.5 (сэмплер стянут к центроиду). Рекомендация: брать `W` из `analytic_moment_matrix` (корректно + детерминированно + быстро), MC — только для быстрых прикидок.
 
 > **Предсуществующий несвязанный дефект:** `tests/unit/test_iteration11_metrics_cache.py::test_metrics_survive_save_load_without_results` падает и без правок итерации 12 (доказано `git stash`) — конфликт теста с фичей регидрации результатов (коммит `acdbc7f`). К §13/§14 не относится.
 

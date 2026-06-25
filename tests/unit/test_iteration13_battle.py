@@ -131,6 +131,30 @@ def test_battle_branches_converge_to_analytic_optimum():
                                 n_candidates=600)
     d3 = {bid: runner.branches[bid].d_best for bid in goals}
 
+    # --- сводка результата (видно при `pytest -s`) ---
+    seed_n = runner.origin_counts().get("seed", 0)
+    print("\n=== БОЕВОЙ ТЕСТ: ветки vs аналитический оптимум ===")
+    print(f"общий стартовый план (seed): {seed_n} опытов — используется ВСЕМИ ветками")
+    print(f"{'ветка':<9}|{'опытов':>7}|{'d_best ф1/ф2/ф3':>22}|"
+          f"{'d_opt':>7}|{'gap%':>6}|{'||x-x*||':>9}")
+    for bid in goals:
+        d_opt = opt[bid]["d"]
+        xb = np.asarray(runner.branches[bid].x_best, float)
+        xo = np.asarray(opt[bid]["x"], float)
+        dist = float(np.linalg.norm(xb - xo))
+        gap = 100.0 * (1.0 - d3[bid] / d_opt) if d_opt > 0 else 0.0
+        prog = f"{d1[bid]:.2f}/{d2[bid]:.2f}/{d3[bid]:.2f}"
+        print(f"{bid:<9}|{runner.branches[bid].spent:>7}|{prog:>22}|"
+              f"{d_opt:>7.3f}|{gap:>6.1f}|{dist:>9.3f}")
+    total = seed_n + sum(runner.branches[bid].spent for bid in goals)
+    print(f"всего измерений в общей базе: {total}  "
+          f"(seed {seed_n} + ветки {total - seed_n})")
+    print("рецепты (доли A,B,C + код T,P), pipeline x* vs аналитика x*:")
+    for bid in goals:
+        xb = np.round(np.asarray(runner.branches[bid].x_best, float), 3)
+        xo = np.round(np.asarray(opt[bid]["x"], float), 3)
+        print(f"  {bid:<9} pipeline={xb.tolist()}  analytic={xo.tolist()}")
+
     # ---- проверки ----
     n_strict = 0
     for bid in goals:

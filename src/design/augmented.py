@@ -25,8 +25,29 @@ import numpy as np
 from ..core import block_geometry as bg
 from ..core.schema import DataPoint, ProjectSchema, composite_coords
 from .block_model import ModelTerms, build_model_terms, model_matrix
-from .block_moments import block_moment_matrix
+from .block_moments import analytic_moment_matrix, block_moment_matrix
 from .i_optimal import IAugmentResult, i_optimal_augment_sequential
+
+
+def build_moments(schema: ProjectSchema, *, terms: Optional[ModelTerms] = None,
+                  method: str = "analytic", n_mc: int = 5000,
+                  seed: Optional[int] = None) -> np.ndarray:
+    """Матрица моментов ``W = E_D[f fᵀ]`` на произведении области (§13.5).
+
+    * ``method="analytic"`` (дефолт) — закрытая форма на СТАНДАРТНОМ симплексе ×
+      ``[0,1]^d`` (``block_moments.analytic_moment_matrix``): детерминированно, без
+      MC-смещения сэмплера (§13.11), границы ``L/U`` mixture НЕ учитываются (область
+      интереса = компонентный симплекс, §13.5).
+    * ``method="mc"`` — Monte-Carlo по ДОПУСТИМОЙ области (``block_moment_matrix``):
+      для быстрых прикидок; сэмплер неравномерен (стянут к центроиду).
+    """
+    mt = terms if terms is not None else build_model_terms(schema)
+    if method == "analytic":
+        return analytic_moment_matrix(schema, terms=mt)
+    if method == "mc":
+        return block_moment_matrix(schema, n_mc=n_mc, seed=seed, terms=mt)
+    raise ValueError(
+        f"Unknown moment_method '{method}'. Use 'analytic' or 'mc'.")
 
 
 def select_fixed_rows(points: Sequence[DataPoint], target_schema: ProjectSchema
@@ -53,7 +74,7 @@ def select_fixed_rows(points: Sequence[DataPoint], target_schema: ProjectSchema
 
 def augmented_design(
         target_schema: ProjectSchema, existing_points: Sequence[DataPoint], *,
-        terms: Optional[ModelTerms] = None,
+        terms: Optional[ModelTerms] = None, moment_method: str = "analytic",
         n_max: int = 50, margin: int = 12, min_total: Optional[int] = None,
         rel_tol: float = 0.03, n_random: int = 500, n_mc: int = 5000,
         ridge: float = 1e-8, seed: Optional[int] = None
@@ -63,11 +84,17 @@ def augmented_design(
     pool и W строит блочный слой (§13.4/§13.5); M5 только копит ``EᵀE`` и отбирает
     по §5.5. Различие mixture-only / process-only / mixture-process живёт в наборе
     блоков схемы, а не в ветке кода. Возвращает ``(IAugmentResult, used, skipped)``.
+
+    ``moment_method`` (§13.11): ``"analytic"`` (дефолт) — детерминированные моменты
+    на СТАНДАРТНОМ симплексе × ``[0,1]^d`` (границы ``L/U`` mixture не учитываются,
+    область интереса = компонентный симплекс, §13.5); ``"mc"`` — Monte-Carlo по
+    допустимой области (``n_mc``/``seed``; для быстрых прикидок, сэмплер смещён).
     """
     mt = terms if terms is not None else build_model_terms(target_schema)
     fixed, used, skipped = select_fixed_rows(existing_points, target_schema)
     pool = bg.build_candidate_pool(target_schema, n_random=n_random, seed=seed)
-    W = block_moment_matrix(target_schema, n_mc=n_mc, seed=seed, terms=mt)
+    W = build_moments(target_schema, terms=mt, method=moment_method,
+                      n_mc=n_mc, seed=seed)
 
     def mm(X: np.ndarray) -> np.ndarray:
         return model_matrix(target_schema, X, terms=mt)

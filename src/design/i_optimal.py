@@ -17,11 +17,13 @@ R reference: ``AlgDesign::optFederov(criterion="I")``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Union
+from math import factorial
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from ..core.linalg import scheffe_matrix, scheffe_matrix_terms
+from ..core.linalg import (scheffe_matrix, scheffe_matrix_terms,
+                           scheffe_term_indices)
 from ..core.simplex import SimplexRegion
 
 
@@ -52,19 +54,68 @@ class IOptimalResult:
         }
 
 
+def _simplex_term_moments(terms: Sequence[Tuple[int, ...]], q: int) -> np.ndarray:
+    """Аналитические моменты ``E[f_r f_s]`` на СТАНДАРТНОМ симплексе ``S^{q-1}``.
+
+    ``terms`` — Scheffé-термы (кортежи индексов компонентов; ``q_eff``-редукция
+    допустима). Закрытая форма (Дирихле(1,…,1), §13.5)::
+
+        E[∏ x_i^{a_i}] = (q-1)!·∏ a_i! / (q-1+Σa)! ,
+
+    где ``a_i`` — суммарная степень компонента ``i`` в произведении термов ``r,s``.
+    Та же формула, что в ``block_moments.analytic_moment_matrix`` ⇒ детерминированно
+    (без MC-смещения ``SimplexRegion.random_points``, §13.11) и совпадает бит-в-бит
+    с блочной аналитикой для mixture-only. ``q`` — ПОЛНОЕ число компонентов (симплекс
+    интегрируется по всем ``q``, неактивные компоненты остаются свободными).
+    """
+    expo = []
+    for t in terms:
+        a = [0] * q
+        for i in t:
+            a[i] += 1
+        expo.append(a)
+    p = len(expo)
+    M = np.empty((p, p))
+    fq = factorial(q - 1)
+    for r in range(p):
+        for s in range(p):
+            a = [expo[r][i] + expo[s][i] for i in range(q)]
+            num = fq
+            for ai in a:
+                num *= factorial(ai)
+            M[r, s] = num / factorial(q - 1 + sum(a))
+    return M
+
+
 def region_moment_matrix(region: SimplexRegion, model: Union[str, int],
                          n_mc: int = 5000, seed: Optional[int] = None,
-                         terms: Optional[List] = None) -> np.ndarray:
-    """Monte-Carlo estimate of W = E[f(x) f(x)ᵀ] over the feasible region.
+                         terms: Optional[List] = None,
+                         method: str = "mc") -> np.ndarray:
+    """Региональная матрица моментов ``W = E[f(x) f(x)ᵀ]``.
 
-    Sampling is done over the FEASIBLE (constrained) region via
-    ``region.random_points`` — i.e. with ``L_i, U_i`` honoured, not the full
-    simplex (FinalCheckList §5.5.2). If ``terms`` is given, W is built on the
-    q_eff-reduced model basis (see :func:`scheffe_active_terms`).
+    ``method``:
+
+    * ``"mc"`` (по умолчанию) — Monte-Carlo по ДОПУСТИМОЙ (ограниченной) области
+      через ``region.random_points`` (границы ``L_i, U_i`` учитываются, §5.5.2).
+      ВНИМАНИЕ: сэмплер неравномерен (стянут к центроиду, §13.11) — годится для
+      быстрых прикидок, но не равен равномерному интегралу.
+    * ``"analytic"`` — закрытая форма на СТАНДАРТНОМ симплексе (§13.5): границы
+      ``L/U`` НЕ учитываются (область интереса = компонентный симплекс),
+      детерминированно и точно. Совпадает с ``block_moments.analytic_moment_matrix``
+      для mixture-only.
+
+    Если ``terms`` задан, ``W`` строится на ``q_eff``-редуцированном базисе
+    (см. :func:`scheffe_active_terms`).
     """
-    pts = region.random_points(n_mc, seed=seed)
-    F = _model_matrix(pts, model, terms)
-    return (F.T @ F) / F.shape[0]
+    if method == "analytic":
+        tlist = (list(terms) if terms is not None
+                 else scheffe_term_indices(region.q, model))
+        return _simplex_term_moments(tlist, region.q)
+    if method == "mc":
+        pts = region.random_points(n_mc, seed=seed)
+        F = _model_matrix(pts, model, terms)
+        return (F.T @ F) / F.shape[0]
+    raise ValueError(f"Unknown method '{method}'. Use 'mc' or 'analytic'.")
 
 
 

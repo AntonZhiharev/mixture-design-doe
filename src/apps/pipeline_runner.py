@@ -624,10 +624,11 @@ class PipelineRunner:
                                     seed=self.cfg.seed)
         if existing is not None:
             pool = self._exclude_points(pool, existing)
-        _pg("Матрица моментов области (Монте-Карло)", 0.2)
-        # 5.5.2: моменты по ОГРАНИЧЕННОЙ области, на q_eff-редуцированном базисе
-        W = region_moment_matrix(self.region, self.cfg.model, n_mc=6000,
-                                 seed=self.cfg.seed, terms=terms)
+        _pg("Матрица моментов области (аналитически)", 0.2)
+        # 5.5.2: моменты на СТАНДАРТНОМ симплексе (аналитически, §13.5/§13.11) —
+        # детерминированно, без MC-смещения сэмплера; на q_eff-редуцированном базисе
+        W = region_moment_matrix(self.region, self.cfg.model,
+                                 terms=terms, method="analytic")
 
         min_total = p_quad + self.M5_MARGIN
         # бюджет N_max: жёсткий потолок добора (5.5.3); override n_add отключает

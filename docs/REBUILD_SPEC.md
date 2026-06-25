@@ -1,7 +1,7 @@
 # 🔧 REBUILD SPEC — MoE/GP Pipeline для Mixture DOE (ПВХ)
 
 > Итоговое самодостаточное ТЗ для глобальной пересборки приложения.
-> Версия 1.5 (синхронизирована с текущей сборкой: реализованы M1–M8, итерации 1–6; **M9 (PipelineTrace + MCP `doe-introspect`)** — §11, итерация 7; **golden-тесты против R 4.6.0** — §6; реализовано **Streamlit-приложение pipeline M1–M8 + чекпоинты** (итерация 8); см. §8).
+> Версия 1.6 (синхронизирована с текущей сборкой: реализованы M1–M8, итерации 1–6; **M9 (PipelineTrace + MCP `doe-introspect`)** — §11, итерация 7; **golden-тесты против R 4.6.0** — §6; реализовано **Streamlit-приложение pipeline M1–M8 + чекпоинты** (итерация 8); см. §8. **§13–14 (Mixture-Process + Schema Evolution + Augmented Design)** — спроектировано, в реализации).
 
 
 
@@ -536,6 +536,371 @@ active learning** над общей моделью. *(Детализация —
 - **3b** M3 per-property screening + M6 суррогат на каждое свойство.
 - **3c** модель ветки + branch active learning (acquisition по desirability) + M8-рецепт ветки; персист веток.
 - **3d** UI: конфиг свойств, M2 с несколькими `y`, менеджер веток (создать целевые наборы → запустить → сравнить рецепты).
+
+---
+
+## 13–14. Mixture-Process + Sequential Augmented Design (объединённая итерация)
+
+> §13 (Mixture-Process) и §14 (Schema Evolution + Augmented Design) сведены в
+> **один реализуемый контракт**: обе фичи пересекаются в одной точке — требуют,
+> чтобы **точка плана была составным версионированным объектом, а генератор
+> дизайна — поблочным с поддержкой fixed-строк**. Это общий фундамент, на котором
+> стоят обе фичи; реализовывать по отдельности нельзя — будет два несовместимых
+> формата точки.
+
+**Зачем.** До сих пор пространство планирования = симплекс рецепта (Σx=1). Реальные
+задачи почти всегда содержат **процессные параметры** (температура, время, давление,
+скорость, pH…), не связанные массовым ограничением. Обобщение пространства до
+**произведения симплекса и гиперкуба** превращает узкий рецептурный инструмент в
+общий **mixture-process DoE-движок**. Граничные случаи покрываются тем же механизмом:
+
+| Режим | mixture-блок | process-блок | Эквивалент |
+|---|---|---|---|
+| **Mixture-only** (текущий) | есть | нет | Scheffé / симплекс-дизайн |
+| **Mixture-process** (целевой) | есть | есть | mixture×process designs |
+| **Process-only** («жёсткий») | нет | есть | классический RSM / факторный дизайн на кубе |
+
+> **Инвариант.** mixture-only и process-only — **частные случаи** общего поблочного
+> механизма, а НЕ отдельные ветки кода. Если появилось `if process_only: …` на
+> уровне алгоритмов дизайна/модели — это ошибка архитектуры. Различие живёт только
+> в **наборе блоков** и их правилах.
+
+### 13.0 Главный объединяющий инвариант
+
+```
+ЕДИНЫЙ ФУНДАМЕНТ:
+  • Точка = составной объект {blocks: X, responses: Y} + schema_version + origin_tag
+  • Генератор дизайна = поблочный (mixture/process) + поддержка FIXED-строк
+  • Критерий остановки = §5.5 (ΔI/I), I на ТЕКУЩЕЙ модели и ТЕКУЩЕМ объединённом дизайне
+
+Mixture-Process = «какие блоки есть в схеме»
+Augmented design = «как добрать точки к уже собранным при той же/новой схеме»
+```
+
+### 13.1 Структуры данных (фундамент обеих фич)
+
+```python
+# ---- Схема (версионируется) ----
+class VariableBlock:
+    kind: Literal["MIXTURE", "PROCESS"]
+    names: list[str]
+    # MIXTURE: L_i, U_i покомпонентные (опц.), constraint = simplex
+    # PROCESS: (L_j, U_j) на фактор, constraint = box; + code<->real
+    bounds: dict[str, tuple[float, float]]
+
+class ResponseSpec:
+    name: str
+    kind: Literal["max", "min", "target"]
+    target: float | None
+    weight: float
+
+class ModelSpec:
+    cross_level: Literal["additive", "cross-main", "full-cross"]  # дефолт cross-main
+    process_order: Literal["linear", "quadratic"]                 # дефолт quadratic
+
+class ProjectSchema:
+    version: int
+    blocks: list[VariableBlock]        # 0..1 MIXTURE, 0..1 PROCESS (оба пустых запрещены)
+    responses: list[ResponseSpec]
+    model: ModelSpec
+
+# ---- Точка (составная, версионированная) ----
+MISSING = object()  # явный сентинел, НЕ None, НЕ 0.0
+
+class DataPoint:
+    schema_version: int                       # в какой схеме собрана
+    X: dict[str, list[float]]                 # {"MIXTURE": [...], "PROCESS": [...]}  (PROCESS — в коде [0,1])
+    Y: dict[str, float | MISSING]             # MISSING допустим ПОКОЛОНОЧНО
+    origin_tag: dict                          # branch_id, stage, schema_version
+    fixed_in_augment: bool = False            # пометка при использовании как опорной
+
+# ---- Состояние проекта ----
+class ProjectState:
+    schema_history: list[ProjectSchema]       # все версии, неизменяемые
+    current_schema_version: int
+    points: list[DataPoint]                   # точки разных версий сосуществуют
+    surrogates: dict[str, GPModel]            # per-response, на ОБЪЕДИНЁННОЙ базе
+    branches: list[Branch]
+    config_snapshot: dict                     # seeds, гиперпараметры, версии
+```
+
+**Инварианты структуры (assert при сборке точки):**
+- `MISSING` допустим **только в `Y`**, не в `X` (missing-in-inputs — out of scope).
+- `X["PROCESS"]` хранится **в коде [0,1]**; физические единицы — через `code↔real` блока.
+- сумма `=1` проверяется **только** для `X["MIXTURE"]`; если mixture-блока нет — проверки нет.
+- каждая точка ссылается на **существующую** версию в `schema_history`.
+
+### 13.2 Нормировка process-переменных (обязательно)
+
+> Симплекс уже в [0,1] по природе. Process-переменные — нет. Несопоставимость метрик
+> исказит GP-ARD, матрицу моментов I-opt и acquisition.
+
+- Все process-переменные **кодируются в [0,1]** (единый стандарт) для **всех
+  внутренних расчётов**: генерация дизайна, GP-ядро, моменты, EI/desirability.
+- Исходные физические единицы — **только** в UI, рецепте и `Y`-сборе.
+- Преобразование `code ↔ real` — единая функция на блок, обратимая, в `config_snapshot`.
+
+### 13.3 Модель отклика — генератор термов (вход дизайна!)
+
+Полная форма (mixture-process):
+
+η = Σ β_i x_i + Σ β_ij x_i x_j   (Scheffé, mixture)
+  + Σ γ_k z_k + Σ γ_kl z_k z_l   (process, RSM)
+  + Σ δ_ik x_i z_k               (кросс mixture×process)
+
+```python
+def build_model_terms(schema: ProjectSchema) -> ModelTerms:
+    """
+    Единый генератор для ВСЕХ режимов. Никаких if mode==...
+    Режим определяется НАЛИЧИЕМ блоков, не флагом.
+    """
+    mix = get_block(schema, "MIXTURE")     # может быть None  → process-only
+    proc = get_block(schema, "PROCESS")    # может быть None  → mixture-only
+    terms = []
+
+    if mix:
+        terms += scheffe_linear(mix)                    # Σ β_i x_i
+        terms += scheffe_quadratic(mix)                 # Σ β_ij x_i x_j (без intercept!)
+    if proc:
+        terms += process_linear(proc)                   # Σ γ_k z_k
+        if schema.model.process_order == "quadratic":
+            terms += process_quadratic(proc)            # γ_kk z_k^2, γ_kl z_k z_l
+        if not mix:
+            terms += [INTERCEPT]                        # process-only → нужен intercept
+    if mix and proc:
+        terms += cross_terms(mix, proc, schema.model.cross_level)  # δ_ik x_i z_k
+    return ModelTerms(terms)
+```
+
+Уровни модели (конфиг, по убыванию числа параметров):
+
+| Уровень | Mixture | Process | Кросс | Когда |
+|---|---|---|---|---|
+| `additive` | Scheffé | linear/quad | нет | две почти независимые задачи (редко) |
+| `cross-main` *(дефолт)* | Scheffé | linear/quad | x_i z_k только для **главных** компонентов (после M3) | баланс |
+| `full-cross` | Scheffé | quad | все x_i z_k | когда точек хватает |
+
+> **Критично (§13.3):** `cross_terms` присутствуют при `cross-main`/`full-cross`.
+> Если их нет — задачи склеены. `cross-main` берёт x_i z_k только для главных
+> компонентов после M3.
+> **Scheffé без intercept** (симплекс уже несёт константу через Σx=1). Process-only —
+> **с** intercept. Это частая ошибка — assert на это.
+> **Дефолт кросс-членов адаптивен по фазе:** до M3-screening главных компонентов нет
+> → `cross-main` на старте M2 падает в `additive`; после M3 включается `cross-main`
+> по реально отобранным главным компонентам; `full-cross` — когда бюджет n покрывает p.
+> `p` **считается и логируется** для выбранного уровня (контроль n vs p).
+
+### 13.4 Поблочный геометрический слой (основной рефакторинг)
+
+```python
+class BlockGeometry:
+    """Полиморфно по типу блока. Каждый метод применяет правило ТИПА."""
+
+    def project(self, block: VariableBlock, coords):
+        if block.kind == "MIXTURE": return simplex_project(coords, block.bounds)
+        if block.kind == "PROCESS": return box_clip(coords, [0,1])  # в коде всегда [0,1]
+
+    def validate(self, block, coords, eps=1e-9):
+        if block.kind == "MIXTURE":
+            return abs(sum(coords) - 1) < eps and all(c >= -eps for c in coords)
+        if block.kind == "PROCESS":
+            return all(0 - eps <= c <= 1 + eps for c in coords)
+
+    def exchange_step(self, block, coords, rng):
+        if block.kind == "MIXTURE": return cox_direction_step(coords, block.bounds, rng)
+        if block.kind == "PROCESS": return interval_step(coords, [0,1], rng)
+```
+
+> **Правило (§13.4):** симплекс-проекция трогает **только** x; clip — **только** z.
+> Никогда наоборот — самый частый баг при наивной реализации.
+> Все assert Σx=1 работают **только** на mixture-блоке, не на всём векторе.
+
+### 13.5 Моменты и I-критерий (на произведении области)
+
+```python
+def moment_matrix(schema, terms) -> np.ndarray:
+    """M = ∫_D f f^T,  D = simplex × [0,1]^d.  Произведение → факторизуется по блокам."""
+    # mixture-моменты по правильному симплексу (псевдокомпоненты)
+    # process-моменты по нормированному кубу [0,1]^d
+    # кросс-моменты = произведение соответствующих интегралов (независимость блоков!)
+    ...
+
+def i_value(X_model, M, jitter=1e-10):
+    XtX = X_model.T @ X_model + jitter * np.eye(X_model.shape[1])
+    return np.trace(np.linalg.solve(XtX, M))     # tr[(X'X)^{-1} M]
+```
+
+> Сверяется golden-тестом группы A (R-эталон, atol 1e-8). Координаты — псевдокомпоненты
+> для mixture, [0,1] для process. Тот же jitter, что в R.
+
+### 13.6 Sequential Augmented Design (ядро §14, переиспользует §5.5)
+
+```python
+def augmented_design(state: ProjectState,
+                     target_schema: ProjectSchema,
+                     region,
+                     stop_cfg: StopConfig) -> list[DataPoint]:
+    """
+    Добор точек к УЖЕ СОБРАННЫМ под (возможно новую) схему/модель.
+    Старые валидные точки = FIXED (стартовая информационная матрица), НЕ переделываем.
+    """
+    terms = build_model_terms(target_schema)
+    p = len(terms.list)
+
+    fixed = select_fixed_rows(state.points, target_schema)   # см. migration policy §13.7
+    X_fixed = model_matrix(fixed, terms)                     # их вклад в X'X
+
+    M = moment_matrix(target_schema, terms)
+    geom = assemble_point_geometry(target_schema)
+
+    new_rows = []
+    I_prev = i_value(X_fixed, M) if len(fixed) else np.inf
+    while True:
+        cand = coordinate_exchange_one(
+            fixed_info = X_fixed_info(X_fixed, new_rows),     # X'X учитывает fixed+new
+            terms = terms, M = M, geom = geom,
+            n_restarts = stop_cfg.restarts, rng = stop_cfg.rng,
+        )
+        new_rows.append(cand)
+        I_now = i_value(model_matrix(fixed + new_rows, terms), M)
+
+        n_total = len(fixed) + len(new_rows)
+        rel_gain = (I_prev - I_now) / I_prev if I_prev < np.inf else 1.0
+        reason = stop_reason(rel_gain, n_total, p, len(new_rows), stop_cfg)
+        if reason:
+            log_stop(reason, n_total, p, I_now)               # наблюдаемость §5.5
+            break
+        I_prev = I_now
+
+    return [to_datapoint(r, target_schema) for r in new_rows]
+
+
+def stop_reason(rel_gain, n_total, p, n_new, cfg):
+    # §5.5: ОТНОСИТЕЛЬНЫЙ критерий, НЕ абсолютный порог на I.
+    if n_total < p + cfg.margin:        return None            # не хватает на модель
+    if n_new   >= cfg.n_max:            return "budget"
+    if rel_gain < cfg.eps:              return "relative_gain" # ← основной выход
+    return None
+```
+
+> **Связь §5.5 ↔ augmented:** критерий остановки **тот же самый** (ΔI/I<ε, бюджет,
+> n≥p+margin). Меняются только две вещи:
+> 1. I считается на **полной целевой модели** `target_schema` (с новыми кросс/process-членами);
+> 2. стартовая информационная матрица — **не ноль**, а X_fixedᵀ·X_fixed (вклад уже собранных точек).
+> Никакого нового критерия не пишем — переиспользуем `stop_reason`. Если в коде
+> появился второй критерий остановки «для augment» — это дубль, ошибка.
+
+### 13.7 Migration policy — что со старыми точками при смене схемы (§14)
+
+```python
+def select_fixed_rows(points, target_schema) -> list[DataPoint]:
+    """
+    Решает, какие старые точки годятся как FIXED для новой модели.
+    НИКАКИХ молчаливых нулей/средних. Только явные политики.
+    """
+    fixed = []
+    for pt in points:
+        old = get_schema(pt.schema_version)
+        added_vars = schema_diff_vars(old, target_schema)     # новые ПЕРЕМЕННЫЕ (не члены)
+        if not added_vars:
+            fixed.append(pt)                                   # схема не расширялась по X
+            continue
+        resolved = resolve_added_vars(pt, added_vars, target_schema.migration)
+        if resolved is APPLICABLE:
+            fixed.append(with_resolved_vars(pt, added_vars))   # known-constant / recompute
+        # else: точка НЕ годится для членов с новым параметром → не в fixed
+    return fixed
+```
+
+**Политики миграции (явные, на блок/параметр).**
+
+Добавлен параметр z_new:
+
+| Политика | Что делает | Результат для точки |
+|---|---|---|
+| `known-constant(v)` | старые опыты шли при известном фикс. значении | z_new=v, точка **валидна** |
+| `unknown` | значение не записано | точка **не в fixed** для членов с z_new (но годна для старой подмодели) |
+| `recompute(fn)` | вычислимо из существующих X | пересчитать |
+
+Добавлен отклик y_new:
+- старые точки: `Y[y_new] = MISSING` → суррогат y_new учится **только** на точках с
+  измеренным значением (per-response, M6 это уже умеет).
+
+**Запрещено:** подставлять `0.0` / среднее / `None` молча. Только `MISSING` или явная
+политика. Каждое решение — в `schema_history` лог.
+
+> **Асимметрия «новый член из старых переменных» vs «новый параметр».** Когда
+> `target_schema` добавляет лишь **новый член из уже существующих переменных**
+> (например `cross-main` после нового screening подтянул x_3·z_1, где x_3 и z_1 уже
+> были в схеме) — старые fixed-точки дают столбец x_3·z_1 **автоматически** (он
+> вычислим из их x_3 и z_1). То есть расширение **модели** (больше членов из тех же
+> переменных) почти бесплатно переиспользует данные, а расширение **пространства**
+> (новый параметр z) — требует миграционной политики. `schema_diff_vars` обязан
+> различать эти два случая: новые ПЕРЕМЕННЫЕ vs новые ЧЛЕНЫ из старых переменных,
+> чтобы не помечать точку невалидной там, где член просто вычислим.
+
+### 13.8 Влияние на M1–M8 (сводно, обе фичи)
+
+| Модуль | Mixture-Process (§13) | Augmented/Schema (§14) |
+|---|---|---|
+| **M1 геометрия** | произведение блоков; mixture/process-only = частные случаи | — |
+| **M2 D-opt / M5 I-opt** | поблочный exchange, модель §13.3 как вход | **fixed-строки** в exchange (опорная инфо-матрица) |
+| **M3 screening** | ARD на x и z; отбор главных кросс-членов | переучивается на расширенной схеме |
+| **M4 GMM (output)** | без изменений | переучивается при новом y |
+| **M5 / §5.5** | моменты на произведении области | критерий тот же, I на целевой модели + fixed |
+| **M6 per-response GP** | ARD по x и норм. z; mean §13.3 | новый y = новый суррогат; MISSING → не в обучении |
+| **M7 ветки / AL** | acquisition на S×куб (поблочно) | работает на current_schema; старые точки с MISSING вне обучения |
+| **M8 desirability** | без изменений; рецепт = {состав + условия} | новый y входит в желательность |
+
+### 13.9 Объединённый чек-лист реализации
+
+**Фундамент (общий для §13 и §14) — строить ПЕРВЫМ**
+- [ ] Точка = составной объект `{X: {block: [...]}, Y: {resp: val|MISSING}}` + `schema_version` + `origin_tag`. **Не плоский массив.**
+- [ ] `MISSING` — явный сентинел, допустим **только в `Y`**, не в `X`.
+- [ ] Схема версионируется: `schema_history` неизменяема, точки разных версий сосуществуют.
+- [ ] Запрет «оба блока пустые»; ≤1 MIXTURE, ≤1 PROCESS.
+- [ ] `config_snapshot`: seeds, гиперпараметры, версии — воспроизводимость.
+
+**Mixture-Process (§13)**
+- [ ] Проекция/clip/валидатор/exchange — **поблочные**, по `kind`.
+- [ ] Симплекс-проекция → только x; clip → только z. Не наоборот.
+- [ ] Σ=1 проверяется только на MIXTURE-блоке; process-only: нет проверки Σ=1; mixture-only: нет process-clip.
+- [ ] z внутри всех расчётов ∈ [0,1]; `code↔real` обратима; в снимке.
+- [ ] Кросс-термы x_i z_k присутствуют при `cross-main`/`full-cross`.
+- [ ] Scheffé **без** intercept; process-only **с** intercept (assert).
+- [ ] p считается/логируется; режим = по наличию блоков, **нет** `if mode`.
+- [ ] M по произведению области (симплекс × норм. куб); кросс-моменты = произведение интегралов.
+
+**Schema Evolution + Augmented Design (§14)**
+- [ ] Политики `known-constant` / `unknown→MISSING` / `recompute` — явные, в логе.
+- [ ] **Никаких молчаливых 0/средних** в X или Y.
+- [ ] Новый отклик → старые точки `Y[y_new]=MISSING`, суррогат учится только на измеренных.
+- [ ] `select_fixed_rows` отбирает валидные старые точки для целевой модели.
+- [ ] Coordinate-exchange учитывает X_fixedᵀ·X_fixed как стартовую инфо-матрицу (не ноль).
+- [ ] Старые fixed-точки **не двигаются**, добираются только новые.
+- [ ] `schema_diff_vars` различает новые ПЕРЕМЕННЫЕ vs новые ЧЛЕНЫ из старых переменных.
+- [ ] `stop_reason` — единая функция; **нет** второго критерия для augment.
+- [ ] Выход по `relative_gain` (ΔI/I), НЕ по абсолютному порогу I; не останавливаться при n_total < p+margin.
+- [ ] I считается на **целевой** модели и **объединённом** (fixed+new) дизайне; лог остановки: reason, n_total, p, I.
+
+**Регресс (доказательство сохранности базы)**
+- [ ] **mixture-only бит-в-бит** со старым golden (дизайн по I/det ±1%, Scheffé atol 1e-8, GP μ/σ atol 1e-6).
+- [ ] **augment без смены схемы** == старое поведение §5.5 (fixed = все старые точки, та же модель).
+- [ ] golden-группа A (значение I vs R) проходит на mixture, process, mixture-process.
+
+> **Топ-3 «протекающих» места этой итерации:**
+> 1. **Формат точки** — составной версионированный объект. Если плоский массив — обе фичи сломаются при первом расширении схемы.
+> 2. **Единый критерий остановки** — augment переиспользует `stop_reason` из §5.5, не пишет свой. Иначе дубль и рассинхрон.
+> 3. **`MISSING` только в `Y`, никаких молчаливых нулей** — отравленная модель иначе неотлаживаема.
+
+### 13.10 Порядок реализации (чтобы не переписывать)
+
+1. **Фундамент** (структуры §13.1) — точка, схема, версионирование. Без этого остальное ляжет на неверный формат.
+2. **Генератор термов** (§13.3) + **поблочная геометрия** (§13.4) — общая база для дизайна.
+3. **Моменты + i_value** (§13.5) → прогнать **golden-группу A** (фундамент верен).
+4. **Augmented design** (§13.6) поверх существующего exchange + `select_fixed_rows` (§13.7).
+5. **Регресс mixture-only и augment-без-схемы** — гейт перед мержем.
+6. Миграционные политики (§13.7) — расширяешь по мере появления реальных сценариев.
 
 ---
 

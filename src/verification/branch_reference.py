@@ -99,3 +99,74 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
              for p in truth.property_names}
     return {"x": best_x, "d": float(best_d), "y": y_opt,
             "x_scan": x_scan, "d_scan": d_scan}
+
+
+# ----------------------------------------------------------------------
+# Фазовый (ограниченный маской свободы) оптимум — «потолок» фазы
+# ----------------------------------------------------------------------
+def _mask_from(spec, names, size: int) -> np.ndarray:
+    """Имена/индексы свободных переменных → булева маска длиной ``size``."""
+    m = np.zeros(int(size), dtype=bool)
+    names = list(names)
+    for item in spec:
+        idx = names.index(item) if isinstance(item, str) else int(item)
+        if 0 <= idx < size:
+            m[idx] = True
+    return m
+
+
+def masked_region_points(truth: MultiMixtureProcessTruth, n: int, seed: int,
+                         mixture_free, process_free, baseline) -> np.ndarray:
+    """Точки в ОГРАНИЧЕННОЙ маской области: свободные координаты варьируют,
+    «закрытые» держатся на ``baseline`` (Σx=1 сохраняется). Та же проекция, что
+    в :class:`MixtureProcessRunner` — но в верификационном слое, без ядра."""
+    schema = truth.schema
+    q = int(schema.n_mixture)
+    d = int(schema.n_process)
+    base = np.asarray(baseline, float).ravel()
+    full = composite_random_points(schema, int(n), seed=seed)
+    out = np.tile(base, (int(n), 1))
+
+    if q > 0:
+        mf = _mask_from(mixture_free, schema.mixture_names, q)
+        held = ~mf
+        held_sum = float(base[:q][held].sum()) if held.any() else 0.0
+        c = np.tile(base[:q], (int(n), 1))
+        if mf.any():
+            samp = full[:, :q]
+            fs = samp[:, mf].sum(axis=1, keepdims=True)
+            fs = np.where(fs > 1e-12, fs, 1.0)
+            c[:, mf] = samp[:, mf] * (1.0 - held_sum) / fs
+        out[:, :q] = c
+
+    if d > 0:
+        pf = _mask_from(process_free, schema.process_names, d)
+        z = np.tile(base[q:], (int(n), 1))
+        if pf.any():
+            z[:, pf] = full[:, q:][:, pf]
+        out[:, q:] = z
+
+    return out
+
+
+def branch_optimum_masked(truth: MultiMixtureProcessTruth,
+                          goal: Mapping[str, DesirabilitySpec], *,
+                          baseline, mixture_free=(), process_free=(),
+                          n_scan: int = 40000, seed: int = 0) -> Dict[str, Any]:
+    """«Потолок» ветки под маской свободы фазы (плотный скан, без scipy).
+
+    Лучшая достижимая desirability, когда варьируются лишь ``mixture_free`` и
+    ``process_free`` (остальное — на ``baseline``). Это эталон «дотянул ли
+    пайплайн до потенциала ФАЗЫ» (в отличие от глобального :func:`branch_optimum`).
+    Скан в низкоразмерной области точен без локального уточнения.
+    """
+    pts = masked_region_points(truth, int(n_scan), seed,
+                               mixture_free, process_free, baseline)
+    dvals = np.asarray(_desirability_at(truth, goal, pts), float).ravel()
+    b = int(np.argmax(dvals))
+    xb = pts[b]
+    y = {p: float(truth.truths[p].true(xb.reshape(1, -1))[0])
+         for p in truth.property_names}
+    return {"x": xb, "d": float(dvals[b]), "y": y}
+
+

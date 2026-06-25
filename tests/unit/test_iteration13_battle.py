@@ -19,14 +19,23 @@
 desirability растёт от фазы к фазе и на финале достигает существенной доли
 аналитического оптимума (которого без C/процесса в ранних фазах достичь нельзя).
 """
+import warnings
+
 import numpy as np
+from sklearn.exceptions import ConvergenceWarning
 
 from src.core.schema import ProjectSchema, VariableBlock, ModelSpec
 from src.design.block_model import build_model_terms
 from src.optimize.desirability import DesirabilitySpec
 from src.verification.mixture_process_truth import MultiMixtureProcessTruth
-from src.verification.branch_reference import branch_optimum
+from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
+
+# Косметика: GP на чистой (без шума) истине загоняет noise→0 и часть length-scale
+# к границам → sklearn сыплет ConvergenceWarning. Это НЕ ошибка фита и НЕ влияет
+# на корректность; глушим ТОЛЬКО предупреждение, границы ядра GPExpert не трогаем.
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
 
 
 # ----------------------------------------------------------------------
@@ -155,6 +164,22 @@ def test_battle_branches_converge_to_analytic_optimum():
         xo = np.round(np.asarray(opt[bid]["x"], float), 3)
         print(f"  {bid:<9} pipeline={xb.tolist()}  analytic={xo.tolist()}")
 
+    # фазовый «потолок» (best-achievable под маской) — потенциал каждой фазы
+    baseline = [1/3, 1/3, 1/3, 0.5, 0.5]
+    phase_free = [(["A", "B"], []),
+                  (["A", "B"], ["T"]),
+                  (["A", "B", "C"], ["T", "P"])]
+    ceil = {bid: [branch_optimum_masked(truth, goals[bid], baseline=baseline,
+                                        mixture_free=mf, process_free=pf,
+                                        seed=300 + j)["d"]
+                  for j, (mf, pf) in enumerate(phase_free)]
+            for bid in goals}
+    print("потолок фазы (max достижимый под маской) vs pipeline d_best:")
+    for bid in goals:
+        c = ceil[bid]
+        print(f"  {bid:<9} ceil={c[0]:.2f}/{c[1]:.2f}/{c[2]:.2f}  "
+              f"pipe={d1[bid]:.2f}/{d2[bid]:.2f}/{d3[bid]:.2f}")
+
     # ---- проверки ----
     n_strict = 0
     for bid in goals:
@@ -168,6 +193,16 @@ def test_battle_branches_converge_to_analytic_optimum():
         # 3) на финале достигнута существенная доля аналитического оптимума
         assert d3[bid] >= 0.7 * d_opt, (
             f"{bid}: финал {d3[bid]:.3f} < 70% от d_opt {d_opt:.3f}")
+        # 3b) фазовый потолок: растёт по фазам (раскрытие не сужает достижимое),
+        #     финал фазы 3 ~ глобальный оптимум, и пайплайн не превосходит потолок
+        #     СВОЕЙ фазы (корректность маски свободы)
+        c = ceil[bid]
+        assert c[1] >= c[0] - 0.02 and c[2] >= c[1] - 0.02, (
+            f"{bid}: потолки фаз не монотонны: {c}")
+        assert d_opt >= c[2] - 0.02, f"{bid}: d_opt {d_opt:.3f} < потолок ф3 {c[2]:.3f}"
+        assert d1[bid] <= c[0] + 0.02, f"{bid}: ф1 выше потолка {d1[bid]:.3f}>{c[0]:.3f}"
+        assert d2[bid] <= c[1] + 0.02, f"{bid}: ф2 выше потолка {d2[bid]:.3f}>{c[1]:.3f}"
+        assert d3[bid] <= c[2] + 0.02, f"{bid}: ф3 выше потолка {d3[bid]:.3f}>{c[2]:.3f}"
         # 4) раскрытие реально помогло (строгий рост хотя бы у части веток)
         if d3[bid] > d1[bid] + 0.03:
             n_strict += 1

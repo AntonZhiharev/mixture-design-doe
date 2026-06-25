@@ -12,7 +12,8 @@ from src.core.schema import (ProjectSchema, VariableBlock, ModelSpec)
 from src.design.block_model import build_model_terms
 from src.optimize.desirability import DesirabilitySpec
 from src.verification.mixture_process_truth import MultiMixtureProcessTruth
-from src.verification.branch_reference import branch_optimum
+from src.verification.branch_reference import branch_optimum, branch_optimum_masked
+
 
 
 def _mix_only():
@@ -65,3 +66,29 @@ def test_process_goal_optimum():
     # составные координаты [A,B,C,T,P]; T — индекс q=3
     assert opt["x"][3] > 0.85
     assert opt["d"] > 0.9
+
+
+def test_masked_phase_ceiling_below_global_without_process():
+    """Потолок фазы под маской: без свободы T достижимое НИЖЕ глобального
+    оптимума (T заперт на baseline), а с T — почти дотягивает (REBUILD_SPEC §14)."""
+    schema = _mix_proc()
+    terms = build_model_terms(schema)
+    coef = np.zeros(terms.p)
+    coef[terms.names.index("T")] = 10.0          # отклик = 10*T
+    truth = MultiMixtureProcessTruth(schema, {"cure": coef})
+    goal = {"cure": DesirabilitySpec("max", low=0.0, high=10.0)}
+    base = [1/3, 1/3, 1/3, 0.5, 0.5]             # T заперт на 0.5 → отклик 5 → d=0.5
+
+    g = branch_optimum(truth, goal, n_scan=12000, seed=3)["d"]
+    no_t = branch_optimum_masked(truth, goal, baseline=base,
+                                 mixture_free=["A", "B"], process_free=[],
+                                 n_scan=20000, seed=5)["d"]
+    with_t = branch_optimum_masked(truth, goal, baseline=base,
+                                   mixture_free=["A", "B"], process_free=["T"],
+                                   n_scan=20000, seed=6)["d"]
+    assert abs(no_t - 0.5) < 0.02                # T=0.5 → ровно половина шкалы
+    assert with_t > no_t + 0.3                   # свобода T резко поднимает потолок
+    assert with_t <= g + 1e-6                    # но не выше глобального оптимума
+    assert with_t > 0.9 * g                      # и почти дотягивает до него
+
+

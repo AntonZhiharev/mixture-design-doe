@@ -863,13 +863,13 @@ def select_fixed_rows(points, target_schema) -> list[DataPoint]:
 - [x] `MISSING` — явный сентинел, допустим **только в `Y`**, не в `X`. *(DataPoint.validate)*
 - [x] Схема версионируется: `schema_history` неизменяема, точки разных версий сосуществуют. *(schema_evolution.SchemaHistory + evolve_schema)*
 - [x] Запрет «оба блока пустые»; ≤1 MIXTURE, ≤1 PROCESS. *(ProjectSchema.__post_init__)*
-- [ ] `config_snapshot`: seeds, гиперпараметры, версии — воспроизводимость.
+- [x] `config_snapshot`: seeds, гиперпараметры, версии + `code↔real` на блок — воспроизводимость. *(core.config_snapshot.ConfigSnapshot; интегрирован в ProjectState; test_iteration12_config_snapshot)*
 
 **Mixture-Process (§13)**
 - [~] Проекция/clip/валидатор/exchange — **поблочные**, по `kind`. *(project/clip/validate поблочные; кандидаты = декартово произведение блоков; покоординатный block-exchange не вводился — добор pool-based, §13.6)*
 - [x] Симплекс-проекция → только x; clip → только z. Не наоборот. *(block_geometry)*
 - [x] Σ=1 проверяется только на MIXTURE-блоке; process-only: нет проверки Σ=1; mixture-only: нет process-clip. *(block_geometry.validate)*
-- [~] z внутри всех расчётов ∈ [0,1]; `code↔real` обратима; в снимке. *(to_code/from_code обратимы; в `config_snapshot` пока не сохраняется)*
+- [x] z внутри всех расчётов ∈ [0,1]; `code↔real` обратима; в снимке. *(to_code/from_code обратимы; сохраняются в `ConfigSnapshot.code_real` и воспроизводятся из снимка)*
 - [x] Кросс-термы x_i z_k присутствуют при `cross-main`/`full-cross`. *(block_model.build_model_terms)*
 - [x] Scheffé **без** intercept; process-only **с** intercept (assert). *(build_model_terms)*
 - [x] p считается/логируется; режим = по наличию блоков, **нет** `if mode`. *(count_params/resolve_model_for_budget)*
@@ -888,7 +888,7 @@ def select_fixed_rows(points, target_schema) -> list[DataPoint]:
 - [x] I считается на **целевой** модели и **объединённом** (fixed+new) дизайне; лог остановки: reason, n_total, p, I. *(model_matrix_fn + IAugmentResult)*
 
 **Регресс (доказательство сохранности базы)**
-- [~] **mixture-only бит-в-бит** со старым golden (дизайн по I/det ±1%, Scheffé atol 1e-8, GP μ/σ atol 1e-6). *(model_matrix==scheffe и W==region_moment_matrix бит-в-бит; полный GP μ/σ golden не прогонялся)*
+- [x] **mixture-only бит-в-бит** со старым golden (дизайн по I/det ±1%, Scheffé atol 1e-8, GP μ/σ atol 1e-6). *(model_matrix==scheffe и W==region_moment_matrix бит-в-бит; GP-постериор μ/σ на составных координатах сверен с независимым `gp_posterior` на mixture/process/mixture-process, atol/rtol 1e-6 — test_golden_gp_composite)*
 - [x] **augment без смены схемы** == старое поведение §5.5: инъекция `model_matrix_fn` для mixture-only бит-в-бит совпала с legacy Scheffé-путём (indices/i_history/stop_reason). *(test_iteration12_augment)*
 - [x] golden-группа A (значение I vs R) проходит на mixture, process, mixture-process. *(аналитические моменты vs независимый эталон, atol 1e-8; test_golden_product_moments)*
 
@@ -917,11 +917,14 @@ def select_fixed_rows(points, target_schema) -> list[DataPoint]:
 - §13.7 schema-evolution: `core/schema_evolution.py` (SchemaHistory + evolve_schema + migrate_point + select_fixed_rows; политики known-constant/unknown/recompute; новый отклик→MISSING) + поле `ProjectSchema.migration`; прогрессия mixture→mixture+process→+параметр+отклик под тестом (`test_iteration12_evolution.py`).
 - §13.5/§13.11 АНАЛИТИЧЕСКИЕ моменты как ДЕФОЛТ (устранение MC-смещения golden-A): блочный добор (`design/augmented.augmented_design` + новый публичный `build_moments`) и M5 (`apps/pipeline_runner.run_m5`) берут `W` из закрытой формы (`block_moments.analytic_moment_matrix` / `i_optimal.region_moment_matrix(method="analytic")`) — детерминированно, без смещения `SimplexRegion.random_points`. MC оставлен опцией (`moment_method="mc"` / `method="mc"`) для быстрых прикидок; дефолт `region_moment_matrix` остаётся `mc` (бит-в-бит регресс §13.9 не сломан). Две независимые реализации закрытой формы сверены (atol 1e-12) и инвариант результата к `n_mc` — `tests/unit/test_iteration12_analytic_moments.py`.
 
+**Сделано (итерация 13) — закрыт остаток §13.11 п.1–3** (тесты `tests/unit/test_iteration12_config_snapshot.py`, `tests/golden/test_golden_gp_composite.py`):
+- **`config_snapshot`** (§13.1/§13.2): `core/config_snapshot.py::ConfigSnapshot` — seeds/гиперпараметры/версии (окружение+схема) + `code↔real` на КАЖДЫЙ блок (по сохранённым `lower/upper` блок и его обратимые `to_code`/`from_code` восстанавливаются из снимка, без доступа к схеме); round-trip `from_dict(to_dict())` тождественен.
+- **Персистентность версионирования:** `core/state.py::ProjectState` аддитивно несёт `schema_history`/`current_schema_version`/`points`/`config_snapshot` (save/load round-trip; старые `state.json` M1–M8 грузятся с пустыми дефолтами — обратная совместимость под тестом). Хелперы: `add_schema`/`add_point`/`schema_for`/`latest_schema`/`set_config_snapshot`/`get_config_snapshot`.
+- **Полный GP-golden μ/σ на составных координатах:** продакшн `GPExpert` (sklearn) при фикс. θ сверен с независимым Cholesky-эталоном `reference.gp_posterior` на mixture-only/process-only/mixture-process (atol/rtol 1e-6). Нюанс зафиксирован: составной Scheffé-базис при mixture-process РАНГ-ДЕФИЦИТЕН (Σ_i x_i·z_k = z_k из-за Σx=1) ⇒ тренд берётся из продакшн `mean_` (lstsq/SVD устойчив к неполному рангу), а НЕЗАВИСИМО сверяется именно GP-постериор остатков (μ_resid, σ) — ровно цель п.3.
+
 **Остаток:**
-1. **`config_snapshot`** (§13.1): seeds/гиперпараметры/версии + `code↔real` process-блока — в снимок (воспроизводимость).
-2. **Персистентность:** интеграция версионирования (`schema_history`/points) в сохранение проекта — отдельным шагом, чтобы не дестабилизировать текущий `core/state.py` (persistence M1–M8).
-3. **Полный GP-golden μ/σ** для mixture-process (сейчас регресс mixture-only — через бит-в-бит инъекцию и моменты, но не через GP-постериор на составных координатах).
-4. *(СДЕЛАНО — см. «Сделано» выше)* ~~Неравномерность `SimplexRegion.random_points`~~: путь моментов (M5 и блочный добор) переведён на аналитику, MC сохранён опцией. Остаточно (не критично): сам сэмплер `random_points` (смещён к центроиду) не переписан — он остаётся только в генерации пула кандидатов (где важна допустимость, а не равномерность) и в опциональном MC-пути.
+1. *(СДЕЛАНО — см. «Сделано (итерация 13)»)* ~~`config_snapshot`~~ · ~~персистентность версионирования~~ · ~~полный GP-golden μ/σ на составных координатах~~.
+2. *(СДЕЛАНО ранее)* ~~Неравномерность `SimplexRegion.random_points`~~: путь моментов (M5 и блочный добор) переведён на аналитику, MC сохранён опцией. Остаточно (не критично): сам сэмплер `random_points` (смещён к центроиду) не переписан — он остаётся только в генерации пула кандидатов (где важна допустимость, а не равномерность) и в опциональном MC-пути.
 
 > **Предсуществующий несвязанный дефект:** `tests/unit/test_iteration11_metrics_cache.py::test_metrics_survive_save_load_without_results` падает и без правок итерации 12 (доказано `git stash`) — конфликт теста с фичей регидрации результатов (коммит `acdbc7f`). К §13/§14 не относится.
 

@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
-from ..core.schema import ProjectSchema
+from ..core.schema import MIXTURE, PROCESS, DataPoint, ProjectSchema
 from ..models.gp_expert import GPExpert
 from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget)
@@ -76,6 +76,14 @@ class MixtureProcessRunner:
         self.origin: List[str] = []
         self.surrogates: Dict[str, GPExpert] = {}
         self.branches: Dict[str, Branch] = {}
+
+        # §15.1.2: ВЕДУЩАЯ база — список DataPoint с версионированной схемой;
+        # numpy X/Y/origin — ПРОИЗВОДНЫЕ (пересобираются из points для GP).
+        # baseline «закрытых» фазой координат пишется в X точки РЕАЛЬНЫМ значением
+        # (не маской) — иначе select_fixed_rows не увидит, например, T=0.5.
+        self.points: List[DataPoint] = []
+        self.schema_history: List[ProjectSchema] = [schema]
+        self.current_schema_version: int = int(schema.version)
 
     # ------------------------------------------------------------------
     # Фазы раскрытия (маска свободы)
@@ -139,6 +147,44 @@ class MixtureProcessRunner:
         return out
 
     # ------------------------------------------------------------------
+    # Ведущая база точек (DataPoint) ⇄ производные numpy-кэши (§15.1.2)
+    # ------------------------------------------------------------------
+    def _make_point(self, coords: np.ndarray, y_row: np.ndarray,
+                    origin: str) -> DataPoint:
+        """Составная строка ``[x..., z_code...]`` + отклики → ``DataPoint``.
+
+        baseline «закрытых» координат уже лежит в ``coords`` реальным значением
+        (см. :meth:`_masked_candidates`), поэтому пишется в ``X`` как есть —
+        §15.1.2 (baseline-as-value, не маска).
+        """
+        coords = np.asarray(coords, float).ravel()
+        X: Dict[str, List[float]] = {}
+        if self.q > 0:
+            X[MIXTURE] = [float(v) for v in coords[:self.q]]
+        if self.d > 0:
+            X[PROCESS] = [float(v) for v in coords[self.q:self.q + self.d]]
+        Y = {name: float(y_row[i]) for i, name in enumerate(self.property_names)}
+        tag = {"origin": origin, "schema_version": self.current_schema_version}
+        return DataPoint(schema_version=self.current_schema_version,
+                         X=X, Y=Y, origin_tag=tag)
+
+    def _rebuild_arrays(self) -> None:
+        """Пересобрать numpy-кэши (X/Y/origin) из ведущей базы ``points``."""
+        if not self.points:
+            self.X = None
+            self.Y = None
+            self.origin = []
+            return
+        rows: List[List[float]] = []
+        ys: List[List[float]] = []
+        for p in self.points:
+            rows.append(list(p.X.get(MIXTURE, [])) + list(p.X.get(PROCESS, [])))
+            ys.append([float(p.Y[name]) for name in self.property_names])
+        self.X = np.asarray(rows, float)
+        self.Y = np.asarray(ys, float)
+        self.origin = [p.origin_tag.get("origin", "seed") for p in self.points]
+
+    # ------------------------------------------------------------------
     # Общая модель проекта (GP на каждое свойство, составные координаты)
     # ------------------------------------------------------------------
     def fit_surrogates(self) -> None:
@@ -156,9 +202,9 @@ class MixtureProcessRunner:
         s = self.seed if seed is None else int(seed)
         X0 = self._masked_candidates(n, s)
         Y0 = np.atleast_2d(self.oracle.evaluate(X0))
-        self.X = X0
-        self.Y = Y0
-        self.origin = ["seed"] * len(X0)
+        self.points = [self._make_point(X0[i], Y0[i], "seed")
+                       for i in range(len(X0))]
+        self._rebuild_arrays()
         self.fit_surrogates()
         return {"n": int(len(X0)), "P": int(self.Y.shape[1])}
 
@@ -202,9 +248,10 @@ class MixtureProcessRunner:
         newX = propose_by_score(cands, acq, n_take, min_dist=0.02)
 
         Ynew = np.atleast_2d(self.oracle.evaluate(newX))
-        self.X = np.vstack([self.X, newX])
-        self.Y = np.vstack([self.Y, Ynew])
-        self.origin += [f"branch:{branch_id}"] * len(newX)
+        for i in range(len(newX)):
+            self.points.append(
+                self._make_point(newX[i], Ynew[i], f"branch:{branch_id}"))
+        self._rebuild_arrays()
         br.spent += len(newX)
 
         desir = Desirability(dict(br.goal))

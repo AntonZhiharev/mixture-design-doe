@@ -158,7 +158,7 @@ def branch_optimum_masked(truth: MultiMixtureProcessTruth,
                           goal: Mapping[str, DesirabilitySpec], *,
                           baseline, mixture_free=(), process_free=(),
                           n_scan: int = 40000, seed: int = 0,
-                          refine: bool = True) -> Dict[str, Any]:
+                          refine: bool = True, n_starts: int = 8) -> Dict[str, Any]:
     """«Потолок» ветки под маской свободы фазы: плотный скан + локальное уточнение.
 
     Лучшая достижимая desirability, когда варьируются лишь ``mixture_free`` и
@@ -166,10 +166,13 @@ def branch_optimum_masked(truth: MultiMixtureProcessTruth,
     на ``baseline``). Это эталон «дотянул ли пайплайн до потенциала ФАЗЫ»
     (в отличие от глобального :func:`branch_optimum`).
 
-    После грубого скана делается SLSQP-уточнение ПО СВОБОДНЫМ осям (свободные
+    После грубого скана делается МУЛЬТИСТАРТ-SLSQP по СВОБОДНЫМ осям (свободные
     mixture-доли с Σ=1, свободные process-коды ∈ [0,1]); закрытые координаты
-    держатся фиксированными. Без уточнения чистый скан в высокой размерности
-    (фаза «всё открыто», 5 свободных осей) занижает максимум и ломает
+    держатся фиксированными. Уточнение запускается из ``n_starts`` лучших точек
+    скана и берётся максимум — иначе одиночный старт в высокой размерности (фаза
+    «всё открыто», 5 свободных осей) садится в локальный бассейн на ~1e-3 ниже
+    глобального, и потолок перестаёт быть строгой верхней границей для измеренного
+    ``d_best`` пайплайна. Без уточнения чистый скан занижает максимум и ломает
     монотонность потолков по фазам — а раскрытие переменных НЕ сужает достижимое
     (область фазы k+1 ⊇ фазы k), поэтому потолок обязан расти. ``refine=False``
     оставляет чистый скан (если scipy недоступен — тихий фолбэк на скан).
@@ -195,38 +198,46 @@ def branch_optimum_masked(truth: MultiMixtureProcessTruth,
             free_mix = np.where(mf)[0]
             free_proc = np.where(pf)[0]
             n_fm = int(free_mix.size)
+            # шаблон закрытых координат (held mixture=0 / held process=baseline);
+            # одинаков для всех masked-точек, поэтому фиксируем один раз
+            held = pts[b].copy()
 
             def expand(v):
-                x = xb.copy()                  # held mixture=0 / held process=baseline
+                x = held.copy()
                 if n_fm:
                     x[free_mix] = v[:n_fm]
                 for k, j in enumerate(free_proc):
                     x[q + j] = v[n_fm + k]
                 return x
 
-            v0 = np.concatenate([xb[free_mix], xb[q + free_proc]]) \
-                if (n_fm + free_proc.size) else np.zeros(0)
-            if v0.size:
-                bounds = [(0.0, 1.0)] * v0.size
+            n_free = n_fm + int(free_proc.size)
+            if n_free:
+                bounds = [(0.0, 1.0)] * n_free
                 cons = []
                 if n_fm > 0:
                     cons.append({"type": "eq",
                                  "fun": lambda v: float(np.sum(v[:n_fm]) - 1.0)})
-                res = minimize(
-                    lambda v: -float(_desirability_at(truth, goal, expand(v))[0]),
-                    v0, method="SLSQP", bounds=bounds, constraints=cons,
-                    options={"maxiter": 300, "ftol": 1e-9})
-                cand = expand(np.asarray(res.x, float))
-                if n_fm > 0:                    # перенормировать свободные доли (Σ=1)
-                    fm = np.clip(cand[free_mix], 0.0, None)
-                    s = fm.sum()
-                    if s > 0:
-                        cand[free_mix] = fm / s
-                if free_proc.size:
-                    cand[q + free_proc] = np.clip(cand[q + free_proc], 0.0, 1.0)
-                d_cand = float(_desirability_at(truth, goal, cand)[0])
-                if d_cand >= best_d:
-                    xb, best_d = cand, d_cand
+                # МУЛЬТИСТАРТ: уточняем из top-K точек скана, берём лучшее
+                topk = np.argsort(dvals)[::-1][:max(1, int(n_starts))]
+                for si in topk:
+                    s_pt = pts[si]
+                    v0 = np.concatenate([s_pt[free_mix], s_pt[q + free_proc]])
+                    res = minimize(
+                        lambda v: -float(
+                            _desirability_at(truth, goal, expand(v))[0]),
+                        v0, method="SLSQP", bounds=bounds, constraints=cons,
+                        options={"maxiter": 300, "ftol": 1e-9})
+                    cand = expand(np.asarray(res.x, float))
+                    if n_fm > 0:                # перенормировать свободные доли (Σ=1)
+                        fm = np.clip(cand[free_mix], 0.0, None)
+                        s = fm.sum()
+                        if s > 0:
+                            cand[free_mix] = fm / s
+                    if free_proc.size:
+                        cand[q + free_proc] = np.clip(cand[q + free_proc], 0.0, 1.0)
+                    d_cand = float(_desirability_at(truth, goal, cand)[0])
+                    if d_cand >= best_d:
+                        xb, best_d = cand, d_cand
         except Exception:  # noqa: BLE001 — без scipy остаётся скан-оптимум
             pass
 

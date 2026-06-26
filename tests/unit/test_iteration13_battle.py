@@ -124,26 +124,29 @@ def test_battle_branches_converge_to_analytic_optimum():
                                   baseline=[1/3, 1/3, 1/3, 0.5, 0.5],
                                   seed=7, n_restarts=2)
 
-    # --- Фаза 1: свободны только A,B ---
-    runner.set_free(mixture_free=["A", "B"], process_free=[])
+    # --- Фаза 1: свободны только A,B (схема v1: mixture-only, C заперт bounds) ---
+    runner.begin_phase(mixture_free=["A", "B"], process_free=[])
     runner.seed_initial(n=18, seed=7)
+
     for bid, goal in goals.items():
-        runner.add_branch(bid, goal, budget=40, satisfy_at=1.1, branch_id=bid)
+        runner.add_branch(bid, goal, budget=60, satisfy_at=1.1, branch_id=bid)
     for bid in goals:
         runner.run_branch_round(bid, n_points=5, explore_frac=0.3,
                                 n_candidates=400)
     d1 = {bid: runner.branches[bid].d_best for bid in goals}
 
-    # --- Фаза 2: + процесс T ---
-    runner.set_free(mixture_free=["A", "B"], process_free=["T"])
+    # --- Фаза 2: + процесс T (APPEND в схему, §14: version+1, миграция фазы 1) ---
+    runner.augment_phase_schema(["T"])
     for bid in goals:
+
         runner.run_branch_round(bid, n_points=5, explore_frac=0.25,
                                 n_candidates=400)
     d2 = {bid: runner.branches[bid].d_best for bid in goals}
 
-    # --- Фаза 3: + остаток mixture (C) + процесс P ---
-    runner.set_free(mixture_free=["A", "B", "C"], process_free=["T", "P"])
+    # --- Фаза 3: + процесс P (append) + раскрытие C (relax) АТОМАРНО (§15.1.5) ---
+    runner.augment_phase_atomic(["P"], ["C"])
     for bid in goals:
+
         runner.run_branch_round(bid, n_points=7, explore_frac=0.15,
                                 n_candidates=600)
     d3 = {bid: runner.branches[bid].d_best for bid in goals}
@@ -241,3 +244,83 @@ def test_battle_branches_converge_to_analytic_optimum():
     for bid in goals:
         assert counts.get(f"branch:{bid}", 0) >= 10
         assert runner.branches[bid].x_best is not None
+
+    # ==================================================================
+    # РАСШИРЕННЫЙ ЗАМЕР: на что РЕАЛЬНО способен алгоритм в фазе 3
+    # (полная свобода) и ВО СКОЛЬКО экспериментов это обходится.
+    # Дозабор продолжается, пока ветка СТАГНИРУЕТ (is_stagnating) ИЛИ не
+    # исчерпает бюджет. Эталон достижимого — ПОТОЛОК ФАЗЫ 3
+    # (branch_optimum_masked при полной свободе, ~ глобальный оптимум).
+    # ==================================================================
+    PATIENCE, MIN_DELTA = 3, 5e-3
+    stop_reason = {}
+    for bid in goals:
+        br = runner.branches[bid]
+        while br.remaining() > 0:
+            runner.run_branch_round(bid, n_points=5, explore_frac=0.15,
+                                    n_candidates=600)
+            if br.is_stagnating(patience=PATIENCE, min_delta=MIN_DELTA):
+                stop_reason[bid] = "стагнация"
+                break
+        else:
+            stop_reason[bid] = "бюджет"
+
+    def _cost_to(history, target):
+        """Сколько опытов ВЕТКИ (br.spent) до первого d_best >= target."""
+        for h in history:
+            if float(h["d_best"]) >= target:
+                return int(h["spent"])
+        return None
+
+    seed_n = runner.origin_counts().get("seed", 0)
+    print("\n=== ЦЕНА/КАЧЕСТВО: дозабор фазы 3 до сходимости ===")
+    print("эталон достижимого = ПОТОЛОК ФАЗЫ 3 (полная свобода); "
+          "опыты считаются ПО ВЕТКЕ (seed общий, не входит)")
+    print(f"{'ветка':<9}|{'ceil ф3':>8}|{'d3→final':>16}|{'%ceil':>6}|"
+          f"{'оп.вет':>7}|{'80%':>5}|{'90%':>5}|{'95%':>5}|{'стоп':>10}")
+    d_final = {}
+    for bid in goals:
+        br = runner.branches[bid]
+        c3 = ceil[bid][2]
+        d_final[bid] = br.d_best
+        pct = 100.0 * br.d_best / c3 if c3 > 0 else 0.0
+        c80 = _cost_to(br.history, 0.80 * c3)
+        c90 = _cost_to(br.history, 0.90 * c3)
+        c95 = _cost_to(br.history, 0.95 * c3)
+        def _f(v):
+            return "—" if v is None else str(v)
+        print(f"{bid:<9}|{c3:>8.3f}|{d3[bid]:>6.2f}→{br.d_best:<9.3f}|{pct:>5.0f}%|"
+              f"{br.spent:>7}|{_f(c80):>5}|{_f(c90):>5}|{_f(c95):>5}|"
+              f"{stop_reason[bid]:>10}")
+    total2 = seed_n + sum(runner.branches[bid].spent for bid in goals)
+    print(f"всего измерений в общей базе после дозабора: {total2} "
+          f"(seed {seed_n} + ветки {total2 - seed_n})")
+
+    # --- ИТОГ ПОСЛЕ ДОЗАБОРА: рецепты и свойства pipeline x* vs аналитика ---
+    print("ИТОГ рецепты (доли A,B,C + код T,P), pipeline x* vs аналитика x*:")
+    for bid in goals:
+        xb = np.round(np.asarray(runner.branches[bid].x_best, float), 3)
+        xo = np.round(np.asarray(opt[bid]["x"], float), 3)
+        print(f"  {bid:<9} pipeline={xb.tolist()}  analytic={xo.tolist()}")
+    print("ИТОГ свойства (истина) pipeline vs аналитика; Δ ЦЕНА — отклонение по цене:")
+    for bid in goals:
+        xb = np.asarray(runner.branches[bid].x_best, float).reshape(1, -1)
+        yp = {p: float(truth.truths[p].true(xb)[0]) for p in truth.property_names}
+        ya = {p: float(opt[bid]["y"][p]) for p in truth.property_names}
+        dpa = yp["price"] - ya["price"]
+        dpp = 100.0 * dpa / abs(ya["price"]) if abs(ya["price"]) > 1e-9 else 0.0
+        print(f"  {bid:<9} ЦЕНА pipe={yp['price']:.2f} vs anal={ya['price']:.2f} "
+              f"Δ={dpa:+.2f} ({dpp:+.0f}%) | "
+              f"strength {yp['strength']:.1f}/{ya['strength']:.1f} "
+              f"gloss {yp['gloss']:.1f}/{ya['gloss']:.1f} "
+              f"dry {yp['dry_time']:.1f}/{ya['dry_time']:.1f}")
+
+    # ---- проверки расширенного замера (робастные, без флака) ----
+    for bid in goals:
+        c3 = ceil[bid][2]
+        # дозабор НЕ ухудшает лучший результат (монотонность d_best)
+        assert d_final[bid] >= d3[bid] - 1e-9, (
+            f"{bid}: дозабор ухудшил d_best {d3[bid]:.3f}→{d_final[bid]:.3f}")
+        # нельзя превзойти физический потолок фазы на чистой истине
+        assert d_final[bid] <= c3 + 0.03, (
+            f"{bid}: final {d_final[bid]:.3f} > потолок ф3 {c3:.3f}")

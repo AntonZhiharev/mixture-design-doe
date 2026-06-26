@@ -489,3 +489,66 @@ def test_battle_phase3_atomic_better_than_sequential():
 - **pool/W несогласованность** — РЕШЕНА в §15.0.2: «ограниченные кандидаты при
   полной области интереса» зафиксированы как корректное поведение (не баг), с
   обоснованием `I = tr[(XᵀX)⁻¹·M_full]` и защитой от «фикса в неверную сторону».
+
+---
+
+## §15.6 Статус реализации (шаги §15.3, выполнено)
+
+Все 7 шагов §15.3 реализованы; профильные тесты зелёные (battle 1 passed ~221 c;
+iteration15/mp_runner/12_*/9_* — 77 passed). Ключевые проектные решения,
+зафиксированные при реализации:
+
+- **Ре-архитектура раннера (шаг 6, «удалить mask-путь»).** Старый
+  `set_free`/`_masked_candidates`/baseline-as-value-в-X удалён. Свобода фазы
+  теперь кодируется САМОЙ схемой:
+  - `+process (T,P)` = членство в process-блоке → `augment_phase_schema`
+    (`evolve_schema(add_process, migration=known-constant(baseline))`, `version+1`);
+  - `+mixture (C)` = bounds (`[1/3,1/3]→[0,1]`) → `expand_region_mixture`
+    (без bump) либо `augment_phase_atomic` (атомарно с append-P, один bump);
+  - `begin_phase(mixture_free, process_free)` строит стартовую схему v1
+    (mixture-only при пустом process_free; запертые mixture-компоненты — bounds
+    `[v,v]` на baseline).
+  - Точки хранят координаты ТЕКУЩЕЙ схемы; общий GP всегда видит базу,
+    мигрированную к текущей схеме (`select_fixed_rows`/`migrate_point`),
+    `known-constant` достраивает закрытый параметр РЕАЛЬНЫМ baseline (§15.1.2).
+    Оракул всегда меряется на ПОЛНОМ физическом векторе (`_to_full`).
+
+- **M8-argmax (§15.1.4) встроен в `run_branch_round` как exploit-точка В ПРЕДЕЛАХ
+  бюджета раунда** (последняя из `n_points` — argmax `optimize_xbest`, остальные —
+  acquisition). Это СОЗНАТЕЛЬНО сохраняет контракт `added == n_points` (рерайт
+  `test_iteration13_mp_runner` свёлся к смене семантики `x_best`: теперь это
+  argmax-рецепт, а не «лучшая измеренная»). `x_best` хранится как ПОЛНЫЙ составной
+  рецепт (`_to_full`).
+
+- **`select_fixed_rows` и Y.** `migrate_point` пересобирает `Y` по
+  `target.response_names`; у схемы раннера responses пусты (свойства — от оракула),
+  поэтому измеренные `Y` восстанавливаются из исходных точек дословно (миграция
+  трогает только X-координаты/область).
+
+- **Кандидаты на запертом компоненте.** `SimplexRegion.random_points` непригоден
+  при `lower==upper` (`from_pseudo` игнорирует верхнюю границу → rejection
+  сваливается в центроид). `_phase_candidates` сэмплирует свободные компоненты
+  Дирихле и масштабирует на `1−Σ_locked` (Σx=1), запертые держит на baseline.
+
+### Покрытие §15.2 тестами
+
+- **§15.2.1/.2 (§14 reuse, P3–P6)** — `test_augment_phase_schema_reuses_phase1_as_fixed`
+  (+T: version+1, миграция фазы 1 НЕ выброшена, baseline-as-value `X[:,T]==0.5`,
+  `start_info_matrix_rank>0`, T-члены в модели) + `..._new_round_adds_versioned_points`
+  (версии 1 и 2 сосуществуют). Полная B-vs-C from-scratch сходимость (P1/P2 с
+  маржами) НЕ выделена в отдельный прогон — сходимость покрыта боевым §15.2.3.
+- **§15.2.3 (M8-argmax в боевом)** — `test_iteration13_battle.py` переведён на
+  `begin_phase`/`augment_phase_schema(["T"])`/`augment_phase_atomic(["P"],["C"])`;
+  `x_best` от M8-argmax; робастные проверки (монотонность, потолки) сохранены.
+- **§15.2.4 (region-expansion +C)** — `test_region_expansion_does_not_bump_version`.
+- **§15.2.5 (атомарность)** — `test_atomic_phase_one_bump_both_reasons_logged`
+  (один bump, обе причины в `change_log`, C раскрыт, `design_i_value` конечен).
+  Контрольный `I_atomic ≤ I_seq` как ОТДЕЛЬНЫЙ прогон не добавлен (инвариант
+  §15.1.5 обоснован аналитически; в коде проверяется идентифицируемость дизайна).
+
+### Отложено
+
+- **§15.5 / §15.3 шаг 8** — граничная тяга acquisition к вершинам, если economy
+  всё ещё < 0.97 после M8-argmax. Отдельной итерацией, по факту замера в боевом.
+
+

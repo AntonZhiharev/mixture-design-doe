@@ -9,13 +9,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 """Iteration 15 / §15 — боевая верификация schema augmentation + M8-argmax.
 
-Реализация ведётся по порядку §15.3 (REBUILD_SPEC_15_battle_augmentation.md).
+Реализация по §15.3 (REBUILD_SPEC_15_battle_augmentation.md). После ре-архитектуры
+раннера (§15.3.6) свобода фазы кодируется СХЕМОЙ, а не маской:
 
-Шаг 1 (§15.1.2, ловушка хранения): закрытые фазой координаты пишутся в
-``DataPoint.X`` РЕАЛЬНЫМ значением (например, ``T=0.5``), а не подразумеваются
-маской. Без этого ``select_fixed_rows`` не увидит T у точки фазы 1 и выбросит её.
-Здесь фиксируем, что :class:`MixtureProcessRunner` ведёт версионированную базу
-``points`` (DataPoint), а numpy-кэши X/Y/origin согласованы с ней.
+  * +process (T,P) = APPEND в схему (``augment_phase_schema``, version+1,
+    миграция старых точек = ``known-constant(baseline)``);
+  * +mixture (C)   = RELAX bounds (``expand_region_mixture``, version НЕ растёт);
+  * атомарно       = ``augment_phase_atomic`` (один bump, обе причины в логе).
+
+``baseline-as-value`` (§15.1.2) теперь проявляется при миграции: точка фазы k-1
+получает РЕАЛЬНОЕ значение закрытого параметра (T=0.5) в составных координатах,
+а не MISSING — поэтому переиспользуется как fixed (не выбрасывается).
 """
 import warnings
 
@@ -61,69 +65,57 @@ def _runner():
 
 
 # ----------------------------------------------------------------------
-# §15.3 шаг 1 — baseline пишется в X точки реальным значением
+# §15.3 шаг 1 / §15.3.6 — фаза 1 кодируется схемой (mixture-only, C заперт)
 # ----------------------------------------------------------------------
-def test_phase1_baseline_stored_as_value_in_datapoint():
+def test_phase1_is_mixture_only_with_locked_C():
     r = _runner()
-    # фаза 1: свободны только A,B; C и весь process закрыты на baseline
-    r.set_free(mixture_free=["A", "B"], process_free=[])
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])
     r.seed_initial(n=12, seed=2)
 
-    T_idx, P_idx = 0, 1
+    assert r.current_schema_version == 1
+    assert r.dim == 3 and r.d == 0          # фаза 1 — mixture-only (нет process)
     assert len(r.points) == 12
     for pt in r.points:
-        # §15.1.2: T=0.5 и P=0.5 ЛЕЖАТ в X как значение (не маска)
-        assert pt.X[PROCESS][T_idx] == 0.5
-        assert pt.X[PROCESS][P_idx] == 0.5
-        # закрытый mixture-компонент C тоже зафиксирован значением (baseline 1/3)
-        assert np.isclose(pt.X[MIXTURE][2], 1 / 3)
-        # свободные A,B варьируют, но Σ=1 сохраняется
+        assert PROCESS not in pt.X           # process-блока в схеме v1 нет
+        assert np.isclose(pt.X[MIXTURE][2], 1 / 3)        # C заперт на baseline
         assert np.isclose(sum(pt.X[MIXTURE]), 1.0, atol=1e-9)
-        # все точки фазы 1 ссылаются на версию схемы 1
         assert pt.schema_version == 1
         assert pt.origin_tag["origin"] == "seed"
 
-    # свободные A,B действительно варьируют по базе
     A = np.array([pt.X[MIXTURE][0] for pt in r.points])
     B = np.array([pt.X[MIXTURE][1] for pt in r.points])
-    assert A.std() > 0.05 and B.std() > 0.05
+    assert A.std() > 0.05 and B.std() > 0.05            # свободные A,B варьируют
 
 
 def test_derived_arrays_consistent_with_points():
     r = _runner()
-    r.set_free(mixture_free=["A", "B"], process_free=[])
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])
     r.seed_initial(n=10, seed=4)
 
-    # numpy-кэши — производные от ведущей базы points
-    assert r.X.shape == (10, 5)
+    assert r.X.shape == (10, 3)              # фаза 1 — только mixture-координаты
     assert r.Y.shape == (10, 2)
     assert len(r.origin) == 10 and set(r.origin) == {"seed"}
-
-    # построчная сверка: X[i] == [A,B,C,T,P] точки i, Y[i] == отклики точки i
     for i, pt in enumerate(r.points):
-        row = list(pt.X[MIXTURE]) + list(pt.X[PROCESS])
-        assert np.allclose(r.X[i], row)
+        assert np.allclose(r.X[i], pt.X[MIXTURE])
         assert np.allclose(r.Y[i], [pt.Y["p0"], pt.Y["p1"]])
 
 
 def test_branch_round_appends_versioned_points():
     r = _runner()
-    r.set_free(mixture_free=["A", "B"], process_free=[])
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])
     r.seed_initial(n=12, seed=5)
     n0 = len(r.points)
 
     br = r.add_branch("opt", {"p0": DesirabilitySpec("max", low=-5, high=5)},
                       budget=4, satisfy_at=2.0)
-    r.run_branch_round(br.id, n_points=2, n_candidates=200)
+    out = r.run_branch_round(br.id, n_points=2, n_candidates=200)
 
+    assert out["added"] == 2                 # бюджет раунда соблюдён (acq+argmax)
     assert len(r.points) == n0 + 2
-    assert r.X.shape == (n0 + 2, 5) and r.Y.shape == (n0 + 2, 2)
-    # новые точки ветки: origin-тег и версия схемы (фаза 1 ⇒ v1)
     for pt in r.points[n0:]:
         assert pt.origin_tag["origin"] == f"branch:{br.id}"
         assert pt.schema_version == 1
-        # process всё ещё на baseline (фаза не открывала T/P)
-        assert pt.X[PROCESS] == [0.5, 0.5]
+        assert PROCESS not in pt.X           # фаза 1 не открывала process
     assert r.origin_counts()[f"branch:{br.id}"] == 2
 
 
@@ -147,10 +139,8 @@ def _phase_schemas():
 
 def test_diff_vars_and_bounds_are_orthogonal():
     old, new = _phase_schemas()
-    # ось переменных: видит ТОЛЬКО добавленный process P, mixture-состав не менялся
     dv = schema_diff_vars(old, new)
     assert dv[PROCESS] == ["P"] and dv[MIXTURE] == []
-    # ось границ: видит ТОЛЬКО переребаунденный C; T не менялся, P не общий → пусто
     db = schema_diff_bounds(old, new)
     assert set(db[MIXTURE]) == {"C"}
     assert db[PROCESS] == {}
@@ -160,7 +150,7 @@ def test_diff_vars_and_bounds_are_orthogonal():
 
 def test_diff_bounds_symmetric_detects_narrowing():
     old, new = _phase_schemas()
-    db = schema_diff_bounds(new, old)   # обратное направление: сужение C
+    db = schema_diff_bounds(new, old)
     assert set(db[MIXTURE]) == {"C"}
     olo, ohi, nlo, nhi = db[MIXTURE]["C"]
     assert (olo, ohi) == (0.0, 1.0) and (nlo, nhi) == (1 / 3, 1 / 3)
@@ -183,10 +173,8 @@ def test_evolve_relax_bounds_records_change_log_no_var_added():
     s2 = evolve_schema(s1, relax_bounds={"C": (0.0, 1.0)})
     mb = s2.mixture_block()
     assert (mb.lower, mb.upper) == ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
-    # релаксация — это НЕ добавление переменной (состав симплекса тот же)
     assert schema_diff_vars(s1, s2)[MIXTURE] == [] and schema_diff_vars(s1, s2)[PROCESS] == []
     assert set(schema_diff_bounds(s1, s2)[MIXTURE]) == {"C"}
-    # причина зафиксирована в change_log, append-причин нет
     assert {"relax_bounds": "C"} in s2.change_log
     assert all("append_param" not in e for e in s2.change_log)
 
@@ -224,7 +212,7 @@ def test_select_fixed_keeps_baseline_C_point_after_relax():
                                         PROCESS: [0.5]}, Y={})
     used, skipped = select_fixed_rows([pt], s2, hist)
     assert len(used) == 1 and skipped == []
-    assert used[0].X[MIXTURE] == [1 / 3, 1 / 3, 1 / 3]   # C сохранён, ∈ релакс [0,1]
+    assert used[0].X[MIXTURE] == [1 / 3, 1 / 3, 1 / 3]
 
 
 def test_select_fixed_drops_point_outside_narrowed_bounds():
@@ -234,23 +222,20 @@ def test_select_fixed_drops_point_outside_narrowed_bounds():
     proc = VariableBlock.process(["T"], lower=[0.0], upper=[1.0])
     s1 = ProjectSchema.mixture_process(mix, proc, version=1)
     hist = SchemaHistory.start(s1)
-    s2 = evolve_schema(s1, relax_bounds={"C": (0.0, 0.2)})   # СУЖЕНИЕ C
+    s2 = evolve_schema(s1, relax_bounds={"C": (0.0, 0.2)})
     hist.add(s2)
 
     pt = DataPoint(schema_version=1, X={MIXTURE: [1 / 3, 1 / 3, 1 / 3],
-                                        PROCESS: [0.5]}, Y={})   # C=1/3 > 0.2
+                                        PROCESS: [0.5]}, Y={})
     used, skipped = select_fixed_rows([pt], s2, hist)
     assert used == [] and len(skipped) == 1
 
 
 # ----------------------------------------------------------------------
-# §15.3 шаг 3 — M8-argmax над составной областью (mixture×process), маска
+# §15.3 шаг 3 — M8-argmax над составной областью (mixture×process)
 # ----------------------------------------------------------------------
 def test_optimize_desirability_process_box_pushes_to_edge():
-    """§15.1.4: argmax давит СВОБОДНУЮ process-координату к краю куба (T→1).
-
-    Детерминированно (без GP): предиктор p0 = T (composite-индекс q+0).
-    """
+    """§15.1.4: argmax давит СВОБОДНУЮ process-координату к краю куба (T→1)."""
     region = SimplexRegion(lower=[0.0, 0.0, 0.0], upper=[1.0, 1.0, 1.0],
                            names=["A", "B", "C"])
     q = 3
@@ -260,8 +245,8 @@ def test_optimize_desirability_process_box_pushes_to_edge():
                                 n_candidates=500, refine_iters=200, n_starts=5,
                                 seed=0, process_lower=[0.0, 0.0],
                                 process_upper=[1.0, 1.0])
-    assert res.x.shape == (q + 2,)                 # составной рецепт [A,B,C,T,P]
-    assert res.x[q + 0] > 0.9                      # T прижат к верхней границе
+    assert res.x.shape == (q + 2,)
+    assert res.x[q + 0] > 0.9
 
 
 def test_optimize_desirability_respects_fixed_process():
@@ -275,26 +260,114 @@ def test_optimize_desirability_respects_fixed_process():
                                 n_candidates=500, refine_iters=200, n_starts=5,
                                 seed=0, process_lower=[0.0, 0.0],
                                 process_upper=[1.0, 1.0],
-                                process_fixed={1: 0.3})     # P закрыт на 0.3
-    assert res.x[q + 1] == 0.3                     # P не двигался
-    assert res.x[q + 0] > 0.9                      # T всё равно к краю
+                                process_fixed={1: 0.3})
+    assert res.x[q + 1] == 0.3
+    assert res.x[q + 0] > 0.9
 
 
-def test_runner_optimize_xbest_respects_phase_mask():
-    """Раннер: M8-argmax в фазе 1 держит закрытые C и T,P на baseline."""
+def test_runner_optimize_xbest_phase1_region():
+    """Раннер: M8-argmax в фазе 1 даёт mixture-only рецепт с C на baseline."""
     r = _runner()
-    r.set_free(mixture_free=["A", "B"], process_free=[])   # C,T,P закрыты
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])   # mixture-only
     r.seed_initial(n=14, seed=3)
     br = r.add_branch("opt", {"p0": DesirabilitySpec("max", low=-5, high=5)},
                       budget=10, satisfy_at=2.0)
     res = r.optimize_xbest(br.id, n_candidates=500, refine_iters=100, n_starts=4)
 
-    # закрытые координаты заперты на baseline независимо от модели
-    assert np.isclose(res.x[2], 1 / 3)             # C = baseline
-    assert res.x[3] == 0.5 and res.x[4] == 0.5     # T,P = baseline (process_fixed)
-    # свободный симплекс: Σ(A,B,C)=1
+    assert res.x.shape == (3,)                     # фаза 1 — только mixture
+    assert np.isclose(res.x[2], 1 / 3)             # C заперт на baseline
     assert np.isclose(res.x[:3].sum(), 1.0, atol=1e-6)
 
 
+# ----------------------------------------------------------------------
+# §15.3 шаг 4 — augment_phase_schema: append +T, переиспользование fixed
+# ----------------------------------------------------------------------
+def test_augment_phase_schema_reuses_phase1_as_fixed():
+    """§14/§15.2.1: +T в схему → version+1; точки фазы 1 мигрируют (НЕ выброшены),
+    закрытый T записан РЕАЛЬНЫМ значением baseline (§15.1.2), не MISSING."""
+    r = _runner()
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])
+    r.seed_initial(n=14, seed=6)
+    n_seed = len(r.points)
+
+    r.augment_phase_schema(["T"])                  # version 1 → 2
+
+    assert r.current_schema_version == 2
+    assert r.current_schema.process_names == ("T",)
+    assert {"append_param": "T"} in r.current_schema.change_log
+    assert r.current_schema.migration["T"]["policy"] == "known-constant"
+
+    # P6: точки версии 1 ЖИВЫ в базе (НЕ переизмерены)
+    assert all(pt.schema_version == 1 for pt in r.points)
+    assert len(r.points) == n_seed
+    # фаза 1 точки мигрированы к v2: T дописан baseline'ом (0.5), а не MISSING
+    assert r.X.shape == (n_seed, 4)                # +1 process-координата T
+    assert np.allclose(r.X[:, 3], 0.5)             # §15.1.2 baseline-as-value
+    # P4 (§15.1.3): стартовая инфо-матрица fixed-строк непустая
+    assert r.start_info_matrix_rank() > 0
+
+    # P5: модель новой схемы содержит T-члены (T и кросс A:T)
+    names = build_model_terms(r.current_schema).names
+    assert "T" in names and "A:T" in names
 
 
+def test_augment_phase_schema_new_round_adds_versioned_points():
+    """После +T новые точки ветки несут версию 2 и process-координату."""
+    r = _runner()
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])
+    r.seed_initial(n=12, seed=7)
+    br = r.add_branch("opt", {"p0": DesirabilitySpec("max", low=-5, high=5)},
+                      budget=8, satisfy_at=2.0)
+    r.augment_phase_schema(["T"])
+    r.run_branch_round(br.id, n_points=2, n_candidates=200)
+
+    new = [pt for pt in r.points if pt.schema_version == 2]
+    assert len(new) == 2
+    for pt in new:
+        assert PROCESS in pt.X and len(pt.X[PROCESS]) == 1
+    # P6: версии 1 и 2 сосуществуют в общей базе
+    assert {1, 2} <= {pt.schema_version for pt in r.points}
+
+
+# ----------------------------------------------------------------------
+# §15.2.4 — region-expansion (+C): schema_version НЕ меняется
+# ----------------------------------------------------------------------
+def test_region_expansion_does_not_bump_version():
+    r = _runner()
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])
+    r.seed_initial(n=12, seed=8)
+    r.augment_phase_schema(["T"])               # version → 2 (есть process)
+    v_before = r.current_schema_version
+
+    mb = r.current_schema.mixture_block()
+    assert (mb.lower[2], mb.upper[2]) == (1 / 3, 1 / 3)   # C заперт до релакса
+    r.expand_region_mixture(["C"])              # снятие ограничения симплекса
+
+    assert r.current_schema_version == v_before          # §15.2.4: НЕ растёт
+    mb = r.current_schema.mixture_block()
+    assert (mb.lower[2], mb.upper[2]) == (0.0, 1.0)      # C раскрыт
+    assert {"relax_bounds": "C"} in r.current_schema.change_log
+    # точки переиспользуются как fixed в пределах ОДНОЙ модели (не выброшены)
+    assert r.X.shape[0] == len([p for p in r.points])
+
+
+# ----------------------------------------------------------------------
+# §15.2.5 — атомарность фазы 3 (+P append + C relax вместе)
+# ----------------------------------------------------------------------
+def test_atomic_phase_one_bump_both_reasons_logged():
+    r = _runner()
+    r.begin_phase(mixture_free=["A", "B"], process_free=[])
+    r.seed_initial(n=12, seed=9)
+    r.augment_phase_schema(["T"])               # → v2
+    v_after_T = r.current_schema_version
+
+    r.augment_phase_atomic(["P"], ["C"])        # +P append + C relax атомарно
+
+    assert r.current_schema_version == v_after_T + 1      # ОДИН bump (за P)
+    log = r.current_schema.change_log
+    assert {"append_param": "P"} in log and {"relax_bounds": "C"} in log
+    assert r.current_schema.process_names == ("T", "P")
+    mb = r.current_schema.mixture_block()
+    assert (mb.lower[2], mb.upper[2]) == (0.0, 1.0)      # C раскрыт в той же фазе
+    # дизайн остаётся идентифицируемым (I-критерий конечен)
+    assert np.isfinite(r.design_i_value())

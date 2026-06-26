@@ -199,23 +199,35 @@ def optimize_desirability(region: SimplexRegion,
                           refine_iters: int = 400,
                           refine_scale: float = 0.05,
                           n_starts: int = 5,
-                          seed: Optional[int] = None) -> DesirabilityResult:
-    """Maximise the overall desirability over the constrained mixture simplex.
+                          seed: Optional[int] = None,
+                          process_lower: Optional[Sequence[float]] = None,
+                          process_upper: Optional[Sequence[float]] = None,
+                          process_fixed: Optional[Mapping[int, float]] = None
+                          ) -> DesirabilityResult:
+    """Maximise the overall desirability over the constrained mixture simplex,
+    optionally PRODUCT-ed with a process box (mixture×process, §15.1.4).
 
     Parameters
     ----------
     region      : feasible mixture region (M1).
     predictors  : name -> callable(X)->y giving the predicted property mean.
-                  Wrap a MoE as ``lambda X: moe.predict(X).mean``.
+                  Wrap a MoE as ``lambda X: moe.predict(X).mean``. When a process
+                  box is given, ``X`` is the COMPOSITE matrix ``[x..., z_code...]``.
     specs       : name -> DesirabilitySpec (must match `predictors` keys).
     cost_fn     : optional callable(X)->cost; folded in as a "min" property.
     cost_spec   : DesirabilitySpec for cost (defaults to plain "min" over the
                   observed cost range of the candidate set).
     n_candidates: feasible candidates to score (global stage).
     refine_iters: local random-search steps around the incumbent (0 disables).
-    refine_scale: std of the (pseudocomponent) perturbation during refinement.
+    refine_scale: std of the (pseudocomponent / process-code) perturbation.
+    process_lower / process_upper : per-process-coord box bounds in CODE space
+                  (length ``d``). ``None`` (default) ⇒ mixture-only — поведение и
+                  поток ГСЧ ИДЕНТИЧНЫ прежним (обратная совместимость, §15.1.4).
+    process_fixed : ``{idx: value}`` для ЗАКРЫТЫХ фазой process-координат (маска
+                  свободы): эти координаты держатся на ``value`` и не варьируются.
 
-    Returns a :class:`DesirabilityResult` with the best feasible recipe.
+    Returns a :class:`DesirabilityResult`; при наличии process-бокса ``x`` —
+    составной рецепт ``[x..., z_code...]`` (длиной ``q+d``).
     """
     # ---- assemble the full set of named objectives -------------------
     specs = dict(specs)
@@ -234,12 +246,38 @@ def optimize_desirability(region: SimplexRegion,
             props[cost_name] = np.asarray(cost_fn(X), float).ravel()
         return props
 
+    # ---- process-box setup (d==0 ⇒ строго mixture-only, без лишних draws) ----
+    q = region.q
+    d = 0 if process_lower is None else len(process_lower)
+    plo = np.asarray(process_lower, float) if d else None
+    phi = np.asarray(process_upper, float) if d else None
+    fixed = {int(k): float(v) for k, v in (process_fixed or {}).items()}
+    free_proc = [j for j in range(d) if j not in fixed]
+
+    def _augment(Xmix: np.ndarray, rng_proc) -> np.ndarray:
+        """Дополнить mixture-кандидаты (m×q) process-координатами → (m×(q+d))."""
+        if d == 0:
+            return Xmix
+        Xmix = np.atleast_2d(Xmix)
+        m = len(Xmix)
+        Z = np.empty((m, d), float)
+        for j in range(d):
+            if j in fixed:
+                Z[:, j] = fixed[j]
+            else:
+                Z[:, j] = rng_proc.uniform(plo[j], phi[j], size=m)
+        return np.hstack([Xmix, Z])
+
     # ---- global stage: score a feasible candidate set ----------------
     rng = np.random.default_rng(seed)
     cand = region.random_points(n_candidates, seed=seed)
     verts = region.extreme_vertices()
     cent = region.centroid().reshape(1, -1)
-    candidates = np.vstack([cand, verts, cent]) if len(verts) else np.vstack([cand, cent])
+    mix_candidates = (np.vstack([cand, verts, cent]) if len(verts)
+                      else np.vstack([cand, cent]))
+    rng_proc = (np.random.default_rng((0 if seed is None else seed) + 12345)
+                if d else None)
+    candidates = _augment(mix_candidates, rng_proc)
 
     props = evaluate_props(candidates)
 
@@ -269,29 +307,41 @@ def optimize_desirability(region: SimplexRegion,
                 "n_starts": len(start_indices)}]
 
     # ---- local stage: feasibility-preserving random refinement -------
+    # Рабочий вектор: [mixture pseudocomponents (q), СВОБОДНЫЕ process-коды].
+    # При d==0 размер шага == q ⇒ поток ГСЧ совпадает с прежним (golden цел).
+    step_dim = q + len(free_proc)
     for s_no, gi in enumerate(start_indices):
         x_cur = candidates[gi].copy()
         d_cur = float(d_all[gi])
-        w_cur = region.to_pseudo(x_cur)          # work in pseudocomponents
+        w_cur = region.to_pseudo(x_cur[:q])      # work in pseudocomponents
+        z_cur = x_cur[q:].copy() if d else np.empty(0)
         improved = False
         for it in range(int(refine_iters)):
-            step = rng.normal(0.0, refine_scale, size=region.q)
-            w_try = np.clip(w_cur + step, 0.0, None)
+            step = rng.normal(0.0, refine_scale, size=step_dim)
+            w_try = np.clip(w_cur + step[:q], 0.0, None)
             s = w_try.sum()
             if s <= 0:
                 continue
             w_try = w_try / s
-            x_try = region.from_pseudo(w_try)
-            if not region.is_feasible(x_try):
-                x_try = region.clip(x_try)
-                if not region.is_feasible(x_try):
+            x_mix_try = region.from_pseudo(w_try)
+            if not region.is_feasible(x_mix_try):
+                x_mix_try = region.clip(x_mix_try)
+                if not region.is_feasible(x_mix_try):
                     continue
+            if d:
+                z_try = z_cur.copy()
+                for k, j in enumerate(free_proc):
+                    z_try[j] = float(np.clip(z_cur[j] + step[q + k], plo[j], phi[j]))
+                x_try = np.concatenate([x_mix_try, z_try])
+            else:
+                x_try = x_mix_try
             p_try = evaluate_props(x_try.reshape(1, -1))
             d_try = float(desir.overall(p_try)[0])
             n_eval += 1
             if d_try > d_cur:
                 d_cur, x_cur = d_try, x_try.copy()
-                w_cur = region.to_pseudo(x_cur)
+                w_cur = region.to_pseudo(x_cur[:q])
+                z_cur = x_cur[q:].copy() if d else np.empty(0)
                 improved = True
         history.append({"stage": "start", "start": s_no, "from_global": gi,
                         "d_overall": d_cur, "improved": improved})
@@ -310,3 +360,5 @@ def optimize_desirability(region: SimplexRegion,
         properties=props_scalar, n_evaluated=n_eval,
         refined=refined, n_starts=len(start_indices), history=history,
     )
+
+

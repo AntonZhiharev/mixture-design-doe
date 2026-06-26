@@ -26,10 +26,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 import numpy as np
 
 from ..core.schema import MIXTURE, PROCESS, DataPoint, ProjectSchema
+from ..core.simplex import SimplexRegion
 from ..models.gp_expert import GPExpert
 from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget)
-from ..optimize.desirability import Desirability, DesirabilitySpec
+from ..optimize.desirability import (Desirability, DesirabilitySpec,
+                                     DesirabilityResult, optimize_desirability)
+
 
 
 class MixtureProcessRunner:
@@ -291,3 +294,53 @@ class MixtureProcessRunner:
         for o in self.origin:
             out[o] = out.get(o, 0) + 1
         return out
+
+    # ------------------------------------------------------------------
+    # M8-argmax по суррогату над составной областью под маской (§15.1.4)
+    # ------------------------------------------------------------------
+    def _masked_mixture_region(self) -> SimplexRegion:
+        """SimplexRegion текущей фазы: закрытые mixture-компоненты заперты на
+        baseline (lo=hi=baseline_i), свободные — по границам блока. Σx=1 и
+        выполнимость обеспечивает :class:`SimplexRegion`."""
+        mb = self._mix_block
+        base = self.baseline[:self.q]
+        lo = list(mb.lower)
+        hi = list(mb.upper)
+        for i in range(self.q):
+            if not self._mix_free[i]:
+                lo[i] = float(base[i])
+                hi[i] = float(base[i])
+        return SimplexRegion(lower=lo, upper=hi, names=list(mb.names))
+
+    def optimize_xbest(self, branch_id: str, *, n_candidates: int = 2000,
+                       refine_iters: int = 200, n_starts: int = 5
+                       ) -> DesirabilityResult:
+        """M8-argmax (§15.1.4): мультистарт-максимум desirability ветки по ОБЩИМ
+        суррогатам над СОСТАВНОЙ областью текущей фазы (симплекс под маской ×
+        process-бокс [0,1]^d с закрытыми координатами на baseline).
+
+        Возвращает :class:`DesirabilityResult` с составным рецептом ``x``
+        (``[A..., z_code...]``). Это «эксплойт»-предложение по модели — НЕ
+        «лучшая измеренная»; стоимостный член учитывается, если ``price``-подобное
+        свойство присутствует в цели ветки как ``min``-spec.
+        """
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if not self.surrogates:
+            self.fit_surrogates()
+        br = self.branches[branch_id]
+
+        region = self._masked_mixture_region()
+        base_proc = self.baseline[self.q:]
+        proc_fixed = {j: float(base_proc[j]) for j in range(self.d)
+                      if not self._proc_free[j]}
+        predictors = {name: (lambda X, gp=self.surrogates[name]: gp.predict(X).mean)
+                      for name in br.goal}
+        return optimize_desirability(
+            region, predictors, dict(br.goal),
+            n_candidates=int(n_candidates), refine_iters=int(refine_iters),
+            n_starts=int(n_starts), seed=self.seed + 5000 + br.spent,
+            process_lower=[0.0] * self.d, process_upper=[1.0] * self.d,
+            process_fixed=proc_fixed)
+
+

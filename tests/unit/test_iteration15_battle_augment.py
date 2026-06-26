@@ -27,8 +27,10 @@ from src.core.schema import (MIXTURE, PROCESS, DataPoint, ProjectSchema,
                              schema_diff_bounds)
 from src.core.schema_evolution import (SchemaHistory, evolve_schema,
                                        select_fixed_rows, known_constant)
+from src.core.simplex import SimplexRegion
 from src.design.block_model import build_model_terms
-from src.optimize.desirability import DesirabilitySpec
+from src.optimize.desirability import DesirabilitySpec, optimize_desirability
+
 from src.verification.mixture_process_truth import MultiMixtureProcessTruth
 from src.apps.mixture_process_runner import MixtureProcessRunner
 
@@ -239,6 +241,60 @@ def test_select_fixed_drops_point_outside_narrowed_bounds():
                                         PROCESS: [0.5]}, Y={})   # C=1/3 > 0.2
     used, skipped = select_fixed_rows([pt], s2, hist)
     assert used == [] and len(skipped) == 1
+
+
+# ----------------------------------------------------------------------
+# §15.3 шаг 3 — M8-argmax над составной областью (mixture×process), маска
+# ----------------------------------------------------------------------
+def test_optimize_desirability_process_box_pushes_to_edge():
+    """§15.1.4: argmax давит СВОБОДНУЮ process-координату к краю куба (T→1).
+
+    Детерминированно (без GP): предиктор p0 = T (composite-индекс q+0).
+    """
+    region = SimplexRegion(lower=[0.0, 0.0, 0.0], upper=[1.0, 1.0, 1.0],
+                           names=["A", "B", "C"])
+    q = 3
+    predictors = {"p0": lambda X: np.asarray(X, float)[:, q + 0]}   # = T
+    specs = {"p0": DesirabilitySpec("max", low=0.0, high=1.0)}
+    res = optimize_desirability(region, predictors, specs,
+                                n_candidates=500, refine_iters=200, n_starts=5,
+                                seed=0, process_lower=[0.0, 0.0],
+                                process_upper=[1.0, 1.0])
+    assert res.x.shape == (q + 2,)                 # составной рецепт [A,B,C,T,P]
+    assert res.x[q + 0] > 0.9                      # T прижат к верхней границе
+
+
+def test_optimize_desirability_respects_fixed_process():
+    """Закрытая (process_fixed) координата держится на значении, не варьируется."""
+    region = SimplexRegion(lower=[0.0, 0.0, 0.0], upper=[1.0, 1.0, 1.0],
+                           names=["A", "B", "C"])
+    q = 3
+    predictors = {"p0": lambda X: np.asarray(X, float)[:, q + 0]}   # = T
+    specs = {"p0": DesirabilitySpec("max", low=0.0, high=1.0)}
+    res = optimize_desirability(region, predictors, specs,
+                                n_candidates=500, refine_iters=200, n_starts=5,
+                                seed=0, process_lower=[0.0, 0.0],
+                                process_upper=[1.0, 1.0],
+                                process_fixed={1: 0.3})     # P закрыт на 0.3
+    assert res.x[q + 1] == 0.3                     # P не двигался
+    assert res.x[q + 0] > 0.9                      # T всё равно к краю
+
+
+def test_runner_optimize_xbest_respects_phase_mask():
+    """Раннер: M8-argmax в фазе 1 держит закрытые C и T,P на baseline."""
+    r = _runner()
+    r.set_free(mixture_free=["A", "B"], process_free=[])   # C,T,P закрыты
+    r.seed_initial(n=14, seed=3)
+    br = r.add_branch("opt", {"p0": DesirabilitySpec("max", low=-5, high=5)},
+                      budget=10, satisfy_at=2.0)
+    res = r.optimize_xbest(br.id, n_candidates=500, refine_iters=100, n_starts=4)
+
+    # закрытые координаты заперты на baseline независимо от модели
+    assert np.isclose(res.x[2], 1 / 3)             # C = baseline
+    assert res.x[3] == 0.5 and res.x[4] == 0.5     # T,P = baseline (process_fixed)
+    # свободный симплекс: Σ(A,B,C)=1
+    assert np.isclose(res.x[:3].sum(), 1.0, atol=1e-6)
+
 
 
 

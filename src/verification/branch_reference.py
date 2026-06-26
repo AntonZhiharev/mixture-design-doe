@@ -118,8 +118,13 @@ def _mask_from(spec, names, size: int) -> np.ndarray:
 def masked_region_points(truth: MultiMixtureProcessTruth, n: int, seed: int,
                          mixture_free, process_free, baseline) -> np.ndarray:
     """Точки в ОГРАНИЧЕННОЙ маской области: свободные координаты варьируют,
-    «закрытые» держатся на ``baseline`` (Σx=1 сохраняется). Та же проекция, что
-    в :class:`MixtureProcessRunner` — но в верификационном слое, без ядра."""
+    «закрытые» process-параметры держатся на ``baseline``; «закрытые» (не
+    раскрытые append'ом) mixture-компоненты — на ГРАНИ симплекса 0 (§15.0.4).
+
+    Зеркалит :meth:`MixtureProcessRunner._to_full`: неоткрытый mixture-компонент
+    (например, C в фазе 1) физически ОТСУТСТВУЕТ ⇒ его доля 0, а не baseline 1/3.
+    Иначе «потолок» фазы считался бы на ДРУГОЙ истине (C=1/3), чем меряет пайплайн
+    (C=0), и сравнение d_best с потолком рассогласовано."""
     schema = truth.schema
     q = int(schema.n_mixture)
     d = int(schema.n_process)
@@ -129,14 +134,14 @@ def masked_region_points(truth: MultiMixtureProcessTruth, n: int, seed: int,
 
     if q > 0:
         mf = _mask_from(mixture_free, schema.mixture_names, q)
-        held = ~mf
-        held_sum = float(base[:q][held].sum()) if held.any() else 0.0
-        c = np.tile(base[:q], (int(n), 1))
+        # §15.0.4: закрытые mixture-компоненты на грани 0 (held_sum=0), свободные
+        # заполняют всю долю 1 — как 2-компонентный симплекс {A,B} в фазе 1.
+        c = np.zeros((int(n), q))
         if mf.any():
             samp = full[:, :q]
             fs = samp[:, mf].sum(axis=1, keepdims=True)
             fs = np.where(fs > 1e-12, fs, 1.0)
-            c[:, mf] = samp[:, mf] * (1.0 - held_sum) / fs
+            c[:, mf] = samp[:, mf] / fs
         out[:, :q] = c
 
     if d > 0:
@@ -152,21 +157,81 @@ def masked_region_points(truth: MultiMixtureProcessTruth, n: int, seed: int,
 def branch_optimum_masked(truth: MultiMixtureProcessTruth,
                           goal: Mapping[str, DesirabilitySpec], *,
                           baseline, mixture_free=(), process_free=(),
-                          n_scan: int = 40000, seed: int = 0) -> Dict[str, Any]:
-    """«Потолок» ветки под маской свободы фазы (плотный скан, без scipy).
+                          n_scan: int = 40000, seed: int = 0,
+                          refine: bool = True) -> Dict[str, Any]:
+    """«Потолок» ветки под маской свободы фазы: плотный скан + локальное уточнение.
 
     Лучшая достижимая desirability, когда варьируются лишь ``mixture_free`` и
-    ``process_free`` (остальное — на ``baseline``). Это эталон «дотянул ли
-    пайплайн до потенциала ФАЗЫ» (в отличие от глобального :func:`branch_optimum`).
-    Скан в низкоразмерной области точен без локального уточнения.
+    ``process_free`` (закрытый mixture — на грани 0 (§15.0.4), закрытый process —
+    на ``baseline``). Это эталон «дотянул ли пайплайн до потенциала ФАЗЫ»
+    (в отличие от глобального :func:`branch_optimum`).
+
+    После грубого скана делается SLSQP-уточнение ПО СВОБОДНЫМ осям (свободные
+    mixture-доли с Σ=1, свободные process-коды ∈ [0,1]); закрытые координаты
+    держатся фиксированными. Без уточнения чистый скан в высокой размерности
+    (фаза «всё открыто», 5 свободных осей) занижает максимум и ломает
+    монотонность потолков по фазам — а раскрытие переменных НЕ сужает достижимое
+    (область фазы k+1 ⊇ фазы k), поэтому потолок обязан расти. ``refine=False``
+    оставляет чистый скан (если scipy недоступен — тихий фолбэк на скан).
     """
+    schema = truth.schema
+    q = int(schema.n_mixture)
+    d = int(schema.n_process)
     pts = masked_region_points(truth, int(n_scan), seed,
                                mixture_free, process_free, baseline)
     dvals = np.asarray(_desirability_at(truth, goal, pts), float).ravel()
     b = int(np.argmax(dvals))
-    xb = pts[b]
+    xb = pts[b].copy()
+    best_d = float(dvals[b])
+
+    if refine:
+        try:
+            from scipy.optimize import minimize
+
+            mf = (_mask_from(mixture_free, schema.mixture_names, q)
+                  if q > 0 else np.zeros(0, dtype=bool))
+            pf = (_mask_from(process_free, schema.process_names, d)
+                  if d > 0 else np.zeros(0, dtype=bool))
+            free_mix = np.where(mf)[0]
+            free_proc = np.where(pf)[0]
+            n_fm = int(free_mix.size)
+
+            def expand(v):
+                x = xb.copy()                  # held mixture=0 / held process=baseline
+                if n_fm:
+                    x[free_mix] = v[:n_fm]
+                for k, j in enumerate(free_proc):
+                    x[q + j] = v[n_fm + k]
+                return x
+
+            v0 = np.concatenate([xb[free_mix], xb[q + free_proc]]) \
+                if (n_fm + free_proc.size) else np.zeros(0)
+            if v0.size:
+                bounds = [(0.0, 1.0)] * v0.size
+                cons = []
+                if n_fm > 0:
+                    cons.append({"type": "eq",
+                                 "fun": lambda v: float(np.sum(v[:n_fm]) - 1.0)})
+                res = minimize(
+                    lambda v: -float(_desirability_at(truth, goal, expand(v))[0]),
+                    v0, method="SLSQP", bounds=bounds, constraints=cons,
+                    options={"maxiter": 300, "ftol": 1e-9})
+                cand = expand(np.asarray(res.x, float))
+                if n_fm > 0:                    # перенормировать свободные доли (Σ=1)
+                    fm = np.clip(cand[free_mix], 0.0, None)
+                    s = fm.sum()
+                    if s > 0:
+                        cand[free_mix] = fm / s
+                if free_proc.size:
+                    cand[q + free_proc] = np.clip(cand[q + free_proc], 0.0, 1.0)
+                d_cand = float(_desirability_at(truth, goal, cand)[0])
+                if d_cand >= best_d:
+                    xb, best_d = cand, d_cand
+        except Exception:  # noqa: BLE001 — без scipy остаётся скан-оптимум
+            pass
+
     y = {p: float(truth.truths[p].true(xb.reshape(1, -1))[0])
          for p in truth.property_names}
-    return {"x": xb, "d": float(dvals[b]), "y": y}
+    return {"x": xb, "d": float(best_d), "y": y}
 
 

@@ -58,20 +58,52 @@ class MixtureProcessTruth:
     def d(self) -> int:
         return self.terms.d
 
-    def true(self, Xc) -> np.ndarray:
-        """Безшумный отклик по составным координатам ``Xc`` (n×(q+d))."""
+    def _zero_inactive_mixture(self, Xc: np.ndarray,
+                               active_schema: ProjectSchema) -> np.ndarray:
+        """Занулить mixture-компоненты, ОТСУТСТВУЮЩИЕ в ``active_schema`` (§15.0.4).
+
+        Append-семантика mixture-компонента: пока компонент (например, C) не
+        введён в схему фазы, он НЕ вносит вклад — его реальное значение на грани
+        симплекса C=0. Зануление столбца C до сборки модельной матрицы убирает
+        ВСЕ термы с C (``β_C·C``, ``A·B·C``, …). ``active_schema=None`` сюда не
+        попадает (полная схема — вклад всех компонентов, обратная совместимость).
+        """
+        active = set(active_schema.mixture_names)
+        inactive = [i for i, nm in enumerate(self.schema.mixture_names)
+                    if nm not in active]
+        if not inactive:
+            return Xc
+        Xc = np.array(Xc, dtype=float, copy=True)
+        Xc[:, inactive] = 0.0
+        return Xc
+
+    def true(self, Xc, *, active_schema: Optional[ProjectSchema] = None
+             ) -> np.ndarray:
+        """Безшумный отклик по составным координатам ``Xc`` (n×(q+d)).
+
+        ``active_schema`` (§15.0.4): если задан, mixture-компоненты, которых в нём
+        НЕТ (например, C в фазе 1), зануляются ⇒ их термы не вносят вклад (истина
+        считается на грани симплекса C=0, а не при «молчаливом» baseline C=1/3).
+        ``None`` → полная схема истины (вклад всех компонентов).
+        """
+        Xc = np.atleast_2d(np.asarray(Xc, dtype=float))
+        if active_schema is not None:
+            Xc = self._zero_inactive_mixture(Xc, active_schema)
         M = model_matrix(self.schema, Xc, terms=self.terms)
         return M @ self.coefficients
 
-    def evaluate(self, Xc) -> np.ndarray:
+    def evaluate(self, Xc, *, active_schema: Optional[ProjectSchema] = None
+                 ) -> np.ndarray:
         """Зашумлённый отклик (добавляет ``N(0, noise_sd²)``)."""
-        y = self.true(Xc)
+        y = self.true(Xc, active_schema=active_schema)
         if self.noise_sd > 0:
             y = y + self._rng.normal(0.0, self.noise_sd, size=y.shape)
         return y
 
-    def __call__(self, Xc) -> np.ndarray:
-        return self.evaluate(Xc)
+    def __call__(self, Xc, *, active_schema: Optional[ProjectSchema] = None
+                 ) -> np.ndarray:
+        return self.evaluate(Xc, active_schema=active_schema)
+
 
     def __repr__(self) -> str:
         return (f"MixtureProcessTruth(q={self.q}, d={self.d}, "
@@ -105,18 +137,27 @@ class MultiMixtureProcessTruth:
     def n_properties(self) -> int:
         return len(self.property_names)
 
-    def true(self, Xc) -> np.ndarray:
-        """Безшумные отклики всех свойств, форма (n×P)."""
-        return np.column_stack([self.truths[n].true(Xc)
+    def true(self, Xc, *, active_schema: Optional[ProjectSchema] = None
+             ) -> np.ndarray:
+        """Безшумные отклики всех свойств, форма (n×P).
+
+        ``active_schema`` (§15.0.4) пробрасывается в каждую истину свойства:
+        отсутствующие в нём mixture-компоненты не вносят вклад (грань C=0).
+        """
+        return np.column_stack([self.truths[n].true(Xc, active_schema=active_schema)
                                 for n in self.property_names])
 
-    def evaluate(self, Xc) -> np.ndarray:
+    def evaluate(self, Xc, *, active_schema: Optional[ProjectSchema] = None
+                 ) -> np.ndarray:
         """Зашумлённые отклики всех свойств, форма (n×P)."""
-        return np.column_stack([self.truths[n].evaluate(Xc)
-                                for n in self.property_names])
+        return np.column_stack(
+            [self.truths[n].evaluate(Xc, active_schema=active_schema)
+             for n in self.property_names])
 
-    def __call__(self, Xc) -> np.ndarray:
-        return self.evaluate(Xc)
+    def __call__(self, Xc, *, active_schema: Optional[ProjectSchema] = None
+                 ) -> np.ndarray:
+        return self.evaluate(Xc, active_schema=active_schema)
+
 
     def __repr__(self) -> str:
         return (f"MultiMixtureProcessTruth(P={self.n_properties}, "

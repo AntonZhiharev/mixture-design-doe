@@ -15,12 +15,16 @@ origin-тегами. Новая точка меряется по ВСЕМ P св
     инкрементится, политика миграции старых точек = ``known-constant(baseline)``
     (точки фазы k-1 мерились при baseline этого параметра — это полноценные
     данные, не MISSING). Старые точки переиспользуются как fixed.
-  * **+mixture (C)** — RELAX BOUNDS (:meth:`expand_region_mixture`): снятие
-    ограничения симплекса. Состав симплекса тот же ⇒ ``schema_version`` за это НЕ
-    растёт (§15.2.4); меняется только ОБЛАСТЬ (bounds).
-  * **атомарно «схема+область»** (:meth:`augment_phase_atomic`, §15.1.5): один
-    target несёт И append-process, И relax-mixture; ОДИН bump (за append), обе
-    причины в ``change_log``.
+  * **+mixture (C)** — APPEND В СХЕМУ (:meth:`augment_phase_mixture`, §15.0.4):
+    C — полноценный новый компонент симплекса (Σ переопределяется
+    ``A+B=1 → A+B+C=1``), ``schema_version`` инкрементится. Старые
+    2-компонентные точки мигрируют на ГРАНЬ ``known-constant(0.0)`` (а НЕ на
+    внутренний baseline — отличие от process). Это ОТМЕНЯЕТ прежний
+    region-expansion для C (Предусловие 2 снято в §15.0.4).
+  * **атомарно «схема+схема»** (:meth:`augment_phase_atomic`, §15.1.5): один
+    target несёт И append-process, И append-mixture; ОДИН bump, обе причины в
+    ``change_log`` (``append_param`` + ``append_mixture``).
+
 
 Старого mask+baseline пути (`set_free`/`_masked_candidates`) больше НЕТ: свобода
 фазы кодируется САМОЙ схемой (членство в process-блоке) и её bounds (mixture).
@@ -79,9 +83,10 @@ class MixtureProcessRunner:
 
         self._full_mix = schema.mixture_block()
         self._full_proc = schema.process_block()
-        self.q = int(schema.n_mixture)
+        self.q_full = int(schema.n_mixture)
         self.d_full = int(schema.n_process)
-        self.dim_full = self.q + self.d_full
+        self.dim_full = self.q_full + self.d_full
+
         self.seed = int(seed)
         self.n_restarts = int(n_restarts)
         self.gp_mean_model = gp_mean_model
@@ -94,9 +99,11 @@ class MixtureProcessRunner:
                 raise ValueError(f"baseline длины {self.baseline.size}, "
                                  f"ожидалось {self.dim_full}.")
         else:
-            mix = (np.full(self.q, 1.0 / self.q) if self.q else np.empty(0))
+            mix = (np.full(self.q_full, 1.0 / self.q_full)
+                   if self.q_full else np.empty(0))
             proc = (np.full(self.d_full, 0.5) if self.d_full else np.empty(0))
             self.baseline = np.concatenate([mix, proc])
+
 
         # текущая фаза = полная схема по умолчанию (если begin_phase не вызван)
         self.current_schema: ProjectSchema = schema
@@ -115,9 +122,19 @@ class MixtureProcessRunner:
     # размеры текущей фазы
     # ------------------------------------------------------------------
     @property
+    def q(self) -> int:
+        """Число mixture-компонентов ТЕКУЩЕЙ схемы (растёт при append C, §15.0.4).
+
+        Фазо-зависим: в фазе 1 симплекс РЕАЛЬНО 2-компонентный {A,B} (C
+        отсутствует), после ``augment_phase_mixture(["C"])`` — 3-компонентный.
+        """
+        return int(self.current_schema.n_mixture)
+
+    @property
     def d(self) -> int:
         """Число process-координат ТЕКУЩЕЙ схемы (растёт при append)."""
         return int(self.current_schema.n_process)
+
 
     @property
     def dim(self) -> int:
@@ -131,11 +148,13 @@ class MixtureProcessRunner:
                     ) -> "MixtureProcessRunner":
         """Задать СТАРТОВУЮ ограниченную фазу (схема v1).
 
-        ``mixture_free`` — имена варьируемых mixture-компонентов; остальные
-        ЗАПИРАЮТСЯ bounds'ами на baseline (``[v,v]``). ``process_free`` — имена
-        process-переменных, ПРИСУТСТВУЮЩИХ в v1 (должны быть ПРЕФИКСОМ полного
-        process-порядка, т.к. append идёт в конец); отсутствующие в схеме просто
-        нет — они достраиваются baseline'ом при измерении.
+        ``mixture_free`` (§15.0.4) — имена варьируемых mixture-компонентов; фаза 1
+        РЕАЛЬНО содержит ТОЛЬКО их (остальные ОТСУТСТВУЮТ, а не заперты на
+        baseline — C появится append'ом в фазе 2). Должны быть ПРЕФИКСОМ полного
+        состава симплекса (append новых компонентов идёт в КОНЕЦ, как process).
+        ``process_free`` — имена process-переменных, ПРИСУТСТВУЮЩИХ в v1 (тоже
+        ПРЕФИКС полного process-порядка); отсутствующие достраиваются baseline'ом
+        при измерении.
         """
         if self._full_mix is None:
             raise ValueError("begin_phase требует mixture-блок в схеме.")
@@ -143,14 +162,16 @@ class MixtureProcessRunner:
         names = list(self._full_mix.names)
         full_lo = list(self._full_mix.lower)
         full_hi = list(self._full_mix.upper)
-        base_mix = self.baseline[:self.q]
-        lo, hi = [], []
-        for i, nm in enumerate(names):
-            if nm in free:
-                lo.append(full_lo[i]); hi.append(full_hi[i])
-            else:
-                lo.append(float(base_mix[i])); hi.append(float(base_mix[i]))
-        mix_block = VariableBlock.mixture(names, lower=lo, upper=hi)
+        free_names = [nm for nm in names if nm in free]
+        if free_names != names[:len(free_names)]:
+            raise ValueError(
+                "mixture_free должен быть ПРЕФИКСОМ полного состава симплекса "
+                "(append mixture-компонента идёт в КОНЕЦ).")
+        idx = [names.index(nm) for nm in free_names]
+        mix_block = VariableBlock.mixture(
+            free_names, lower=[full_lo[i] for i in idx],
+            upper=[full_hi[i] for i in idx])
+
 
         proc_open = self._ordered_process(process_free)
         blocks: List[VariableBlock] = [mix_block]
@@ -200,34 +221,41 @@ class MixtureProcessRunner:
         self.fit_surrogates()
         return new
 
-    def expand_region_mixture(self, mixture_vars: Sequence[str]
+    def augment_phase_mixture(self, mixture_vars: Sequence[str]
                               ) -> ProjectSchema:
-        """+C: RELAX bounds mixture-компонента до полной области (§15.2.4).
+        """§15.0.4: APPEND mixture-компонента(ов) C в схему (``version+1``).
 
-        Состав симплекса тот же ⇒ ``schema_version`` НЕ инкрементится; меняется
-        ТОЛЬКО область (bounds). Причина пишется в ``change_log`` ТЕКУЩЕЙ версии.
-        Точки переиспользуются в пределах ОДНОЙ модели (M5), без миграции
-        переменных (имена не менялись).
+        Заменяет прежний region-expansion (Предусловие 2 отменено для C): C —
+        полноценный новый компонент симплекса (Σ переопределяется
+        ``A+B=1 → A+B+C=1``), а не релаксация bounds. Старые (2-компонентные)
+        точки мигрируют на ГРАНЬ симплекса ``known-constant(0.0)`` — единственное
+        значение, при котором Σ сходится (A+B+0=1 ⟺ A+B=1). ОТЛИЧИЕ от
+        process-append: РЕАЛЬНАЯ доля, не code-baseline куба.
         """
-        relaxed = self._relax_mixture_schema(self.current_schema, mixture_vars,
-                                             bump=False)
-        self.current_schema = relaxed
+        add = self._mixture_append_spec(mixture_vars)
+        mig = self._mixture_migration(mixture_vars)
+        new = evolve_schema(self.current_schema, add_mixture=add, migration=mig)
+        self.schema_history.add(new)
+        self.current_schema = new
+        self.current_schema_version = int(new.version)
         self.fit_surrogates()
-        return relaxed
+        return new
 
     def augment_phase_atomic(self, process_vars: Sequence[str],
                              mixture_vars: Sequence[str]) -> ProjectSchema:
-        """§15.1.5: атомарная фаза «схема+область» — ОДИН target, ОДИН bump.
+        """§15.1.5 + §15.0.4: атомарная фаза «схема+схема» — ОДИН target, ОДИН bump.
 
-        Несёт И append-process (bump ``version+1``), И relax-mixture-bounds
-        (co-record в той же версии, без своего bump). Обе причины — в
-        ``change_log``. Один пересчёт модели на РАСШИРЕННОЙ области.
+        Несёт И append-process (T/P), И append-mixture (C) в ОДНОЙ новой версии;
+        обе причины — в ``change_log`` (``append_param`` + ``append_mixture``).
+        Миграции различают оси: process → ``known-constant(baseline-код)``,
+        mixture → ``known-constant(0.0)`` (грань симплекса).
         """
-        add = self._process_append_spec(process_vars)
+        add_p = self._process_append_spec(process_vars)
+        add_m = self._mixture_append_spec(mixture_vars)
         mig = self._process_migration(process_vars)
-        relax = self._relax_bounds_map(mixture_vars)
-        new = evolve_schema(self.current_schema, add_process=add, migration=mig,
-                            relax_bounds=relax)
+        mig.update(self._mixture_migration(mixture_vars))
+        new = evolve_schema(self.current_schema, add_process=add_p,
+                            add_mixture=add_m, migration=mig)
         self.schema_history.add(new)
         self.current_schema = new
         self.current_schema_version = int(new.version)
@@ -248,38 +276,28 @@ class MixtureProcessRunner:
         for nm in self._ordered_process(process_vars):
             j = self._full_proc.names.index(nm)
             lo, hi = self._full_proc.lower[j], self._full_proc.upper[j]
-            code = float(self.baseline[self.q + j])
+            code = float(self.baseline[self.q_full + j])
             real = lo + code * (hi - lo)          # known-constant хранит РЕАЛ
             mig[nm] = known_constant(real)
         return mig
 
-    def _relax_bounds_map(self, mixture_vars):
-        names = list(self._full_mix.names)
-        relax = {}
-        for nm in mixture_vars:
-            i = names.index(nm)
-            relax[nm] = (float(self._full_mix.lower[i]),
-                         float(self._full_mix.upper[i]))
-        return relax
+    def _ordered_mixture(self, names: Sequence[str]) -> List[str]:
+        """Имена mixture-компонентов в каноническом (полном) порядке."""
+        order = list(self._full_mix.names)
+        return [nm for nm in order if nm in set(names)]
 
-    def _relax_mixture_schema(self, schema: ProjectSchema, mixture_vars,
-                              *, bump: bool) -> ProjectSchema:
-        mb = schema.mixture_block()
-        names = list(mb.names)
-        lo = list(mb.lower); hi = list(mb.upper)
-        log = list(schema.change_log)
-        for nm in mixture_vars:
-            i = names.index(nm)
-            nlo, nhi = self._relax_bounds_map([nm])[nm]
-            lo[i] = nlo; hi[i] = nhi
-            log.append({"relax_bounds": nm})
-        new_mb = VariableBlock.mixture(names, lower=lo, upper=hi)
-        blocks = tuple(new_mb if b.is_mixture else b for b in schema.blocks)
-        version = schema.version + 1 if bump else schema.version
-        return ProjectSchema(version=version, blocks=blocks,
-                             responses=schema.responses, model=schema.model,
-                             migration=dict(schema.migration),
-                             change_log=tuple(log))
+    def _mixture_append_spec(self, mixture_vars):
+        out = []
+        for nm in self._ordered_mixture(mixture_vars):
+            i = self._full_mix.names.index(nm)
+            out.append((nm, float(self._full_mix.lower[i]),
+                        float(self._full_mix.upper[i])))
+        return out
+
+    def _mixture_migration(self, mixture_vars):
+        # §15.0.4: грань симплекса C=0 — РЕАЛЬНАЯ доля (не code-трансформ куба)
+        return {nm: known_constant(0.0)
+                for nm in self._ordered_mixture(mixture_vars)}
 
     # ------------------------------------------------------------------
     # Полный физический вектор для оракула / хранение точки (§15.1.2)
@@ -291,12 +309,18 @@ class MixtureProcessRunner:
         полного process-блока, недостающие достраиваются baseline'ом.
         """
         coords_cur = np.asarray(coords_cur, float).ravel()
-        mix = coords_cur[:self.q]
-        proc_cur = coords_cur[self.q:]
-        proc_full = self.baseline[self.q:self.q + self.d_full].copy()
+        q_cur = self.q
+        mix_cur = coords_cur[:q_cur]
+        proc_cur = coords_cur[q_cur:]
+        # mixture: отсутствующие компоненты достраиваются ГРАНЬЮ симплекса 0
+        # (§15.0.4), НЕ baseline — оракул считает истину при C=0 (Σ сходится:
+        # A+B+0=1). process: недостающие — baseline (внутренняя точка куба).
+        mix_full = np.zeros(self.q_full)
+        mix_full[:mix_cur.size] = mix_cur
+        proc_full = self.baseline[self.q_full:self.q_full + self.d_full].copy()
         if proc_cur.size:
             proc_full[:proc_cur.size] = proc_cur
-        return np.concatenate([mix, proc_full])
+        return np.concatenate([mix_full, proc_full])
 
     def _measure(self, coords_cur: np.ndarray) -> np.ndarray:
         """Измерить набор current-координат оракулом (ПО ВСЕМ P свойствам)."""

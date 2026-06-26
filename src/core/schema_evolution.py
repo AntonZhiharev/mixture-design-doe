@@ -23,7 +23,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .schema import (MIXTURE, MISSING, PROCESS, DataPoint, ProjectSchema,
-                     ResponseSpec, VariableBlock, schema_diff_vars)
+                     ResponseSpec, VariableBlock)
+
 
 # Политики миграции — JSON-native dict (сериализуются в ProjectSchema.migration).
 KNOWN_CONSTANT = "known-constant"
@@ -84,6 +85,7 @@ class SchemaHistory:
 # ----------------------------------------------------------------------
 def evolve_schema(old: ProjectSchema, *,
                   add_process: Optional[Sequence[Tuple[str, float, float]]] = None,
+                  add_mixture: Optional[Sequence[Tuple[str, float, float]]] = None,
                   add_responses: Sequence[ResponseSpec] = (),
                   model=None,
                   migration: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -97,14 +99,23 @@ def evolve_schema(old: ProjectSchema, *,
     ``ModelSpec`` (иначе сохраняется старая). ``migration`` — политики для НОВЫХ
     переменных (по имени), доливаются к ``old.migration``.
 
+    ``add_mixture`` — список ``(name, lower, upper)``; добавляется в КОНЕЦ
+    mixture-блока — APPEND mixture-КОМПОНЕНТА (§15.0.4). Σ ПЕРЕОПРЕДЕЛЯЕТСЯ
+    (``A+B=1 → A+B+C=1``). Требует миграционной политики ``known-constant(0.0)``
+    (грань симплекса C=0 — единственное значение, при котором старая
+    2-компонентная точка остаётся валидной по Σ; см. ``migrate_point``). ВАЖНО:
+    отличается от ``add_process`` — для mixture ``known-constant`` хранит РЕАЛЬНУЮ
+    долю (без code-трансформа куба).
+
     ``relax_bounds`` — ``{mixture_var: (new_lo, new_hi)}``: смена ГРАНИЦ
     mixture-компонента (RELAX/сужение области, §15.0.2). Это НЕ append-переменной
     (состав симплекса тот же) — отдельная ось diff'а (Предусловие 4).
 
-    Каждая причина записывается в ``change_log`` НОВОЙ версии: append → запись
-    ``{"append_param": name}``, relax → ``{"relax_bounds": name}``. Атомарная
-    фаза «схема+область» (§15.1.5) несёт ОБЕ причины при ОДНОМ bump: bump
-    формально за append, релаксация — co-record в той же версии без своего bump.
+    Каждая причина записывается в ``change_log`` НОВОЙ версии: append-process →
+    ``{"append_param": name}``, append-mixture → ``{"append_mixture": name}``,
+    relax → ``{"relax_bounds": name}``. Атомарная фаза «схема+область» (§15.1.5)
+    несёт ОБЕ причины при ОДНОМ bump: bump формально за append, релаксация —
+    co-record в той же версии без своего bump.
     """
     blocks = list(old.blocks)
     change_log: List[Dict[str, Any]] = []
@@ -123,6 +134,22 @@ def evolve_schema(old: ProjectSchema, *,
                                            list(pb.upper) + new_hi)
             blocks = [merged if b.is_process else b for b in blocks]
         change_log.extend({"append_param": nm} for nm in new_names)
+
+    if add_mixture:
+        new_names = [str(p[0]) for p in add_mixture]
+        new_lo = [float(p[1]) for p in add_mixture]
+        new_hi = [float(p[2]) for p in add_mixture]
+        mb = old.mixture_block()
+        if mb is None:
+            merged = VariableBlock.mixture(new_names, new_lo, new_hi)
+            blocks.append(merged)
+        else:
+            merged = VariableBlock.mixture(list(mb.names) + new_names,
+                                           list(mb.lower) + new_lo,
+                                           list(mb.upper) + new_hi)
+            blocks = [merged if b.is_mixture else b for b in blocks]
+        change_log.extend({"append_mixture": nm} for nm in new_names)
+
 
     if relax_bounds:
         mb = old.mixture_block()
@@ -166,20 +193,47 @@ def migrate_point(point: DataPoint, old_schema: ProjectSchema,
     политики ⇒ ``None``. Новые ОТКЛИКИ ⇒ ``Y[y_new]=MISSING``. Никаких молчаливых
     подстановок 0/средних. Возвращаемая точка помечается ``fixed_in_augment=True``.
     """
-    diff = schema_diff_vars(old_schema, target)
-    if diff[MIXTURE]:
-        return None  # эволюция mixture-переменных меняет симплекс — отдельная политика
+    # Удаление/переупорядочивание mixture-компонентов не поддержано: допустим
+    # ТОЛЬКО append новых компонентов в КОНЕЦ (§15.0.4). Удалённые → точка не годна.
+    removed_mixture = [nm for nm in old_schema.mixture_names
+                       if nm not in set(target.mixture_names)]
+    if removed_mixture:
+        return None
 
     new_X: Dict[str, List[float]] = {}
 
-    # MIXTURE: размер должен совпасть с целевым
-    if target.mixture_block() is not None:
-        mx = point.X.get(MIXTURE)
-        if mx is None or len(mx) != target.n_mixture:
-            return None
-        new_X[MIXTURE] = [float(v) for v in mx]
+    # MIXTURE: старые доли — ПРЕФИКС целевых; добавленные компоненты (§15.0.4
+    # append) резолвятся по политике. ОТЛИЧИЕ от process: ``known-constant`` для
+    # mixture хранит РЕАЛЬНУЮ долю (грань симплекса C=0), БЕЗ code-трансформа
+    # куба. C=0 — единственное значение, при котором Σ старой точки сходится
+    # (A+B+0=1 ⟺ A+B=1).
+    mb = target.mixture_block()
+    if mb is not None:
+        target_mix = list(target.mixture_names)
+        old_mix = list(old_schema.mixture_names)
+        if target_mix[:len(old_mix)] != old_mix:
+            return None  # mixture-append идёт только в КОНЕЦ (как process)
+        old_props = list(point.X.get(MIXTURE, []))
+        if len(old_props) != len(old_mix):
+            return None  # точка несогласована со своей версией
+        props = [float(v) for v in old_props]
+        for j in range(len(old_mix), len(target_mix)):
+            nm = target_mix[j]
+            pol = target.migration.get(nm) or {"policy": UNKNOWN}
+            kind = pol.get("policy")
+            if kind == KNOWN_CONSTANT:
+                props.append(float(pol["value"]))      # доля как есть (грань)
+            elif kind == RECOMPUTE:
+                fn = (recompute_fns or {}).get(pol.get("fn"))
+                if fn is None:
+                    return None
+                props.append(float(fn(point)))
+            else:  # unknown / неизвестная политика
+                return None
+        new_X[MIXTURE] = props
     elif MIXTURE in point.X:
         return None  # у цели нет mixture-блока, а у точки есть — несовместимо
+
 
     # PROCESS: старые координаты должны быть ПРЕФИКСОМ целевых (evolve добавляет в конец)
     pb = target.process_block()

@@ -45,16 +45,16 @@ def _runner():
 
 def test_phase_region_encodes_freedom_via_schema():
     r = _runner()
-    # фаза 1: свободны только A,B; C заперт bounds на baseline; process-блока нет
+    # §15.0.4 фаза 1: РЕАЛЬНО 2-компонентна {A,B}; C ОТСУТСТВУЕТ (не заперт 1/3);
+    # process-блока нет
     r.begin_phase(mixture_free=["A", "B"], process_free=[])
-    assert r.dim == 3 and r.d == 0
+    assert r.dim == 2 and r.q == 2 and r.d == 0
     cands = r._phase_candidates(40, seed=5)
-    assert cands.shape == (40, 3)
-    assert np.allclose(cands[:, :3].sum(axis=1), 1.0, atol=1e-9)   # Σx=1
-    assert np.allclose(cands[:, 2], 1.0 / 3.0)                     # C заперт
+    assert cands.shape == (40, 2)
+    assert np.allclose(cands[:, :2].sum(axis=1), 1.0, atol=1e-9)   # Σx=1 (A+B)
     assert cands[:, 0].std() > 0.05 and cands[:, 1].std() > 0.05   # A,B варьируют
 
-    # полное раскрытие через схему: +T,+P (append) + C (relax) — всё варьирует
+    # полное раскрытие через схему: +T,+P + C (всё APPEND) — всё варьирует
     r.seed_initial(n=10, seed=5)
     r.augment_phase_atomic(["T", "P"], ["C"])
     assert r.dim == 5 and r.d == 2

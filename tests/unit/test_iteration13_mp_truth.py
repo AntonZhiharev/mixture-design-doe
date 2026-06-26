@@ -84,7 +84,58 @@ def test_multi_truth_shapes_and_price():
     assert truth.property_names[-1] == "price"
 
 
+def test_oracle_active_schema_zeros_absent_mixture_component():
+    """§15.0.4: компонент C, отсутствующий в active_schema фазы 1, НЕ вносит
+    вклад → истина считается при C=0 (а не при молчаливом baseline C=1/3).
+
+    Проверяем тождество ``фаза1(C отсутствует) == полная(C=0 явно)`` и что вклад
+    C реально был (``фаза1 != полная(C как дано)``).
+    """
+    schema = _mp_schema("full-cross")            # {A,B,C}×{T,P}
+    terms = build_model_terms(schema)
+    coef = np.random.default_rng(5).normal(size=terms.p)
+    truth = MixtureProcessTruth(schema, coef)
+
+    v1 = ProjectSchema.mixture_only(["A", "B"])  # фаза 1: C ОТСУТСТВУЕТ в схеме
+
+    x = np.array([[0.4, 0.3, 0.3, 0.2, 0.8]])    # [A,B,C, T,P], C=0.3
+    x_c0 = x.copy()
+    x_c0[:, 2] = 0.0
+
+    y_phase1 = truth.true(x, active_schema=v1)   # C занулён по active_schema
+    y_explicit_c0 = truth.true(x_c0)             # C=0 задан явно (полная схема)
+    assert np.allclose(y_phase1, y_explicit_c0)
+
+    y_c_given = truth.true(x)                     # C=0.3 как дано
+    assert not np.allclose(y_phase1, y_c_given)   # значит вклад C реально был
+
+
+def test_oracle_active_schema_none_backward_compatible():
+    """``active_schema=None`` → прежнее поведение (вклад всех компонентов)."""
+    schema = _mp_schema("full-cross")
+    terms = build_model_terms(schema)
+    coef = np.random.default_rng(6).normal(size=terms.p)
+    truth = MixtureProcessTruth(schema, coef)
+    x = np.array([[0.4, 0.3, 0.3, 0.2, 0.8]])
+    assert np.allclose(truth.true(x), truth.true(x, active_schema=schema))
+
+
+def test_multi_truth_threads_active_schema():
+    """MultiMixtureProcessTruth пробрасывает active_schema в каждую истину."""
+    schema = _mp_schema("full-cross")
+    p = build_model_terms(schema).p
+    rng = np.random.default_rng(7)
+    coef_by = {"strength": rng.normal(size=p), "price": rng.normal(size=p)}
+    truth = MultiMixtureProcessTruth(schema, coef_by, noise_sd=0.0)
+    v1 = ProjectSchema.mixture_only(["A", "B"])
+    Xc = np.array([[0.4, 0.3, 0.3, 0.2, 0.8]])
+    Xc0 = Xc.copy()
+    Xc0[:, 2] = 0.0
+    assert np.allclose(truth.true(Xc, active_schema=v1), truth.true(Xc0))
+
+
 def test_composite_random_points_valid():
+
     schema = _mp_schema()
     Xc = composite_random_points(schema, 50, seed=7)
     assert Xc.shape == (50, 5)

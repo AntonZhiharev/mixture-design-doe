@@ -22,12 +22,16 @@ import warnings
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
 
-from src.core.schema import (MIXTURE, PROCESS, ProjectSchema, VariableBlock,
-                             ModelSpec)
+from src.core.schema import (MIXTURE, PROCESS, DataPoint, ProjectSchema,
+                             VariableBlock, ModelSpec, schema_diff_vars,
+                             schema_diff_bounds)
+from src.core.schema_evolution import (SchemaHistory, evolve_schema,
+                                       select_fixed_rows, known_constant)
 from src.design.block_model import build_model_terms
 from src.optimize.desirability import DesirabilitySpec
 from src.verification.mixture_process_truth import MultiMixtureProcessTruth
 from src.apps.mixture_process_runner import MixtureProcessRunner
+
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
@@ -119,3 +123,122 @@ def test_branch_round_appends_versioned_points():
         # process всё ещё на baseline (фаза не открывала T/P)
         assert pt.X[PROCESS] == [0.5, 0.5]
     assert r.origin_counts()[f"branch:{br.id}"] == 2
+
+
+# ----------------------------------------------------------------------
+# §15.3 шаг 2a — schema_diff_bounds ортогонален schema_diff_vars (Предусл.4)
+# ----------------------------------------------------------------------
+def _phase_schemas():
+    """old: фаза 1 (C заперт [1/3,1/3], process только T);
+    new: C раскрыт [0,1] (релаксация области) + добавлен process P (append)."""
+    mix_old = VariableBlock.mixture(["A", "B", "C"],
+                                    lower=[0.0, 0.0, 1 / 3], upper=[1.0, 1.0, 1 / 3])
+    proc_old = VariableBlock.process(["T"], lower=[0.0], upper=[1.0])
+    old = ProjectSchema.mixture_process(mix_old, proc_old, version=1)
+
+    mix_new = VariableBlock.mixture(["A", "B", "C"],
+                                    lower=[0.0, 0.0, 0.0], upper=[1.0, 1.0, 1.0])
+    proc_new = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
+    new = ProjectSchema.mixture_process(mix_new, proc_new, version=2)
+    return old, new
+
+
+def test_diff_vars_and_bounds_are_orthogonal():
+    old, new = _phase_schemas()
+    # ось переменных: видит ТОЛЬКО добавленный process P, mixture-состав не менялся
+    dv = schema_diff_vars(old, new)
+    assert dv[PROCESS] == ["P"] and dv[MIXTURE] == []
+    # ось границ: видит ТОЛЬКО переребаунденный C; T не менялся, P не общий → пусто
+    db = schema_diff_bounds(old, new)
+    assert set(db[MIXTURE]) == {"C"}
+    assert db[PROCESS] == {}
+    olo, ohi, nlo, nhi = db[MIXTURE]["C"]
+    assert (olo, ohi) == (1 / 3, 1 / 3) and (nlo, nhi) == (0.0, 1.0)
+
+
+def test_diff_bounds_symmetric_detects_narrowing():
+    old, new = _phase_schemas()
+    db = schema_diff_bounds(new, old)   # обратное направление: сужение C
+    assert set(db[MIXTURE]) == {"C"}
+    olo, ohi, nlo, nhi = db[MIXTURE]["C"]
+    assert (olo, ohi) == (0.0, 1.0) and (nlo, nhi) == (1 / 3, 1 / 3)
+
+
+def test_diff_bounds_empty_when_no_change():
+    old, _ = _phase_schemas()
+    assert schema_diff_bounds(old, old) == {MIXTURE: {}, PROCESS: {}}
+
+
+# ----------------------------------------------------------------------
+# §15.3 шаг 2b — evolve relax_bounds + change_log (Предусл.4 / §15.1.5)
+# ----------------------------------------------------------------------
+def test_evolve_relax_bounds_records_change_log_no_var_added():
+    mix = VariableBlock.mixture(["A", "B", "C"],
+                                lower=[0.0, 0.0, 1 / 3], upper=[1.0, 1.0, 1 / 3])
+    proc = VariableBlock.process(["T"], lower=[0.0], upper=[1.0])
+    s1 = ProjectSchema.mixture_process(mix, proc, version=1)
+
+    s2 = evolve_schema(s1, relax_bounds={"C": (0.0, 1.0)})
+    mb = s2.mixture_block()
+    assert (mb.lower, mb.upper) == ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    # релаксация — это НЕ добавление переменной (состав симплекса тот же)
+    assert schema_diff_vars(s1, s2)[MIXTURE] == [] and schema_diff_vars(s1, s2)[PROCESS] == []
+    assert set(schema_diff_bounds(s1, s2)[MIXTURE]) == {"C"}
+    # причина зафиксирована в change_log, append-причин нет
+    assert {"relax_bounds": "C"} in s2.change_log
+    assert all("append_param" not in e for e in s2.change_log)
+
+
+def test_evolve_atomic_append_and_relax_one_bump_both_logged():
+    """§15.1.5: один target несёт +P (append) И C-relax → ОДИН bump, обе причины."""
+    mix = VariableBlock.mixture(["A", "B", "C"],
+                                lower=[0.0, 0.0, 1 / 3], upper=[1.0, 1.0, 1 / 3])
+    proc = VariableBlock.process(["T"], lower=[0.0], upper=[1.0])
+    s_after_T = ProjectSchema.mixture_process(mix, proc, version=2)
+
+    s3 = evolve_schema(s_after_T, add_process=[("P", 0.0, 1.0)],
+                       migration={"P": known_constant(0.5)},
+                       relax_bounds={"C": (0.0, 1.0)})
+    assert s3.version == 3                       # ОДИН bump (формально за append P)
+    assert s3.process_names == ("T", "P")
+    assert {"append_param": "P"} in s3.change_log
+    assert {"relax_bounds": "C"} in s3.change_log
+
+
+# ----------------------------------------------------------------------
+# §15.3 шаг 2c — select_fixed_rows резолвит ось within_new_bounds
+# ----------------------------------------------------------------------
+def test_select_fixed_keeps_baseline_C_point_after_relax():
+    """Боевой (§15.4): baseline-C точка фазы 1 ∈ релаксованных bounds → остаётся."""
+    mix = VariableBlock.mixture(["A", "B", "C"],
+                                lower=[0.0, 0.0, 1 / 3], upper=[1.0, 1.0, 1 / 3])
+    proc = VariableBlock.process(["T"], lower=[0.0], upper=[1.0])
+    s1 = ProjectSchema.mixture_process(mix, proc, version=1)
+    hist = SchemaHistory.start(s1)
+    s2 = evolve_schema(s1, relax_bounds={"C": (0.0, 1.0)})
+    hist.add(s2)
+
+    pt = DataPoint(schema_version=1, X={MIXTURE: [1 / 3, 1 / 3, 1 / 3],
+                                        PROCESS: [0.5]}, Y={})
+    used, skipped = select_fixed_rows([pt], s2, hist)
+    assert len(used) == 1 and skipped == []
+    assert used[0].X[MIXTURE] == [1 / 3, 1 / 3, 1 / 3]   # C сохранён, ∈ релакс [0,1]
+
+
+def test_select_fixed_drops_point_outside_narrowed_bounds():
+    """Негативный (§15.4): точка вне СУЖЕННЫХ bounds исключается, не протекает."""
+    mix = VariableBlock.mixture(["A", "B", "C"],
+                                lower=[0.0, 0.0, 0.0], upper=[1.0, 1.0, 1.0])
+    proc = VariableBlock.process(["T"], lower=[0.0], upper=[1.0])
+    s1 = ProjectSchema.mixture_process(mix, proc, version=1)
+    hist = SchemaHistory.start(s1)
+    s2 = evolve_schema(s1, relax_bounds={"C": (0.0, 0.2)})   # СУЖЕНИЕ C
+    hist.add(s2)
+
+    pt = DataPoint(schema_version=1, X={MIXTURE: [1 / 3, 1 / 3, 1 / 3],
+                                        PROCESS: [0.5]}, Y={})   # C=1/3 > 0.2
+    used, skipped = select_fixed_rows([pt], s2, hist)
+    assert used == [] and len(skipped) == 1
+
+
+

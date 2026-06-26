@@ -86,16 +86,29 @@ def evolve_schema(old: ProjectSchema, *,
                   add_process: Optional[Sequence[Tuple[str, float, float]]] = None,
                   add_responses: Sequence[ResponseSpec] = (),
                   model=None,
-                  migration: Optional[Dict[str, Dict[str, Any]]] = None
+                  migration: Optional[Dict[str, Dict[str, Any]]] = None,
+                  relax_bounds: Optional[Dict[str, Tuple[float, float]]] = None
                   ) -> ProjectSchema:
     """Вернуть НОВУЮ версию схемы (``version+1``).
 
     ``add_process`` — список ``(name, lower, upper)``; добавляется в КОНЕЦ
-    process-блока (или создаётся новый блок). ``add_responses`` — новые отклики.
-    ``model`` — новая ``ModelSpec`` (иначе сохраняется старая). ``migration`` —
-    политики для НОВЫХ переменных (по имени), доливаются к ``old.migration``.
+    process-блока (или создаётся новый блок) — APPEND ПЕРЕМЕННОЙ (§14, требует
+    миграционной политики). ``add_responses`` — новые отклики. ``model`` — новая
+    ``ModelSpec`` (иначе сохраняется старая). ``migration`` — политики для НОВЫХ
+    переменных (по имени), доливаются к ``old.migration``.
+
+    ``relax_bounds`` — ``{mixture_var: (new_lo, new_hi)}``: смена ГРАНИЦ
+    mixture-компонента (RELAX/сужение области, §15.0.2). Это НЕ append-переменной
+    (состав симплекса тот же) — отдельная ось diff'а (Предусловие 4).
+
+    Каждая причина записывается в ``change_log`` НОВОЙ версии: append → запись
+    ``{"append_param": name}``, relax → ``{"relax_bounds": name}``. Атомарная
+    фаза «схема+область» (§15.1.5) несёт ОБЕ причины при ОДНОМ bump: bump
+    формально за append, релаксация — co-record в той же версии без своего bump.
     """
     blocks = list(old.blocks)
+    change_log: List[Dict[str, Any]] = []
+
     if add_process:
         new_names = [str(p[0]) for p in add_process]
         new_lo = [float(p[1]) for p in add_process]
@@ -109,6 +122,25 @@ def evolve_schema(old: ProjectSchema, *,
                                            list(pb.lower) + new_lo,
                                            list(pb.upper) + new_hi)
             blocks = [merged if b.is_process else b for b in blocks]
+        change_log.extend({"append_param": nm} for nm in new_names)
+
+    if relax_bounds:
+        mb = old.mixture_block()
+        if mb is None:
+            raise ValueError("relax_bounds задан, но в схеме нет MIXTURE-блока.")
+        names = list(mb.names)
+        lo = list(mb.lower)
+        hi = list(mb.upper)
+        for var, (nlo, nhi) in relax_bounds.items():
+            if var not in names:
+                raise ValueError(
+                    f"relax_bounds: переменная '{var}' не найдена в MIXTURE.")
+            j = names.index(var)
+            lo[j] = float(nlo)
+            hi[j] = float(nhi)
+            change_log.append({"relax_bounds": var})
+        new_mb = VariableBlock.mixture(names, lower=lo, upper=hi)
+        blocks = [new_mb if b.is_mixture else b for b in blocks]
 
     responses = list(old.responses) + list(add_responses)
     mig = dict(old.migration)
@@ -116,7 +148,9 @@ def evolve_schema(old: ProjectSchema, *,
         mig.update(migration)
     return ProjectSchema(version=old.version + 1, blocks=tuple(blocks),
                          responses=tuple(responses),
-                         model=model or old.model, migration=mig)
+                         model=model or old.model, migration=mig,
+                         change_log=tuple(change_log))
+
 
 
 # ----------------------------------------------------------------------
@@ -186,6 +220,29 @@ def migrate_point(point: DataPoint, old_schema: ProjectSchema,
                      origin_tag=tag, fixed_in_augment=True)
 
 
+def point_in_region(point: DataPoint, schema: ProjectSchema, *,
+                    tol: float = 1e-6) -> bool:
+    """Лежит ли точка в области ``schema``: mixture ∈ симплекс-регион (L≤x≤U, Σ=1)
+    И process-коды ∈ [0,1]. Переиспользует :meth:`SimplexRegion.is_feasible`.
+
+    Это ось ``within_new_bounds`` (Предусловие 4): после смены границ (relax ИЛИ
+    сужение) точка обязана попасть в НОВУЮ область, иначе она не годна как fixed.
+    """
+    mb = schema.mixture_block()
+    if mb is not None:
+        x = point.X.get(MIXTURE)
+        if x is None or not mb.as_simplex_region().is_feasible(x, tol=tol):
+            return False
+    pb = schema.process_block()
+    if pb is not None:
+        z = point.X.get(PROCESS)
+        if z is None:
+            return False
+        if any((c < -tol or c > 1.0 + tol) for c in z):
+            return False
+    return True
+
+
 def select_fixed_rows(points: Sequence[DataPoint], target_schema: ProjectSchema,
                       history: SchemaHistory, *,
                       recompute_fns: Optional[Dict[str, Callable[[DataPoint], float]]] = None
@@ -194,6 +251,13 @@ def select_fixed_rows(points: Sequence[DataPoint], target_schema: ProjectSchema,
 
     Это полная версия с резолвом старой схемы по версии и политиками миграции
     (``augmented.select_fixed_rows`` — частный случай без истории/миграции).
+
+    Резолвит ДВЕ ортогональные оси diff'а (Предусловие 4 / §15.1.5):
+      1. ``migration`` — added-переменная резолвится по политике (``migrate_point``);
+      2. ``within_new_bounds`` — переребаунденная переменная (НЕ миграция!) даёт
+         проверку вхождения: мигрированная точка обязана лежать в области
+         ``target_schema`` (:func:`point_in_region`), иначе исключается — без
+         молчаливой утечки точки вне новых границ.
     """
     used: List[DataPoint] = []
     skipped: List[DataPoint] = []
@@ -205,7 +269,16 @@ def select_fixed_rows(points: Sequence[DataPoint], target_schema: ProjectSchema,
             continue
         migrated = migrate_point(pt, old, target_schema, recompute_fns=recompute_fns)
         if migrated is None:
-            skipped.append(pt)
+            skipped.append(pt)            # ось migration: нет политики / несовместимо
+        elif not point_in_region(migrated, target_schema):
+            skipped.append(pt)            # ось within_new_bounds: вне новой области
         else:
             used.append(migrated)
+    # defensive (§15.4): любой fixed обязан лежать в области target — ловит пропуск
+    # оси diff'а; при корректном фильтре выше не срабатывает.
+
+    assert all(point_in_region(p, target_schema) for p in used), \
+        "fixed-точка вне области target_schema (пропущена ось diff'а)"
     return used, skipped
+
+

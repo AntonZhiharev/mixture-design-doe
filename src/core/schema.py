@@ -264,10 +264,17 @@ class ProjectSchema:
     # §13.7: политика миграции на ИМЯ переменной → {"policy": ..., "value": ...}.
     # JSON-native (known-constant/unknown/recompute), сериализуема, без классов.
     migration: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # §15.1.5: причины создания этой версии — список записей вида
+    # ``{"append_param": "P"}`` / ``{"relax_bounds": "C"}``. Нужен, чтобы знать,
+    # в какой области/составе собраны точки версии (атомарная фаза «схема+область»
+    # несёт ОБЕ причины при ОДНОМ bump). Аддитивно, дефолт — пусто.
+    change_log: Tuple[Dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "blocks", tuple(self.blocks))
         object.__setattr__(self, "responses", tuple(self.responses))
+        object.__setattr__(self, "change_log",
+                           tuple(dict(e) for e in self.change_log))
         n_mix = sum(1 for b in self.blocks if b.is_mixture)
         n_proc = sum(1 for b in self.blocks if b.is_process)
         if n_mix > 1:
@@ -326,6 +333,7 @@ class ProjectSchema:
             "responses": [r.to_dict() for r in self.responses],
             "model": self.model.to_dict(),
             "migration": {k: dict(v) for k, v in self.migration.items()},
+            "change_log": [dict(e) for e in self.change_log],
         }
 
     @classmethod
@@ -336,6 +344,7 @@ class ProjectSchema:
             responses=tuple(ResponseSpec.from_dict(r) for r in d.get("responses", [])),
             model=ModelSpec.from_dict(d.get("model", {})),
             migration={k: dict(v) for k, v in d.get("migration", {}).items()},
+            change_log=tuple(dict(e) for e in d.get("change_log", [])),
         )
 
     # -- удобные конструкторы (частные случаи общего механизма) --------
@@ -552,3 +561,47 @@ def _block_names(schema: ProjectSchema, kind: str) -> Tuple[str, ...]:
         if b.kind == kind:
             return b.names
     return ()
+
+
+def _block_bounds(schema: ProjectSchema, kind: str) -> Dict[str, Tuple[float, float]]:
+    """Карта ``var → (lower, upper)`` для блока ``kind`` (пусто, если блока нет)."""
+    for b in schema.blocks:
+        if b.kind == kind:
+            return {nm: (float(lo), float(hi))
+                    for nm, lo, hi in zip(b.names, b.lower, b.upper)}
+    return {}
+
+
+def schema_diff_bounds(old: ProjectSchema, new: ProjectSchema, *,
+                       tol: float = 1e-12
+                       ) -> Dict[str, Dict[str, Tuple[float, float, float, float]]]:
+    """ИЗМЕНЕНИЯ ГРАНИЦ переменных, ОБЩИХ для ``old`` и ``new`` (по блокам).
+
+    Возвращает ``{"MIXTURE": {var: (old_lo, old_hi, new_lo, new_hi)}, "PROCESS":
+    {...}}`` — только для переменных, у которых границы изменились (§15.0.2 / §15.0
+    Предусловие 4). Это ОРТОГОНАЛЬНАЯ ось к :func:`schema_diff_vars`:
+
+      * ``schema_diff_vars`` — added/removed ПЕРЕМЕННЫЕ (расширение пространства,
+        требует миграционной политики); НЕ читает границы.
+      * ``schema_diff_bounds`` — изменение ОБЛАСТИ при том же составе (например,
+        C-релаксация ``[1/3,1/3]→[0,1]``); смотрит ТОЛЬКО пересечение имён
+        ``old∩new`` (у новых переменных нет «старых» границ, у удалённых — «новых»).
+
+    Ловит изменение в ЛЮБУЮ сторону: и релаксацию, и сужение (симметрично).
+    Намеренно НЕ расширяет ``schema_diff_vars``: на него завязан ``migrate_point``
+    (``if diff[MIXTURE]: return None``); смешивание осей рискует отбрасыванием
+    валидных точек при C-релаксации.
+    """
+    diff: Dict[str, Dict[str, Tuple[float, float, float, float]]] = {
+        MIXTURE: {}, PROCESS: {}}
+    for kind in _KINDS:
+        ob = _block_bounds(old, kind)
+        nb = _block_bounds(new, kind)
+        for name in ob.keys() & nb.keys():
+            olo, ohi = ob[name]
+            nlo, nhi = nb[name]
+            if abs(olo - nlo) > tol or abs(ohi - nhi) > tol:
+                diff[kind][name] = (olo, ohi, nlo, nhi)
+    return diff
+
+

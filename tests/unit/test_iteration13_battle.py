@@ -66,6 +66,22 @@ def _coef(schema, contributions):
     return v
 
 
+def _refloor_truth(truth, *, B_idx: int, lo: float):
+    """Rebuild the truth on a mixture region with a lower bound floor on one
+    component (e.g. B >= lo), reusing the SAME coefficient vectors. Used to get
+    the analytic optimum UNDER the step-4 floor (apples-to-apples with the
+    floored pipeline x_best)."""
+    s0 = truth.schema
+    mb0 = s0.mixture_block()
+    lower = list(mb0.lower)
+    lower[B_idx] = float(lo)
+    mix = VariableBlock.mixture(list(mb0.names), lower=lower, upper=list(mb0.upper))
+    proc = s0.process_block()
+    s = ProjectSchema.mixture_process(mix, proc, model=s0.model)
+    coef_by = {name: truth.truths[name].coefficients for name in truth.property_names}
+    return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
+
+
 def _build_truth():
     s = _truth_schema()
     # ИСТИННАЯ мисспецификация: термы ВНЕ Scheffé-quadratic тренда пайплайна,
@@ -107,8 +123,14 @@ def _build_truth():
         # dry_time (min): composition-dependent (A fast, B/C slow), T-gated (C:T)
         "dry_time":  _coef(s, {"A": -1, "B": 3, "C": 3, "T": -4, "C:T": -5,
                                "T^2": 2}),
-        # price (min): equal linear base - synergies, not price, drive the mixture
-        "price":     _coef(s, {"A": 2.0, "B": 2.0, "C": 2.0}),
+        # price (min): mild gradient + NEGATIVE pairwise "blend discount" (a mix
+        # of two components costs less than either pure). A *constant* price
+        # (A=B=C) would be 2*(A+B+C)=2 on the simplex (Sum x=1) -> always zero
+        # deviation, meaningless. A pure linear gradient minimises at a vertex
+        # (degenerate). The blend discount keeps price VARYING across the simplex
+        # (nonzero, branch-specific deviation) with an INTERIOR minimum.
+        "price":     _coef(s, {"A": 2.0, "B": 2.2, "C": 2.4,
+                               "A*B": -1.5, "A*C": -1.5, "B*C": -1.5}),
     }
     return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
 
@@ -405,9 +427,39 @@ def test_battle_branches_converge_to_analytic_optimum():
         b = p.X["MIXTURE"][1]
         assert b >= B_FLOOR - 1e-6, f"active point violates B>= {B_FLOOR}: B={b}"
 
-    # M8-argmax on the floored region: the degenerate component is back in play
-    res = runner.optimize_xbest("fast")
-    xb_after = np.asarray(res.x, float)
+    # M8-argmax on the floored region for ALL branches (the floor is a global
+    # region constraint), and the analytic optimum recomputed UNDER THE SAME
+    # floor (apples-to-apples) so the post-step-4 summary mirrors the earlier
+    # phase summaries (recipes + properties, pipeline x* vs analytic x*).
+    floored_truth = _refloor_truth(truth, B_idx=1, lo=B_FLOOR)
+    opt4 = {bid: branch_optimum(floored_truth, goals[bid], n_scan=20000,
+                                seed=4000 + i)
+            for i, bid in enumerate(goals)}
+    xb4 = {}
+    for bid in goals:
+        xb4[bid] = np.asarray(runner.optimize_xbest(bid).x, float)
+
+    print("FINAL+floor recipes (A,B,C + T,P), pipeline x* vs analytic x* "
+          f"(B>={B_FLOOR}):")
+    for bid in goals:
+        xb = np.round(xb4[bid], 3)
+        xo = np.round(np.asarray(opt4[bid]["x"], float), 3)
+        print(f"  {bid:<9} pipeline={xb.tolist()}  analytic={xo.tolist()}")
+    print("FINAL+floor properties (truth) pipeline vs analytic; dPRICE - price dev:")
+    for bid in goals:
+        xb = xb4[bid].reshape(1, -1)
+        yp = {p: float(truth.truths[p].true(xb)[0]) for p in truth.property_names}
+        ya = {p: float(opt4[bid]["y"][p]) for p in truth.property_names}
+        dpa = yp["price"] - ya["price"]
+        dpp = 100.0 * dpa / abs(ya["price"]) if abs(ya["price"]) > 1e-9 else 0.0
+        print(f"  {bid:<9} PRICE pipe={yp['price']:.2f} vs anal={ya['price']:.2f} "
+              f"d={dpa:+.2f} ({dpp:+.0f}%) | "
+              f"strength {yp['strength']:.1f}/{ya['strength']:.1f} "
+              f"gloss {yp['gloss']:.1f}/{ya['gloss']:.1f} "
+              f"dry {yp['dry_time']:.1f}/{ya['dry_time']:.1f}")
+
+    # the degenerate component is back in play: fast's M8-argmax recipe keeps B
+    xb_after = xb4["fast"]
     print(f"fast x_best after floor  (A,B,C,T,P)="
           f"{np.round(xb_after, 3).tolist()}  B={xb_after[1]:.3f}")
     assert xb_after[1] >= B_FLOOR - 1e-6, (

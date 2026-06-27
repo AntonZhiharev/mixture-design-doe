@@ -41,10 +41,33 @@ class Branch:
     x_best: Optional[List[float]] = None   # best recipe found so far
     d_best: float = 0.0                    # best measured branch desirability
     history: List[dict] = field(default_factory=list)
+    # -- §15.6 §2: экономические атрибуты ветки (для двойного стопа §4) -
+    # Ветка — живой объект; экономика эволюционирует вместе с ней (§2.1):
+    #   volume   V      — объём потребления (изд/период), масштаб экономии;
+    #   cost_exp c_exp  — стоимость одного эксперимента (₽/опыт), порог выгоды;
+    #   horizon  H      — горизонт окупаемости (период), DEFAULT ветки; на раунд
+    #                     может быть override (см. resolve_horizon, §2.1).
+    # Дефолты нейтральны (V=0 ⇒ экономическая ценность=0): пока экономика не
+    # задана, двойной стоп ведёт себя как чисто технический — обратная
+    # совместимость со старыми ветками (рождение ветки, §2.1).
+    volume: float = 0.0
+    cost_exp: float = 0.0
+    horizon: float = 0.0
+
+
 
     # -- bookkeeping ---------------------------------------------------
     def remaining(self) -> int:
         return max(0, int(self.budget) - int(self.spent))
+    def resolve_horizon(self, override: Optional[float] = None) -> float:
+        """Горизонт H для раунда (§2.1): override на раунд ИЛИ default ветки.
+
+        ``override`` — разовый горизонт под дорогой эксперимент конкретного
+        клиента (не меняет default ветки). ``None`` ⇒ берётся ``self.horizon``.
+        """
+        return float(self.horizon if override is None else override)
+
+
 
     def refresh_status(self) -> str:
         if self.d_best >= self.satisfy_at:
@@ -83,6 +106,8 @@ class Branch:
             "satisfy_at": float(self.satisfy_at), "status": self.status,
             "x_best": list(self.x_best) if self.x_best is not None else None,
             "d_best": float(self.d_best), "history": list(self.history),
+            "volume": float(self.volume), "cost_exp": float(self.cost_exp),
+            "horizon": float(self.horizon),       # §15.6 §2: экономика ветки
         }
 
     @classmethod
@@ -97,6 +122,9 @@ class Branch:
             x_best=list(xb) if xb is not None else None,
             d_best=float(d.get("d_best", 0.0)),
             history=list(d.get("history", [])),
+            volume=float(d.get("volume", 0.0)),
+            cost_exp=float(d.get("cost_exp", 0.0)),
+            horizon=float(d.get("horizon", 0.0)),
         )
 
 

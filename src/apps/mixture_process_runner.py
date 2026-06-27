@@ -54,7 +54,11 @@ from ..core.schema import (MIXTURE, PROCESS, DataPoint, ProjectSchema,
 from ..core.simplex import SimplexRegion
 
 from ..core.schema_evolution import (SchemaHistory, evolve_schema,
-                                     select_fixed_rows, known_constant)
+                                     known_constant,
+                                     migrate_point, point_in_region)
+from ..design.move_bounds import (move_bounds, handle_dropped_fixed,
+                                  RegionMove, RegionMoveError,
+                                  POLICY_EXCLUDE, POLICY_ERROR, POLICY_BOUNDARY)
 from ..models.gp_expert import GPExpert
 from ..design.block_model import build_model_terms, model_matrix
 from ..design.augmented import build_moments
@@ -117,6 +121,12 @@ class MixtureProcessRunner:
         self.origin: List[str] = []
         self.surrogates: Dict[str, GPExpert] = {}
         self.branches: Dict[str, Branch] = {}
+        # §15.0.3: после движения границ области (move_region) точки, выпавшие из
+        # НОВОЙ области, легально исключаются из активного pool по политике
+        # ``exclude`` (но ОСТАЮТСЯ в self.points — история ≠ активный pool, движение
+        # обратимо). Журнал движений области (для интроспекции/обратимости).
+        self._region_moves: List[Dict[str, Any]] = []
+        self._drop_policy: str = POLICY_EXCLUDE
 
     # ------------------------------------------------------------------
     # размеры текущей фазы
@@ -262,6 +272,55 @@ class MixtureProcessRunner:
         self.fit_surrogates()
         return new
 
+    # ------------------------------------------------------------------
+    # Движение границ ОБЛАСТИ (§15.0.3) — НЕ эволюция схемы (без bump)
+    # ------------------------------------------------------------------
+    def move_region(self, deltas: Mapping[str, "tuple"], *,
+                    policy: str = POLICY_EXCLUDE,
+                    intent: Optional[str] = None) -> RegionMove:
+        """Подвинуть границы СУЩЕСТВУЮЩИХ компонентов через примитив move_bounds.
+
+        Это REGION-операция (§15.0.3 / §15.2.4): ``schema_version`` НЕ растёт —
+        состав схемы тот же, меняется лишь область (bounds). Версионные bump'ы —
+        дело ``augment_phase_*`` (append переменной). Примитив :func:`move_bounds`
+        классифицирует движение (relax/restrict/shift; rebalance → NotImplemented)
+        и проверяет инварианты симплекс-замкнутости ДО применения.
+
+        Точки общей базы НЕ удаляются (``self.points`` = история). После сужения
+        выпавшие из новой области точки легально исключаются из активного pool
+        (политика ``exclude``, см. :meth:`_migrated_points`), но восстановятся при
+        обратном расширении (обратимость, §15.0.3.3). Для ``policy=error`` движение
+        отклоняется, если хоть одна точка с измеренным Y выпадает (без потерь
+        данных); ``boundary`` (проекция) для точек с измеренным Y запрещён.
+
+        ``intent`` — необязательная пометка ЗАЧЕМ двигаем (economy/physical/ROI),
+        пишется в журнал ``_region_moves``; примитив от неё не зависит.
+        """
+        move = move_bounds(self.current_schema, dict(deltas))
+
+        # policy=error / boundary: проверить судьбу КАЖДОЙ активной точки заранее,
+        # чтобы запретить молчаливую потерю (или запрещённую Y-проекцию) ДО
+        # подмены области. handle_dropped_fixed поднимет RegionMoveError сам.
+        if policy in (POLICY_ERROR, POLICY_BOUNDARY):
+            for p in self._migrated_points():
+                handle_dropped_fixed(p, move.region_after, policy=policy)
+
+        self._drop_policy = policy
+        self.current_schema = move.region_after
+        # История хранит АКТУАЛЬНОЕ определение текущей версии (область после
+        # движения) — миграция старых точек bounds-агностична (migrate_point не
+        # читает old.bounds), поэтому замена объекта версии безопасна и нужна,
+        # чтобы _mixture_region/_phase_candidates видели новую область.
+        self.schema_history.versions = [
+            move.region_after if s.version == move.region_after.version else s
+            for s in self.schema_history.versions]
+        self._region_moves.append({
+            "move_type": move.move_type, "deltas": dict(deltas),
+            "intent": intent, "policy": policy,
+            "version": int(self.current_schema_version)})
+        self.fit_surrogates()
+        return move
+
     # -- вспомогательные построители схем -------------------------------
     def _process_append_spec(self, process_vars):
         out = []
@@ -345,27 +404,39 @@ class MixtureProcessRunner:
     # Ведущая база (DataPoint) ⇄ производные numpy-кэши на ТЕКУЩЕЙ схеме
     # ------------------------------------------------------------------
     def _migrated_points(self) -> List[DataPoint]:
-        """Все точки базы, мигрированные к ТЕКУЩЕЙ схеме (§13.7).
+        """Активные точки базы, мигрированные к ТЕКУЩЕЙ схеме (§13.7 + §15.0.3).
+
+        Различает ДВА механизма выпадения точки:
+          * **сбой миграции** (``migrate_point``→None: нет политики/несовместимый
+            состав) — БАГ конфигурации, всегда ``RuntimeError``;
+          * **вне текущей области** (миграция прошла, но точка не в
+            ``current_schema`` после движения границ ``move_region``) — ЛЕГАЛЬНОЕ
+            выпадение по политике ``exclude`` (§15.0.3.3): точка остаётся в
+            ``self.points`` (история ≠ активный pool), при обратном расширении
+            области снова пройдёт ``point_in_region`` ⇒ вернётся (обратимость).
 
         baseline закрытых ранее параметров уходит в ``known-constant`` миграции;
-        точка остаётся валидной для расширенной модели. ``skipped`` обязан быть
-        пустым (иначе потеряли бы данные молча — это баг конфигурации).
+        ИЗМЕРЕННЫЕ Y возвращаются из исходных точек дословно (responses схемы
+        раннера пусты — свойства от оракула).
         """
         if not self.points:
             return []
-        used, skipped = select_fixed_rows(self.points, self.current_schema,
-                                          self.schema_history)
-        if skipped:
+        used: List[DataPoint] = []
+        migration_failed: List[DataPoint] = []
+        for src in self.points:
+            old = self.schema_history.get(src.schema_version)
+            mig = migrate_point(src, old, self.current_schema)
+            if mig is None:
+                migration_failed.append(src)            # ось migration — баг
+                continue
+            if not point_in_region(mig, self.current_schema):
+                continue                                # вне области — exclude (история)
+            mig.Y = dict(src.Y)                         # измеренные Y дословно
+            used.append(mig)
+        if migration_failed:
             raise RuntimeError(
-                f"{len(skipped)} точек не мигрировали к схеме "
+                f"{len(migration_failed)} точек не мигрировали к схеме "
                 f"v{self.current_schema_version} — проверь политику миграции.")
-        # migrate_point пересобирает Y по target.response_names; у схемы раннера
-        # responses пусты (свойства — от оракула), поэтому ИЗМЕРЕННЫЕ Y вернём
-        # из исходных точек дословно (skipped пуст ⇒ порядок used совпадает 1:1).
-        if len(used) != len(self.points):
-            raise RuntimeError("Несоответствие used/points при миграции Y.")
-        for src, mig in zip(self.points, used):
-            mig.Y = dict(src.Y)
         return used
 
 

@@ -204,6 +204,71 @@ def _recap_truth(truth, *, var: str, lo: float, hi: float):
 
 
 # ----------------------------------------------------------------------
+# Pretty-printers for the test trace (ASCII-only: the Windows cp1252 console
+# raises UnicodeEncodeError on Cyrillic/Unicode arrows, so we stick to ASCII).
+# ----------------------------------------------------------------------
+def _fmt_spec(spec):
+    """One Derringer-Suich goal as a human-readable condition string."""
+    if spec.kind == "target":
+        body = (f"TARGET={spec.target:g} (range [{spec.low:g},{spec.high:g}], "
+                f"d=0 outside, peak at target)")
+    elif spec.kind == "max":
+        body = (f"MAXIMIZE (d: 0 at y<={spec.low:g} -> 1 at y>={spec.high:g})")
+    else:  # min
+        body = (f"MINIMIZE (d: 1 at y<={spec.low:g} -> 0 at y>={spec.high:g})")
+    return f"{body}  w={spec.weight:g}"
+
+
+def _fmt_truth(truth, prop):
+    """The truth function eta(prop) as a sum of nonzero terms*coeff (honest:
+    read straight from the coefficient vector, so it can never drift)."""
+    t = truth.truths[prop]
+    parts = [f"{c:+g}*{name}"
+             for name, c in zip(t.terms.names, t.coefficients)
+             if abs(c) > 1e-12]
+    return " ".join(parts) if parts else "0"
+
+
+def _print_truth_functions(truth, props=None):
+    """Print eta(prop) for the requested properties (default: all)."""
+    props = props or truth.property_names
+    print("  truth functions eta(x,z)  [A,B,C fractions; T,P code in [0,1]]:")
+    for p in props:
+        print(f"    {p:<9} = {_fmt_truth(truth, p)}")
+
+
+def _print_goal(bid, goal):
+    """Print a branch goal: every property + its desirability condition."""
+    print(f"  goal [{bid}] (overall = weighted geo-mean of d_i; any d_i=0 -> veto):")
+    for prop, spec in goal.items():
+        print(f"    {prop:<9}: {_fmt_spec(spec)}")
+
+
+def _print_vars(runner, *, label):
+    """Print the variables CURRENTLY in play (schema bounds = phase freedom)."""
+    s = runner.current_schema
+    parts = []
+    mb = s.mixture_block()
+    if mb is not None:
+        for nm, lo, hi in zip(mb.names, mb.lower, mb.upper):
+            tag = "" if lo < hi - 1e-12 else " [fixed]"
+            parts.append(f"{nm} in [{lo:g},{hi:g}]{tag}")
+    pb = s.process_block()
+    if pb is not None:
+        for nm, lo, hi in zip(pb.names, pb.lower, pb.upper):
+            parts.append(f"{nm} in [{lo:g},{hi:g}] (code)")
+    absent_mix = [nm for nm in runner.full_schema.mixture_names
+                  if mb is None or nm not in mb.names]
+    absent_proc = [nm for nm in runner.full_schema.process_names
+                   if pb is None or nm not in pb.names]
+    absent = absent_mix + absent_proc
+    print(f"  {label}: variables in play (schema v{s.version}): "
+          + ", ".join(parts))
+    if absent:
+        print(f"    not yet introduced (baseline-substituted): {', '.join(absent)}")
+
+
+# ----------------------------------------------------------------------
 def test_battle_branches_converge_to_analytic_optimum():
     truth = _build_truth()
     goals = _branch_goals()
@@ -212,12 +277,23 @@ def test_battle_branches_converge_to_analytic_optimum():
     opt = {bid: branch_optimum(truth, goal, n_scan=20000, seed=100 + i)
            for i, (bid, goal) in enumerate(goals.items())}
 
+    # --- synthetic "lab": variables, truth functions, branch goals -----
+    print("\n=== SYNTHETIC LAB: variables, truth functions, goals ===")
+    print("  MIXTURE {A,B,C} fractions (Sum=1); PROCESS {T,P} code in [0,1]; "
+          "baseline=[1/3,1/3,1/3, 0.5,0.5]")
+    _print_truth_functions(truth)
+    print("  branch goals (3 lines; price appears in each; intra-branch tension):")
+    for bid, goal in goals.items():
+        _print_goal(bid, goal)
+
     runner = MixtureProcessRunner(_model_schema(), truth,
                                   baseline=[1/3, 1/3, 1/3, 0.5, 0.5],
                                   seed=7, n_restarts=2)
 
     # --- Фаза 1: свободны только A,B (схема v1: mixture-only, C заперт bounds) ---
+    print("\n--- PHASE 1: only A,B free (C and process not yet introduced) ---")
     runner.begin_phase(mixture_free=["A", "B"], process_free=[])
+    _print_vars(runner, label="phase 1")
     runner.seed_initial(n=18, seed=7)
 
     for bid, goal in goals.items():
@@ -228,7 +304,9 @@ def test_battle_branches_converge_to_analytic_optimum():
     d1 = {bid: runner.branches[bid].d_best for bid in goals}
 
     # --- Фаза 2: + процесс T (APPEND в схему, §14: version+1, миграция фазы 1) ---
+    print("\n--- PHASE 2: + process T (append to schema, version+1) ---")
     runner.augment_phase_schema(["T"])
+    _print_vars(runner, label="phase 2")
     for bid in goals:
 
         runner.run_branch_round(bid, n_points=5, explore_frac=0.25,
@@ -236,7 +314,9 @@ def test_battle_branches_converge_to_analytic_optimum():
     d2 = {bid: runner.branches[bid].d_best for bid in goals}
 
     # --- Фаза 3: + процесс P (append) + раскрытие C (relax) АТОМАРНО (§15.1.5) ---
+    print("\n--- PHASE 3: + process P (append) + open C (full simplex), atomic ---")
     runner.augment_phase_atomic(["P"], ["C"])
+    _print_vars(runner, label="phase 3")
     for bid in goals:
 
         runner.run_branch_round(bid, n_points=7, explore_frac=0.15,
@@ -446,7 +526,10 @@ def test_battle_branches_converge_to_analytic_optimum():
     from src.design.move_bounds import MOVE_RESTRICT, MOVE_RELAX
 
     print("\n=== STEP 4: new GLOSS goal 'matte' needs B -> honest floor ===")
+    _print_vars(runner, label="step 4")
     matte_goal = _matte_goal()
+    _print_goal("matte", matte_goal)
+    _print_truth_functions(truth, ["gloss", "strength", "price"])
     # the new goal's analytic optimum genuinely needs B in play (B ~ 0.32)
     matte_opt = branch_optimum(truth, matte_goal, n_scan=20000, seed=4242)
     print(f"matte ANALYTIC optimum (A,B,C,T,P)="
@@ -579,7 +662,10 @@ def test_battle_branches_converge_to_analytic_optimum():
         return float(Desirability(dict(goal)).overall(means)[0])
 
     print("\n=== STEP 5: new high-C goal 'deep_gloss' needs boundary RELAX ===")
+    _print_vars(runner, label="step 5")
     deep_goal = _deep_gloss_goal()
+    _print_goal("deep_gloss", deep_goal)
+    _print_truth_functions(truth, ["gloss", "strength", "price"])
 
     # the new goal's analytic optimum needs C far beyond any narrow cap
     deep_opt_full = branch_optimum(truth, deep_goal, n_scan=20000, seed=5151)

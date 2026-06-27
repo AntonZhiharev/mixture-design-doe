@@ -58,7 +58,8 @@ from ..core.schema_evolution import (SchemaHistory, evolve_schema,
                                      migrate_point, point_in_region)
 from ..design.move_bounds import (move_bounds, handle_dropped_fixed,
                                   RegionMove, RegionMoveError,
-                                  POLICY_EXCLUDE, POLICY_ERROR, POLICY_BOUNDARY)
+                                  POLICY_EXCLUDE, POLICY_ERROR, POLICY_BOUNDARY,
+                                  BORDER_HARD, BORDER_SOFT, boundary_hits)
 from ..models.gp_expert import GPExpert
 from ..design.block_model import build_model_terms, model_matrix
 from ..design.augmented import build_moments
@@ -66,6 +67,23 @@ from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget)
 from ..optimize.desirability import (Desirability, DesirabilitySpec,
                                      DesirabilityResult, optimize_desirability)
+
+
+def _expand_delta(schema, var, side, new_bound):
+    """(lower, upper) для расширения границы ``var`` в сторону ``side`` (§15.6 §6).
+
+    Берёт текущие bounds переменной и двигает ТОЛЬКО упёршуюся сторону к
+    ``new_bound`` (другая остаётся прежней) — формат дельты для ``move_bounds``.
+    """
+    mb = schema.mixture_block()
+    names = list(mb.names)
+    if var not in names:
+        raise KeyError(f"'{var}' не mixture-компонент текущей схемы.")
+    j = names.index(var)
+    lo, hi = float(mb.lower[j]), float(mb.upper[j])
+    if side == "lower":
+        return (float(new_bound), hi)
+    return (lo, float(new_bound))
 
 
 class MixtureProcessRunner:
@@ -127,6 +145,10 @@ class MixtureProcessRunner:
         # обратимо). Журнал движений области (для интроспекции/обратимости).
         self._region_moves: List[Dict[str, Any]] = []
         self._drop_policy: str = POLICY_EXCLUDE
+        # §15.6 §6 / A0.5: происхождение границ (hard/soft). ДЕФОЛТ — soft (можно
+        # двигать). hard (физика/закон/бюджет) двигать НЕЛЬЗЯ. Храним отдельно от
+        # frozen-схемы (политика, не состояние модели): {var: "hard"|"soft"}.
+        self._border_origin: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # размеры текущей фазы
@@ -295,7 +317,19 @@ class MixtureProcessRunner:
 
         ``intent`` — необязательная пометка ЗАЧЕМ двигаем (economy/physical/ROI),
         пишется в журнал ``_region_moves``; примитив от неё не зависит.
+
+        A0.5/A0.6: движение границы с происхождением ``hard`` ЗАПРЕЩЕНО (физика/
+        закон/бюджет) — :class:`RegionMoveError`. Происхождение задаётся
+        :meth:`set_border_origin` (дефолт ``soft``). Система не двигает молча:
+        денежную триаду для ``soft``-упора готовит :meth:`border_money_triad`.
         """
+        for var in deltas:
+            if self.border_origin(var) == BORDER_HARD:
+                raise RegionMoveError(
+                    f"граница '{var}' помечена как hard (A0.5): движение запрещено "
+                    f"по происхождению. Снимите hard-метку осознанно через "
+                    f"set_border_origin('{var}', 'soft'), если это действительно "
+                    f"мягкое ограничение.")
         move = move_bounds(self.current_schema, dict(deltas))
 
         # policy=error / boundary: проверить судьбу КАЖДОЙ активной точки заранее,
@@ -320,6 +354,87 @@ class MixtureProcessRunner:
             "version": int(self.current_schema_version)})
         self.fit_surrogates()
         return move
+
+    # ------------------------------------------------------------------
+    # §15.6 §6 / A0.5 — происхождение границ (hard/soft) + денежная триада
+    # ------------------------------------------------------------------
+    def border_origin(self, var: str) -> str:
+        """Происхождение границы переменной (дефолт ``soft`` — можно двигать)."""
+        return self._border_origin.get(var, BORDER_SOFT)
+
+    def set_border_origin(self, var: str, origin: str) -> None:
+        """Пометить границу ``var`` как ``hard`` (нельзя двигать) или ``soft``.
+
+        A0.5: hard = физика/закон/бюджет. A0.6: метка — ОСОЗНАННОЕ решение
+        пользователя; пометив hard, он запрещает молчаливое движение этой оси.
+        """
+        if origin not in (BORDER_HARD, BORDER_SOFT):
+            raise ValueError(f"origin должен быть '{BORDER_SOFT}'|'{BORDER_HARD}', "
+                             f"дано '{origin}'.")
+        self._border_origin[var] = origin
+
+    def border_money_triad(self, branch_id: str, var: str, side: str,
+                           new_bound: float, composition_price_fn, *,
+                           rho_property: str = "rho",
+                           n_experiments: int = 10,
+                           horizon: Optional[float] = None,
+                           n_candidates: int = 400):
+        """Денежная триада §6 для упора оптимума ветки в ``soft``-границу ``var``.
+
+        Сравнивает лучшую цену изделия В ТЕКУЩЕЙ области с лучшей ожидаемой ценой
+        ЗА расширенной границей (``var`` до ``new_bound``); экономия за период =
+        ``Δprice_изд · V`` ветки, цена добычи = ``N · c_exp``, окупаемость
+        сравнивается с горизонтом ветки (override на раунд через ``horizon``).
+
+        ``hard``-граница ⇒ :class:`economic_stop.HardBoundaryError` (триада не
+        предлагается, A0.5). Возвращает :class:`economic_stop.MoneyTriad`.
+
+        ``composition_price_fn(Xc)`` — цена состава ₽/кг (зависит от состава);
+        ``rho_property`` — имя GP-свойства плотности в общих суррогатах (§3).
+        Это ПРЕДЛОЖЕНИЕ пользователю (A0.6): метод НЕ двигает границу.
+        """
+        from ..optimize.economic_stop import (boundary_signal,
+                                               expected_price_improvement)
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if rho_property not in self.surrogates:
+            raise KeyError(f"Нет суррогата плотности '{rho_property}'. "
+                           f"ρ должно быть полноценным GP-свойством (§3).")
+        br = self.branches[branch_id]
+
+        def _best_price(region_schema):
+            reg = region_schema.mixture_block().as_simplex_region()
+            mix = reg.random_points(int(n_candidates), seed=self.seed + 909)
+            mix = np.atleast_2d(mix)
+            if self.d > 0:
+                rng = np.random.default_rng(self.seed + 910)
+                proc = rng.uniform(0.0, 1.0, size=(mix.shape[0], self.d))
+                Xc = np.hstack([mix, proc])
+            else:
+                Xc = mix
+            pc = np.asarray(composition_price_fn(Xc), float).ravel()
+            pred = self.surrogates[rho_property].predict(Xc)
+            price = pc * np.asarray(pred.mean, float).ravel()
+            return float(price.min()), Xc, pc, np.asarray(pred.std, float).ravel()
+
+        price_cur, _, _, _ = _best_price(self.current_schema)
+        # область ЗА границей: тот же примитив, но без применения движения
+        widened = move_bounds(self.current_schema,
+                              {var: _expand_delta(self.current_schema, var, side,
+                                                  float(new_bound))}).region_after
+        price_new, Xc_n, pc_n, sd_n = _best_price(widened)
+        ei_price = float(expected_price_improvement(
+            pc_n, self.surrogates[rho_property].predict(Xc_n).mean, sd_n,
+            price_best=price_cur, seed=self.seed + 911).max())
+        delta = max(price_cur - price_new, ei_price)
+
+        H = br.resolve_horizon(horizon)
+        return boundary_signal(
+            var, side, self.border_origin(var),
+            delta_price_item=delta, volume=br.volume,
+            n_experiments=int(n_experiments), cost_exp=br.cost_exp, horizon=H)
+
+
 
     # -- вспомогательные построители схем -------------------------------
     def _process_append_spec(self, process_vars):

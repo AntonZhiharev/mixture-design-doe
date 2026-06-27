@@ -424,4 +424,40 @@ def suggest_bounds_move(schema: ProjectSchema, *, intent: str,
         return dict(new_limit) if new_limit else None
     if intent in (INTENT_ROI, INTENT_SHRINK):
         return dict(new_roi) if new_roi else None
+
+
+# ----------------------------------------------------------------------
+# §15.6 §6 / A0.5 — происхождение границы (hard/soft) и детектор упора
+# ----------------------------------------------------------------------
+# A0.5: граница имеет ПРОИСХОЖДЕНИЕ. ``hard`` (физика/закон/бюджет) двигать
+# нельзя; ``soft`` (ДЕФОЛТ) — можно. Происхождение — это ПОЛИТИКА, не состояние
+# физической модели, поэтому НЕ зашивается во frozen ``VariableBlock`` (иначе
+# ломается сериализация/golden схемы) — его держит вызывающий слой (раннер),
+# дефолт ``soft`` (см. :meth:`MixtureProcessRunner.border_origin`).
+BORDER_HARD = "hard"
+BORDER_SOFT = "soft"
+
+
+def boundary_hits(schema: ProjectSchema, optimum: Dict[str, float],
+                  *, tol: float = 1e-6) -> Dict[str, str]:
+    """Где оптимум УПЁРСЯ в текущую границу области (§15.6 §6 триггер).
+
+    Возвращает ``{var: side}`` для переменных, чьё значение оптимума лежит НА
+    границе (в пределах ``tol``) или за ней: ``side ∈ {"lower", "upper"}``. Пустой
+    dict ⇒ оптимум строго внутри (двигать границу незачем — H2-like, §15.0.3.4).
+
+    Это ДЕТЕКТОР (геометрия), он не знает про hard/soft и ничего не двигает —
+    решение по происхождению и денежной триаде принимает экономический слой
+    (:func:`economic_stop.boundary_signal`) с согласия пользователя (A0.6).
+    """
+    hits: Dict[str, str] = {}
+    for var, val in optimum.items():
+        lo, hi = _var_bounds(schema, var)
+        v = float(val)
+        if v <= lo + tol:
+            hits[var] = "lower"
+        elif v >= hi - tol:
+            hits[var] = "upper"
+    return hits
+
     return None

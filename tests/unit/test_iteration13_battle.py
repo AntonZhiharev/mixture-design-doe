@@ -26,7 +26,7 @@ from sklearn.exceptions import ConvergenceWarning
 
 from src.core.schema import ProjectSchema, VariableBlock, ModelSpec
 from src.design.block_model import build_model_terms
-from src.optimize.desirability import DesirabilitySpec
+from src.optimize.desirability import DesirabilitySpec, Desirability
 from src.verification.mixture_process_truth import MultiMixtureProcessTruth
 from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
@@ -156,6 +156,51 @@ def _branch_goals():
                                          target=8.0, weight=1.0),
             "price":    DesirabilitySpec("min", low=1.0, high=5.0, weight=0.5)},
     }
+
+
+def _matte_goal():
+    """NEW product line (STEP 4): a matte/soft-sheen finish where GLOSS is the
+    leading objective and B is its FUNCTIONAL gloss agent. Its analytic optimum
+    is strictly interior with B firmly in play (B ~ 0.32) - this is what makes
+    the later `B >= floor` honest: B is a mandatory component of this line, not
+    an arbitrary decree."""
+    return {
+        "gloss":    DesirabilitySpec("max", low=1.0, high=13.0, weight=1.5),
+        "strength": DesirabilitySpec("max", low=2.0, high=12.0, weight=1.0),
+        "price":    DesirabilitySpec("min", low=1.0, high=5.0, weight=0.5),
+    }
+
+
+def _deep_gloss_goal():
+    """NEW product line (STEP 5): a deep high-gloss finish that needs a LARGE
+    dose of the C component (its analytic optimum sits at C ~ 0.45). When the
+    project currently caps C <= 0.20 (a region-of-interest limit), this optimum
+    is OUT OF REACH - the goal can only be met by RELAXING (expanding) C's upper
+    bound. That is the honest trigger for a move_bounds RELAX."""
+    return {
+        "gloss":    DesirabilitySpec("max", low=8.0, high=13.0, weight=2.0),
+        "strength": DesirabilitySpec("max", low=2.0, high=12.0, weight=1.0),
+        "price":    DesirabilitySpec("min", low=1.0, high=5.0, weight=0.3),
+    }
+
+
+def _recap_truth(truth, *, var: str, lo: float, hi: float):
+    """Rebuild the truth on a mixture region with NEW [lo,hi] bounds on ONE
+    component, reusing the SAME coefficient vectors. Used to get the analytic
+    optimum UNDER a region cap/floor (apples-to-apples with a region-moved
+    pipeline x_best). Generalises :func:`_refloor_truth` to any single bound."""
+    s0 = truth.schema
+    mb0 = s0.mixture_block()
+    lower = list(mb0.lower)
+    upper = list(mb0.upper)
+    j = list(mb0.names).index(var)
+    lower[j] = float(lo)
+    upper[j] = float(hi)
+    mix = VariableBlock.mixture(list(mb0.names), lower=lower, upper=upper)
+    proc = s0.process_block()
+    s = ProjectSchema.mixture_process(mix, proc, model=s0.model)
+    coef_by = {name: truth.truths[name].coefficients for name in truth.property_names}
+    return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
 
 
 # ----------------------------------------------------------------------
@@ -374,15 +419,22 @@ def test_battle_branches_converge_to_analytic_optimum():
             f"{bid}: final {d_final[bid]:.3f} > потолок ф3 {c3:.3f}")
 
     # ==================================================================
-    # STEP 4: MOVE BOUNDS as an ANTI-DEGENERACY FLOOR (REBUILD_SPEC §15.0.3).
+    # STEP 4: A NEW GOAL DRIVES AN HONEST ANTI-DEGENERACY FLOOR (§15.0.3).
     #
-    # The interior-tradeoff truth keeps premium/economy strictly interior, but
-    # `fast` lets one recipe component (B) collapse toward the simplex edge
-    # (B ~ 0). A formulator may REQUIRE every component to stay "in play" (a
-    # minimum dose for processing/regulatory reasons). We express that as a
-    # LOWER-BOUND shift via the move_bounds primitive: B >= B_FLOOR.
+    # The MOVE_RESTRICT must not be an arbitrary decree - it must ARISE from a
+    # real objective. So a NEW product line `matte` arrives whose leading goal
+    # is GLOSS and whose FUNCTIONAL gloss agent is component B: its analytic
+    # optimum is strictly interior with B firmly in play (B ~ 0.32). We let the
+    # pipeline pursue that new goal on the SAME shared physics model (canon:
+    # one model per project, a branch is just intent), then read off its x_best.
     #
-    # This is a REGION move (move_bounds), NOT a schema change:
+    # Because the matte line MANDATES B as a functional component, the project
+    # now imposes a MINIMUM B DOSE B >= B_FLOOR across ALL recipes (so a
+    # degenerate B ~ 0 recipe like `fast` is no longer admissible - B must stay
+    # in play to remain matte-compatible on the shared production line). THAT is
+    # the honest trigger for the floor.
+    #
+    # The floor is a REGION move (move_bounds), NOT a schema change:
     #   * schema_version must NOT bump (§15.2.4);
     #   * the shared base (history) is NEVER truncated - points with B<floor stay
     #     in runner.points, only excluded from the ACTIVE pool (policy "exclude",
@@ -391,20 +443,47 @@ def test_battle_branches_converge_to_analytic_optimum():
     #     B >= floor -> the degenerate component is back in play;
     #   * reversibility: dropping the floor restores the excluded points.
     # ==================================================================
-    from src.design.move_bounds import MOVE_RESTRICT
+    from src.design.move_bounds import MOVE_RESTRICT, MOVE_RELAX
 
-    print("\n=== STEP 4: move_bounds anti-degeneracy floor (fast: B >= floor) ===")
-    # confirm the pre-floor degeneracy we are fixing
+    print("\n=== STEP 4: new GLOSS goal 'matte' needs B -> honest floor ===")
+    matte_goal = _matte_goal()
+    # the new goal's analytic optimum genuinely needs B in play (B ~ 0.32)
+    matte_opt = branch_optimum(truth, matte_goal, n_scan=20000, seed=4242)
+    print(f"matte ANALYTIC optimum (A,B,C,T,P)="
+          f"{np.round(matte_opt['x'], 3).tolist()}  B={matte_opt['x'][1]:.3f} "
+          f"d={matte_opt['d']:.3f}")
+    assert matte_opt["x"][1] > 0.12, (
+        "matte's optimum must genuinely need B in play to justify the floor; "
+        f"got B={matte_opt['x'][1]:.3f}")
+
+    # the pipeline pursues the new goal on the SHARED model (a few exploit rounds)
+    runner.add_branch("matte", matte_goal, budget=10, satisfy_at=1.1,
+                      branch_id="matte")
+    for _ in range(2):
+        runner.run_branch_round("matte", n_points=5, explore_frac=0.2,
+                                n_candidates=500)
+    xb_matte = np.asarray(runner.branches["matte"].x_best, float)
+    print(f"matte PIPELINE x_best   (A,B,C,T,P)="
+          f"{np.round(xb_matte, 3).tolist()}  B={xb_matte[1]:.3f} "
+          f"d_best={runner.branches['matte'].d_best:.3f}")
+    assert xb_matte[1] > 0.12, (
+        f"pipeline did not keep B in play for the matte goal: B={xb_matte[1]:.3f}")
+
+    # this NEW goal is what justifies a project-wide minimum B dose. The
+    # degenerate `fast` recipe (B ~ 0) is now inadmissible on the shared line:
     xb_before = np.asarray(runner.branches["fast"].x_best, float)
     print(f"fast x_best before floor (A,B,C,T,P)="
-          f"{np.round(xb_before, 3).tolist()}  B={xb_before[1]:.3f}")
+          f"{np.round(xb_before, 3).tolist()}  B={xb_before[1]:.3f} "
+          f"(< floor -> must be brought back in play)")
 
     v_before = runner.current_schema_version
     n_hist_before = len(runner.points)
     n_active_before = len(runner._migrated_points())
 
+    # floor motivated by the matte goal (a minimum functional B dose); we keep
+    # it just under matte's optimum so it binds the degenerate `fast`, not matte
     B_FLOOR = 0.12
-    mv = runner.move_region({"B": (B_FLOOR, 1.0)}, intent="physical_constraint")
+    mv = runner.move_region({"B": (B_FLOOR, 1.0)}, intent="reach_target")
     n_active_after = len(runner._migrated_points())
     dropped = n_active_before - n_active_after
 
@@ -475,3 +554,105 @@ def test_battle_branches_converge_to_analytic_optimum():
         "dropping the floor did not restore the excluded points "
         "(history must be reusable - §15.0.3.3 reversibility)")
     assert runner.current_schema_version == v_before  # still a region move
+
+    # ==================================================================
+    # STEP 5: A NEW GOAL DEMANDS A BOUNDARY EXPANSION (move_bounds RELAX).
+    #
+    # The project currently constrains component C to a narrow region-of-interest
+    # cap C <= C_CAP (e.g. a supplier/quality limit on the C dose). Now a NEW
+    # product line `deep_gloss` arrives: a deep, high-gloss finish whose analytic
+    # optimum needs a LARGE dose of C (C ~ 0.45) - WELL BEYOND the current cap.
+    #
+    # Under the cap that optimum is OUT OF REACH: the best achievable desirability
+    # is pinned at the capped ceiling (d ~ 0.64). The ONLY honest way to satisfy
+    # the new goal is to RELAX (expand) C's upper bound - a MOVE_RELAX. After the
+    # expansion the optimum becomes reachable and the pipeline climbs (d ~ 0.75).
+    #
+    # Invariants mirror Step 4: a RELAX is a REGION move (no schema bump), the
+    # shared base is preserved, and points that the earlier cap had excluded come
+    # back into the active pool when the bound re-opens (reversibility).
+    # ==================================================================
+    def _d_truth(goal, x):
+        """Overall desirability BY TRUTH at a pipeline recipe ``x`` (q+d)."""
+        xc = np.asarray(x, float).reshape(1, -1)
+        means = {p: truth.truths[p].true(xc) for p in goal}
+        return float(Desirability(dict(goal)).overall(means)[0])
+
+    print("\n=== STEP 5: new high-C goal 'deep_gloss' needs boundary RELAX ===")
+    deep_goal = _deep_gloss_goal()
+
+    # the new goal's analytic optimum needs C far beyond any narrow cap
+    deep_opt_full = branch_optimum(truth, deep_goal, n_scan=20000, seed=5151)
+    print(f"deep_gloss ANALYTIC optimum (A,B,C,T,P)="
+          f"{np.round(deep_opt_full['x'], 3).tolist()}  C={deep_opt_full['x'][2]:.3f} "
+          f"d={deep_opt_full['d']:.3f}")
+
+    C_CAP = 0.20
+    assert deep_opt_full["x"][2] > C_CAP + 0.1, (
+        "deep_gloss optimum must lie well beyond the cap to justify a RELAX; "
+        f"got C={deep_opt_full['x'][2]:.3f} vs cap {C_CAP}")
+
+    # analytic ceiling UNDER the cap vs UNDER full freedom (apples-to-apples):
+    # the move is NECESSARY only if the cap genuinely lowers the achievable max.
+    capped_truth = _recap_truth(truth, var="C", lo=0.0, hi=C_CAP)
+    deep_opt_cap = branch_optimum(capped_truth, deep_goal, n_scan=20000, seed=5252)
+    print(f"deep_gloss analytic ceiling: capped(C<={C_CAP})={deep_opt_cap['d']:.3f} "
+          f"-> full={deep_opt_full['d']:.3f}  (relax lifts the ceiling)")
+    assert deep_opt_full["d"] > deep_opt_cap["d"] + 0.05, (
+        "the cap must genuinely lower the achievable optimum for the RELAX to be "
+        f"necessary (capped {deep_opt_cap['d']:.3f} vs full {deep_opt_full['d']:.3f})")
+
+    runner.add_branch("deep_gloss", deep_goal, budget=30, satisfy_at=1.1,
+                      branch_id="deep_gloss")
+
+    # --- impose the current narrow cap on C (MOVE_RESTRICT) ---
+    v5_before = runner.current_schema_version
+    mv_cap = runner.move_region({"C": (0.0, C_CAP)}, intent="region_of_interest")
+    assert mv_cap.move_type == MOVE_RESTRICT
+    assert runner.current_schema_version == v5_before  # region move, no bump
+
+    # pipeline pursues the new goal UNDER the cap; achievable is pinned by the cap
+    for _ in range(2):
+        runner.run_branch_round("deep_gloss", n_points=5, explore_frac=0.2,
+                                n_candidates=500)
+    xb_cap = np.asarray(runner.optimize_xbest("deep_gloss").x, float)
+    d_cap_pipe = _d_truth(deep_goal, xb_cap)
+    print(f"under cap C<={C_CAP}: pipeline x_best="
+          f"{np.round(xb_cap, 3).tolist()}  C={xb_cap[2]:.3f}  d_truth={d_cap_pipe:.3f}")
+    # the capped recipe respects the cap and cannot beat the capped ceiling
+    assert xb_cap[2] <= C_CAP + 1e-6, (
+        f"capped pipeline recipe violates C<= {C_CAP}: C={xb_cap[2]:.3f}")
+    assert d_cap_pipe <= deep_opt_cap["d"] + 0.03, (
+        f"capped pipeline d_truth {d_cap_pipe:.3f} exceeds capped ceiling "
+        f"{deep_opt_cap['d']:.3f} (cannot beat the analytic max under the cap)")
+
+    # --- the new goal JUSTIFIES expanding C's upper bound (MOVE_RELAX) ---
+    n_active_cap = len(runner._migrated_points())
+    mv_relax = runner.move_region({"C": (0.0, 1.0)}, intent="region_of_interest")
+    n_active_relaxed = len(runner._migrated_points())
+    print(f"move_type={mv_relax.move_type}  C cap {C_CAP} -> 1.0  "
+          f"active pool {n_active_cap} -> {n_active_relaxed} "
+          f"(restored {n_active_relaxed - n_active_cap} high-C points)")
+    assert mv_relax.move_type == MOVE_RELAX
+    assert runner.current_schema_version == v5_before  # still a region move
+    # relaxing the cap brings the previously-excluded high-C points back (revers.)
+    assert n_active_relaxed > n_active_cap, (
+        "relaxing C's bound did not restore the excluded high-C points")
+
+    # with the bound re-opened the pipeline can finally chase the high-C optimum
+    for _ in range(3):
+        runner.run_branch_round("deep_gloss", n_points=5, explore_frac=0.15,
+                                n_candidates=600)
+    xb_relax = np.asarray(runner.optimize_xbest("deep_gloss").x, float)
+    d_relax_pipe = _d_truth(deep_goal, xb_relax)
+    print(f"after RELAX C<=1.0: pipeline x_best="
+          f"{np.round(xb_relax, 3).tolist()}  C={xb_relax[2]:.3f}  d_truth={d_relax_pipe:.3f}")
+
+    # the expansion genuinely helped: the recipe moved into the newly opened
+    # high-C region and desirability climbed past the capped ceiling
+    assert xb_relax[2] > C_CAP + 1e-6, (
+        f"boundary RELAX failed to push C beyond the old cap: C={xb_relax[2]:.3f}")
+    assert d_relax_pipe > d_cap_pipe + 0.02, (
+        f"boundary expansion did not improve the new goal: capped {d_cap_pipe:.3f} "
+        f"-> relaxed {d_relax_pipe:.3f}")
+    assert abs(xb_relax[:3].sum() - 1.0) < 1e-6  # still a valid composition

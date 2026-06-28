@@ -92,10 +92,75 @@ def economic_value(ei_price, volume: float, horizon: float) -> float:
 
     ``economic_value = max_x EI_price(x) · V · H``  [₽ за горизонт].
     ``ei_price`` — массив по кандидатам (берётся максимум) или скаляр.
+
+    ⚠️ ЭТО objective-AGNOSTIC оценка: считает ЛЮБОЕ удешевление, даже если ветка
+    туда не пойдёт (её d_overall там не растёт). Для тяжёлой/разреженной ветки это
+    переоценивает выгоду «дешёвого угла», который цель не преследует (диагностика
+    §5.3). Когда нужна ЧЕСТНАЯ денежная выгода ИМЕННО ветки — см.
+    :func:`price_attributed_value` (§5 per-property: деньги только за прирост
+    d_overall, атрибутированный ценовой оси).
     """
     ei = np.atleast_1d(np.asarray(ei_price, float))
     best = float(ei.max()) if ei.size else 0.0
     return best * float(volume) * float(horizon)
+
+
+def price_attributed_value(price_savings, *, d_overall_cur, d_overall_cand,
+                           d_price_cur, d_price_cand,
+                           price_weight: float, total_weight: float,
+                           volume: float, horizon: float,
+                           d_floor: float = 1e-6) -> float:
+    """§5 per-property: денежная ценность раунда, АТРИБУТИРОВАННАЯ ценовой оси.
+
+    Чинит objective-agnostic переоценку :func:`economic_value` (диагностика §5.3:
+    «фантом дешёвого угла»). Сырое удешевление ``price_savings`` (₽/изд, EI по ρ)
+    засчитывается ТОЛЬКО там, где (а) ветка реально улучшает свой ``d_overall`` и
+    (б) это улучшение идёт ИМЕННО через цену. Долю цены берём из лог-разложения
+    ВЗВЕШЕННОГО ГЕОМЕТРИЧЕСКОГО СРЕДНЕГО desirability (§3):
+
+        log d_overall   = Σ_i (w_i/Σw)·log d_i
+        Δlog d_overall  = Σ_i (w_i/Σw)·Δlog d_i              (best → кандидат)
+        вклад_цены      = (w_price/Σw)·Δlog d_price
+        α(x) = clip( вклад_цены / Δlog d_overall , 0, 1 )   если Δlog d_overall>0,
+               иначе 0   (нет прироста цели → денег нет)
+
+        economic_value = V·H · max_x [ price_savings(x)·α(x) ]   [₽ за горизонт]
+
+    Поведение на крайних случаях:
+      * дешёвый угол (цена падает, но d_overall НЕ растёт — другое свойство
+        вето/проседает): Δlog d_overall ≤ 0 ⇒ α=0 ⇒ денег 0 (фантом убран);
+      * улучшение чисто через ДРУГУЮ ось (цена не двигается): вклад_цены=0 ⇒ α=0;
+      * улучшение чисто через цену: вклад_цены≈Δlog d_overall ⇒ α≈1 ⇒ полная цена.
+
+    Параметры (массивы — поэлементно по кандидатам; ``*_cur`` — скаляры у текущего
+    лучшего рецепта ветки)
+    ----------
+    price_savings   : EI на удешевление изделия по кандидатам (₽/изд, ≥0).
+    d_overall_cur/cand : d_overall ветки у текущего лучшего / у кандидатов.
+    d_price_cur/cand   : desirability ЦЕНОВОЙ оси у текущего лучшего / кандидатов.
+    price_weight    : вес ценовой оси ``w_price`` в гео-среднем ветки.
+    total_weight    : сумма весов всех осей ветки ``Σw``.
+    volume, horizon : V (изд/период) и H (горизонт) — как в :func:`economic_value`.
+    d_floor         : нижняя отсечка desirability перед log (вето/нули → d_floor).
+    """
+    ps = np.atleast_1d(np.asarray(price_savings, float))
+    do_cur = max(float(d_overall_cur), float(d_floor))
+    do_cand = np.clip(np.atleast_1d(np.asarray(d_overall_cand, float)),
+                      float(d_floor), None)
+    dp_cur = max(float(d_price_cur), float(d_floor))
+    dp_cand = np.clip(np.atleast_1d(np.asarray(d_price_cand, float)),
+                      float(d_floor), None)
+    w = float(price_weight) / float(total_weight)
+    dlog_overall = np.log(do_cand) - np.log(do_cur)
+    dlog_price = np.log(dp_cand) - np.log(dp_cur)
+    contrib = w * dlog_price
+    with np.errstate(divide="ignore", invalid="ignore"):
+        alpha = np.where(dlog_overall > 0.0,
+                         np.clip(contrib / dlog_overall, 0.0, 1.0), 0.0)
+    val = ps * alpha
+    best = float(np.max(val)) if val.size else 0.0
+    return max(best, 0.0) * float(volume) * float(horizon)
+
 
 
 

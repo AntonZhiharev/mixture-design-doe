@@ -26,13 +26,15 @@ from sklearn.exceptions import ConvergenceWarning
 
 from src.core.schema import ProjectSchema, VariableBlock, ModelSpec
 from src.design.block_model import build_model_terms
-from src.optimize.desirability import DesirabilitySpec, Desirability
+from src.optimize.desirability import (DesirabilitySpec, Desirability,
+                                        desirability_value)
 from src.verification.mixture_process_truth import (MultiMixtureProcessTruth,
                                                     composite_random_points)
 from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
 from src.optimize.economic_stop import (decide_stop, expected_price_improvement,
-                                        economic_value)
+                                        economic_value, price_attributed_value)
+
 
 
 
@@ -160,10 +162,66 @@ def _comp_price3(Xc):
     return Xc[:, :3] @ w
 
 
+# ----------------------------------------------------------------------
+# §5 per-property: денежная ценность раунда, АТРИБУТИРОВАННАЯ ценовой оси.
+# Чинит objective-agnostic «фантом дешёвого угла» (диагностика §5.3): деньги
+# засчитываются только за прирост d_overall ветки, идущий ЧЕРЕЗ цену.
+# ----------------------------------------------------------------------
+def _props_at(runner, X, names, *, comp_price_fn, price_axis_name, rho_name):
+    """Средние предсказания свойств ``names`` на точках X (составная матрица).
+    Ось цены: если есть суррогат (Scheffé price, шаги 4-5) — берём его среднее;
+    иначе (step6) собираем price_состав(X)·ρ̂ (цена изделия)."""
+    X = np.atleast_2d(np.asarray(X, float))
+    props = {}
+    for nm in names:
+        if nm in runner.surrogates:
+            props[nm] = np.asarray(runner.surrogates[nm].predict(X).mean, float)
+        elif nm == price_axis_name and comp_price_fn is not None:
+            rho = np.asarray(runner.surrogates[rho_name].predict(X).mean, float)
+            props[nm] = np.asarray(comp_price_fn(X), float).ravel() * rho
+        else:
+            raise KeyError(f"нет предиктора для оси '{nm}'")
+    return props
+
+
+def _attributed_econ_value(runner, bid, cands, price_savings, *,
+                           goal_specs, price_spec, comp_price_fn=None,
+                           rho_name="rho", price_axis_name="price"):
+    """Денежная ценность раунда ветки, атрибутированная ценовой оси (§5).
+
+    Строит РЕАЛЬНУЮ Desirability ветки (цели + цена), считает d_overall и
+    desirability ценовой оси у текущего лучшего рецепта и у кандидатов, затем
+    масштабирует сырое удешевление ``price_savings`` (EI по ρ) долей прироста
+    d_overall, идущей ЧЕРЕЗ цену (см. :func:`price_attributed_value`)."""
+    br = runner.branches[bid]
+    full = dict(goal_specs)
+    full.setdefault(price_axis_name, price_spec)
+    desir = Desirability(full)
+    names = list(full.keys())
+    # текущий лучший рецепт ветки
+    xb = np.asarray(br.x_best, float).reshape(1, -1)
+    p_cur = _props_at(runner, xb, names, comp_price_fn=comp_price_fn,
+                      price_axis_name=price_axis_name, rho_name=rho_name)
+    do_cur = float(desir.overall(p_cur)[0])
+    dp_cur = float(desirability_value(p_cur[price_axis_name][0], price_spec))
+    # кандидаты
+    p_cand = _props_at(runner, cands, names, comp_price_fn=comp_price_fn,
+                       price_axis_name=price_axis_name, rho_name=rho_name)
+    do_cand = desir.overall(p_cand)
+    dp_cand = desirability_value(p_cand[price_axis_name], price_spec)
+    return price_attributed_value(
+        price_savings, d_overall_cur=do_cur, d_overall_cand=do_cand,
+        d_price_cur=dp_cur, d_price_cand=dp_cand,
+        price_weight=price_spec.weight,
+        total_weight=sum(s.weight for s in full.values()),
+        volume=br.volume, horizon=br.horizon)
+
+
 def _run_with_economic_stop(runner, bid, *, ceil, volume, horizon, cost_exp,
-                            comp_price_fn=_comp_price3, rho_name="rho",
-                            n_points=5, explore_frac=0.2, n_candidates=500,
-                            eps=5e-3, min_rounds=2):
+                            goal_specs, comp_price_fn=_comp_price3,
+                            rho_name="rho", n_points=5, explore_frac=0.2,
+                            n_candidates=500, eps=5e-3, min_rounds=2):
+
     """Гонять раунды ветки до ПРИНЦИПИАЛЬНОЙ остановки (§4 decide_stop): тот же
     ДВОЙНОЙ критерий, что и в step6 (технический Δd/потолок + экономический
     EI_price·V·H vs c_exp), но в 3-комп мире {A,B,C} (ρ без D, цена изделия =
@@ -191,8 +249,16 @@ def _run_with_economic_stop(runner, bid, *, ceil, volume, horizon, cost_exp,
         ei = expected_price_improvement(comp_price_fn(cands), pred.mean, pred.std,
                                         price_best=price_best,
                                         seed=runner.seed + br.spent)
-        ev = economic_value(ei, br.volume, br.horizon)
+        # §5 per-property: денежная ценность раунда, атрибутированная цене (§5.3).
+        # Ось цены здесь — Scheffé-свойство 'price' (в objective), масштаб денег —
+        # EI по ρ. Деньги только за прирост d_overall ветки ЧЕРЕЗ цену.
+        ev = _attributed_econ_value(runner, bid, cands, ei,
+                                    goal_specs=goal_specs,
+                                    price_spec=goal_specs["price"],
+                                    comp_price_fn=comp_price_fn,
+                                    rho_name=rho_name)
         reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
+
                              economic_value=ev, cost_exp=br.cost_exp, eps=eps)
         if (br.spent - start) >= int(min_rounds) * int(n_points) \
                 and reason is not None:
@@ -612,8 +678,9 @@ def test_battle_branches_converge_to_analytic_optimum():
     matte_ceil = 0.99 * matte_opt["d"]
     matte_stop = _run_with_economic_stop(
         runner, "matte", ceil=matte_ceil, volume=1.0, horizon=12.0,
-        cost_exp=4500.0, n_points=5, explore_frac=0.2, n_candidates=500,
-        min_rounds=2)
+        cost_exp=4500.0, goal_specs=matte_goal, n_points=5, explore_frac=0.2,
+        n_candidates=500, min_rounds=2)
+
     print(f"step4 matte economic stop: {matte_stop}  "
           f"(d_best={runner.branches['matte'].d_best:.3f} ceil={matte_ceil:.3f})")
     assert matte_stop in {"ceil_reached", "not_economical", "stagnation", "budget"}
@@ -774,8 +841,9 @@ def test_battle_branches_converge_to_analytic_optimum():
     cap_ceil = 0.99 * deep_opt_cap["d"]
     cap_stop = _run_with_economic_stop(
         runner, "deep_gloss", ceil=cap_ceil, volume=2.0, horizon=12.0,
-        cost_exp=4500.0, n_points=5, explore_frac=0.2, n_candidates=500,
-        min_rounds=2)
+        cost_exp=4500.0, goal_specs=deep_goal, n_points=5, explore_frac=0.2,
+        n_candidates=500, min_rounds=2)
+
     print(f"step5 capped deep_gloss economic stop: {cap_stop}")
     assert cap_stop in {"ceil_reached", "not_economical", "stagnation", "budget"}
     xb_cap = np.asarray(runner.optimize_xbest("deep_gloss").x, float)
@@ -807,8 +875,9 @@ def test_battle_branches_converge_to_analytic_optimum():
     relax_ceil = 0.99 * deep_opt_full["d"]
     relax_stop = _run_with_economic_stop(
         runner, "deep_gloss", ceil=relax_ceil, volume=2.0, horizon=12.0,
-        cost_exp=4500.0, n_points=5, explore_frac=0.15, n_candidates=600,
-        min_rounds=3)
+        cost_exp=4500.0, goal_specs=deep_goal, n_points=5, explore_frac=0.15,
+        n_candidates=600, min_rounds=3)
+
     print(f"step5 relaxed deep_gloss economic stop: {relax_stop}")
     assert relax_stop in {"ceil_reached", "not_economical", "stagnation", "budget"}
     xb_relax = np.asarray(runner.optimize_xbest("deep_gloss").x, float)
@@ -1037,8 +1106,17 @@ def test_battle_step6_item_price_economy_white_branch():
             ei = expected_price_improvement(pc, pred.mean, pred.std,
                                             price_best=price_best,
                                             seed=runner.seed + br.spent)
-            ev = economic_value(ei, br.volume, br.horizon)
+            # §5 per-property: денежная ценность раунда, атрибутированная цене
+            # (objective-attributed, §5.3). Деньги — только за прирост d_overall
+            # ветки ЧЕРЕЗ удешевление изделия; «дешёвый угол», который ветка не
+            # преследует (whiteStrength тянет в дорогую D-область), даёт ~0.
+            ev = _attributed_econ_value(runner, bid, cands, ei,
+                                        goal_specs=goals[bid],
+                                        price_spec=price_spec[bid],
+                                        comp_price_fn=_comp_price,
+                                        rho_name="rho")
             econ_last[bid] = (float(np.max(ei)), float(ev))
+
             reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
                                  economic_value=ev, cost_exp=br.cost_exp, eps=EPS)
             if br.spent >= WARMUP and reason is not None:

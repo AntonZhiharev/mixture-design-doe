@@ -48,6 +48,27 @@ STOP_CEIL = "ceil_reached"
 STOP_STAGNATION = "stagnation"
 STOP_NOT_ECONOMICAL = "not_economical"
 
+# ----------------------------------------------------------------------
+# Политика использования экономики на входе ядра (§4 уточнение, решение сессии).
+# ----------------------------------------------------------------------
+# Экономическая нога §4 считается ЧЕРЕЗ цену, атрибутированную ветке (§5). Поэтому
+# она ПРИНЦИПИАЛЬНО уходит в 0 там, где ценовой рычаг исчерпан, а качественный
+# headroom огромен (дешёвый-плохой угол: attr=0 при d≪ceil). Если позволить такой
+# price-only ноге ВЕТИРОВАТЬ, низкий c_exp заморозит ветку в худшей точке на t=0 —
+# хотя технический рычаг обязан вести качество НЕЗАВИСИМО. Политика разводит две
+# роли экономики:
+#
+#   * ``ECON_BINDING``  — §4 каноника: экономика СВЯЗЫВАЕТ (``not_economical``
+#     может остановить цикл). Дефолт — обратная совместимость.
+#   * ``ECON_ADVISORY`` — внутри цикла принято решение тянуть до ПОТОЛКА /
+#     СТАГНАЦИИ / СХОЖДЕНИЯ, не обращая внимания на экономику: price-only нога
+#     НЕ ветирует живой техпрогресс (``Δd≥ε ∧ d<ceil`` ⇒ продолжаем). Но
+#     экономика НЕ исчезает молча — ядро всё равно поднимает ``econ_red_flag``
+#     (ред-флаг для показа пользователю), чтобы «невыгодно» было видно.
+ECON_BINDING = "binding"
+ECON_ADVISORY = "advisory"
+
+
 
 # ----------------------------------------------------------------------
 # Денежная оценка раунда (§6): EI на цену изделия через σ_ρ
@@ -285,27 +306,54 @@ def optimal_round_size(curve_value, cost_exp: float) -> int:
 
 
 # ----------------------------------------------------------------------
-# §4 — ЧИСТАЯ логика двойного стоп-критерия
+# §4 — ЧИСТАЯ логика двойного стоп-критерия (+ политика экономики)
 # ----------------------------------------------------------------------
-def decide_stop(*, delta_d: float, d_best: float, ceil: float,
-                economic_value: float, cost_exp: float,
-                eps: float = 5e-3) -> Optional[str]:
-    """Двойной стоп §4. Возвращает ``stop_reason`` или ``None`` (продолжать).
+@dataclass
+class StopDecision:
+    """Решение ядра §4: СВЯЗЫВАЮЩАЯ причина + ред-флаг экономики (для показа).
 
-    Продолжать тогда и только тогда, когда выполнено **И**:
+    Разделяет два разных вопроса, которые раньше схлопывались в одну строку:
 
-        технический:   Δd ≥ ε  ∧  d_best < ceil
-        экономический: economic_value > c_exp
+      * ``reason`` — что ОСТАНОВИЛО цикл (``None`` ⇒ продолжать). Это то, на что
+        реагирует движок дозабора.
+      * ``econ_red_flag`` — экономика говорит «невыгодно» (``economic_value ≤
+        c_exp``). Поднимается ВСЕГДА, даже когда цикл продолжается (политика
+        ``ECON_ADVISORY``): price-only нога не ветирует живой техпрогресс, но её
+        сигнал НЕ исчезает молча — ядро отдаёт его наверх для показа пользователю
+        (ред-флаг). При ``ECON_BINDING`` он совпадает с тем, что причина —
+        ``not_economical``.
+    """
 
-    Нарушено любое → стоп. Приоритет причин (когда нарушено несколько):
+    reason: Optional[str]
+    econ_red_flag: bool
 
-      1. ``ceil_reached``   — упёрлись в потолок достижимого (``d_best ≥ ceil``):
-         улучшать НЕЧЕГО в текущей постановке — это сильнейший сигнал (дальше
-         только движение границ/раскрытие переменных).
-      2. ``not_economical`` — улучшать ЕСТЬ куда (d<ceil), но денежно невыгодно
-         (``economic_value ≤ c_exp``): осознанный экономический стоп §1.
-      3. ``stagnation``     — технически выдохлись (``Δd < ε``), потолок не
-         достигнут и деньги ещё были бы — но прогресс встал.
+
+def evaluate_stop(*, delta_d: float, d_best: float, ceil: float,
+                  economic_value: float, cost_exp: float,
+                  eps: float = 5e-3,
+                  econ_policy: str = ECON_BINDING) -> StopDecision:
+    """Двойной стоп §4 c политикой экономики. Возвращает :class:`StopDecision`.
+
+    Технический рычаг (Δd / потолок) и экономический (``economic_value`` vs
+    ``c_exp``) — РАЗНЫЕ роли. ``econ_policy`` решает, СВЯЗЫВАЕТ ли экономика:
+
+    Общий инвариант (ОБЕ политики): ``ceil_reached`` — абсолютный приоритет.
+    Упёрлись в потолок достижимого (``d_best ≥ ceil``) ⇒ улучшать НЕЧЕГО, дальше
+    только движение границ/раскрытие переменных.
+
+    ``ECON_BINDING`` (дефолт, §4 каноника) — приоритет причин:
+      1. ``ceil_reached``;
+      2. ``not_economical`` (``economic_value ≤ c_exp``) — улучшать есть куда, но
+         денежно невыгодно (осознанный экономический стоп §1);
+      3. ``stagnation`` (``Δd < ε``) — технически выдохлись, деньги ещё были бы.
+
+    ``ECON_ADVISORY`` — экономика НЕ ветирует живой техпрогресс. Пока
+    ``Δd ≥ ε ∧ d_best < ceil`` ⇒ ``reason=None`` (тянем до потолка/стагнации),
+    КАКОЙ БЫ ни была экономика — это обезвреживает «мину» price-only ноги на
+    дешёвом-плохом старте (``attr=0`` при ``d≪ceil``: ценовой рычаг исчерпан, а
+    качественный headroom огромен — технический рычаг обязан вести качество
+    независимо). Когда техпрогресс встал (``Δd < ε``) ⇒ ``stagnation``. ВО ВСЕХ
+    случаях ``econ_red_flag = (economic_value ≤ c_exp)`` поднимается для показа.
 
     Параметры
     ----------
@@ -313,22 +361,53 @@ def decide_stop(*, delta_d: float, d_best: float, ceil: float,
     d_best         : текущая лучшая desirability ветки.
     ceil           : потолок достижимого (аналитический/фазовый).
     economic_value : ``max_x EI_price · V · H`` (₽ за горизонт, см. выше).
-    cost_exp       : стоимость эксперимента c_exp (₽/опыт) — порог выгодности.
+    cost_exp       : стоимость раунда (``N·c_exp``) — порог выгодности (§4-BATCH).
     eps            : технический порог Δd (ε).
+    econ_policy    : ``ECON_BINDING`` | ``ECON_ADVISORY`` (см. модульный коммент).
     """
+    if econ_policy not in (ECON_BINDING, ECON_ADVISORY):
+        raise ValueError(
+            f"econ_policy должен быть '{ECON_BINDING}'|'{ECON_ADVISORY}', "
+            f"дано '{econ_policy}'.")
+
     tech_ceiling_ok = float(d_best) < float(ceil)
     tech_progress_ok = float(delta_d) >= float(eps)
     econ_ok = float(economic_value) > float(cost_exp)
+    red_flag = not econ_ok            # «невыгодно» — ВСЕГДА сообщаем (для показа)
 
-    if tech_ceiling_ok and tech_progress_ok and econ_ok:
-        return None                                   # все условия — продолжаем
-
-    # приоритет причин (см. docstring)
+    # потолок — абсолютный приоритет в обеих политиках
     if not tech_ceiling_ok:
-        return STOP_CEIL
+        return StopDecision(STOP_CEIL, red_flag)
+
+    if econ_policy == ECON_ADVISORY:
+        # price-only нога НЕ ветирует живой техпрогресс (обезвреженная мина t=0):
+        # пока качество растёт — тянем; экономику несём как ред-флаг.
+        if tech_progress_ok:
+            return StopDecision(None, red_flag)
+        return StopDecision(STOP_STAGNATION, red_flag)
+
+    # ECON_BINDING — §4 каноника (приоритет причин)
+    if tech_progress_ok and econ_ok:
+        return StopDecision(None, red_flag)
     if not econ_ok:
-        return STOP_NOT_ECONOMICAL
-    return STOP_STAGNATION
+        return StopDecision(STOP_NOT_ECONOMICAL, red_flag)
+    return StopDecision(STOP_STAGNATION, red_flag)
+
+
+def decide_stop(*, delta_d: float, d_best: float, ceil: float,
+                economic_value: float, cost_exp: float,
+                eps: float = 5e-3,
+                econ_policy: str = ECON_BINDING) -> Optional[str]:
+    """Тонкая строковая обёртка §4 над :func:`evaluate_stop` (обратная
+    совместимость). Возвращает ``stop_reason`` (``None`` ⇒ продолжать) —
+    ``.reason`` решения. Ред-флаг экономики при этом ОТБРАСЫВАЕТСЯ; когда он нужен
+    для показа (особенно под ``ECON_ADVISORY``), вызывай :func:`evaluate_stop`
+    напрямую и читай ``.econ_red_flag``.
+    """
+    return evaluate_stop(delta_d=delta_d, d_best=d_best, ceil=ceil,
+                         economic_value=economic_value, cost_exp=cost_exp,
+                         eps=eps, econ_policy=econ_policy).reason
+
 
 
 # ----------------------------------------------------------------------

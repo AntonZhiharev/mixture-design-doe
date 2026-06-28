@@ -21,8 +21,10 @@ from src.design.branches import Branch
 from src.optimize.desirability import DesirabilitySpec
 from src.optimize.economic_stop import (
     STOP_CEIL, STOP_STAGNATION, STOP_NOT_ECONOMICAL,
-    expected_price_improvement, economic_value, decide_stop,
+    ECON_BINDING, ECON_ADVISORY, StopDecision,
+    expected_price_improvement, economic_value, decide_stop, evaluate_stop,
 )
+
 
 
 def _branch(**kw):
@@ -132,3 +134,156 @@ def test_decide_stop_neutral_economics_falls_back_to_technical():
     r = decide_stop(delta_d=0.02, d_best=0.95, ceil=0.9,
                     economic_value=val, cost_exp=0.0)
     assert r == STOP_CEIL
+
+
+# ----------------------------------------------------------------------
+# §4 ПОЛИТИКА ЭКОНОМИКИ — evaluate_stop(StopDecision) + ECON_BINDING/ADVISORY.
+#
+# Экономическая нога §4 атрибутирована цене (§5) и ПРИНЦИПИАЛЬНО уходит в 0 там,
+# где ценовой рычаг исчерпан, а качественный headroom огромен (дешёвый-плохой
+# угол: attr=0 при d≪ceil). Под ECON_BINDING это ветирует ещё-улучшаемую ветку
+# (мина: низкий c_exp морозит ветку в худшей точке на t=0). ECON_ADVISORY делает
+# техрычаг ведущим: пока Δd≥ε ∧ d<ceil — тянем, экономику несём как ред-флаг.
+# ----------------------------------------------------------------------
+def test_evaluate_stop_returns_stop_decision_with_red_flag():
+    # тип результата — StopDecision(reason, econ_red_flag); невыгодно ⇒ флаг True
+    dec = evaluate_stop(delta_d=0.02, d_best=0.6, ceil=0.9,
+                        economic_value=50.0, cost_exp=100.0)
+    assert isinstance(dec, StopDecision)
+    assert dec.reason == STOP_NOT_ECONOMICAL and dec.econ_red_flag is True
+    # выгодно ⇒ флаг False
+    dec2 = evaluate_stop(delta_d=0.02, d_best=0.6, ceil=0.9,
+                         economic_value=500.0, cost_exp=100.0)
+    assert dec2.reason is None and dec2.econ_red_flag is False
+
+
+def test_decide_stop_is_thin_reason_wrapper_over_evaluate_stop():
+    # decide_stop == evaluate_stop(...).reason на наборе кейсов, обе политики
+    cases = [
+        dict(delta_d=0.02, d_best=0.6, ceil=0.9, economic_value=500.0, cost_exp=100.0),
+        dict(delta_d=0.02, d_best=0.6, ceil=0.9, economic_value=50.0, cost_exp=100.0),
+        dict(delta_d=0.0,  d_best=0.95, ceil=0.9, economic_value=0.0, cost_exp=100.0),
+        dict(delta_d=0.001, d_best=0.6, ceil=0.9, economic_value=500.0, cost_exp=100.0),
+    ]
+    for c in cases:
+        for pol in (ECON_BINDING, ECON_ADVISORY):
+            assert decide_stop(econ_policy=pol, **c) == \
+                   evaluate_stop(econ_policy=pol, **c).reason
+
+
+def test_binding_is_default_and_preserves_canon():
+    # дефолт = ECON_BINDING ⇒ нынешняя §4-каноника не меняется
+    assert evaluate_stop(delta_d=0.02, d_best=0.6, ceil=0.9,
+                         economic_value=50.0, cost_exp=100.0).reason == \
+        evaluate_stop(delta_d=0.02, d_best=0.6, ceil=0.9, economic_value=50.0,
+                      cost_exp=100.0, econ_policy=ECON_BINDING).reason
+
+
+def test_advisory_does_not_freeze_branch_at_cheap_bad_start():
+    """МИНА §5.3: дешёвый-плохой старт (attr=0) при d≪ceil и ЖИВОМ техпрогрессе.
+
+    BINDING ветирует (not_economical) — ветка замёрзла бы в худшей точке.
+    ADVISORY: техрычаг ведёт — reason=None (тянем), но ред-флаг ПОДНЯТ (показать).
+    """
+    mine = dict(delta_d=0.124, d_best=0.47, ceil=0.99,
+                economic_value=0.0, cost_exp=700.0)
+    # binding — мина срабатывает
+    assert decide_stop(**mine) == STOP_NOT_ECONOMICAL
+    # advisory — мина обезврежена, но экономика не исчезает молча
+    dec = evaluate_stop(econ_policy=ECON_ADVISORY, **mine)
+    assert dec.reason is None
+    assert dec.econ_red_flag is True
+
+
+def test_advisory_stops_on_stagnation_not_economics():
+    # техпрогресс встал (Δd<ε), есть headroom, невыгодно: ADVISORY ⇒ stagnation
+    # (НЕ not_economical), ред-флаг несёт экономику
+    dec = evaluate_stop(delta_d=0.001, d_best=0.6, ceil=0.99,
+                        economic_value=0.0, cost_exp=700.0,
+                        econ_policy=ECON_ADVISORY)
+    assert dec.reason == STOP_STAGNATION and dec.econ_red_flag is True
+
+
+def test_advisory_ceiling_remains_absolute():
+    # потолок — абсолютный приоритет и под ADVISORY (нечего улучшать)
+    dec = evaluate_stop(delta_d=0.124, d_best=0.995, ceil=0.99,
+                        economic_value=5000.0, cost_exp=700.0,
+                        econ_policy=ECON_ADVISORY)
+    assert dec.reason == STOP_CEIL and dec.econ_red_flag is False
+
+
+def test_invalid_econ_policy_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        evaluate_stop(delta_d=0.02, d_best=0.6, ceil=0.9, economic_value=50.0,
+                      cost_exp=100.0, econ_policy="whatever")
+
+
+# ----------------------------------------------------------------------
+# ПОЛОСА c_exp≈700: «гони» (attr>c_exp) vs «стоп» (хвост) на траектории
+# economy (числа из _econ_curve_diag): пик ≈1084, attr=0 на дешёвом-плохом старте.
+# При 1500·N=7500 полосы НЕТ (пик 1084 ≪ 7500) — экономика инертна. При c_exp≈700
+# полоса появляется, и тут видно различие политик:
+#   * BINDING тормозит на ПЕРВОМ же раунде (attr 22.7 ≤ 700) — мина на t=0;
+#   * ADVISORY проходит ВСЮ полосу «гони» и останавливается ТЕХнически (стагнация),
+#     неся ред-флаг там, где экономика просела.
+# ----------------------------------------------------------------------
+# (d_best как доля d_opt, attr EI·V·H) — t=0..1, economy-кривая (см. диагностику)
+_TRAJ_D = [0.469, 0.593, 0.692, 0.772, 0.840, 0.898, 0.948, 0.965, 0.970,
+           0.971, 0.9715]
+_TRAJ_ATTR = [0.0, 22.7, 15.0, 615.3, 535.9, 1061.8, 1075.2, 1084.3, 692.6,
+              159.6, 0.0]
+_C_EXP_MID = 700.0          # ВНУТРИ кривой: 0 < 700 < пик 1084
+_CEIL = 0.99               # не достигается (max 0.9715) → стоп будет техническим
+_EPS = 5e-3
+
+
+def _walk(policy):
+    """Прогнать траекторию через ядро: вернуть (stop_index, decisions).
+    stop_index — номер раунда (1-based), где reason != None впервые."""
+    decisions, stop_index = [], None
+    prev = _TRAJ_D[0]
+    for i in range(1, len(_TRAJ_D)):
+        delta = _TRAJ_D[i] - prev
+        prev = _TRAJ_D[i]
+        dec = evaluate_stop(delta_d=delta, d_best=_TRAJ_D[i], ceil=_CEIL,
+                            economic_value=_TRAJ_ATTR[i], cost_exp=_C_EXP_MID,
+                            eps=_EPS, econ_policy=policy)
+        decisions.append(dec)
+        if dec.reason is not None and stop_index is None:
+            stop_index = i
+    return stop_index, decisions
+
+
+def test_cexp_band_exists_inside_curve():
+    # c_exp≈700 реально внутри кривой: есть полоса «гони» (attr>c_exp) И хвост
+    go = [a for a in _TRAJ_ATTR if a > _C_EXP_MID]
+    stop = [a for a in _TRAJ_ATTR if a <= _C_EXP_MID]
+    assert go and stop, "c_exp должен делить кривую на «гони» и «стоп»"
+    assert max(_TRAJ_ATTR) > _C_EXP_MID > min(_TRAJ_ATTR)
+    # при 1500·N=7500 полосы «гони» НЕТ (пик ≪ порога) — экономика инертна
+    assert max(_TRAJ_ATTR) < 7500.0
+
+
+def test_binding_freezes_at_cheap_bad_start_low_cexp():
+    # BINDING + низкий c_exp: стоп на ПЕРВОМ раунде (attr 22.7 ≤ 700) → мина t=0
+    stop_b, dec_b = _walk(ECON_BINDING)
+    assert stop_b == 1
+    assert dec_b[0].reason == STOP_NOT_ECONOMICAL
+
+
+def test_advisory_tugs_through_go_band_then_technical_stop():
+    # ADVISORY проходит всю полосу «гони» и стопает ТЕХнически (стагнация),
+    # сильно позже мины BINDING; в точке стопа ред-флаг поднят (экономика просела)
+    stop_a, dec_a = _walk(ECON_ADVISORY)
+    stop_b, _ = _walk(ECON_BINDING)
+    assert stop_a is not None and stop_a > stop_b      # тянул дольше мины
+    assert dec_a[stop_a - 1].reason == STOP_STAGNATION  # стоп технический
+    # до стопа экономика НЕ ветировала ни разу (price-only нога молчала)
+    assert all(d.reason is None for d in dec_a[:stop_a - 1])
+    # полоса «гони» реально пройдена: был раунд с attr>c_exp ДО стопа
+    passed_go = any(_TRAJ_ATTR[i + 1] > _C_EXP_MID for i in range(stop_a - 1))
+    assert passed_go
+    # на техническом стопе экономика просела → ред-флаг показан пользователю
+    assert dec_a[stop_a - 1].econ_red_flag is True
+

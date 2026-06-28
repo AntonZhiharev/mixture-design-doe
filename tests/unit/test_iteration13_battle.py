@@ -32,9 +32,12 @@ from src.verification.mixture_process_truth import (MultiMixtureProcessTruth,
                                                     composite_random_points)
 from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
-from src.optimize.economic_stop import (decide_stop, expected_price_improvement,
+from src.optimize.economic_stop import (decide_stop, evaluate_stop,
+                                        ECON_ADVISORY,
+                                        expected_price_improvement,
                                         economic_value, price_attributed_value,
                                         price_attribution_alpha, best_of_n_value)
+
 
 
 
@@ -1229,4 +1232,90 @@ def test_battle_step6_item_price_economy_white_branch():
     assert counts.get("seed", 0) == 28
     for bid in goals:
         assert counts.get(f"branch:{bid}", 0) >= 10
+
+    # ==================================================================
+    # STEP 6b: ОВЕРРАЙД ПОЛИТИКИ ЭКОНОМИКИ (ECON_BINDING -> ECON_ADVISORY).
+    #
+    # На пассе 1 (выше) ветка остановилась по ЭКОНОМИКЕ (not_economical): её
+    # экономическая нога атрибутирована цене (§5) и у оптимума уходит в 0
+    # (ценовой рычаг исчерпан), поэтому при низком пороге она ветирует. Под
+    # ECON_BINDING это и есть мина §5.3 — price-only нога морозит ветку.
+    #
+    # Теперь пользователь ЯВНО снимает экономическое ограничение и запускает
+    # ВТОРОЙ цикл той же ветки под ECON_ADVISORY: «тянем до потолка/стагнации,
+    # не обращая внимания на деньги; технический рычаг ведёт качество». Печатаем
+    # ДВЕ СТРОКИ на ветку и МЕЖДУ НИМИ — зафиксированное УКАЗАНИЕ (directive).
+    # Инвариант: под ADVISORY экономика НЕ может быть причиной стопа, но её
+    # ред-флаг доносится наверх (econ_red_flag=True) — «невыгодно» видно.
+    # ==================================================================
+    econ_stopped = [bid for bid in goals
+                    if stop_reason[bid] == "not_economical"]
+    print("\n=== STEP 6b: ECON_ADVISORY override (two passes, directive between) ===")
+    print(f"branches stopped by economics on pass 1 (BINDING): {econ_stopped}")
+    # сценарий должен реально содержать экономический стоп (premium на оптимуме)
+    assert "premium" in econ_stopped, (
+        f"ожидали not_economical у premium на пассе 1, получили: {stop_reason}")
+
+    advisory_stop, advisory_flag = {}, {}
+    for bid in econ_stopped:
+        br = runner.branches[bid]
+        ceil = CEIL_FRAC * opt[bid]["d"]
+        d_before = br.d_best
+        ei_v, ev_v = econ_last.get(bid, (0.0, 0.0))
+        # СТРОКА 1 — пасс 1 (BINDING): экономика связала
+        print(f"  {bid:<9} pass1(BINDING)  d_best={d_before:.3f} "
+              f"ceil={ceil:.3f}  EI$={ei_v:.2f} bestN$={ev_v:.1f} "
+              f"Nc_exp={5 * br.cost_exp:.0f}  stop=not_economical")
+        # --- ЗАФИКСИРОВАННОЕ УКАЗАНИЕ (между строкой 1 и строкой 2) ---
+        print(f"  DIRECTIVE [{bid}]: user disables economic constraint -> "
+              f"econ_policy=ECON_ADVISORY (price-only leg may NOT veto live "
+              f"technical progress; pull to ceiling/stagnation).")
+        prev_d = br.d_best
+        price_best = float("inf")
+        final_reason, red = "budget", False
+        while br.remaining() > 0:
+            res = runner.run_branch_round(bid, n_points=5, explore_frac=0.2,
+                                          n_candidates=500)
+            Ynew = np.atleast_2d(res["y_new"])
+            Xnew = np.atleast_2d(res["x_new"])
+            pim = _comp_price(Xnew) * Ynew[:, rho_i]
+            price_best = min(price_best, float(np.min(pim)))
+            delta = br.d_best - prev_d
+            prev_d = br.d_best
+            cands = runner._phase_candidates(500, runner.seed + br.spent)
+            pc = _comp_price(cands)
+            pred = runner.surrogates["rho"].predict(cands)
+            ev = _attributed_batch_value(
+                runner, bid, cands, comp_price=pc, rho_mean=pred.mean,
+                rho_std=pred.std, price_best=price_best, n_batch=5,
+                goal_specs=goals[bid], price_spec=price_spec[bid],
+                comp_price_fn=_comp_price, rho_name="rho",
+                seed=runner.seed + br.spent)
+            # ЯВНО другая политика — экономика НЕ ветирует живой техпрогресс
+            dec = evaluate_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
+                                economic_value=ev, cost_exp=5 * br.cost_exp,
+                                eps=EPS, econ_policy=ECON_ADVISORY)
+            red = red or bool(dec.econ_red_flag)
+            if dec.reason is not None:
+                final_reason = dec.reason
+                break
+        advisory_stop[bid] = final_reason
+        advisory_flag[bid] = red
+        # СТРОКА 2 — пасс 2 (ADVISORY): стоп ТЕХнический, ред-флаг донесён
+        print(f"  {bid:<9} pass2(ADVISORY) d_best {d_before:.3f}->{br.d_best:.3f} "
+              f"runs={br.spent}  stop={final_reason}  econ_red_flag={red}")
+
+    # ---- проверки оверрайда ----
+    for bid in econ_stopped:
+        br = runner.branches[bid]
+        # под ADVISORY экономика НЕ может быть причиной стопа (нога не ветирует)
+        assert advisory_stop[bid] != "not_economical", (
+            f"{bid}: ADVISORY всё ещё ветирует экономикой: {advisory_stop[bid]}")
+        assert advisory_stop[bid] in {"ceil_reached", "stagnation", "budget"}
+        # экономика НЕ исчезла молча — ред-флаг донесён наверх для показа
+        assert advisory_flag[bid] is True, (
+            f"{bid}: ред-флаг экономики потерян под ADVISORY")
+        # дозабор не ухудшил лучшую desirability и не превзошёл оптимум
+        assert br.d_best <= opt[bid]["d"] + 0.03
+
 

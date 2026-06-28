@@ -1319,3 +1319,341 @@ def test_battle_step6_item_price_economy_white_branch():
         assert br.d_best <= opt[bid]["d"] + 0.03
 
 
+# ======================================================================
+# STEP 7 (REBUILD_SPEC §5/§15.6): КОМПОНЕНТ-АНАЛОГ B1 «ВЫДАВЛИВАЕТ» B.
+#
+# Сценарий поставщика: к рабочему составу {A,B,C,D} приходит НОВЫЙ компонент B1 —
+# прямой аналог B, но с другим экономико-техническим балансом:
+#   * ЦЕНА: B1 на 30% ДЕШЕВЛЕ B            (B=200 -> B1=140 усл.ед/кг);
+#   * СВОЙСТВА: вклад B1 в целевые уравнения на 10% ХУЖЕ B (коэффициент ×0.9
+#     НА КАЖДОМ терме, где участвует B: линейном, парном, тройном, кросс).
+# B1 — ИСТИННЫЙ химический аналог: он повторяет ВСЮ структуру взаимодействий B
+# (B*C, A*B, A*B*C, B*D, B:T, ...), просто слабее и дешевле — мы НЕ выдумываем ему
+# отдельную физику, а зеркалим B (см. ``_mirror_B_to_B1`` / ``_with_b1_analog``).
+#
+# Вопрос боя: ВЫДАВИТ ли B1 старый B из рецепта? Ответ — ОТ ЦЕЛИ ВЕТКИ:
+#   * `economy` (цена давит, w_price=2): экономия 30% перевешивает потерю 10%
+#     качества -> оптимум сажает ВСЮ B-массу на B1 (B≈0, B1>0) — B ВЫДАВЛЕН;
+#   * `premium` (цена слабая, w_price=0.3): держит ли B — печатаем для контраста.
+#
+# ЭКОНОМИКА «ОДИН РАЗ» (по ТЗ): на price-driven ветке `economy` ценовой рычаг у
+# дешёвого B1-оптимума ИСЧЕРПЫВАЕТСЯ (EI_price->0) -> §4 BINDING даёт сработать
+# экономическому стопу (``not_economical``) РОВНО ОДИН раз. Затем пользователь
+# СНИМАЕТ экономическое ограничение и даёт ЕЩЁ ОДИН цикл под ECON_ADVISORY
+# (экономику ИГНОРИРУЕМ: тянем до потолка/стагнации, ред-флаг несём для показа).
+# ======================================================================
+_COMPS5 = ["A", "B", "B1", "C", "D"]
+# B1 на 30% дешевле B: 200 -> 140. Остальные цены — как в step6 (§15.6 §3).
+_PRICE5 = {"A": 95.0, "B": 200.0, "B1": 140.0, "C": 23.0, "D": 315.0}
+B1_QUALITY = 0.9     # вклад B1 в свойства = 0.9 * вклад B (на 10% хуже)
+B1_PRICE_FRAC = 0.7  # цена B1 = 0.7 * цена B (на 30% дешевле); 0.7*200 = 140
+assert abs(_PRICE5["B1"] - B1_PRICE_FRAC * _PRICE5["B"]) < 1e-9
+
+
+def _econ5_truth_schema():
+    mix = VariableBlock.mixture(_COMPS5)
+    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
+    model = ModelSpec(cross_level="full-cross", mixture_order="cubic",
+                      process_order="quadratic")
+    return ProjectSchema.mixture_process(mix, proc, model=model)
+
+
+def _econ5_model_schema():
+    mix = VariableBlock.mixture(_COMPS5)
+    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
+    model = ModelSpec(cross_level="full-cross", mixture_order="quadratic",
+                      process_order="quadratic")
+    return ProjectSchema.mixture_process(mix, proc, model=model)
+
+
+def _mirror_B_to_B1(term_name):
+    """Зеркалит имя терма, заменяя компонент B на B1 (или None, если B нет).
+
+    Имена термов канонические (компоненты в порядке индексов схемы, склейка '*';
+    кросс mixture×process — через ':'). Так как индекс B (1) и B1 (2) соседние,
+    позиционная замена токена B->B1 сохраняет канонический порядок имени
+    (A*B*C -> A*B1*C, B*C -> B1*C, B:T -> B1:T). Чисто-процессные термы (T, P,
+    T^2, P^2, T*P) и термы без B возвращают None (B1 их не дублирует)."""
+    if ":" in term_name:                       # кросс  comp:proc
+        comp, proc = term_name.split(":")
+        toks = comp.split("*")
+        if "B" not in toks:
+            return None
+        return "*".join("B1" if t == "B" else t for t in toks) + ":" + proc
+    toks = term_name.split("*")                # mixture (или чистый process)
+    if "B" not in toks:
+        return None
+    return "*".join("B1" if t == "B" else t for t in toks)
+
+
+def _with_b1_analog(base):
+    """Дополнить вклады свойства ЗЕРКАЛОМ B1 (×B1_QUALITY на каждом B-терме).
+
+    B1 — аналог B: всякий терм с B получает близнеца с B1 и коэффициентом 0.9·c.
+    Остальные термы (без B) не трогаются. Возвращает новый dict для ``_coef``."""
+    out = dict(base)
+    for name, c in list(base.items()):
+        mirror = _mirror_B_to_B1(name)
+        if mirror is not None:
+            out[mirror] = B1_QUALITY * float(c)
+    return out
+
+
+def _build_b1_truth():
+    """5-комп истина {A,B,B1,C,D}: те же отклики, что в step6 (база над {A,B,C,D}),
+    но КАЖДЫЙ B-терм продублирован B1-аналогом (×0.9). ρ — полноценный отклик;
+    цена изделия собирается price_состав(x)·ρ (B1 дешевле B на 30%)."""
+    s = _econ5_truth_schema()
+    base = {
+        "strength": {"A": 6, "B": 10, "C": 2, "D": 2, "A:T": 5, "C:T": 3,
+                     "T^2": -3, "A*B": 9, "A*C": 5, "B*C": 16, "A*B*C": 12,
+                     "B*D": 4},
+        "gloss":    {"A": 3, "B": 7, "C": 3, "D": 2, "P": 6, "P^2": -4,
+                     "A*B": 7, "B*C": 14, "A*C": 6, "A*B*C": 15},
+        "dry_time": {"A": -4, "B": 2, "C": 4, "D": 1, "T": -4, "C:T": -5,
+                     "T^2": 2},
+        "whiteStrength": {"A": 5, "B": 6, "C": 3, "D": 1, "C*D": -8, "A*D": -5,
+                          "B*D": -4},
+        "rho":      {"A": 0.7, "B": 1.0, "C": 1.7, "D": 0.6},
+    }
+    coef_by = {p: _coef(s, _with_b1_analog(c)) for p, c in base.items()}
+    return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
+
+
+def _comp_price5(Xc):
+    """price_состав [усл.ед/кг] для 5-комп мира {A,B,B1,C,D} (B1 дешевле B)."""
+    Xc = np.atleast_2d(np.asarray(Xc, float))
+    w = np.array([_PRICE5[k] for k in _COMPS5], float)
+    return Xc[:, :5] @ w
+
+
+def _item_price5(truth):
+    """cost_fn эталона: цена изделия по ИСТИНЕ = price_состав·ρ_truth."""
+    def _fn(Xc):
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        rho = np.asarray(truth.truths["rho"].true(Xc), float).ravel()
+        return _comp_price5(Xc) * rho
+    return _fn
+
+
+def _range5(truth, name, fn=None, n=40000, seed=2):
+    Xc = composite_random_points(truth.schema, n, seed=seed)
+    y = (np.asarray(fn(Xc), float).ravel() if fn is not None
+         else np.asarray(truth.truths[name].true(Xc), float).ravel())
+    return float(y.min()), float(y.max())
+
+
+def test_battle_step7_b1_analog_displaces_b():
+    """STEP 7: компонент-аналог B1 (−30% цена, −10% свойства) выдавливает B на
+    price-driven ветке; экономика срабатывает ОДИН раз (BINDING), затем игнор-цикл
+    (ADVISORY)."""
+    truth = _build_b1_truth()
+    item_price = _item_price5(truth)
+    BI, B1I = 1, 2                              # индексы B и B1 в [A,B,B1,C,D,T,P]
+
+    print("\n=== STEP 7: B1 = analog of B (-30% price, -10% properties) ===")
+    print(f"  prices [u/kg]: A={_PRICE5['A']:.0f} B={_PRICE5['B']:.0f} "
+          f"B1={_PRICE5['B1']:.0f} (=0.7*B) C={_PRICE5['C']:.0f} "
+          f"D={_PRICE5['D']:.0f}")
+    print(f"  B1 property contribution = {B1_QUALITY:g} * B on EVERY B-term "
+          "(linear/pair/triple/cross): a genuine weaker-but-cheaper analog.")
+    _print_truth_functions(truth, ["strength", "gloss", "rho"])
+
+    # --- две ветки: economy (цена давит) и premium (цена слабая) ---------
+    plo, phi = _range5(truth, "price", fn=item_price)
+    goals = {
+        # economy: прочность (через B-семейство) против цены — РЕШЕНИЕ B vs B1
+        "economy": {"strength": DesirabilitySpec("max", low=2.0, high=12.0,
+                                                  weight=1.0)},
+        # premium: прочность+глянец (оба любят B-семейство), цена слабая
+        "premium": {"strength": DesirabilitySpec("max", low=2.0, high=12.0,
+                                                 weight=1.0),
+                    "gloss":    DesirabilitySpec("max", low=1.0, high=13.0,
+                                                 weight=1.0)},
+    }
+    price_spec = {"economy": DesirabilitySpec("min", low=plo, high=phi, weight=2.0),
+                  "premium": DesirabilitySpec("min", low=plo, high=phi, weight=0.3)}
+    branch_econ = {"economy": (5.0, 1.1), "premium": (1.0, 1.0)}  # (V, ρ-ориентир)
+
+    # --- аналитический оптимум с ценой (cost_fn) -------------------------
+    opt = {}
+    for i, bid in enumerate(goals):
+        opt[bid] = branch_optimum(truth, goals[bid], n_scan=40000, seed=700 + i,
+                                  cost_fn=item_price, cost_name="price",
+                                  cost_spec=price_spec[bid])
+    print("ANALYTIC optima (A,B,B1,C,D,T,P) with item-price cost:")
+    for bid in goals:
+        xo = np.asarray(opt[bid]["x"], float)
+        verdict = ("B1 DISPLACES B" if xo[B1I] > xo[BI] + 1e-3
+                   else "B kept")
+        print(f"  {bid:<8} x={np.round(xo, 3).tolist()}  "
+              f"B={xo[BI]:.3f} B1={xo[B1I]:.3f}  d={opt[bid]['d']:.3f}  -> {verdict}")
+
+    # --- ГЛАВНОЕ: на economy B1 ВЫДАВИЛ B в аналитике --------------------
+    xo_e = np.asarray(opt["economy"]["x"], float)
+    assert xo_e[B1I] > xo_e[BI] + 1e-3, (
+        f"economy: B1 не выдавил B аналитически: B={xo_e[BI]:.3f} "
+        f"B1={xo_e[B1I]:.3f}")
+    assert xo_e[B1I] > 0.10, (
+        f"economy: B1 не вошёл реально в игру: B1={xo_e[B1I]:.3f}")
+
+    # --- пайплайн на ОДНОЙ общей модели; цена изделия как cost-цель ------
+    runner = MixtureProcessRunner(_econ5_model_schema(), truth,
+                                  baseline=[0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 0.5],
+                                  seed=21, n_restarts=2)
+    runner.begin_phase(mixture_free=_COMPS5, process_free=["T", "P"])
+    runner.seed_initial(n=40, seed=21)
+    H_HORIZON, C_EXP = 12.0, 1500.0
+    for bid in goals:
+        br = runner.add_branch(bid, goals[bid], budget=40, satisfy_at=1.1,
+                               branch_id=bid)
+        runner.set_branch_cost(bid, _comp_price5, price_spec[bid],
+                               rho_property="rho", cost_name="price")
+        br.volume = float(branch_econ[bid][0])
+        br.cost_exp = C_EXP
+        br.horizon = H_HORIZON
+
+    # --- ПАСС 1 (ECON_BINDING): даём экономике СРАБОТАТЬ ровно один раз ---
+    # Потолок намеренно НЕДОСТИЖИМ (десириабилити ∈ [0,1], ceil=10): по ТЗ стопом
+    # управляет ИМЕННО экономика, а не «потолок качества». Тогда на price-driven
+    # ветке у дешёвого B1-оптимума ценовой рычаг исчерпывается (EI_price->0) и §4
+    # BINDING даёт сработать ``not_economical`` (а не ceil_reached).
+    ECON_CEIL, EPS, WARMUP = 10.0, 5e-3, 10
+    rho_i = runner.prop_index["rho"]
+    stop_reason = {}
+    for bid in goals:
+        br = runner.branches[bid]
+        ceil = ECON_CEIL
+
+        price_best = float("inf")
+        prev_d = br.d_best
+        final_reason = "budget"
+        while br.remaining() > 0:
+            res = runner.run_branch_round(bid, n_points=5, explore_frac=0.2,
+                                          n_candidates=500)
+            Ynew = np.atleast_2d(res["y_new"])
+            Xnew = np.atleast_2d(res["x_new"])
+            price_best = min(price_best,
+                             float(np.min(_comp_price5(Xnew) * Ynew[:, rho_i])))
+            delta = br.d_best - prev_d
+            prev_d = br.d_best
+            cands = runner._phase_candidates(500, runner.seed + br.spent)
+            pc = _comp_price5(cands)
+            pred = runner.surrogates["rho"].predict(cands)
+            ev = _attributed_batch_value(
+                runner, bid, cands, comp_price=pc, rho_mean=pred.mean,
+                rho_std=pred.std, price_best=price_best, n_batch=5,
+                goal_specs=goals[bid], price_spec=price_spec[bid],
+                comp_price_fn=_comp_price5, rho_name="rho",
+                seed=runner.seed + br.spent)
+            reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
+                                 economic_value=ev, cost_exp=5 * br.cost_exp,
+                                 eps=EPS)
+            if br.spent >= WARMUP and reason is not None:
+                final_reason = reason
+                break
+        stop_reason[bid] = final_reason
+
+    print("PASS 1 (ECON_BINDING) stop reasons:")
+    for bid in goals:
+        br = runner.branches[bid]
+        xb = np.asarray(br.x_best, float)
+        verdict = ("B1 DISPLACES B" if xb[B1I] > xb[BI] + 1e-3 else "B kept")
+        print(f"  {bid:<8} runs={br.spent:>3} d_best={br.d_best:.3f} "
+              f"B={xb[BI]:.3f} B1={xb[B1I]:.3f}  stop={stop_reason[bid]:<14} "
+              f"-> {verdict}")
+
+    # --- пайплайн на economy тоже выдавил B (B1 > B) ---------------------
+    xb_e = np.asarray(runner.branches["economy"].x_best, float)
+    assert xb_e[B1I] > xb_e[BI], (
+        f"economy pipeline: B1 не выдавил B: B={xb_e[BI]:.3f} B1={xb_e[B1I]:.3f}")
+
+    # economy должна была СРАБОТАТЬ экономикой (ценовой рычаг исчерпан у дешёвого
+    # B1-оптимума) — это и есть «дали экономике сработать ОДИН раз».
+    assert stop_reason["economy"] == "not_economical", (
+        f"ожидали not_economical у economy на пассе 1, получили: "
+        f"{stop_reason['economy']}")
+
+    # ==================================================================
+    # ПАСС 2 (ECON_ADVISORY): даём ЕЩЁ ОДИН цикл, ИГНОРИРУЯ экономику.
+    # Пользователь снял экономическое ограничение -> price-only нога НЕ ветирует
+    # живой техпрогресс; тянем до потолка/стагнации, ред-флаг несём для показа.
+    # ==================================================================
+    econ_stopped = [bid for bid in goals
+                    if stop_reason[bid] == "not_economical"]
+    print("\n=== STEP 7b: ECON_ADVISORY override (economic constraint ignored) ===")
+    print(f"branches stopped by economics on pass 1: {econ_stopped}")
+    advisory_stop, advisory_flag = {}, {}
+    for bid in econ_stopped:
+        br = runner.branches[bid]
+        ceil = ECON_CEIL                       # тот же недостижимый потолок (§ТЗ)
+        d_before = br.d_best
+        print(f"  DIRECTIVE [{bid}]: user disables economic constraint -> "
+              f"ECON_ADVISORY (ignore economics for ONE more cycle).")
+
+        prev_d = br.d_best
+        price_best = float("inf")
+        final_reason, red = "budget", False
+        while br.remaining() > 0:
+            res = runner.run_branch_round(bid, n_points=5, explore_frac=0.2,
+                                          n_candidates=500)
+            Ynew = np.atleast_2d(res["y_new"])
+            Xnew = np.atleast_2d(res["x_new"])
+            price_best = min(price_best,
+                             float(np.min(_comp_price5(Xnew) * Ynew[:, rho_i])))
+            delta = br.d_best - prev_d
+            prev_d = br.d_best
+            cands = runner._phase_candidates(500, runner.seed + br.spent)
+            pc = _comp_price5(cands)
+            pred = runner.surrogates["rho"].predict(cands)
+            ev = _attributed_batch_value(
+                runner, bid, cands, comp_price=pc, rho_mean=pred.mean,
+                rho_std=pred.std, price_best=price_best, n_batch=5,
+                goal_specs=goals[bid], price_spec=price_spec[bid],
+                comp_price_fn=_comp_price5, rho_name="rho",
+                seed=runner.seed + br.spent)
+            dec = evaluate_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
+                                economic_value=ev, cost_exp=5 * br.cost_exp,
+                                eps=EPS, econ_policy=ECON_ADVISORY)
+            red = red or bool(dec.econ_red_flag)
+            if dec.reason is not None:
+                final_reason = dec.reason
+                break
+        advisory_stop[bid] = final_reason
+        advisory_flag[bid] = red
+        xb = np.asarray(br.x_best, float)
+        print(f"  {bid:<8} pass2(ADVISORY) d_best {d_before:.3f}->{br.d_best:.3f} "
+              f"runs={br.spent} stop={final_reason} econ_red_flag={red}  "
+              f"B={xb[BI]:.3f} B1={xb[B1I]:.3f}")
+
+    # ---- проверки оверрайда (экономика «один раз», дальше игнор) --------
+    for bid in econ_stopped:
+        br = runner.branches[bid]
+        # под ADVISORY экономика НЕ ветирует (нога не останавливает)
+        assert advisory_stop[bid] != "not_economical", (
+            f"{bid}: ADVISORY всё ещё ветирует экономикой: {advisory_stop[bid]}")
+        assert advisory_stop[bid] in {"ceil_reached", "stagnation", "budget"}
+        # экономика не исчезла молча — ред-флаг донесён наверх
+        assert advisory_flag[bid] is True, (
+            f"{bid}: ред-флаг экономики потерян под ADVISORY")
+        # дозабор не ухудшил d_best и не превзошёл оптимум
+        assert br.d_best <= opt[bid]["d"] + 0.03
+
+    # economy фигурирует в econ_stopped -> «экономика сработала ровно один раз»
+    assert "economy" in econ_stopped, (
+        f"economy не дала экономике сработать: {stop_reason}")
+
+    # финальный вердикт по economy: B1 окончательно выдавил B
+    xb_e = np.asarray(runner.branches["economy"].x_best, float)
+    print(f"\nVERDICT: economy pipeline B={xb_e[BI]:.3f} B1={xb_e[B1I]:.3f} -> "
+          f"{'B1 ВЫДАВИЛ B' if xb_e[B1I] > xb_e[BI] else 'B удержался'}")
+    assert xb_e[B1I] > xb_e[BI]
+
+    # общая база выросла, у каждой ветки есть измеренные точки
+    counts = runner.origin_counts()
+    assert counts.get("seed", 0) == 40
+    for bid in goals:
+        assert counts.get(f"branch:{bid}", 0) >= 5
+
+
+

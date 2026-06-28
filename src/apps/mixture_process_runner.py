@@ -59,7 +59,8 @@ from ..core.schema_evolution import (SchemaHistory, evolve_schema,
 from ..design.move_bounds import (move_bounds, handle_dropped_fixed,
                                   RegionMove, RegionMoveError,
                                   POLICY_EXCLUDE, POLICY_ERROR, POLICY_BOUNDARY,
-                                  BORDER_HARD, BORDER_SOFT, boundary_hits)
+                                  BORDER_HARD, BORDER_SOFT, boundary_hits,
+                                  _var_bounds)
 from ..models.gp_expert import GPExpert
 from ..design.block_model import build_model_terms, model_matrix
 from ..design.augmented import build_moments
@@ -433,6 +434,80 @@ class MixtureProcessRunner:
             var, side, self.border_origin(var),
             delta_price_item=delta, volume=br.volume,
             n_experiments=int(n_experiments), cost_exp=br.cost_exp, horizon=H)
+
+    def flat_axis_at_border(self, branch_id: str, var: str, side: str,
+                            new_bound: float, *, n_samples: int = 21,
+                            cost_fn=None, cost_spec=None, cost_name: str = "cost",
+                            tol: float = 1e-9):
+        """A0.7-детектор: вырождена ли ось ``var`` для цели ветки (objective-gap).
+
+        Строит ``objective_fn(t) -> d_overall`` ТЕКУЩЕЙ постановки ветки: варьирует
+        ТОЛЬКО ось ``var`` (mixture-компонент с пропорциональной перенормировкой
+        Σ=1 или process-координату), всё прочее держит у M8-оптимума ветки, и
+        считает desirability через РЕАЛЬНУЮ :class:`Desirability` по ОБЩИМ
+        суррогатам. Если задан ``cost_fn`` (``price_изд`` с ρ, §3), он входит как
+        ``min``-свойство — тогда flat-статус честно ПЕРЕОЦЕНИВАЕТСЯ с ценой/ρ
+        (§3 «Следствие»: ось, плоская без ρ, может стать не-плоской с ρ(...,P)).
+
+        Возвращает :class:`economic_stop.FlatAxisResult`: ``flat`` ⇒ ось
+        неидентифицируема, репортится ``objective_gap`` (Δd за границей), ``x_gap``
+        = ``None`` (двигать переменную нечего, A0.7). Это ДИАГНОСТИКА (read-only).
+        """
+        from ..optimize.economic_stop import detect_flat_axis
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if not self.surrogates:
+            self.fit_surrogates()
+        br = self.branches[branch_id]
+        x_opt = np.asarray(self.optimize_xbest(branch_id).x, float).ravel()
+
+        names = list(self.current_schema.mixture_names)
+        proc_names = list(self.current_schema.process_names)
+        if var in names:
+            axis = names.index(var)                 # mixture-компонент
+            lo, hi = _var_bounds(self.current_schema, var)
+        elif var in proc_names:
+            axis = self.q + proc_names.index(var)    # process в коде [0,1]
+            lo, hi = 0.0, 1.0
+        else:
+            raise KeyError(f"'{var}' нет в текущей схеме (mixture/process).")
+
+        is_mixture = var in names
+        specs = dict(br.goal)
+        if cost_fn is not None:
+            from ..optimize.desirability import DesirabilitySpec
+            specs[cost_name] = (cost_spec if cost_spec is not None
+                                else DesirabilitySpec("min", low=0.0, high=1.0))
+        desir = Desirability(specs)
+
+        def _set_axis(t: float) -> np.ndarray:
+            x = x_opt.copy()
+            if is_mixture and self.q > 1:
+                t = float(np.clip(t, 0.0, 1.0))
+                others = [k for k in range(self.q) if k != axis]
+                rest = float(x[others].sum())
+                x[axis] = t
+                if rest > 1e-12:
+                    x[others] *= (1.0 - t) / rest
+                else:
+                    x[others] = (1.0 - t) / max(len(others), 1)
+            else:
+                x[axis] = float(t)
+            return x
+
+        def objective_fn(ts) -> np.ndarray:
+            ts = np.atleast_1d(np.asarray(ts, float))
+            X = np.vstack([_set_axis(t) for t in ts])
+            props = {n: self.surrogates[n].predict(X).mean for n in br.goal}
+            if cost_fn is not None:
+                props[cost_name] = np.asarray(cost_fn(X), float).ravel()
+            return desir.overall(props)
+
+        samples = np.linspace(lo, hi, int(n_samples))
+        border_value = hi if side == "upper" else lo
+        return detect_flat_axis(var, objective_fn, samples,
+                                border_value=float(border_value),
+                                beyond_value=float(new_bound), tol=float(tol))
 
 
 

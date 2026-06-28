@@ -992,6 +992,104 @@ def render_branches(runner: PipelineRunner):
             except RuntimeError as exc:
                 st.error(str(exc))
 
+    # --- §15.6: экономический стоп + граница-сигнал + flat-ось (A0.7) ----
+    # ЧИСТО READ-ONLY (A0.6): система НИКОГДА не двигает границы молча — это
+    # ПРЕДЛОЖЕНИЯ с цифрами, решение за пользователем.
+    with st.expander("💰 §15.6 — стоп/деньги/границы (предложения, read-only)"):
+        st.caption("Двойной стоп (технический И экономический), денежная триада "
+                   "при упоре в soft-границу и A0.7: на ВЫРОЖДЕННОЙ (flat) оси "
+                   "репортится objective-gap (Δd за границей), а не «двигать x». "
+                   "Ничего не меняется автоматически — это предложения (A0.6).")
+        if not runner.branches:
+            st.info("Заведите ветку, чтобы оценить экономику остановки/границ.")
+        else:
+            from src.optimize.economic_stop import (decide_stop, money_triad,
+                                                     STOP_CEIL, STOP_STAGNATION,
+                                                     STOP_NOT_ECONOMICAL)
+            bnames = {b.name: bid for bid, b in runner.branches.items()}
+            ce = st.columns([3, 2, 2])
+            bsel = ce[0].selectbox("Ветка", list(bnames), key="econ_branch")
+            comp = ce[1].selectbox("Компонент (ось)", list(runner.names),
+                                   key="econ_comp")
+            new_bound = ce[2].number_input("Граница за пределом (доля)",
+                                           min_value=0.0, max_value=1.0,
+                                           value=1.0, step=0.05, key="econ_bound")
+            ce2 = st.columns([1, 1, 1, 1])
+            volume = ce2[0].number_input("V (изд/период)", min_value=0.0,
+                                         value=1000.0, step=100.0, key="econ_V")
+            cexp = ce2[1].number_input("c_exp (₽/опыт)", min_value=0.0,
+                                       value=50.0, step=10.0, key="econ_cexp")
+            horizon = ce2[2].number_input("H (период)", min_value=0.0,
+                                          value=6.0, step=1.0, key="econ_H")
+            dprice = ce2[3].number_input("Δprice_изд за границей (₽/изд)",
+                                         min_value=0.0, value=0.2, step=0.05,
+                                         key="econ_dprice")
+            _render_econ_eval = st.button(
+                "💰 Оценить экономику остановки и границы", key="econ_eval")
+            if _render_econ_eval:
+                bid = bnames[bsel]
+                br = runner.branches[bid]
+                try:
+                    # 1) flat-ось (A0.7): objective-gap vs x-gap
+                    flat = runner.flat_axis_mixture(bid, comp, "upper",
+                                                    float(new_bound))
+                    if flat.flat:
+                        st.warning(
+                            f"Ось **{comp}** ВЫРОЖДЕНА (flat, неидентифицируема): "
+                            f"spread={flat.spread:.2e}. Двигать долю бессмысленно "
+                            f"(A0.7) → репортим **objective-gap** = "
+                            f"{flat.objective_gap:+.4f} Δd, x-gap игнор.")
+                    else:
+                        st.info(
+                            f"Ось **{comp}** различима: spread={flat.spread:.2e}, "
+                            f"x-gap={flat.x_gap:+.4f} (двигать долю осмысленно), "
+                            f"objective-gap={flat.objective_gap:+.4f} Δd.")
+
+                    # 2) денежная триада §6 (mixture-only runner → soft, A0.5)
+                    t = money_triad(comp, "upper",
+                                    delta_price_item=float(dprice),
+                                    volume=float(volume),
+                                    n_experiments=max(1, br.remaining()),
+                                    cost_exp=float(cexp), horizon=float(horizon))
+                    st.markdown(
+                        f"**Денежная триада (soft-граница {comp}):**\n"
+                        f"- экономия: **{t.saving_per_period:.1f} ₽/период** "
+                        f"(= Δprice·V)\n"
+                        f"- цена добычи: **{t.acquisition_cost:.1f} ₽** "
+                        f"(= N·c_exp)\n"
+                        f"- окупаемость: **{t.payback_periods:.2f} периодов** "
+                        f"(сравнить с H={horizon:g})")
+                    if t.worth_it:
+                        st.success("Окупается в горизонте → двигать стоит "
+                                   "(решение за вами, A0.6).")
+                    else:
+                        st.warning("НЕ окупается в горизонте → двигать "
+                                   "невыгодно (решение за вами, A0.6).")
+
+                    # 3) двойной стоп §4 — причина остановки
+                    delta_d = 0.0
+                    if len(br.history) >= 2:
+                        delta_d = float(br.history[-1].get("d_best", br.d_best)) \
+                            - float(br.history[-2].get("d_best", 0.0))
+                    econ_val = float(dprice) * float(volume) * float(horizon)
+                    reason = decide_stop(delta_d=delta_d, d_best=br.d_best,
+                                         ceil=br.satisfy_at,
+                                         economic_value=econ_val,
+                                         cost_exp=float(cexp))
+                    labels = {STOP_CEIL: "🎯 потолок достигнут (ceil_reached)",
+                              STOP_STAGNATION: "🛑 прогресс встал (stagnation)",
+                              STOP_NOT_ECONOMICAL: "💸 невыгодно (not_economical)",
+                              None: "▶ продолжать (есть куда и выгодно)"}
+                    st.caption(f"Двойной стоп §4: **{labels[reason]}** "
+                               f"(Δd={delta_d:+.4f}, d_best={br.d_best:.3f}, "
+                               f"ceil={br.satisfy_at:.3f}, "
+                               f"econ_value={econ_val:.1f} ₽ vs c_exp={cexp:g}).")
+                except (KeyError, ValueError, RuntimeError) as exc:
+                    st.error(str(exc))
+
+
+
+
     st.session_state["runner"] = runner
 
 

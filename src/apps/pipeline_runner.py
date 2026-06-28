@@ -1001,6 +1001,76 @@ class PipelineRunner:
             out[o] = out.get(o, 0) + 1
         return out
 
+
+    # ===================== §15.6 A0.7 — flat-ось (objective-gap) ======
+    def flat_axis_mixture(self, branch_id: str, comp: str, side: str,
+                          new_bound: float, *, n_samples: int = 21,
+                          tol: float = 1e-9):
+        """A0.7-детектор для mixture-компонента ``comp`` цели ветки (objective-gap).
+
+        Строит ``objective_fn(t) -> d_overall`` ТЕКУЩЕЙ постановки ветки: варьирует
+        ТОЛЬКО долю ``comp`` (остальные перенормируются пропорционально, Σx=1),
+        фиксируя прочее у M8-оптимума ветки, и считает desirability через РЕАЛЬНУЮ
+        :class:`Desirability` по ОБЩИМ суррогатам проекта. ``spread ≤ tol`` ⇒ ось
+        вырождена (неидентифицируема) ⇒ репортится ``objective_gap`` (Δd за
+        границей), ``x_gap = None`` (двигать долю нечего, A0.7). Это ДИАГНОСТИКА
+        (read-only — состояние проекта не меняется, A0.6).
+        """
+        from src.optimize.economic_stop import detect_flat_axis
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if not self.surrogates:
+            self.run_m6()
+        br = self.branches[branch_id]
+        names = list(self.names)
+        if comp not in names:
+            raise KeyError(f"'{comp}' не компонент состава ({names}).")
+        axis = names.index(comp)
+        lo = float(self.region.lower[axis])
+        hi = float(self.region.upper[axis])
+
+        # опорный рецепт: M8-argmax цели ветки (а не «лучшая измеренная»)
+        x_opt = self._branch_xbest(branch_id)
+        desir = Desirability(dict(br.goal))
+
+        def _set_comp(t):
+            x = np.asarray(x_opt, float).copy()
+            t = float(np.clip(t, 0.0, 1.0))
+            others = [k for k in range(self.q) if k != axis]
+            rest = float(x[others].sum())
+            x[axis] = t
+            if rest > 1e-12:
+                x[others] = x[others] * ((1.0 - t) / rest)
+            elif others:
+                x[others] = (1.0 - t) / len(others)
+            return x
+
+        def objective_fn(ts):
+            ts = np.atleast_1d(np.asarray(ts, float))
+            X = np.vstack([_set_comp(t) for t in ts])
+            props = {n: self.surrogates[n].predict(X).mean for n in br.goal}
+            return desir.overall(props)
+
+        samples = np.linspace(lo, hi, int(n_samples))
+        border_value = hi if side == "upper" else lo
+        return detect_flat_axis(comp, objective_fn, samples,
+                                border_value=float(border_value),
+                                beyond_value=float(new_bound), tol=float(tol))
+
+    def _branch_xbest(self, branch_id: str) -> np.ndarray:
+        """M8-argmax рецепт цели ветки по общим суррогатам (опора для A0.7)."""
+        br = self.branches[branch_id]
+        if br.x_best is not None:
+            return np.asarray(br.x_best, float).ravel()
+        predictors = {n: (lambda X, n=n: self.surrogates[n].predict(X).mean)
+                      for n in br.goal}
+        res = optimize_desirability(self.region, predictors, dict(br.goal),
+                                    n_candidates=2000, refine_iters=200,
+                                    seed=self.cfg.seed)
+        return np.asarray(res.x, float).ravel()
+
+
+
     # ===================== Кэш метрик стадий (лёгкая персистентность) ==
     # Порядок зависимостей стадий: всё правее зависит от откликов/данных.
     _STAGE_ORDER = ["M1", "M2", "M3_fit", "M3_ard", "M4", "M5", "M6", "M7",

@@ -220,3 +220,83 @@ def boundary_signal(var: str, side: str, origin: str, *,
     return money_triad(var, side, delta_price_item=delta_price_item,
                        volume=volume, n_experiments=n_experiments,
                        cost_exp=cost_exp, horizon=horizon)
+
+
+# ----------------------------------------------------------------------
+# §15.6 A0.7 — ВЫРОЖДЕННОЕ (flat) направление цели → objective-gap, НЕ x-gap
+# ----------------------------------------------------------------------
+@dataclass
+class FlatAxisResult:
+    """Диагностика направления оси, в которое упёрся оптимум (аксиома A0.7).
+
+    Когда оптимум стоит НА границе оси, наивно репортить «x-gap» (на сколько
+    подвинуть переменную) НЕЛЬЗЯ: если целевая функция **плоская** по этой оси
+    (∂d/∂x≡0 в окрестности), переменная **неидентифицируема** — двигать её
+    бессмысленно. Тогда репортится **objective-gap** (на сколько вырастет d за
+    границей), а x-gap игнорируется. Эталон A0.7: economy/P, spread=0.00e+00.
+
+    ⚠️ Flat-статус считается на ТЕКУЩЕЙ цели (включая ``price_изд`` с ρ как
+    свойство, §3): ось, плоская БЕЗ ρ, может ПЕРЕСТАТЬ быть плоской с введением
+    ρ(...,P) — детектор это переоценивает, потому что ``objective_fn`` прогоняет
+    РЕАЛЬНУЮ :meth:`Desirability.overall` текущей постановки (§3 «Следствие»).
+
+    Поля:
+      * ``var``           — имя оси (переменной);
+      * ``flat``          — ``spread ≤ tol`` ⇒ ось вырождена/неидентифицируема;
+      * ``spread``        — ``max(d) − min(d)`` вдоль оси (РЕАЛЬНАЯ desirability);
+      * ``objective_gap`` — ``d_за_границей − d_на_границе`` (Δd; репортится
+        ВМЕСТО x-gap, когда ось flat — это «на сколько подвинуть границу стоит»);
+      * ``x_gap``         — предложение «подвинуть x» (``beyond − border``); для
+        flat-оси ``None`` — двигать НЕЧЕГО (цель не зависит от оси);
+      * ``identifiable``  — ``not flat`` (ось различима целью).
+    """
+
+    var: str
+    flat: bool
+    spread: float
+    objective_gap: float
+    x_gap: Optional[float]
+    identifiable: bool
+
+
+def axis_spread(d_values) -> float:
+    """``max(d) − min(d)`` по набору desirability вдоль оси (0 для пустого/одного)."""
+    d = np.atleast_1d(np.asarray(d_values, float))
+    return float(d.max() - d.min()) if d.size else 0.0
+
+
+def detect_flat_axis(var: str, objective_fn, axis_samples, *,
+                     border_value: float, beyond_value: float,
+                     tol: float = 1e-9) -> FlatAxisResult:
+    """Детектор вырожденного направления цели (A0.7): flat ⇒ objective-gap.
+
+    ``objective_fn`` — ВЕКТОРИЗОВАННАЯ функция ``t -> d_overall`` (массив на
+    массив): варьирует ТОЛЬКО эту ось, всё прочее фиксирует у оптимума, и считает
+    desirability через РЕАЛЬНУЮ :meth:`Desirability.overall` ТЕКУЩЕЙ постановки
+    (с ценой/ρ, §3). Этим flat-статус честно переоценивается при добавлении ρ.
+
+    Алгоритм (§3 «Следствие» + §0 A0.7):
+      1. ``spread = max(d) − min(d)`` на ``axis_samples`` внутри текущих границ;
+      2. ``spread ≤ tol`` ⇒ ось **flat** (неидентифицируема) ⇒ репортим
+         ``objective_gap`` (Δd за границей), ``x_gap = None`` (двигать нечего);
+      3. иначе ось различима ⇒ ``x_gap = beyond − border`` (обычный путь,
+         триада §6 уместна), ``objective_gap`` — справочно.
+
+    ``border_value`` — текущая граница по оси (где упёрся оптимум);
+    ``beyond_value`` — значение за расширенной границей (для objective-gap).
+    """
+    d_in = np.atleast_1d(np.asarray(objective_fn(np.asarray(axis_samples,
+                                                            float)), float))
+    spread = axis_spread(d_in)
+    d_border = float(np.atleast_1d(
+        np.asarray(objective_fn(np.asarray([float(border_value)], float)),
+                   float))[0])
+    d_beyond = float(np.atleast_1d(
+        np.asarray(objective_fn(np.asarray([float(beyond_value)], float)),
+                   float))[0])
+    objective_gap = d_beyond - d_border
+    flat = spread <= float(tol)
+    x_gap = None if flat else float(beyond_value) - float(border_value)
+    return FlatAxisResult(var=str(var), flat=flat, spread=spread,
+                          objective_gap=objective_gap, x_gap=x_gap,
+                          identifiable=not flat)

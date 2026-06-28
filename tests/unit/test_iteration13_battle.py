@@ -27,9 +27,11 @@ from sklearn.exceptions import ConvergenceWarning
 from src.core.schema import ProjectSchema, VariableBlock, ModelSpec
 from src.design.block_model import build_model_terms
 from src.optimize.desirability import DesirabilitySpec, Desirability
-from src.verification.mixture_process_truth import MultiMixtureProcessTruth
+from src.verification.mixture_process_truth import (MultiMixtureProcessTruth,
+                                                    composite_random_points)
 from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
+
 
 # Косметика: GP на чистой (без шума) истине загоняет noise→0 и часть length-scale
 # к границам → sklearn сыплет ConvergenceWarning. Это НЕ ошибка фита и НЕ влияет
@@ -742,3 +744,218 @@ def test_battle_branches_converge_to_analytic_optimum():
         f"boundary expansion did not improve the new goal: capped {d_cap_pipe:.3f} "
         f"-> relaxed {d_relax_pipe:.3f}")
     assert abs(xb_relax[:3].sum() - 1.0) < 1e-6  # still a valid composition
+
+
+# ======================================================================
+# STEP 6 (REBUILD_SPEC §15.6 §3): ЦЕНА ИЗДЕЛИЯ КАК ЭКОНОМИЧЕСКАЯ ЦЕЛЬ.
+#
+# Отдельный 4-компонентный мир {A,B,C,D} с РЕАЛЬНЫМИ ценами компонентов
+# (A=95 B=200 C=23 D=315 усл.ед/кг). Ключевой канон Пути A:
+#   * ρ (ПЛОТНОСТЬ) — ПОЛНОЦЕННЫЙ моделируемый отклик (GP, как strength/gloss);
+#   * цена за изделие  price_изд = price_состав(x)·ρ(x)  НЕ хранится отдельным
+#     свойством и НЕ фитится в Шеффе — собирается на лету (``set_branch_cost`` в
+#     пайплайне; ``cost_fn`` в эталоне). price_состав детерминирована (известные
+#     цены), единственный неизвестный множитель — ρ.
+# Новое свойство whiteStrength (MIN) ведёт ветку `white`, которой нужен компонент
+# D (отбеливатель) — D реально «в игре» в её оптимуме (интерьерный trade-off).
+# Проверяем: пайплайн с ценовой целью приближается к АНАЛИТИЧЕСКОМУ оптимуму
+# КАЖДОЙ ветки (с учётом цены), white держит D, а цена реально двигает рецепт
+# (аналитика с ценой дешевле аналитики без цены).
+# ======================================================================
+_COMPS4 = ["A", "B", "C", "D"]
+_PRICE4 = {"A": 95.0, "B": 200.0, "C": 23.0, "D": 315.0}
+# branch -> (объём т/мес, плотность-ориентир) — экономический контекст
+_BRANCH_ECON = {"premium": (1.0, 1.0), "economy": (5.0, 1.1),
+                "fast": (10.0, 1.4), "white": (1.0, 1.0)}
+_PRICE_W = {"premium": 0.3, "economy": 1.0, "fast": 0.5, "white": 0.5}
+
+
+def _econ_truth_schema():
+    mix = VariableBlock.mixture(_COMPS4)
+    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
+    model = ModelSpec(cross_level="full-cross", mixture_order="cubic",
+                      process_order="quadratic")
+    return ProjectSchema.mixture_process(mix, proc, model=model)
+
+
+def _econ_model_schema():
+    mix = VariableBlock.mixture(_COMPS4)
+    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
+    model = ModelSpec(cross_level="full-cross", mixture_order="quadratic",
+                      process_order="quadratic")
+    return ProjectSchema.mixture_process(mix, proc, model=model)
+
+
+def _build_econ_truth():
+    """4-комп истина {A,B,C,D}: 5 откликов (без свойства price — цена собирается
+    из price_состав·ρ). ρ — полноценный отклик. Коэффициенты подобраны так, чтобы
+    оптимумы веток были интерьерными (компоненты «в игре», не вырождаются)."""
+    s = _econ_truth_schema()
+    coef_by = {
+        # strength (max): B критичен через сильные B-синергии; чистый C слаб →
+        # выбрасывать B дорого (держит B в economy несмотря на дороговизну B)
+        "strength":  _coef(s, {"A": 6, "B": 10, "C": 2, "D": 2,
+                               "A:T": 5, "C:T": 3, "T^2": -3,
+                               "A*B": 9, "A*C": 5, "B*C": 16, "A*B*C": 12,
+                               "B*D": 4}),
+        # gloss (max/target): B-гряда; низкая база от A/C/P → target=8 требует B
+        "gloss":     _coef(s, {"A": 3, "B": 7, "C": 3, "D": 2, "P": 6, "P^2": -4,
+                               "A*B": 7, "B*C": 14, "A*C": 6, "A*B*C": 15}),
+        # dry_time (min): A быстрый, C медленный → fast держит A; T-гейт
+        "dry_time":  _coef(s, {"A": -4, "B": 2, "C": 4, "D": 1,
+                               "T": -4, "C:T": -5, "T^2": 2}),
+        # whiteStrength (MIN, меньше=лучше): D — отбеливатель; A,B,C белят в ПАРЕ
+        # с D (A*D/B*D/C*D < 0) → white хочет реальный БЛЕНД вокруг D (интерьер)
+        "whiteStrength": _coef(s, {"A": 5, "B": 6, "C": 3, "D": 1,
+                                   "C*D": -8, "A*D": -5, "B*D": -4}),
+        # rho = ПЛОТНОСТЬ (отклик опыта), линейный бленд — множитель цены изделия
+        "rho":       _coef(s, {"A": 0.7, "B": 1.0, "C": 1.7, "D": 0.6}),
+    }
+    return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
+
+
+def _comp_price(Xc):
+    """price_состав [усл.ед/кг]: детерминированная функция состава (НЕ свойство)."""
+    Xc = np.atleast_2d(np.asarray(Xc, float))
+    w = np.array([_PRICE4[k] for k in _COMPS4], float)
+    return Xc[:, :4] @ w
+
+
+def _item_price_truth_fn(truth):
+    """cost_fn эталона: цена изделия по ИСТИНЕ = price_состав·ρ_truth."""
+    def _fn(Xc):
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        rho = np.asarray(truth.truths["rho"].true(Xc), float).ravel()
+        return _comp_price(Xc) * rho
+    return _fn
+
+
+def _prop_range(truth, name, n=40000, seed=2):
+    Xc = composite_random_points(truth.schema, n, seed=seed)
+    y = np.asarray(truth.truths[name].true(Xc), float).ravel() if name != "price" \
+        else None
+    if name == "price":
+        y = _item_price_truth_fn(truth)(Xc)
+    return float(y.min()), float(y.max())
+
+
+def _econ_goals(truth):
+    """4 ветки; ЦЕНА у каждой — но как cost-цель (price_изд), не как свойство."""
+    plo, phi = _prop_range(truth, "price")
+    wlo, whi = _prop_range(truth, "whiteStrength")
+    price_spec = {bid: DesirabilitySpec("min", low=plo, high=phi,
+                                        weight=_PRICE_W[bid])
+                  for bid in _BRANCH_ECON}
+    goals = {
+        "premium": {
+            "strength": DesirabilitySpec("max", low=2.0, high=12.0, weight=1.0),
+            "gloss":    DesirabilitySpec("max", low=1.0, high=13.0, weight=1.0)},
+        "economy": {
+            "strength": DesirabilitySpec("max", low=2.0, high=12.0, weight=1.0),
+            "dry_time": DesirabilitySpec("min", low=-3.0, high=3.0, weight=1.0)},
+        "fast": {
+            "dry_time": DesirabilitySpec("min", low=-3.0, high=3.0, weight=1.5),
+            "gloss":    DesirabilitySpec("target", low=1.0, high=13.0,
+                                         target=8.0, weight=1.0)},
+        "white": {
+            "whiteStrength": DesirabilitySpec("min", low=wlo, high=whi, weight=2.0),
+            "strength":      DesirabilitySpec("max", low=2.0, high=12.0,
+                                              weight=1.0)},
+    }
+    return goals, price_spec, (plo, phi), (wlo, whi)
+
+
+def test_battle_step6_item_price_economy_white_branch():
+    """STEP 6: ρ-цена изделия как cost-цель + ветка `white` (нужен D)."""
+    truth = _build_econ_truth()
+    goals, price_spec, (plo, phi), (wlo, whi) = _econ_goals(truth)
+    item_price = _item_price_truth_fn(truth)
+
+    print("\n=== STEP 6: item price = price_sostav * rho; 4-comp {A,B,C,D} ===")
+    print(f"  prices [u/kg]: A={_PRICE4['A']:.0f} B={_PRICE4['B']:.0f} "
+          f"C={_PRICE4['C']:.0f} D={_PRICE4['D']:.0f}; "
+          f"price_izd range=[{plo:.0f},{phi:.0f}]")
+    print("  rho is a MODELED response (GP); price NOT a property (assembled).")
+    _print_truth_functions(truth)
+
+    # --- аналитический оптимум каждой ветки С УЧЁТОМ ЦЕНЫ (cost_fn) -----
+    opt = {}
+    for i, (bid, goal) in enumerate(goals.items()):
+        opt[bid] = branch_optimum(truth, goal, n_scan=40000, seed=600 + i,
+                                  cost_fn=item_price, cost_name="price",
+                                  cost_spec=price_spec[bid])
+
+    # --- цена реально двигает рецепт: аналитика С ценой дешевле, чем БЕЗ ----
+    econ_free = branch_optimum(truth, goals["economy"], n_scan=40000, seed=777)
+    p_econ_cost = item_price(np.asarray(opt["economy"]["x"]).reshape(1, -1))[0]
+    p_econ_free = item_price(np.asarray(econ_free["x"]).reshape(1, -1))[0]
+    print(f"  economy item-price: with-cost={p_econ_cost:.0f} < "
+          f"no-cost={p_econ_free:.0f}  (price truly shifts the recipe)")
+    assert p_econ_cost < p_econ_free - 1e-6, (
+        f"ценовая цель не удешевила экономную ветку: "
+        f"{p_econ_cost:.1f} !< {p_econ_free:.1f}")
+
+    # --- white's optimum genuinely needs D in play (whitener) -------------
+    xo_white = np.asarray(opt["white"]["x"], float)
+    print(f"  white ANALYTIC (A,B,C,D,T,P)={np.round(xo_white, 3).tolist()}  "
+          f"D={xo_white[3]:.3f} d={opt['white']['d']:.3f}")
+    assert xo_white[3] > 0.08, (
+        f"white's optimum must keep D (whitener) in play: D={xo_white[3]:.3f}")
+
+    # --- пайплайн на ОДНОЙ общей модели; цена изделия как cost-цель ветки ---
+    runner = MixtureProcessRunner(_econ_model_schema(), truth,
+                                  baseline=[0.25, 0.25, 0.25, 0.25, 0.5, 0.5],
+                                  seed=13, n_restarts=2)
+    runner.begin_phase(mixture_free=_COMPS4, process_free=["T", "P"])
+    runner.seed_initial(n=28, seed=13)
+    for bid, goal in goals.items():
+        runner.add_branch(bid, goal, budget=30, satisfy_at=1.1, branch_id=bid)
+        runner.set_branch_cost(bid, _comp_price, price_spec[bid],
+                               rho_property="rho", cost_name="price")
+    for _ in range(5):
+        for bid in goals:
+            runner.run_branch_round(bid, n_points=5, explore_frac=0.2,
+                                    n_candidates=500)
+
+    # --- summary (pytest -s) ---------------------------------------------
+    print(f"{'branch':<9}|{'runs':>5}|{'d_best':>7}|{'d_opt':>7}|{'%opt':>5}|"
+          f"{'item$':>7}|{'opt$':>7}")
+    for bid in goals:
+        br = runner.branches[bid]
+        xb = np.asarray(br.x_best, float)
+        pb = float(item_price(xb.reshape(1, -1))[0])
+        po = float(item_price(np.asarray(opt[bid]["x"]).reshape(1, -1))[0])
+        pct = 100.0 * br.d_best / opt[bid]["d"] if opt[bid]["d"] > 0 else 0.0
+        print(f"{bid:<9}|{br.spent:>5}|{br.d_best:>7.3f}|{opt[bid]['d']:>7.3f}|"
+              f"{pct:>4.0f}%|{pb:>7.0f}|{po:>7.0f}")
+
+    # ---- проверки (робастные) ----
+    for bid in goals:
+        br = runner.branches[bid]
+        d_opt = opt[bid]["d"]
+        # 1) санити: нельзя превзойти аналитический оптимум на чистой истине
+        assert br.d_best <= d_opt + 0.03, (
+            f"{bid}: d_best={br.d_best:.3f} > d_opt={d_opt:.3f}")
+        # 2) достигнута существенная доля оптимума (мисспецификация + цена)
+        assert br.d_best >= 0.5 * d_opt, (
+            f"{bid}: финал {br.d_best:.3f} < 50% от d_opt {d_opt:.3f}")
+        # 3) валидный состав
+        assert abs(np.asarray(br.x_best, float)[:4].sum() - 1.0) < 1e-6
+
+    # 4) white реально держит D в игре (отбеливатель не выродился)
+    xb_white = np.asarray(runner.branches["white"].x_best, float)
+    print(f"  white PIPELINE (A,B,C,D,T,P)={np.round(xb_white, 3).tolist()}  "
+          f"D={xb_white[3]:.3f}")
+    assert xb_white[3] > 0.06, (
+        f"пайплайн не удержал D для white: D={xb_white[3]:.3f}")
+    # whiteStrength у пайплайна лучше (ниже) среднего по симплексу
+    ws_pipe = float(truth.truths["whiteStrength"].true(xb_white.reshape(1, -1))[0])
+    assert ws_pipe < 0.5 * (wlo + whi), (
+        f"white не снизил whiteStrength: {ws_pipe:.2f} (mid={(wlo+whi)/2:.2f})")
+
+    # 5) общая база выросла, у каждой ветки есть измеренные точки
+    counts = runner.origin_counts()
+    assert counts.get("seed", 0) == 28
+    for bid in goals:
+        assert counts.get(f"branch:{bid}", 0) >= 10
+

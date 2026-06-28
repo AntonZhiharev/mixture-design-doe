@@ -33,7 +33,8 @@ from src.verification.mixture_process_truth import (MultiMixtureProcessTruth,
 from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
 from src.optimize.economic_stop import (decide_stop, expected_price_improvement,
-                                        economic_value, price_attributed_value)
+                                        economic_value, price_attributed_value,
+                                        price_attribution_alpha, best_of_n_value)
 
 
 
@@ -217,6 +218,42 @@ def _attributed_econ_value(runner, bid, cands, price_savings, *,
         volume=br.volume, horizon=br.horizon)
 
 
+def _attributed_batch_value(runner, bid, cands, *, comp_price, rho_mean,
+                            rho_std, price_best, n_batch, goal_specs, price_spec,
+                            comp_price_fn=None, rho_name="rho",
+                            price_axis_name="price", seed=None):
+    """БАТЧ-версия :func:`_attributed_econ_value` (§4-BATCH): денежная ценность
+    РАУНДА из ``n_batch`` опытов = ``E[улучшение лучшей из N]·V·H``, max-тип q-EI,
+    атрибутированный ценовой оси (§5). Сравнивать с ``n_batch·c_exp`` (цена раунда).
+
+    Та же α(x), что и в max-single пути (одна реализация —
+    :func:`price_attribution_alpha`), но вместо ``max_x`` берётся вогнутый
+    best-of-N (:func:`best_of_n_value`): N опытов СТОЯТ N·c_exp и ПРИНОСЯТ
+    best-of-N, а не одну точку — так чинятся ЕДИНИЦЫ стоп-критерия."""
+    br = runner.branches[bid]
+    full = dict(goal_specs)
+    full.setdefault(price_axis_name, price_spec)
+    desir = Desirability(full)
+    names = list(full.keys())
+    xb = np.asarray(br.x_best, float).reshape(1, -1)
+    p_cur = _props_at(runner, xb, names, comp_price_fn=comp_price_fn,
+                      price_axis_name=price_axis_name, rho_name=rho_name)
+    do_cur = float(desir.overall(p_cur)[0])
+    dp_cur = float(desirability_value(p_cur[price_axis_name][0], price_spec))
+    p_cand = _props_at(runner, cands, names, comp_price_fn=comp_price_fn,
+                       price_axis_name=price_axis_name, rho_name=rho_name)
+    do_cand = desir.overall(p_cand)
+    dp_cand = desirability_value(p_cand[price_axis_name], price_spec)
+    alpha = price_attribution_alpha(
+        d_overall_cur=do_cur, d_overall_cand=do_cand,
+        d_price_cur=dp_cur, d_price_cand=dp_cand,
+        price_weight=price_spec.weight,
+        total_weight=sum(s.weight for s in full.values()))
+    return best_of_n_value(comp_price, rho_mean, rho_std, price_best,
+                           n_batch=int(n_batch), volume=br.volume,
+                           horizon=br.horizon, alpha=alpha, seed=seed)
+
+
 def _run_with_economic_stop(runner, bid, *, ceil, volume, horizon, cost_exp,
                             goal_specs, comp_price_fn=_comp_price3,
                             rho_name="rho", n_points=5, explore_frac=0.2,
@@ -246,20 +283,18 @@ def _run_with_economic_stop(runner, bid, *, ceil, volume, horizon, cost_exp,
         prev_d = br.d_best
         cands = runner._phase_candidates(n_candidates, runner.seed + br.spent)
         pred = runner.surrogates[rho_name].predict(cands)
-        ei = expected_price_improvement(comp_price_fn(cands), pred.mean, pred.std,
-                                        price_best=price_best,
-                                        seed=runner.seed + br.spent)
-        # §5 per-property: денежная ценность раунда, атрибутированная цене (§5.3).
-        # Ось цены здесь — Scheffé-свойство 'price' (в objective), масштаб денег —
-        # EI по ρ. Деньги только за прирост d_overall ветки ЧЕРЕЗ цену.
-        ev = _attributed_econ_value(runner, bid, cands, ei,
-                                    goal_specs=goal_specs,
-                                    price_spec=goal_specs["price"],
-                                    comp_price_fn=comp_price_fn,
-                                    rho_name=rho_name)
+        # §4-BATCH: ценность РАУНДА из N опытов = E[best-of-N]·V·H (max-тип q-EI),
+        # атрибутированная цене (§5). Сравниваем с ЦЕНОЙ РАУНДА N·c_exp — N опытов
+        # СТОЯТ N·c_exp и приносят best-of-N, а не одну точку (единицы стопа).
+        ev = _attributed_batch_value(
+            runner, bid, cands, comp_price=comp_price_fn(cands),
+            rho_mean=pred.mean, rho_std=pred.std, price_best=price_best,
+            n_batch=n_points, goal_specs=goal_specs,
+            price_spec=goal_specs["price"], comp_price_fn=comp_price_fn,
+            rho_name=rho_name, seed=runner.seed + br.spent)
         reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
-
-                             economic_value=ev, cost_exp=br.cost_exp, eps=eps)
+                             economic_value=ev,
+                             cost_exp=n_points * br.cost_exp, eps=eps)
         if (br.spent - start) >= int(min_rounds) * int(n_points) \
                 and reason is not None:
             final_reason = reason
@@ -678,7 +713,7 @@ def test_battle_branches_converge_to_analytic_optimum():
     matte_ceil = 0.99 * matte_opt["d"]
     matte_stop = _run_with_economic_stop(
         runner, "matte", ceil=matte_ceil, volume=1.0, horizon=12.0,
-        cost_exp=4500.0, goal_specs=matte_goal, n_points=5, explore_frac=0.2,
+        cost_exp=1500.0, goal_specs=matte_goal, n_points=5, explore_frac=0.2,
         n_candidates=500, min_rounds=2)
 
     print(f"step4 matte economic stop: {matte_stop}  "
@@ -841,7 +876,7 @@ def test_battle_branches_converge_to_analytic_optimum():
     cap_ceil = 0.99 * deep_opt_cap["d"]
     cap_stop = _run_with_economic_stop(
         runner, "deep_gloss", ceil=cap_ceil, volume=2.0, horizon=12.0,
-        cost_exp=4500.0, goal_specs=deep_goal, n_points=5, explore_frac=0.2,
+        cost_exp=1500.0, goal_specs=deep_goal, n_points=5, explore_frac=0.2,
         n_candidates=500, min_rounds=2)
 
     print(f"step5 capped deep_gloss economic stop: {cap_stop}")
@@ -875,7 +910,7 @@ def test_battle_branches_converge_to_analytic_optimum():
     relax_ceil = 0.99 * deep_opt_full["d"]
     relax_stop = _run_with_economic_stop(
         runner, "deep_gloss", ceil=relax_ceil, volume=2.0, horizon=12.0,
-        cost_exp=4500.0, goal_specs=deep_goal, n_points=5, explore_frac=0.15,
+        cost_exp=1500.0, goal_specs=deep_goal, n_points=5, explore_frac=0.15,
         n_candidates=600, min_rounds=3)
 
     print(f"step5 relaxed deep_gloss economic stop: {relax_stop}")
@@ -1060,7 +1095,7 @@ def test_battle_step6_item_price_economy_white_branch():
     # экономика ВЕТКИ (§15.6 §2): объём потребления V, цена опыта c_exp, горизонт
     # окупаемости H. Они кормят ДВОЙНОЙ стоп-критерий §4 (см. ниже): без них
     # (V=0) экономическая ценность раунда = 0 и ветка стартует "невыгодной".
-    H_HORIZON, C_EXP = 12.0, 4500.0
+    H_HORIZON, C_EXP = 12.0, 1500.0
     for bid, goal in goals.items():
         br = runner.add_branch(bid, goal, budget=30, satisfy_at=1.1,
                                branch_id=bid)
@@ -1106,19 +1141,23 @@ def test_battle_step6_item_price_economy_white_branch():
             ei = expected_price_improvement(pc, pred.mean, pred.std,
                                             price_best=price_best,
                                             seed=runner.seed + br.spent)
-            # §5 per-property: денежная ценность раунда, атрибутированная цене
-            # (objective-attributed, §5.3). Деньги — только за прирост d_overall
-            # ветки ЧЕРЕЗ удешевление изделия; «дешёвый угол», который ветка не
-            # преследует (whiteStrength тянет в дорогую D-область), даёт ~0.
-            ev = _attributed_econ_value(runner, bid, cands, ei,
-                                        goal_specs=goals[bid],
-                                        price_spec=price_spec[bid],
-                                        comp_price_fn=_comp_price,
-                                        rho_name="rho")
+            # §4-BATCH: ценность РАУНДА из N опытов = E[best-of-N]·V·H (max-тип
+            # q-EI), атрибутированная цене (§5.3). Деньги — только за прирост
+            # d_overall ветки ЧЕРЕЗ удешевление изделия; «дешёвый угол», который
+            # ветка не преследует (whiteStrength тянет в дорогую D-область), ~0.
+            # Сравниваем с ЦЕНОЙ РАУНДА N·c_exp (N опытов стоят N·c_exp и приносят
+            # best-of-N, а не одну точку) — так чинятся ЕДИНИЦЫ стоп-критерия.
+            ev = _attributed_batch_value(
+                runner, bid, cands, comp_price=pc, rho_mean=pred.mean,
+                rho_std=pred.std, price_best=price_best, n_batch=5,
+                goal_specs=goals[bid], price_spec=price_spec[bid],
+                comp_price_fn=_comp_price, rho_name="rho",
+                seed=runner.seed + br.spent)
             econ_last[bid] = (float(np.max(ei)), float(ev))
 
             reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
-                                 economic_value=ev, cost_exp=br.cost_exp, eps=EPS)
+                                 economic_value=ev,
+                                 cost_exp=5 * br.cost_exp, eps=EPS)
             if br.spent >= WARMUP and reason is not None:
                 final_reason = reason
                 break
@@ -1131,8 +1170,8 @@ def test_battle_step6_item_price_economy_white_branch():
           "stagnation / budget")
 
     print(f"{'branch':<9}|{'runs':>5}|{'d_best':>7}|{'d_opt':>7}|{'%opt':>5}|"
-          f"{'item$':>7}|{'opt$':>7}|{'V':>4}|{'EI$':>6}|{'EI*V*H':>8}|"
-          f"{'c_exp':>6}|{'stop':>14}")
+          f"{'item$':>7}|{'opt$':>7}|{'V':>4}|{'EI$':>6}|{'bestN$':>8}|"
+          f"{'Nc_exp':>7}|{'stop':>14}")
     for bid in goals:
         br = runner.branches[bid]
         xb = np.asarray(br.x_best, float)
@@ -1142,7 +1181,7 @@ def test_battle_step6_item_price_economy_white_branch():
         ei_v, ev_v = econ_last.get(bid, (0.0, 0.0))
         print(f"{bid:<9}|{br.spent:>5}|{br.d_best:>7.3f}|{opt[bid]['d']:>7.3f}|"
               f"{pct:>4.0f}%|{pb:>7.0f}|{po:>7.0f}|{br.volume:>4.0f}|"
-              f"{ei_v:>6.2f}|{ev_v:>8.1f}|{br.cost_exp:>6.0f}|"
+              f"{ei_v:>6.2f}|{ev_v:>8.1f}|{5 * br.cost_exp:>7.0f}|"
               f"{stop_reason[bid]:>14}")
     print("  read: ceil_reached = hit the ceiling (>=99% of analytic, nothing "
           "left to improve);")

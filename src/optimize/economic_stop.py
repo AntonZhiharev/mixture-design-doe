@@ -144,6 +144,31 @@ def price_attributed_value(price_savings, *, d_overall_cur, d_overall_cand,
     d_floor         : нижняя отсечка desirability перед log (вето/нули → d_floor).
     """
     ps = np.atleast_1d(np.asarray(price_savings, float))
+    alpha = price_attribution_alpha(
+        d_overall_cur=d_overall_cur, d_overall_cand=d_overall_cand,
+        d_price_cur=d_price_cur, d_price_cand=d_price_cand,
+        price_weight=price_weight, total_weight=total_weight, d_floor=d_floor)
+    val = ps * alpha
+    best = float(np.max(val)) if val.size else 0.0
+    return max(best, 0.0) * float(volume) * float(horizon)
+
+
+def price_attribution_alpha(*, d_overall_cur, d_overall_cand,
+                            d_price_cur, d_price_cand,
+                            price_weight: float, total_weight: float,
+                            d_floor: float = 1e-6) -> np.ndarray:
+    """Доля прироста d_overall, атрибутированная ЦЕНОВОЙ оси, по кандидатам (§5).
+
+    Вынесено из :func:`price_attributed_value`, чтобы ОДНА реализация α(x) кормила
+    и max-single путь, и БАТЧ best-of-N (:func:`best_of_n_value`) — без копий
+    формулы (канон §5: деньги только за прирост цели ЧЕРЕЗ цену).
+
+        α(x) = clip( (w_price/Σw)·Δlog d_price / Δlog d_overall , 0, 1 )
+               если Δlog d_overall > 0,  иначе 0.
+
+    Возвращает массив ``(n,)`` в ``[0,1]`` (0 там, где цель не растёт / растёт не
+    через цену). Параметры — как в :func:`price_attributed_value`.
+    """
     do_cur = max(float(d_overall_cur), float(d_floor))
     do_cand = np.clip(np.atleast_1d(np.asarray(d_overall_cand, float)),
                       float(d_floor), None)
@@ -157,11 +182,106 @@ def price_attributed_value(price_savings, *, d_overall_cur, d_overall_cand,
     with np.errstate(divide="ignore", invalid="ignore"):
         alpha = np.where(dlog_overall > 0.0,
                          np.clip(contrib / dlog_overall, 0.0, 1.0), 0.0)
-    val = ps * alpha
-    best = float(np.max(val)) if val.size else 0.0
-    return max(best, 0.0) * float(volume) * float(horizon)
+    return np.asarray(alpha, float)
 
 
+# ----------------------------------------------------------------------
+# §4-BATCH — q-EI «улучшение ЛУЧШЕЙ из N точек» (max-тип) + оптимальный размер
+# раунда N*. Чинит ЕДИНИЦЫ стопа: раунд из N опытов СТОИТ N·c_exp и приносит
+# E[best-of-N], а не одну точку. Связка ОБЯЗАНА быть «best-of-N vs N·c_exp»:
+#
+#     E[ улучшение лучшей из N ]·V·H   >   N·c_exp
+#     └──────── max-тип q-EI ────────┘     └ цена раунда ┘
+#
+# best-of-N растёт с N, но СУБЛИНЕЙНО (вогнуто), а N·c_exp линейна ⇒ есть N*
+# (маржинальная точка перестаёт окупаться). Так маржинальная (1) и батч (2)
+# трактовки сшиты. ⚠️ Слева ОБЯЗАН быть батч max-тип, НЕ max_x одной точки —
+# иначе «одна точка должна окупить все N» → преждевременный стоп.
+# ----------------------------------------------------------------------
+def best_of_n_curve_value(composition_price, rho_mean, rho_std,
+                          price_best: float, *, n_max: int,
+                          volume: float, horizon: float,
+                          alpha=None, n_mc: int = 512,
+                          seed: Optional[int] = None) -> np.ndarray:
+    """Кривая ``value(k) = E[ улучшение лучшей из k ]·V·H`` для ``k=1..n_max``.
+
+    Денежный масштаб — то же удешевление изделия, что и в
+    :func:`expected_price_improvement` (gain = ``max(price_best − price_изд, 0)``,
+    ρ~N(μ,σ)); при ``alpha`` (§5 per-property) каждый кандидат домножается на свою
+    долю ``α(x)`` ДО взятия максимума — деньги только за прирост цели через цену.
+
+    Батч из ``k`` кандидатов выбирается ЖАДНО (submodular greedy): на каждом шаге
+    добавляем кандидата, максимизирующего ``E[max]``. Для монотонной submodular
+    ``E[max]`` маржинальные приросты НЕ ВОЗРАСТАЮТ ⇒ кривая **вогнута** по построению
+    (это и проверяет N*-тест). На сходимости ``best-of-N ≈ max-single`` (всё мелко).
+
+    Возвращает массив ``(min(n_max, n_cand),)`` — ₽ за горизонт, неубывающий.
+    """
+    pc = np.atleast_1d(np.asarray(composition_price, float))
+    mu = np.atleast_1d(np.asarray(rho_mean, float))
+    sd = np.clip(np.atleast_1d(np.asarray(rho_std, float)), 0.0, None)
+    n = max(pc.shape[0], mu.shape[0], sd.shape[0])
+    pc = np.broadcast_to(pc, (n,))
+    mu = np.broadcast_to(mu, (n,))
+    sd = np.broadcast_to(sd, (n,))
+    a = (np.ones(n, float) if alpha is None
+         else np.clip(np.broadcast_to(np.atleast_1d(np.asarray(alpha, float)),
+                                      (n,)), 0.0, None))
+
+    rng = np.random.default_rng(seed)
+    Z = rng.standard_normal((int(n_mc), n))
+    price = pc[None, :] * (mu[None, :] + sd[None, :] * Z)      # (S×n)
+    gain = np.clip(float(price_best) - price, 0.0, None) * a[None, :]   # attr.
+
+    k_max = int(min(int(n_max), n))
+    running = np.zeros(int(n_mc), float)
+    chosen = np.zeros(n, dtype=bool)
+    curve = np.empty(k_max, float)
+    for k in range(k_max):
+        # E[max] при добавлении каждого ещё-не-выбранного кандидата
+        cand_val = np.where(chosen, -np.inf,
+                            np.maximum(running[:, None], gain).mean(axis=0))
+        j = int(np.argmax(cand_val))
+        running = np.maximum(running, gain[:, j])
+        chosen[j] = True
+        curve[k] = running.mean()
+    return curve * float(volume) * float(horizon)
+
+
+def best_of_n_value(composition_price, rho_mean, rho_std, price_best: float, *,
+                    n_batch: int, volume: float, horizon: float,
+                    alpha=None, n_mc: int = 512,
+                    seed: Optional[int] = None) -> float:
+    """Денежная ценность РАУНДА из ``n_batch`` опытов (₽ за горизонт), max-тип q-EI.
+
+    ``= E[ улучшение лучшей из n_batch ]·V·H``. Сравнивать с ``n_batch·c_exp``
+    (цена раунда), НЕ с одиночным ``c_exp`` — см. :func:`decide_stop`. Тонкая
+    обёртка над :func:`best_of_n_curve_value` (берёт последний элемент кривой).
+    """
+    if int(n_batch) <= 0:
+        return 0.0
+    curve = best_of_n_curve_value(composition_price, rho_mean, rho_std,
+                                  price_best, n_max=int(n_batch), volume=volume,
+                                  horizon=horizon, alpha=alpha, n_mc=n_mc,
+                                  seed=seed)
+    return float(curve[-1]) if curve.size else 0.0
+
+
+def optimal_round_size(curve_value, cost_exp: float) -> int:
+    """Оптимальный размер раунда ``N*`` по кривой best-of-N (₽ за горизонт).
+
+    ``N* = max{ k : value(k) − value(k−1) > c_exp }`` (``value(0)=0``) — добавляем
+    точки в раунд, пока МАРЖИНАЛЬНАЯ окупается (прирост best-of-k·V·H перекрывает
+    одиночный ``c_exp``). Поскольку кривая ВОГНУТА (см. :func:`best_of_n_curve_value`),
+    маржиналь не возрастает ⇒ ``N*`` корректно определён первым «провалом ниже».
+    ``0`` — если уже первая точка не окупается.
+    """
+    cv = np.atleast_1d(np.asarray(curve_value, float))
+    if cv.size == 0:
+        return 0
+    marg = np.diff(np.concatenate(([0.0], cv)))         # value(k)-value(k-1)
+    below = np.where(marg <= float(cost_exp))[0]
+    return int(below[0]) if below.size else int(cv.size)
 
 
 # ----------------------------------------------------------------------

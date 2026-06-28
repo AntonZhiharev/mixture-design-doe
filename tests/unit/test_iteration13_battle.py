@@ -136,9 +136,69 @@ def _build_truth():
         # (nonzero, branch-specific deviation) with an INTERIOR minimum.
         "price":     _coef(s, {"A": 2.0, "B": 2.2, "C": 2.4,
                                "A*B": -1.5, "A*C": -1.5, "B*C": -1.5}),
+        # rho = ПЛОТНОСТЬ (полноценный отклик опыта, GP) для ЭКОНОМИЧЕСКОГО стопа
+        # §4 в шагах 4-5; линейный бленд по {A,B,C} БЕЗ компонента D — множитель
+        # цены изделия price_состав(A,B,C)·ρ (см. _comp_price3 / _run_with_economic_stop).
+        "rho":       _coef(s, {"A": 0.7, "B": 1.0, "C": 1.7}),
     }
     return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
 
+
+# ----------------------------------------------------------------------
+# ЭКОНОМИКА для §4 decide_stop в ШАГАХ 4-5 (3-комп мир {A,B,C}, БЕЗ D/white).
+# ρ добавлена в истину как полноценный отклик; цена изделия собирается на лету
+# price_состав(A,B,C)·ρ — ровно как в step6, но без компонента D и без ветки
+# `white` (она D-зависима и здесь не нужна).
+# ----------------------------------------------------------------------
+_PRICE3 = {"A": 95.0, "B": 200.0, "C": 23.0}
+
+
+def _comp_price3(Xc):
+    """price_состав [усл.ед/кг] для 3-комп мира {A,B,C} (детерминирована, БЕЗ D)."""
+    Xc = np.atleast_2d(np.asarray(Xc, float))
+    w = np.array([_PRICE3["A"], _PRICE3["B"], _PRICE3["C"]], float)
+    return Xc[:, :3] @ w
+
+
+def _run_with_economic_stop(runner, bid, *, ceil, volume, horizon, cost_exp,
+                            comp_price_fn=_comp_price3, rho_name="rho",
+                            n_points=5, explore_frac=0.2, n_candidates=500,
+                            eps=5e-3, min_rounds=2):
+    """Гонять раунды ветки до ПРИНЦИПИАЛЬНОЙ остановки (§4 decide_stop): тот же
+    ДВОЙНОЙ критерий, что и в step6 (технический Δd/потолок + экономический
+    EI_price·V·H vs c_exp), но в 3-комп мире {A,B,C} (ρ без D, цена изделия =
+    price_состав(A,B,C)·ρ). ``min_rounds`` — минимум раундов В ЭТОМ цикле до
+    того, как разрешена остановка (прогрев). Возвращает stop_reason."""
+    br = runner.branches[bid]
+    br.volume, br.horizon, br.cost_exp = float(volume), float(horizon), float(cost_exp)
+    rho_i = runner.prop_index[rho_name]
+    start = br.spent
+    price_best = float("inf")
+    prev_d = br.d_best
+    final_reason = "budget"
+    while br.remaining() > 0:
+        res = runner.run_branch_round(bid, n_points=n_points,
+                                      explore_frac=explore_frac,
+                                      n_candidates=n_candidates)
+        Ynew = np.atleast_2d(res["y_new"])
+        Xnew = np.atleast_2d(res["x_new"])
+        price_best = min(price_best,
+                         float(np.min(comp_price_fn(Xnew) * Ynew[:, rho_i])))
+        delta = br.d_best - prev_d
+        prev_d = br.d_best
+        cands = runner._phase_candidates(n_candidates, runner.seed + br.spent)
+        pred = runner.surrogates[rho_name].predict(cands)
+        ei = expected_price_improvement(comp_price_fn(cands), pred.mean, pred.std,
+                                        price_best=price_best,
+                                        seed=runner.seed + br.spent)
+        ev = economic_value(ei, br.volume, br.horizon)
+        reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
+                             economic_value=ev, cost_exp=br.cost_exp, eps=eps)
+        if (br.spent - start) >= int(min_rounds) * int(n_points) \
+                and reason is not None:
+            final_reason = reason
+            break
+    return final_reason
 
 
 def _branch_goals():
@@ -544,12 +604,19 @@ def test_battle_branches_converge_to_analytic_optimum():
         "matte's optimum must genuinely need B in play to justify the floor; "
         f"got B={matte_opt['x'][1]:.3f}")
 
-    # the pipeline pursues the new goal on the SHARED model (a few exploit rounds)
-    runner.add_branch("matte", matte_goal, budget=10, satisfy_at=1.1,
+    # the pipeline pursues the new goal on the SHARED model. Остановка — по тому
+    # же §4 decide_stop, что и в step6 (потолок = 99% аналитики matte; экономика
+    # EI_price·V·H vs c_exp), в 3-комп мире {A,B,C} (ρ без D, цена без D).
+    runner.add_branch("matte", matte_goal, budget=30, satisfy_at=1.1,
                       branch_id="matte")
-    for _ in range(2):
-        runner.run_branch_round("matte", n_points=5, explore_frac=0.2,
-                                n_candidates=500)
+    matte_ceil = 0.99 * matte_opt["d"]
+    matte_stop = _run_with_economic_stop(
+        runner, "matte", ceil=matte_ceil, volume=1.0, horizon=12.0,
+        cost_exp=4500.0, n_points=5, explore_frac=0.2, n_candidates=500,
+        min_rounds=2)
+    print(f"step4 matte economic stop: {matte_stop}  "
+          f"(d_best={runner.branches['matte'].d_best:.3f} ceil={matte_ceil:.3f})")
+    assert matte_stop in {"ceil_reached", "not_economical", "stagnation", "budget"}
     xb_matte = np.asarray(runner.branches["matte"].x_best, float)
     print(f"matte PIPELINE x_best   (A,B,C,T,P)="
           f"{np.round(xb_matte, 3).tolist()}  B={xb_matte[1]:.3f} "
@@ -693,7 +760,7 @@ def test_battle_branches_converge_to_analytic_optimum():
         "the cap must genuinely lower the achievable optimum for the RELAX to be "
         f"necessary (capped {deep_opt_cap['d']:.3f} vs full {deep_opt_full['d']:.3f})")
 
-    runner.add_branch("deep_gloss", deep_goal, budget=30, satisfy_at=1.1,
+    runner.add_branch("deep_gloss", deep_goal, budget=60, satisfy_at=1.1,
                       branch_id="deep_gloss")
 
     # --- impose the current narrow cap on C (MOVE_RESTRICT) ---
@@ -702,10 +769,15 @@ def test_battle_branches_converge_to_analytic_optimum():
     assert mv_cap.move_type == MOVE_RESTRICT
     assert runner.current_schema_version == v5_before  # region move, no bump
 
-    # pipeline pursues the new goal UNDER the cap; achievable is pinned by the cap
-    for _ in range(2):
-        runner.run_branch_round("deep_gloss", n_points=5, explore_frac=0.2,
-                                n_candidates=500)
+    # pipeline pursues the new goal UNDER the cap; achievable is pinned by the cap.
+    # Остановка — тот же §4 decide_stop (потолок = 99% capped-аналитики).
+    cap_ceil = 0.99 * deep_opt_cap["d"]
+    cap_stop = _run_with_economic_stop(
+        runner, "deep_gloss", ceil=cap_ceil, volume=2.0, horizon=12.0,
+        cost_exp=4500.0, n_points=5, explore_frac=0.2, n_candidates=500,
+        min_rounds=2)
+    print(f"step5 capped deep_gloss economic stop: {cap_stop}")
+    assert cap_stop in {"ceil_reached", "not_economical", "stagnation", "budget"}
     xb_cap = np.asarray(runner.optimize_xbest("deep_gloss").x, float)
     d_cap_pipe = _d_truth(deep_goal, xb_cap)
     print(f"under cap C<={C_CAP}: pipeline x_best="
@@ -730,10 +802,15 @@ def test_battle_branches_converge_to_analytic_optimum():
     assert n_active_relaxed > n_active_cap, (
         "relaxing C's bound did not restore the excluded high-C points")
 
-    # with the bound re-opened the pipeline can finally chase the high-C optimum
-    for _ in range(3):
-        runner.run_branch_round("deep_gloss", n_points=5, explore_frac=0.15,
-                                n_candidates=600)
+    # with the bound re-opened the pipeline can finally chase the high-C optimum.
+    # Остановка снова §4 decide_stop (потолок = 99% full-аналитики после RELAX).
+    relax_ceil = 0.99 * deep_opt_full["d"]
+    relax_stop = _run_with_economic_stop(
+        runner, "deep_gloss", ceil=relax_ceil, volume=2.0, horizon=12.0,
+        cost_exp=4500.0, n_points=5, explore_frac=0.15, n_candidates=600,
+        min_rounds=3)
+    print(f"step5 relaxed deep_gloss economic stop: {relax_stop}")
+    assert relax_stop in {"ceil_reached", "not_economical", "stagnation", "budget"}
     xb_relax = np.asarray(runner.optimize_xbest("deep_gloss").x, float)
     d_relax_pipe = _d_truth(deep_goal, xb_relax)
     print(f"after RELAX C<=1.0: pipeline x_best="
@@ -914,7 +991,7 @@ def test_battle_step6_item_price_economy_white_branch():
     # экономика ВЕТКИ (§15.6 §2): объём потребления V, цена опыта c_exp, горизонт
     # окупаемости H. Они кормят ДВОЙНОЙ стоп-критерий §4 (см. ниже): без них
     # (V=0) экономическая ценность раунда = 0 и ветка стартует "невыгодной".
-    H_HORIZON, C_EXP = 12.0, 50.0
+    H_HORIZON, C_EXP = 12.0, 4500.0
     for bid, goal in goals.items():
         br = runner.add_branch(bid, goal, budget=30, satisfy_at=1.1,
                                branch_id=bid)

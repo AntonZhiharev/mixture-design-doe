@@ -28,22 +28,45 @@ from .mixture_process_truth import (MultiMixtureProcessTruth,
 
 def _desirability_at(truth: MultiMixtureProcessTruth,
                      goal: Mapping[str, DesirabilitySpec],
-                     Xc: np.ndarray) -> np.ndarray:
-    """Overall-desirability цели ветки по ИСТИНЕ в точках ``Xc`` (n×(q+d))."""
+                     Xc: np.ndarray, *,
+                     cost_fn=None, cost_name: str = "cost",
+                     cost_spec: "DesirabilitySpec" = None) -> np.ndarray:
+    """Overall-desirability цели ветки по ИСТИНЕ в точках ``Xc`` (n×(q+d)).
+
+    Если задан ``cost_fn`` (§15.6 §3): цена за изделие складывается как
+    дополнительная ``min``-цель ``cost_name``. ``cost_fn`` считает цену ПО ИСТИНЕ
+    напрямую (например ``price_состав(X)·truth.truths['rho'].true(X)``) — Шеффе-фит
+    цены НЕ нужен (см. ``make_item_cost_fn``/``price_per_item``). Эталон и пайплайн
+    используют ОДНУ форму цены; различие лишь в источнике ρ (истина vs суррогат).
+    ``cost_spec`` ОБЯЗАТЕЛЕН при ``cost_fn`` (фиксированный диапазон цены — иначе
+    скан и уточнение мерили бы по разным шкалам)."""
     Xc = np.atleast_2d(np.asarray(Xc, float))
     missing = set(goal) - set(truth.property_names)
     if missing:
         raise KeyError(f"Цель ветки ссылается на свойства вне истины: "
                        f"{sorted(missing)}.")
+    specs = dict(goal)
     means = {p: truth.truths[p].true(Xc) for p in goal}
-    return Desirability(dict(goal)).overall(means)
+    if cost_fn is not None:
+        if cost_spec is None:
+            raise ValueError("cost_fn требует явный cost_spec (фиксированный "
+                             "диапазон цены для согласованности скан/уточнение).")
+        means[cost_name] = np.asarray(cost_fn(Xc), float).ravel()
+        specs[cost_name] = cost_spec
+    return Desirability(specs).overall(means)
 
 
 def branch_optimum(truth: MultiMixtureProcessTruth,
                    goal: Mapping[str, DesirabilitySpec], *,
                    n_scan: int = 20000, seed: int = 0,
-                   refine: bool = True) -> Dict[str, Any]:
+                   refine: bool = True,
+                   cost_fn=None, cost_name: str = "cost",
+                   cost_spec: "DesirabilitySpec" = None) -> Dict[str, Any]:
     """Аналитический оптимум ветки над полной составной областью.
+
+    ``cost_fn``/``cost_name``/``cost_spec`` (§15.6 §3) — опциональная цена за
+    изделие как ``min``-цель (см. :func:`_desirability_at`); ``cost_fn`` считает
+    цену по ИСТИНЕ (``price_состав·rho_truth``), без Шеффе-фита.
 
     Возвращает ``{"x": составной вектор оптимума, "d": overall-desirability в
     нём, "y": {property → значение истины}, "x_scan"/"d_scan": результат
@@ -52,9 +75,10 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
     schema = truth.schema
     q = int(schema.n_mixture)
     d = int(schema.n_process)
+    ckw = dict(cost_fn=cost_fn, cost_name=cost_name, cost_spec=cost_spec)
 
     Xc = composite_random_points(schema, int(n_scan), seed=seed)
-    dvals = np.asarray(_desirability_at(truth, goal, Xc), float).ravel()
+    dvals = np.asarray(_desirability_at(truth, goal, Xc, **ckw), float).ravel()
     b = int(np.argmax(dvals))
     x_scan = Xc[b].copy()
     d_scan = float(dvals[b])
@@ -77,7 +101,7 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
                              "fun": lambda v: float(np.sum(v[:q]) - 1.0)})
 
             res = minimize(
-                lambda v: -float(_desirability_at(truth, goal, v)[0]),
+                lambda v: -float(_desirability_at(truth, goal, v, **ckw)[0]),
                 x_scan, method="SLSQP", bounds=bounds, constraints=cons,
                 options={"maxiter": 300, "ftol": 1e-9})
 
@@ -89,7 +113,7 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
                     cand[:q] = cand[:q] / s
             if d > 0:
                 cand[q:] = np.clip(cand[q:], 0.0, 1.0)
-            d_cand = float(_desirability_at(truth, goal, cand)[0])
+            d_cand = float(_desirability_at(truth, goal, cand, **ckw)[0])
             if d_cand >= best_d:
                 best_x, best_d = cand, d_cand
         except Exception:  # noqa: BLE001 — без scipy остаётся скан-оптимум
@@ -99,6 +123,7 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
              for p in truth.property_names}
     return {"x": best_x, "d": float(best_d), "y": y_opt,
             "x_scan": x_scan, "d_scan": d_scan}
+
 
 
 # ----------------------------------------------------------------------

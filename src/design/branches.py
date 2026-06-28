@@ -132,12 +132,20 @@ class Branch:
 def branch_scores(surrogates: Mapping[str, "object"],
                   goal: Mapping[str, DesirabilitySpec],
                   candidates: np.ndarray,
-                  explore_frac: float = 0.3):
+                  explore_frac: float = 0.3, *,
+                  cost_fn=None, cost_name: str = "cost",
+                  cost_spec: Optional[DesirabilitySpec] = None):
     """Branch acquisition over a feasible candidate set (higher = better).
+
+    Если задан ``cost_fn`` (§15.6 §3): цена за изделие складывается в exploit-часть
+    как дополнительная ``min``-цель ``cost_name`` (требует ``cost_spec`` —
+    фиксированный диапазон цены). ``cost_fn`` собирает цену из суррогата ρ
+    (``make_item_cost_fn``), поэтому explore-часть (σ̄) считается по goal-свойствам
+    как и раньше — обратная совместимость без cost.
 
     Returns ``(acq, d_pred, sigma)``:
       * acq    : blended exploit/explore score per candidate;
-      * d_pred : branch desirability of the predicted property means;
+      * d_pred : branch desirability of the predicted property means (+цена);
       * sigma  : mean predictive std across the goal properties.
     """
     candidates = np.atleast_2d(np.asarray(candidates, float))
@@ -153,12 +161,21 @@ def branch_scores(surrogates: Mapping[str, "object"],
         sigma += np.asarray(pred.std, float).ravel()
     sigma /= max(len(goal), 1)
 
-    d_pred = Desirability(dict(goal)).overall(means)
+    specs = dict(goal)
+    if cost_fn is not None:
+        if cost_spec is None:
+            raise ValueError("cost_fn требует явный cost_spec (фиксированный "
+                             "диапазон цены).")
+        means[cost_name] = np.asarray(cost_fn(candidates), float).ravel()
+        specs[cost_name] = cost_spec
+
+    d_pred = Desirability(specs).overall(means)
     smax = float(sigma.max()) if sigma.size else 0.0
     sigma_n = sigma / smax if smax > 0 else np.zeros_like(sigma)
     explore_frac = float(np.clip(explore_frac, 0.0, 1.0))
     acq = (1.0 - explore_frac) * d_pred + explore_frac * sigma_n
     return acq, d_pred, sigma
+
 
 
 def allocate_budget(branches: Mapping[str, Branch],

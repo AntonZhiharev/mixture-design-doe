@@ -67,7 +67,9 @@ from ..design.augmented import build_moments
 from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget)
 from ..optimize.desirability import (Desirability, DesirabilitySpec,
-                                     DesirabilityResult, optimize_desirability)
+                                     DesirabilityResult, optimize_desirability,
+                                     make_item_cost_fn)
+
 
 
 def _expand_delta(schema, var, side, new_bound):
@@ -140,6 +142,13 @@ class MixtureProcessRunner:
         self.origin: List[str] = []
         self.surrogates: Dict[str, GPExpert] = {}
         self.branches: Dict[str, Branch] = {}
+        # §15.6 §3: опциональная ЦЕНОВАЯ цель ветки (цена за изделие как min).
+        # Хранится в runner (а не в Branch): держит callable composition_price_fn
+        # и имя ρ-свойства; cost_fn собирается на лету из ТЕКУЩИХ суррогатов
+        # (ρ̂ меняется каждый раунд). {branch_id: {price_fn, cost_spec, cost_name,
+        # rho_property}}. Пусто ⇒ ветка чисто техническая (обратная совместимость).
+        self._branch_cost: Dict[str, Dict[str, Any]] = {}
+
         # §15.0.3: после движения границ области (move_region) точки, выпавшие из
         # НОВОЙ области, легально исключаются из активного pool по политике
         # ``exclude`` (но ОСТАЮТСЯ в self.points — история ≠ активный pool, движение
@@ -721,6 +730,48 @@ class MixtureProcessRunner:
         self.branches[bid] = br
         return br
 
+    def set_branch_cost(self, branch_id: str, composition_price_fn,
+                        cost_spec: DesirabilitySpec, *,
+                        rho_property: str = "rho",
+                        cost_name: str = "price") -> None:
+        """§15.6 §3: задать ЦЕНОВУЮ цель ветки — цена за изделие как ``min``.
+
+        ``price_изд = composition_price_fn(Xc) · ρ̂(Xc)`` (см. ``make_item_cost_fn``):
+        ``composition_price_fn`` — цена состава ₽/кг (зависит от состава), ρ̂ —
+        среднее ОБЩЕГО суррогата ``rho_property``. Цена НЕ хранится отдельным
+        свойством и НЕ фитится в Шеффе — собирается на лету из ТЕКУЩИХ суррогатов
+        (ρ̂ меняется каждый раунд). ``cost_spec`` — фиксированный ``min``-диапазон
+        цены (одинаков для acquisition/argmax/измеренного d_best).
+
+        ``rho_property`` обязан быть полноценным GP-свойством (есть в оракуле):
+        измеренный d_best считает цену по ИЗМЕРЕННОЙ ρ, а acquisition/argmax — по ρ̂.
+        """
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if rho_property not in self.property_names:
+            raise KeyError(f"ρ-свойство '{rho_property}' не среди свойств оракула "
+                           f"{self.property_names} (§3: ρ — полноценный отклик).")
+        self._branch_cost[branch_id] = {
+            "price_fn": composition_price_fn, "cost_spec": cost_spec,
+            "cost_name": str(cost_name), "rho_property": str(rho_property)}
+
+    def _branch_cost_fn(self, branch_id: str):
+        """``(cost_fn, cost_name, cost_spec)`` ценовой цели ветки или ``(None,)*3``.
+
+        ``cost_fn`` собирается из ТЕКУЩИХ суррогатов (ρ̂ = ``surrogates[rho]``) —
+        вызывать ПОСЛЕ ``fit_surrogates``. Нет ценовой цели ⇒ ``(None, None, None)``
+        (ветка чисто техническая, обратная совместимость)."""
+        cfg = self._branch_cost.get(branch_id)
+        if cfg is None:
+            return None, None, None
+        rho = cfg["rho_property"]
+        if rho not in self.surrogates:
+            raise KeyError(f"Нет суррогата ρ '{rho}' — сначала fit_surrogates().")
+        rho_pred = (lambda X, gp=self.surrogates[rho]: gp.predict(X).mean)
+        cost_fn = make_item_cost_fn(cfg["price_fn"], rho_pred)
+        return cost_fn, cfg["cost_name"], cfg["cost_spec"]
+
+
     def run_branch_round(self, branch_id: str, n_points: int = 2,
                          explore_frac: float = 0.3, n_candidates: int = 600
                          ) -> Dict[str, Any]:
@@ -746,12 +797,17 @@ class MixtureProcessRunner:
         n_exploit = 1 if n_take >= 2 else (1 if n_take == 1 else 0)
         n_acq = n_take - n_exploit
 
+        # §15.6 §3: ценовая цель ветки (если задана) — цена = price_состав·ρ̂
+        cost_fn, cost_name, cost_spec = self._branch_cost_fn(branch_id)
+
         seed = self.seed + 1000 + br.spent
         newX_list: List[np.ndarray] = []
         if n_acq > 0:
             cands = self._phase_candidates(n_candidates, seed)
-            acq, d_pred, sigma = branch_scores(self.surrogates, br.goal, cands,
-                                               explore_frac=explore_frac)
+            acq, d_pred, sigma = branch_scores(
+                self.surrogates, br.goal, cands, explore_frac=explore_frac,
+                cost_fn=cost_fn, cost_name=(cost_name or "cost"),
+                cost_spec=cost_spec)
             acqX = propose_by_score(cands, acq, n_acq, min_dist=0.02)
             newX_list.append(np.atleast_2d(acqX))
         if n_exploit > 0:
@@ -770,9 +826,19 @@ class MixtureProcessRunner:
                 self._make_point(newX[i], Ynew[i], f"branch:{branch_id}"))
         br.spent += len(newX)
 
-        desir = Desirability(dict(br.goal))
+        # измеренный d_best (§3): цена за изделие — по ИЗМЕРЕННОЙ ρ (оракул отдал
+        # ρ в Ynew), а не по суррогату; argmax/acquisition выше — по ρ̂.
+        specs = dict(br.goal)
         meas = {name: Ynew[:, self.prop_index[name]] for name in br.goal}
+        if branch_id in self._branch_cost:
+            cfg = self._branch_cost[branch_id]
+            pc = np.asarray(cfg["price_fn"](newX), float).ravel()
+            rho_meas = Ynew[:, self.prop_index[cfg["rho_property"]]]
+            meas[cfg["cost_name"]] = pc * rho_meas
+            specs[cfg["cost_name"]] = cfg["cost_spec"]
+        desir = Desirability(specs)
         d_meas = np.asarray(desir.overall(meas), float).ravel()
+
         bi = int(np.argmax(d_meas))
         if float(d_meas[bi]) > br.d_best:
             br.d_best = float(d_meas[bi])
@@ -833,7 +899,12 @@ class MixtureProcessRunner:
         if self.d > 0:
             kw.update(process_lower=[0.0] * self.d,
                       process_upper=[1.0] * self.d)
+        # §15.6 §3: argmax по desirability+цена (цена = price_состав·ρ̂ из суррогата)
+        cost_fn, cost_name, cost_spec = self._branch_cost_fn(branch_id)
+        if cost_fn is not None:
+            kw.update(cost_fn=cost_fn, cost_name=cost_name, cost_spec=cost_spec)
         return optimize_desirability(region, predictors, dict(br.goal), **kw)
+
 
     # ------------------------------------------------------------------
     # Диагностика дизайна (§15.1.3 / §15.2 P4 / §15.2.5)

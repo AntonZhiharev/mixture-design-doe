@@ -9,7 +9,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 """Iteration 15 / §15 — боевая верификация schema augmentation + M8-argmax.
 
-Реализация по §15.3 (REBUILD_SPEC_15_battle_augmentation.md). После ре-архитектуры
+Реализация по §15.3 (REBUILD_SPEC.md §15). После ре-архитектуры
 раннера (§15.3.6) свобода фазы кодируется СХЕМОЙ, а не маской:
 
   * +process (T,P) = APPEND в схему (``augment_phase_schema``, version+1,

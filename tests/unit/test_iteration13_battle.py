@@ -31,6 +31,9 @@ from src.verification.mixture_process_truth import (MultiMixtureProcessTruth,
                                                     composite_random_points)
 from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
+from src.optimize.economic_stop import (decide_stop, expected_price_improvement,
+                                        economic_value)
+
 
 
 # Косметика: GP на чистой (без шума) истине загоняет noise→0 и часть length-scale
@@ -908,28 +911,93 @@ def test_battle_step6_item_price_economy_white_branch():
                                   seed=13, n_restarts=2)
     runner.begin_phase(mixture_free=_COMPS4, process_free=["T", "P"])
     runner.seed_initial(n=28, seed=13)
+    # экономика ВЕТКИ (§15.6 §2): объём потребления V, цена опыта c_exp, горизонт
+    # окупаемости H. Они кормят ДВОЙНОЙ стоп-критерий §4 (см. ниже): без них
+    # (V=0) экономическая ценность раунда = 0 и ветка стартует "невыгодной".
+    H_HORIZON, C_EXP = 12.0, 50.0
     for bid, goal in goals.items():
-        runner.add_branch(bid, goal, budget=30, satisfy_at=1.1, branch_id=bid)
+        br = runner.add_branch(bid, goal, budget=30, satisfy_at=1.1,
+                               branch_id=bid)
         runner.set_branch_cost(bid, _comp_price, price_spec[bid],
                                rho_property="rho", cost_name="price")
-    for _ in range(5):
-        for bid in goals:
-            runner.run_branch_round(bid, n_points=5, explore_frac=0.2,
-                                    n_candidates=500)
+        br.volume = float(_BRANCH_ECON[bid][0])   # V — изд/период
+        br.cost_exp = C_EXP                        # c_exp — ₽/опыт
+        br.horizon = H_HORIZON                     # H — горизонт окупаемости
 
-    # --- summary (pytest -s) ---------------------------------------------
+    # --- ПРИНЦИПИАЛЬНАЯ остановка (§15.6 §4 decide_stop), НЕ фиксированный цикл ---
+    # После КАЖДОГО раунда ветки спрашиваем ДВОЙНОЙ критерий §4 и печатаем причину:
+    #   ceil_reached   — d_best упёрся в потолок достижимого (>=99% аналитики):
+    #                    улучшать в текущей постановке НЕЧЕГО;
+    #   not_economical — улучшать есть куда (d<ceil), но денежно невыгодно:
+    #                    max_x EI_price·V·H <= c_exp (экономический стоп §1);
+    #   stagnation     — прогресс встал (Δd<eps), хотя потолок не достигнут;
+    #   budget         — кончился бюджет ветки раньше любого из критериев.
+    # Потолок берём как 99% аналитического оптимума с ценой (за пределами — шум
+    # измерения чистой истины GP, дальше двигать смысла нет).
+    CEIL_FRAC, EPS, WARMUP = 0.99, 5e-3, 10
+    rho_i = runner.prop_index["rho"]
+    stop_reason, econ_last = {}, {}
+    for bid in goals:
+        br = runner.branches[bid]
+        ceil = CEIL_FRAC * opt[bid]["d"]
+        price_best = float("inf")
+        prev_d = br.d_best
+        final_reason = "budget"
+        while br.remaining() > 0:
+            res = runner.run_branch_round(bid, n_points=5, explore_frac=0.2,
+                                          n_candidates=500)
+            Ynew = np.atleast_2d(res["y_new"])
+            Xnew = np.atleast_2d(res["x_new"])
+            # лучшая ИЗМЕРЕННАЯ цена изделия ветки = price_состав·ρ_изм (§3)
+            pim = _comp_price(Xnew) * Ynew[:, rho_i]
+            price_best = min(price_best, float(np.min(pim)))
+            delta = br.d_best - prev_d
+            prev_d = br.d_best
+            # денежная ценность ЕЩЁ ОДНОГО раунда (§6): max_x EI_price·V·H по ρ̂
+            cands = runner._phase_candidates(500, runner.seed + br.spent)
+            pc = _comp_price(cands)
+            pred = runner.surrogates["rho"].predict(cands)
+            ei = expected_price_improvement(pc, pred.mean, pred.std,
+                                            price_best=price_best,
+                                            seed=runner.seed + br.spent)
+            ev = economic_value(ei, br.volume, br.horizon)
+            econ_last[bid] = (float(np.max(ei)), float(ev))
+            reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
+                                 economic_value=ev, cost_exp=br.cost_exp, eps=EPS)
+            if br.spent >= WARMUP and reason is not None:
+                final_reason = reason
+                break
+        stop_reason[bid] = final_reason
+
+    # --- summary (pytest -s): теперь с ПРИЧИНОЙ остановки и экономикой ----
+    # NB: prints are ASCII-only (Windows cp1252 console raises UnicodeEncodeError
+    # on Cyrillic when stdout is redirected to a file) — see module docstring.
+    print("stop reasons (double criterion S4): ceil_reached / not_economical / "
+          "stagnation / budget")
+
     print(f"{'branch':<9}|{'runs':>5}|{'d_best':>7}|{'d_opt':>7}|{'%opt':>5}|"
-          f"{'item$':>7}|{'opt$':>7}")
+          f"{'item$':>7}|{'opt$':>7}|{'V':>4}|{'EI$':>6}|{'EI*V*H':>8}|"
+          f"{'c_exp':>6}|{'stop':>14}")
     for bid in goals:
         br = runner.branches[bid]
         xb = np.asarray(br.x_best, float)
         pb = float(item_price(xb.reshape(1, -1))[0])
         po = float(item_price(np.asarray(opt[bid]["x"]).reshape(1, -1))[0])
         pct = 100.0 * br.d_best / opt[bid]["d"] if opt[bid]["d"] > 0 else 0.0
+        ei_v, ev_v = econ_last.get(bid, (0.0, 0.0))
         print(f"{bid:<9}|{br.spent:>5}|{br.d_best:>7.3f}|{opt[bid]['d']:>7.3f}|"
-              f"{pct:>4.0f}%|{pb:>7.0f}|{po:>7.0f}")
+              f"{pct:>4.0f}%|{pb:>7.0f}|{po:>7.0f}|{br.volume:>4.0f}|"
+              f"{ei_v:>6.2f}|{ev_v:>8.1f}|{br.cost_exp:>6.0f}|"
+              f"{stop_reason[bid]:>14}")
+    print("  read: ceil_reached = hit the ceiling (>=99% of analytic, nothing "
+          "left to improve);")
+    print("        not_economical = EI_price*V*H <= c_exp (round does not pay "
+          "off);")
+    print("        stagnation = progress stalled; budget = branch budget spent.")
+
 
     # ---- проверки (робастные) ----
+    valid_reasons = {"ceil_reached", "not_economical", "stagnation", "budget"}
     for bid in goals:
         br = runner.branches[bid]
         d_opt = opt[bid]["d"]
@@ -941,6 +1009,15 @@ def test_battle_step6_item_price_economy_white_branch():
             f"{bid}: финал {br.d_best:.3f} < 50% от d_opt {d_opt:.3f}")
         # 3) валидный состав
         assert abs(np.asarray(br.x_best, float)[:4].sum() - 1.0) < 1e-6
+        # 4) остановка — по ПРИНЦИПИАЛЬНОМУ критерию §4 (известная причина)
+        assert stop_reason[bid] in valid_reasons, (
+            f"{bid}: неизвестная причина остановки {stop_reason[bid]}")
+
+    # 4b) сошедшиеся ветки остановились ОСОЗНАННО (не просто по бюджету): хотя бы
+    #     одна по принципиальному критерию (потолок/экономика/стагнация)
+    assert any(stop_reason[bid] != "budget" for bid in goals), (
+        f"ни одна ветка не остановилась по критерию §4: {stop_reason}")
+
 
     # 4) white реально держит D в игре (отбеливатель не выродился)
     xb_white = np.asarray(runner.branches["white"].x_best, float)

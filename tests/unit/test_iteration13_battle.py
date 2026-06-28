@@ -1643,11 +1643,13 @@ def test_battle_step7_b1_analog_displaces_b():
     assert "economy" in econ_stopped, (
         f"economy не дала экономике сработать: {stop_reason}")
 
-    # финальный вердикт по economy: B1 окончательно выдавил B
+    # финальный вердикт по economy: B1 окончательно выдавил B (ASCII-only print —
+    # при редиректе stdout в файл Windows cp1252 не кодирует кириллицу, см. docstring)
     xb_e = np.asarray(runner.branches["economy"].x_best, float)
     print(f"\nVERDICT: economy pipeline B={xb_e[BI]:.3f} B1={xb_e[B1I]:.3f} -> "
-          f"{'B1 ВЫДАВИЛ B' if xb_e[B1I] > xb_e[BI] else 'B удержался'}")
+          f"{'B1 DISPLACES B' if xb_e[B1I] > xb_e[BI] else 'B kept'}")
     assert xb_e[B1I] > xb_e[BI]
+
 
     # общая база выросла, у каждой ветки есть измеренные точки
     counts = runner.origin_counts()

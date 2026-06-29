@@ -85,7 +85,26 @@ def test_optimal_round_size_interior_and_edges():
     assert optimal_round_size(curve, marg[0] + 1.0) == 0       # даже 1-я нет
 
 
+def test_batch_dominates_single_unattributed():
+    """НЕАТРИБУТИРОВАННЫЙ best-of-N (α=None) ВСЕГДА >= max-single·V·H — батч q-EI
+    реально вычисляется (НЕ заглушка, дающая 0).
+
+    Это прямой ответ на боевой catch «bestN$=0.0 < EI$»: ноль в боевом ``bestN$``
+    идёт ТОЛЬКО от §5-атрибуции α (см. :func:`test_attribution_zero_kills_money`),
+    а не от несчитающегося батча. Сырой best-of-N доминирует одиночную EI: лучшая
+    из N точек не хуже лучшей из одной (best-of-N >= best-of-1 == max-single)."""
+    cp, mu, sd, pb = _candidates()
+    V, H, S, seed = 5.0, 12.0, 4000, 7
+    ei = expected_price_improvement(cp, mu, sd, price_best=pb, n_mc=S, seed=seed)
+    single = economic_value(ei, V, H)               # max-single · V · H
+    raw5 = best_of_n_value(cp, mu, sd, pb, n_batch=5, volume=V, horizon=H,
+                           alpha=None, n_mc=S, seed=seed)
+    assert raw5 > 0.0                                 # батч не нулевой (не заглушка)
+    assert raw5 >= single - 1e-9                      # best-of-N >= max-single·V·H
+
+
 def test_attribution_zero_kills_money():
+
     """§5 в батче: α=0 ⇒ денег 0 (фантом не воскресает); смешанная α — деньги
     только от кандидатов с α>0, и батч ≤ безатрибутивного."""
     cp, mu, sd, pb = _candidates()

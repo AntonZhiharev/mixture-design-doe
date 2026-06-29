@@ -1156,7 +1156,16 @@ def test_battle_step6_item_price_economy_white_branch():
                 goal_specs=goals[bid], price_spec=price_spec[bid],
                 comp_price_fn=_comp_price, rho_name="rho",
                 seed=runner.seed + br.spent)
-            econ_last[bid] = (float(np.max(ei)), float(ev))
+            # rawN$ — НЕАТРИБУТИРОВАННЫЙ best-of-N·V·H (α=None): доказывает, что
+            # БАТЧ q-EI РЕАЛЬНО считается (rawN$ >= EI$·V·H ≥ EI$, best-of-N >=
+            # max-single). Ноль в bestN$ (атрибутированном) идёт ТОЛЬКО от α (§5),
+            # а НЕ от заглушки — прямой ответ на catch «bestN$=0 < EI$».
+            ev_raw = best_of_n_value(
+                pc, pred.mean, pred.std, price_best, n_batch=5,
+                volume=br.volume, horizon=br.horizon, alpha=None,
+                seed=runner.seed + br.spent)
+            econ_last[bid] = (float(np.max(ei)), float(ev_raw), float(ev))
+
 
             reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
                                  economic_value=ev,
@@ -1173,7 +1182,7 @@ def test_battle_step6_item_price_economy_white_branch():
           "stagnation / budget")
 
     print(f"{'branch':<9}|{'runs':>5}|{'d_best':>7}|{'d_opt':>7}|{'%opt':>5}|"
-          f"{'item$':>7}|{'opt$':>7}|{'V':>4}|{'EI$':>6}|{'bestN$':>8}|"
+          f"{'item$':>7}|{'opt$':>7}|{'V':>4}|{'EI$':>6}|{'rawN$':>9}|{'bestN$':>8}|"
           f"{'Nc_exp':>7}|{'stop':>14}")
     for bid in goals:
         br = runner.branches[bid]
@@ -1181,19 +1190,36 @@ def test_battle_step6_item_price_economy_white_branch():
         pb = float(item_price(xb.reshape(1, -1))[0])
         po = float(item_price(np.asarray(opt[bid]["x"]).reshape(1, -1))[0])
         pct = 100.0 * br.d_best / opt[bid]["d"] if opt[bid]["d"] > 0 else 0.0
-        ei_v, ev_v = econ_last.get(bid, (0.0, 0.0))
+        ei_v, raw_v, ev_v = econ_last.get(bid, (0.0, 0.0, 0.0))
         print(f"{bid:<9}|{br.spent:>5}|{br.d_best:>7.3f}|{opt[bid]['d']:>7.3f}|"
               f"{pct:>4.0f}%|{pb:>7.0f}|{po:>7.0f}|{br.volume:>4.0f}|"
-              f"{ei_v:>6.2f}|{ev_v:>8.1f}|{5 * br.cost_exp:>7.0f}|"
+              f"{ei_v:>6.2f}|{raw_v:>9.1f}|{ev_v:>8.1f}|{5 * br.cost_exp:>7.0f}|"
               f"{stop_reason[bid]:>14}")
     print("  read: ceil_reached = hit the ceiling (>=99% of analytic, nothing "
           "left to improve);")
     print("        not_economical = EI_price*V*H <= c_exp (round does not pay "
           "off);")
     print("        stagnation = progress stalled; budget = branch budget spent.")
+    print("        EI$ = RAW single price EI (per item); rawN$ = UNATTRIBUTED "
+          "best-of-N*V*H (batch q-EI is computed: rawN$>=EI$*V*H>=EI$);")
+    print("        bestN$ = price-ATTRIBUTED batch (alpha, S5) -> what GATES; "
+          "bestN$=0 means alpha=0 (no objective gain via price), NOT a stub.")
 
+    # ---- инвариант батча (прямой ответ на «bestN$=0 — заглушка?») --------
+    # rawN$ — РЕАЛЬНЫЙ несатрибутированный best-of-N·V·H, ВСЕГДА >= EI$·V·H
+    # (батч >= одиночной); атрибутированный bestN$ <= rawN$. Ноль в bestN$ идёт
+    # ТОЛЬКО от α-атрибуции §5, а НЕ от незаполненного q-EI.
+    for bid in goals:
+        ei_v, raw_v, ev_v = econ_last.get(bid, (0.0, 0.0, 0.0))
+        br = runner.branches[bid]
+        assert raw_v >= ei_v * br.volume * br.horizon - 1e-6, (
+            f"{bid}: rawN$ {raw_v:.3f} < EI$*V*H {ei_v*br.volume*br.horizon:.3f} "
+            "(батч q-EI не считается?)")
+        assert ev_v <= raw_v + 1e-6, (
+            f"{bid}: attributed bestN$ {ev_v:.3f} > rawN$ {raw_v:.3f} (α<=1 нарушен)")
 
     # ---- проверки (робастные) ----
+
     valid_reasons = {"ceil_reached", "not_economical", "stagnation", "budget"}
     for bid in goals:
         br = runner.branches[bid]
@@ -1261,11 +1287,14 @@ def test_battle_step6_item_price_economy_white_branch():
         br = runner.branches[bid]
         ceil = CEIL_FRAC * opt[bid]["d"]
         d_before = br.d_best
-        ei_v, ev_v = econ_last.get(bid, (0.0, 0.0))
-        # СТРОКА 1 — пасс 1 (BINDING): экономика связала
+        ei_v, raw_v, ev_v = econ_last.get(bid, (0.0, 0.0, 0.0))
+        # СТРОКА 1 — пасс 1 (BINDING): экономика связала. rawN$ (несатрибутир.
+        # best-of-N) >> bestN$ (атрибутированный) — батч считается, ноль bestN$
+        # от α=0 (ценовой рычаг не растит цель premium), НЕ заглушка.
         print(f"  {bid:<9} pass1(BINDING)  d_best={d_before:.3f} "
-              f"ceil={ceil:.3f}  EI$={ei_v:.2f} bestN$={ev_v:.1f} "
+              f"ceil={ceil:.3f}  EI$={ei_v:.2f} rawN$={raw_v:.1f} bestN$={ev_v:.1f} "
               f"Nc_exp={5 * br.cost_exp:.0f}  stop=not_economical")
+
         # --- ЗАФИКСИРОВАННОЕ УКАЗАНИЕ (между строкой 1 и строкой 2) ---
         print(f"  DIRECTIVE [{bid}]: user disables economic constraint -> "
               f"econ_policy=ECON_ADVISORY (price-only leg may NOT veto live "

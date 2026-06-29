@@ -1197,8 +1197,13 @@ def test_battle_step6_item_price_economy_white_branch():
               f"{stop_reason[bid]:>14}")
     print("  read: ceil_reached = hit the ceiling (>=99% of analytic, nothing "
           "left to improve);")
-    print("        not_economical = EI_price*V*H <= c_exp (round does not pay "
-          "off);")
+    # ВАЖНО (честный лог для MCP-читателя, §4): гейтит АТРИБУТИРОВАННЫЙ bestN$
+    # (§5), а НЕ сырой EI_price*V*H. Раньше эта строка описывала СЫРОЕ прочтение
+    # (rawN$) и противоречила строке bestN$ ниже ("what GATES") — MCP принял бы
+    # легенду за источник истины и реанимировал бы фантом дешёвого угла.
+    print("        not_economical = bestN$ (price-ATTRIBUTED, S5) <= N*c_exp "
+          "(round does not pay off); the gate eats the ATTRIBUTED batch, NOT "
+          "raw EI_price*V*H (proven by the DISCRIMINATING PROBE below);")
     print("        stagnation = progress stalled; budget = branch budget spent.")
     print("        EI$ = RAW single price EI (per item); rawN$ = UNATTRIBUTED "
           "best-of-N*V*H (batch q-EI is computed: rawN$>=EI$*V*H>=EI$);")
@@ -1217,6 +1222,61 @@ def test_battle_step6_item_price_economy_white_branch():
             "(батч q-EI не считается?)")
         assert ev_v <= raw_v + 1e-6, (
             f"{bid}: attributed bestN$ {ev_v:.3f} > rawN$ {raw_v:.3f} (α<=1 нарушен)")
+
+    # ==================================================================
+    # ДИСКРИМИНИРУЮЩИЙ ПРОБ: гейт ест bestN$ (АТРИБУТИРОВАННЫЙ §5), НЕ rawN$.
+    #
+    # Тонкость: в основном прогоне ОБА прочтения дают ОДИН вердикт — и rawN$
+    # (=673), и bestN$ (=0) <= Nc_exp=7500 -> not_economical при ЛЮБОМ прочтении.
+    # Тест зелёный, но СВЯЗЫВАЮЩЕЕ поведение НЕ возбуждено (закрыто декларацией, а
+    # не эмпирически). Чтобы вердикты РАЗОШЛИСЬ, берём ветку с rawN$ >> bestN$
+    # (premium) и ставим порог раунда СТРОГО МЕЖДУ ними:
+    #
+    #     bestN$  <  N*c_probe  <  rawN$
+    #
+    # тогда одно и то же :func:`decide_stop` даёт ПРОТИВОПОЛОЖНЫЕ вердикты в
+    # зависимости от того, какую величину ему скормить:
+    #   * АТРИБУТИРОВАННЫЙ bestN$ <= N*c_probe -> not_economical (стоп §5);
+    #   * СЫРОЙ           rawN$  >  N*c_probe -> None (economical, «продолжай»).
+    # Вердикты расходятся -> видно, какую величину код РЕАЛЬНО ест. Реальный цикл
+    # выше скормил decide_stop именно АТРИБУТИРОВАННЫЙ ev (bestN$) и дал premium
+    # not_economical -> гейт читает атрибутированное, §5 НЕ течёт (фантом сырого
+    # прочтения не вернулся через заднюю дверь).
+    ei_p, raw_p, best_p = econ_last["premium"]
+    assert raw_p > best_p + 1.0, (
+        "проб невозможен: нужен зазор rawN$ >> bestN$ у premium для расхождения "
+        f"вердиктов (rawN$={raw_p:.1f}, bestN$={best_p:.1f})")
+    probe_round_cost = 0.5 * (best_p + raw_p)        # СТРОГО между bestN$ и rawN$
+    assert best_p < probe_round_cost < raw_p
+    # технические ноги держим «живыми» (прогресс есть, потолок далеко), чтобы
+    # РЕШАЛА именно экономика, а не Δd/ceil
+    gate_attributed = decide_stop(delta_d=1.0, d_best=0.0, ceil=1.0,
+                                  economic_value=best_p,
+                                  cost_exp=probe_round_cost, eps=EPS)
+    gate_raw = decide_stop(delta_d=1.0, d_best=0.0, ceil=1.0,
+                           economic_value=raw_p,
+                           cost_exp=probe_round_cost, eps=EPS)
+    print("\n=== DISCRIMINATING PROBE: gate eats bestN$ (attributed), not rawN$ ===")
+    print(f"  premium rawN$={raw_p:.1f}  bestN$={best_p:.1f}  "
+          f"probe N*c_exp={probe_round_cost:.1f} (strictly between them)")
+    print(f"  gate(economic_value=bestN$ attributed) -> {gate_attributed}  "
+          f"(expected not_economical: S5 gate)")
+    print(f"  gate(economic_value=rawN$  raw)        -> {gate_raw}  "
+          f"(would CONTINUE: phantom/raw reading)")
+    # ВЕРДИКТЫ РАСХОДЯТСЯ -> проб валиден (одна величина вето, другая нет)
+    assert gate_attributed == "not_economical", (
+        "gate на АТРИБУТИРОВАННОМ bestN$ обязан дать not_economical при "
+        f"bestN$={best_p:.1f} <= N*c_probe={probe_round_cost:.1f}")
+    assert gate_raw is None, (
+        "контрафакт: gate на СЫРОМ rawN$ при ТОМ ЖЕ пороге обязан ПРОДОЛЖИТЬ "
+        f"(rawN$={raw_p:.1f} > N*c_probe={probe_round_cost:.1f}) — иначе проб не "
+        "различает два прочтения")
+    assert gate_attributed != gate_raw, "вердикты не разошлись — проб не различает"
+    # и РЕАЛЬНЫЙ цикл выше скормил decide_stop именно bestN$ (ev) -> premium
+    # остановлен not_economical: гейт читает АТРИБУТИРОВАННОЕ, §5 не течёт.
+    assert stop_reason["premium"] == "not_economical", (
+        f"премиум остановлен не экономикой ({stop_reason['premium']}) — основной "
+        "цикл не подтверждает, что гейт ест атрибутированный bestN$")
 
     # ---- проверки (робастные) ----
 

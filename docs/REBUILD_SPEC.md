@@ -1844,33 +1844,37 @@ REFERENCE` — роль всегда однозначна. Один и тот ж
 | §16.A | `response_role`/`branch_roles`/`responses_by_role`/`price_channel_suppressed` (роль из намерения, branch-local) | `src/apps/mixture_process_runner.py` | 6 passed ✅ |
 | §16.B | `rho_optimized` в `price_attribution_alpha`/`price_attributed_value` (Гр-1: `α≡0`) | `src/optimize/economic_stop.py` | discriminating-probe Гр-2 ✅ |
 | §16.C | интеграция роль→атрибуция (branch-local Гр-3): `price_channel_suppressed(branch)` кормит `rho_optimized` | (тест) | Гр-3 ✅ (8 passed total) |
+| §16.D | ФАКТИЧЕСКАЯ денежная нога стопа ветки `branch_economic_value`/`branch_stop_decision` (роль ρ→`price_attributed_value`, branch-local) | `src/apps/mixture_process_runner.py` | `test_iteration16_money_stop.py` ✅ (10 passed) |
 
-### §16.1 ОСТАТОК — открытый пункт ТЗ (НЕ реализовано)
+### §16.0.D Денежная нога стопа, читающая роль (реализовано, ✅)
 
-Перенесено из сессии итерации 16 (контекст исчерпан до начала). Канон тот же:
-сначала логика + unit-тест, потом UI.
+`rho_optimized` доведён из ЧИСТЫХ функций `economic_stop` до РАННЕРА:
+:meth:`MixtureProcessRunner.branch_economic_value` считает ₽ за горизонт через
+`price_attributed_value` с `rho_optimized=self.price_channel_suppressed(bid)`
+(σ_ρ-разведка через `expected_price_improvement`, атрибуция §5 — деньги только
+за прирост d_overall ИМЕННО через цену, роль ρ читается branch-local).
+:meth:`branch_stop_decision` кормит это в двойной стоп §4 (`evaluate_stop`).
+Опорный инкумбент — `_branch_reference_recipe` (измеренный `x_best` ветки или
+центроид+baseline). Покрыто матрицей (роль × сценарий): ρ=цель-без-цены / ρ=цена
+(PRICE_INPUT, канал жив, ₽>0) / ρ=цель+цена (OPTIMIZED, канал занулён, ₽=0 РОВНО) /
+многоного́я ветка / ветка без ρ; + регрессия `evaluate_stop`: при занулённом
+канале денежная нога НЕ фантомит (`not_economical`/red-flag честно; ADVISORY не
+ветирует, но несёт red-flag).
 
-**D. Протянуть зануление канала в ФАКТИЧЕСКИЙ денежный стоп ветки.**
-Сейчас `rho_optimized` живёт только в ЧИСТЫХ функциях `economic_stop`; раннер
-(`MixtureProcessRunner`) в денежном стопе/VoI пока **не вызывает**
-`price_attributed_value` вообще (в §15.6-пути активны лишь `boundary_signal`/
-триада). Нужно:
-- [ ] довести денежную ногу стопа ветки до вызова `price_attributed_value`
-  (или `best_of_n_value` с `alpha`, посчитанной через
-  `price_attribution_alpha(..., rho_optimized=self.price_channel_suppressed(bid))`);
-- [ ] **полная матрица покрытия** (роль × сценарий), различающие (не
-  декоративные) проверки: ρ=цель-БЕЗ-цены; ρ=цена-БЕЗ-цели (PRICE_INPUT, канал
-  жив); ρ=цель+цена (OPTIMIZED, канал занулён); несколько ценовых ног в одной
-  ветке; ветка вообще без ρ;
-- [ ] регрессия `evaluate_stop`/`decide_stop`: при занулённом канале денежная
-  нога не «фантомит» (`not_economical`/red-flag поднимается честно).
+> Трактовка «несколько ценовых ног»: архитектура (`set_branch_cost`) держит ОДНУ
+> ценовую ногу на ветку; «несколько ног» прочитано как многоного́я по КАЧЕСТВУ
+> ветка + ценовая нога (знаменатель атрибуции Σw + роль ρ — то, что §16 проверяет).
 
-**E+. UI + AI/MCP (после того как логика D зелёная).**
+### §16.1 ОСТАТОК — открытый пункт ТЗ (E+, НЕ реализовано)
+
+Канон тот же: сначала логика + unit-тест (D — закрыт), потом UI.
+
+**E+. UI + AI/MCP (логика D зелёная).**
 - [ ] read-only показ роли каждого отклика в ветке и факта зануления σ_ρ-канала
   (`render_branches`, экспандер §15.6/§16), A0.6 — система ничего не меняет молча;
 - [ ] прокинуть роль/атрибуцию в `doe-introspect` (MCP) и в assistant —
   объяснение «почему денег за ρ нет» (двойной счёт убран);
-- [ ] обновить «Карту реализации» выше строкой §16, когда D+E закрыты.
+- [ ] обновить «Карту реализации» выше строкой §16, когда E+ закрыт.
 
 ---
 

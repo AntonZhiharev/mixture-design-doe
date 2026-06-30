@@ -832,6 +832,156 @@ class MixtureProcessRunner:
             return False
         return cfg["rho_property"] in self.branches[branch_id].goal
 
+    # ------------------------------------------------------------------
+    # §16 D — ФАКТИЧЕСКАЯ денежная нога стопа ветки, ЧИТАЮЩАЯ роль ρ.
+    # Тянет зануление σ_ρ-канала (price_channel_suppressed, Гр-1) до РЕАЛЬНОГО
+    # денежного VoI-гейта: economic_value ветки считается через
+    # price_attributed_value с rho_optimized=price_channel_suppressed(bid).
+    # Раньше rho_optimized жил лишь в ЧИСТЫХ функциях economic_stop, а раннер
+    # денежную ногу не вызывал вовсе (в §15.6-пути активны только триада/
+    # boundary_signal). Атрибуция branch-local: читает намерение ИМЕННО ветки.
+    # ------------------------------------------------------------------
+    def _branch_reference_recipe(self, branch_id: str) -> np.ndarray:
+        """Опорный «инкумбент» ветки в координатах ТЕКУЩЕЙ схемы (длина q+d).
+
+        Это опорная точка для атрибуции прироста (§5): относительно неё считаются
+        ``price_best`` (порог EI) и ``d_overall_cur`` (база Δlog d_overall). Если у
+        ветки есть измеренный ``x_best``, совместимый с текущим q (mixture-доли
+        суммируются в 1) — берём его срез к текущей схеме; иначе нейтральная
+        опорная точка: ЦЕНТРОИД mixture-региона + process-baseline (всегда
+        допустима, фазо-устойчива — не зависит от того, бежали ли уже раунды).
+        """
+        proc = (self.baseline[self.q_full:self.q_full + self.d].copy()
+                if self.d > 0 else np.empty(0))
+        xb = self.branches[branch_id].x_best
+        if xb is not None:
+            xb = np.asarray(xb, float).ravel()
+            mix = xb[:self.q]
+            if mix.size == self.q and abs(float(mix.sum()) - 1.0) < 1e-6:
+                if self.d > 0 and xb.size >= self.q_full + self.d:
+                    proc = xb[self.q_full:self.q_full + self.d]
+                return np.concatenate([mix, proc]) if self.d > 0 else mix
+        mix = np.asarray(self._mixture_region().centroid(), float).ravel()
+        return np.concatenate([mix, proc]) if self.d > 0 else mix
+
+    def branch_economic_value(self, branch_id: str, *, n_candidates: int = 600,
+                              n_mc: int = 512, horizon: Optional[float] = None,
+                              x_ref: Optional[Sequence[float]] = None,
+                              price_best: Optional[float] = None,
+                              seed: Optional[int] = None) -> float:
+        """§16 D: ЧЕСТНАЯ денежная ценность раунда ветки (₽ за горизонт),
+        АТРИБУТИРОВАННАЯ ценовой оси и ЧИТАЮЩАЯ роль ρ (Гр-1).
+
+        Связывает три куска §16 в один денежный сигнал:
+          1. σ_ρ-разведку — :func:`expected_price_improvement` (EI на удешевление
+             изделия ``price_изд = price_состав·ρ``, ρ~N(μ̂,σ̂) общего суррогата);
+          2. атрибуцию §5 — :func:`price_attributed_value` (деньги ТОЛЬКО за
+             прирост ``d_overall`` ветки ИМЕННО через цену, не за «фантом дешёвого
+             угла»);
+          3. РОЛЬ ρ — ``rho_optimized=self.price_channel_suppressed(branch_id)``:
+             если ρ носит роль OPTIMIZED (цель И питает цену), ВЕСЬ ценовой
+             разведочный канал занулён (``α≡0``) — двойной счёт одной δρ убран.
+
+        Ветка без ценовой ноги (``set_branch_cost`` не задан) ⇒ ``0.0``: денежного
+        VoI-гейта нет (чисто техническая ветка, обратная совместимость). Опорный
+        инкумбент — :meth:`_branch_reference_recipe` (или ``x_ref`` override, в
+        координатах текущей схемы); ``price_best`` по умолчанию — цена изделия в
+        опорной точке. Это ДИАГНОСТИКА (read-only): метод ничего не измеряет.
+        """
+        from ..optimize.economic_stop import (expected_price_improvement,
+                                               price_attributed_value)
+        from ..optimize.desirability import desirability_value
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        cfg = self._branch_cost.get(branch_id)
+        if cfg is None:
+            return 0.0                  # нет ценовой ноги ⇒ денежного гейта нет
+        if not self.surrogates:
+            self.fit_surrogates()
+        br = self.branches[branch_id]
+        rho = cfg["rho_property"]
+        cost_name = cfg["cost_name"]
+        cost_spec = cfg["cost_spec"]
+        price_fn = cfg["price_fn"]
+        s = (self.seed + 2000 + br.spent) if seed is None else int(seed)
+
+        # опорный рецепт (инкумбент) и его цена/качество (по ρ̂ суррогата)
+        x_cur = (np.asarray(x_ref, float).ravel() if x_ref is not None
+                 else self._branch_reference_recipe(branch_id))
+        Xc_cur = x_cur.reshape(1, -1)
+        pc_cur = float(np.asarray(price_fn(Xc_cur), float).ravel()[0])
+        rho_cur = float(np.asarray(self.surrogates[rho].predict(Xc_cur).mean,
+                                   float).ravel()[0])
+        price_cur = pc_cur * rho_cur
+        pb = price_cur if price_best is None else float(price_best)
+
+        specs = dict(br.goal)
+        specs[cost_name] = cost_spec
+        desir = Desirability(specs)
+
+        def _d_overall(X, price_item):
+            means = {n: np.asarray(self.surrogates[n].predict(X).mean,
+                                   float).ravel() for n in br.goal}
+            means[cost_name] = np.asarray(price_item, float).ravel()
+            return np.asarray(desir.overall(means), float).ravel()
+
+        d_overall_cur = float(_d_overall(Xc_cur, [price_cur])[0])
+        d_price_cur = float(np.asarray(desirability_value(price_cur, cost_spec),
+                                       float).ravel()[0])
+
+        cand = self._phase_candidates(int(n_candidates), s)
+        pc_c = np.asarray(price_fn(cand), float).ravel()
+        pred = self.surrogates[rho].predict(cand)
+        rho_mean = np.asarray(pred.mean, float).ravel()
+        rho_std = np.asarray(pred.std, float).ravel()
+        price_item_c = pc_c * rho_mean
+        d_overall_cand = _d_overall(cand, price_item_c)
+        d_price_cand = np.asarray(desirability_value(price_item_c, cost_spec),
+                                  float).ravel()
+
+        price_savings = expected_price_improvement(
+            pc_c, rho_mean, rho_std, price_best=pb, n_mc=int(n_mc), seed=s + 7)
+
+        price_weight = float(cost_spec.weight)
+        total_weight = (float(sum(sp.weight for sp in br.goal.values()))
+                        + price_weight)
+        H = br.resolve_horizon(horizon)
+        return price_attributed_value(
+            price_savings, d_overall_cur=d_overall_cur,
+            d_overall_cand=d_overall_cand, d_price_cur=d_price_cur,
+            d_price_cand=d_price_cand, price_weight=price_weight,
+            total_weight=total_weight, volume=br.volume, horizon=H,
+            rho_optimized=self.price_channel_suppressed(branch_id))
+
+    def branch_stop_decision(self, branch_id: str, *, delta_d: float,
+                             ceil: float, eps: float = 5e-3,
+                             econ_policy: Optional[str] = None,
+                             n_round: int = 1, n_candidates: int = 600,
+                             n_mc: int = 512, horizon: Optional[float] = None,
+                             x_ref: Optional[Sequence[float]] = None,
+                             price_best: Optional[float] = None,
+                             seed: Optional[int] = None):
+        """§16 D: двойной стоп §4 ветки с денежной ногой, ЧИТАЮЩЕЙ роль ρ.
+
+        Денежная нога ``economic_value`` — :meth:`branch_economic_value` (роль ρ
+        уже учтена: при OPTIMIZED-ρ канал занулён ⇒ ``economic_value=0``).
+        Цена раунда — ``N·c_exp`` (``n_round·br.cost_exp``, §4-BATCH). Возвращает
+        :class:`economic_stop.StopDecision`: при занулённом канале денежная нога
+        НЕ фантомит — ``econ_red_flag`` поднимается честно (а под ``ECON_BINDING``
+        причина — ``not_economical``), вместо мнимой выгоды за σ_ρ.
+        """
+        from ..optimize.economic_stop import evaluate_stop, ECON_BINDING
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        br = self.branches[branch_id]
+        ev = self.branch_economic_value(
+            branch_id, n_candidates=n_candidates, n_mc=n_mc, horizon=horizon,
+            x_ref=x_ref, price_best=price_best, seed=seed)
+        round_cost = float(br.cost_exp) * int(n_round)
+        return evaluate_stop(
+            delta_d=float(delta_d), d_best=float(br.d_best), ceil=float(ceil),
+            economic_value=float(ev), cost_exp=round_cost, eps=float(eps),
+            econ_policy=(ECON_BINDING if econ_policy is None else econ_policy))
 
     def run_branch_round(self, branch_id: str, n_points: int = 2,
                          explore_frac: float = 0.3, n_candidates: int = 600

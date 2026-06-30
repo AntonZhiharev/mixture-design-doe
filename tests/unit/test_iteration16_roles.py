@@ -20,8 +20,11 @@ from src.design.block_model import build_model_terms
 from src.design.branches import (ROLE_OPTIMIZED, ROLE_PRICE_INPUT,
                                   ROLE_REFERENCE)
 from src.optimize.desirability import DesirabilitySpec
+from src.optimize.economic_stop import (price_attributed_value,
+                                         price_attribution_alpha)
 from src.verification.mixture_process_truth import MultiMixtureProcessTruth
 from src.apps.mixture_process_runner import MixtureProcessRunner
+
 
 
 def _schema():
@@ -133,3 +136,59 @@ def test_unknown_response_and_branch_raise():
         r.response_role("b1", "nope")
     with pytest.raises(KeyError):
         r.response_role("nobranch", "p0")
+
+
+# ----------------------------------------------------------------------
+# Шаг B — атрибуция, ЧИТАЮЩАЯ роль: при ρ=OPTIMIZED ценовой σ_ρ-канал занулён
+# (Гр-1, убираем двойной счёт одной δρ). discriminating-probe: одни и те же
+# числа, разный флаг ⇒ разный результат — доказывает, что роль РЕАЛЬНО читается.
+# ----------------------------------------------------------------------
+def test_probe_rho_optimized_zeroes_price_channel():
+    """Гр-2 discriminating-probe: при ρ=OPTIMIZED α≡0 и денежная нога=0, ХОТЯ
+    d_overall растёт ИМЕННО через цену (rho_optimized=False дало бы деньги)."""
+    # цель растёт целиком через цену: d_price 0.5→0.9, d_overall 0.5→0.9
+    kw = dict(d_overall_cur=0.5, d_overall_cand=np.array([0.9]),
+              d_price_cur=0.5, d_price_cand=np.array([0.9]),
+              price_weight=1.0, total_weight=1.0)
+    a_input = price_attribution_alpha(rho_optimized=False, **kw)
+    a_opt = price_attribution_alpha(rho_optimized=True, **kw)
+    assert a_input[0] > 0.0            # роль PRICE_INPUT: деньги за цену есть
+    assert np.all(a_opt == 0.0)        # роль OPTIMIZED: σ_ρ ушла в качество
+    assert a_opt.shape == a_input.shape  # форма канала сохранена (не скаляр)
+
+    money_kw = dict(price_savings=np.array([3.0]), volume=10.0, horizon=2.0,
+                    **kw)
+    v_input = price_attributed_value(rho_optimized=False, **money_kw)
+    v_opt = price_attributed_value(rho_optimized=True, **money_kw)
+    assert v_input > 0.0               # PRICE_INPUT: ₽ за горизонт > 0
+    assert v_opt == 0.0                # OPTIMIZED: денежная нога занулена
+
+
+def test_role_to_attribution_branch_local_integration():
+    """Гр-3 branch-local: price_channel_suppressed конкретной ветки кормит
+    rho_optimized. Один оракул, одни числа — НО b3(ρ=цель)⇒0, b2(ρ=цена)⇒₽>0."""
+    r = _runner()
+    r.add_branch("cost", {"p0": DesirabilitySpec("max", low=-5, high=5)},
+                 branch_id="b2")
+    r.set_branch_cost("b2", _price_fn,
+                      DesirabilitySpec("min", low=0.0, high=10.0),
+                      rho_property="p1")
+    r.add_branch("dual", {"p0": DesirabilitySpec("max", low=-5, high=5),
+                          "p1": DesirabilitySpec("min", low=-5, high=5)},
+                 branch_id="b3")
+    r.set_branch_cost("b3", _price_fn,
+                      DesirabilitySpec("min", low=0.0, high=10.0),
+                      rho_property="p1")
+    money_kw = dict(price_savings=np.array([3.0]),
+                    d_overall_cur=0.5, d_overall_cand=np.array([0.9]),
+                    d_price_cur=0.5, d_price_cand=np.array([0.9]),
+                    price_weight=1.0, total_weight=1.0,
+                    volume=10.0, horizon=2.0)
+    v_b2 = price_attributed_value(
+        rho_optimized=r.price_channel_suppressed("b2"), **money_kw)
+    v_b3 = price_attributed_value(
+        rho_optimized=r.price_channel_suppressed("b3"), **money_kw)
+    assert v_b2 > 0.0                  # b2: ρ=PRICE_INPUT ⇒ деньги за цену
+    assert v_b3 == 0.0                 # b3: ρ=OPTIMIZED ⇒ канал занулён
+
+

@@ -130,7 +130,8 @@ def price_attributed_value(price_savings, *, d_overall_cur, d_overall_cand,
                            d_price_cur, d_price_cand,
                            price_weight: float, total_weight: float,
                            volume: float, horizon: float,
-                           d_floor: float = 1e-6) -> float:
+                           d_floor: float = 1e-6,
+                           rho_optimized: bool = False) -> float:
     """§5 per-property: денежная ценность раунда, АТРИБУТИРОВАННАЯ ценовой оси.
 
     Чинит objective-agnostic переоценку :func:`economic_value` (диагностика §5.3:
@@ -168,7 +169,8 @@ def price_attributed_value(price_savings, *, d_overall_cur, d_overall_cand,
     alpha = price_attribution_alpha(
         d_overall_cur=d_overall_cur, d_overall_cand=d_overall_cand,
         d_price_cur=d_price_cur, d_price_cand=d_price_cand,
-        price_weight=price_weight, total_weight=total_weight, d_floor=d_floor)
+        price_weight=price_weight, total_weight=total_weight, d_floor=d_floor,
+        rho_optimized=rho_optimized)
     val = ps * alpha
     best = float(np.max(val)) if val.size else 0.0
     return max(best, 0.0) * float(volume) * float(horizon)
@@ -177,7 +179,8 @@ def price_attributed_value(price_savings, *, d_overall_cur, d_overall_cand,
 def price_attribution_alpha(*, d_overall_cur, d_overall_cand,
                             d_price_cur, d_price_cand,
                             price_weight: float, total_weight: float,
-                            d_floor: float = 1e-6) -> np.ndarray:
+                            d_floor: float = 1e-6,
+                            rho_optimized: bool = False) -> np.ndarray:
     """Доля прироста d_overall, атрибутированная ЦЕНОВОЙ оси, по кандидатам (§5).
 
     Вынесено из :func:`price_attributed_value`, чтобы ОДНА реализация α(x) кормила
@@ -189,7 +192,21 @@ def price_attribution_alpha(*, d_overall_cur, d_overall_cand,
 
     Возвращает массив ``(n,)`` в ``[0,1]`` (0 там, где цель не растёт / растёт не
     через цену). Параметры — как в :func:`price_attributed_value`.
+
+    ``rho_optimized`` (§5/§12 Гр-1, атрибуция, читающая РОЛЬ) — ρ ветки носит роль
+    OPTIMIZED И одновременно питает цену (``price_изд = price_состав·ρ``). Тогда
+    ВЕСЬ EI на удешевление течёт через σ_ρ (числитель price_состав детерминирован,
+    см. :func:`expected_price_improvement`), а эта σ_ρ-разведка УЖЕ оправдана
+    качественной ногой d_ρ. Засчитывать её ещё и деньгами — двойной счёт одной δρ.
+    Поэтому ``rho_optimized=True`` зануляет ВЕСЬ ценовой разведочный канал
+    (``α≡0``): денежная нога от σ_ρ = 0 (вся неопределённость ушла в качество).
+    Ценовая выгода от ВЫБОРА состава (детерминированный price_состав·μ_ρ) — это уже
+    технический рычаг desirability, не денежный VoI-гейт. ``Tag`` сам по себе НЕ
+    спасает от фантома — спасает именно это чтение роли в атрибуции.
     """
+    do_cand = np.atleast_1d(np.asarray(d_overall_cand, float))
+    if bool(rho_optimized):
+        return np.zeros(do_cand.shape, float)
     do_cur = max(float(d_overall_cur), float(d_floor))
     do_cand = np.clip(np.atleast_1d(np.asarray(d_overall_cand, float)),
                       float(d_floor), None)

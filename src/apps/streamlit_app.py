@@ -33,6 +33,7 @@ from src.apps.pipeline_runner import (PipelineConfig, PipelineRunner,  # noqa: E
                                        list_projects)
 from src.optimize.desirability import DesirabilitySpec  # noqa: E402
 from src.apps import assistant as ai  # noqa: E402
+from src.apps.campaign_ui import render_campaign  # noqa: E402
 
 
 STAGES = [
@@ -1240,15 +1241,20 @@ def main():
                      f"(текущая: {runner.state.stage})")
 
     tabs = st.tabs([t for _, t in STAGES]
-                   + ["🌿 Ветки", "🎯 Benchmark", "💬 Ассистент"])
+                   + ["🌿 Ветки", "🧬 Кампания", "🎯 Benchmark", "💬 Ассистент"])
     for tab, (k, title) in zip(tabs, STAGES):
         with tab:
             render_stage(runner, k, title)
-    with tabs[-3]:
+    n = len(STAGES)
+    with tabs[n + 0]:
         render_branches(runner)
-    with tabs[-2]:
+    with tabs[n + 1]:
+        # 🧬 Кампания (ТЗ v1.1, §16/§16.1): per-branch роли + эволюция кампании
+        # поверх ОТДЕЛЬНОГО MixtureProcessRunner (другая модель проекта, §5/§12).
+        render_campaign()
+    with tabs[n + 2]:
         render_benchmark(runner)
-    with tabs[-1]:
+    with tabs[n + 3]:
         render_assistant(runner)
 
 

@@ -31,12 +31,14 @@ A0.6: модуль НИЧЕГО не меняет — он только ЧИТА
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from ..design.branches import (ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
                                 ROLE_PRIORITY)
+from ..optimize.desirability import Desirability, DesirabilitySpec
 
 # ----------------------------------------------------------------------
 # Ярлыки ролей и денежного канала (для UI/MCP; единый источник — без копий)
@@ -311,3 +313,303 @@ def campaign_overview(runner, *, with_money: bool = False,
         "coverage_fraction_threshold": float(coverage_fraction),
         "branches": branches,
     }
+
+
+# ======================================================================
+# ШАГ 2 — Контроллер кампании: обратимые мутации (§4) + смена роли (§5) +
+# undo-стек (§7). Поверх того же MixtureProcessRunner. Канон:
+#
+#   * Мутации меняют ОЦЕНКУ/АКТИВНЫЙ ПУЛ/ОБЪЕКТИВ, НЕ измеренную правду (И-1):
+#     история (``runner.points``) не урезается ни одной операцией (П-11).
+#   * Роль ВЫВОДИТСЯ из намерения (goal + ценовая нога), не хранится отдельно
+#     (нет дубля состояния). Поэтому «смена роли» — это операция над намерением:
+#     PRICE_INPUT→OPTIMIZED добавляет отклик в goal (нужен DesirabilitySpec),
+#     OPTIMIZED→PRICE_INPUT убирает из goal (отклик остаётся ρ ценовой ноги).
+#     Переключение OPTIMIZED↔PRICE_INPUT переключает денежный канал ρ
+#     (И-5/Гр-1: ZEROED↔ALIVE) ТОЛЬКО в этой ветке (Тр-5.5/Гр-3).
+#   * Каждая мутация: snapshot намерения → применить → per-branch RE-SCORE →
+#     показать смещение M8-рекомендации x* (X→Y, Тр-4.2/Тр-5.3) → запись в undo.
+#   * Атомарность В ПРЕДЕЛАХ ВЕТКИ (Тр-5.4): тег/объектив/оценка вместе; ДРУГИЕ
+#     ветки не затрагиваются (общий пул разделяет измеренную правду, не атрибуцию).
+#   * Undo (§7) откатывает ТОЛЬКО обратимую ИНТЕРПРЕТАЦИЮ (роли/веса/форма/цель).
+#     Прогон раунда (новые измерения) в стек НЕ входит и ОБНУЛЯЕТ его (Тр-7.2/7.3):
+#     дно стека = последний снятый раунд (измеренную правду откатить нельзя, И-1).
+# ======================================================================
+# Роли, между которыми разрешён осознанный switch в текущей итерации (REFERENCE —
+# backlog §10): денежный канал ρ переключается именно между этими двумя.
+SWITCHABLE_ROLES = (ROLE_OPTIMIZED, ROLE_PRICE_INPUT)
+
+# Лёгкие параметры M8-argmax для показа смещения рекомендации x* (вызывается на
+# каждую мутацию — глубокий мультистарт не нужен, точка не измеряется).
+_XOPT_KW = dict(n_candidates=300, refine_iters=60, n_starts=2)
+
+
+class CampaignController:
+    """Обратимые мутации намерения ветки + undo поверх ``MixtureProcessRunner``.
+
+    НЕ владеет данными — оборачивает существующий runner (одна модель физики на
+    проект, общий пул, §5/§12). Все read-методы делегируют ШАГ-1 view-model.
+    """
+
+    def __init__(self, runner):
+        self.runner = runner
+        # стек снимков намерения для undo (§7); дно сбрасывается прогоном раунда.
+        self._undo: List[Dict[str, Any]] = []
+
+    # -- read-model (ШАГ 1) passthrough -------------------------------
+    def role_report(self, branch_id: str, **kw) -> Dict[str, Any]:
+        return branch_role_report(self.runner, branch_id, **kw)
+
+    def money_explanation(self, branch_id: str, **kw) -> Dict[str, Any]:
+        return branch_money_explanation(self.runner, branch_id, **kw)
+
+    def overview(self, **kw) -> Dict[str, Any]:
+        return campaign_overview(self.runner, **kw)
+
+    # -- snapshot / restore намерения ветки (для undo) ----------------
+    def _snapshot(self, branch_id: str) -> Dict[str, Any]:
+        br = self.runner.branches[branch_id]
+        cost = (self.runner._branch_cost.get(branch_id)
+                if hasattr(self.runner, "_branch_cost") else None)
+        return {
+            "goal": {k: replace(v) for k, v in (br.goal or {}).items()},
+            "d_best": float(br.d_best),
+            "x_best": (list(br.x_best) if br.x_best is not None else None),
+            "cost": (dict(cost) if cost is not None else None),
+        }
+
+    def _restore(self, branch_id: str, snap: Dict[str, Any]) -> None:
+        br = self.runner.branches[branch_id]
+        br.goal = {k: replace(v) for k, v in snap["goal"].items()}
+        br.d_best = float(snap["d_best"])
+        br.x_best = (list(snap["x_best"]) if snap["x_best"] is not None else None)
+        if hasattr(self.runner, "_branch_cost"):
+            if snap["cost"] is not None:
+                self.runner._branch_cost[branch_id] = dict(snap["cost"])
+            else:
+                self.runner._branch_cost.pop(branch_id, None)
+
+    # -- per-branch re-score (оценка под текущий объектив, не правда) --
+    def _rescore(self, branch_id: str) -> None:
+        """Пересчитать ``d_best``/``x_best`` ветки по ОБЩЕЙ базе под ТЕКУЩИЙ
+        объектив (goal + цена). Меняется ОЦЕНКА, не измеренные Y (И-1)."""
+        runner = self.runner
+        br = runner.branches[branch_id]
+        if not br.goal or runner.X is None or runner.Y is None \
+                or len(runner.X) == 0:
+            return
+        specs = dict(br.goal)
+        meas = {n: np.asarray(runner.Y[:, runner.prop_index[n]], float)
+                for n in br.goal}
+        cfg = (runner._branch_cost.get(branch_id)
+               if hasattr(runner, "_branch_cost") else None)
+        if cfg is not None:
+            pc = np.asarray(cfg["price_fn"](runner.X), float).ravel()
+            rho = np.asarray(runner.Y[:, runner.prop_index[cfg["rho_property"]]],
+                             float)
+            meas[cfg["cost_name"]] = pc * rho
+            specs[cfg["cost_name"]] = cfg["cost_spec"]
+        d = np.asarray(Desirability(specs).overall(meas), float).ravel()
+        if d.size == 0:
+            return
+        bi = int(np.argmax(d))
+        br.d_best = float(d[bi])
+        br.x_best = runner._to_full(runner.X[bi]).tolist()
+        br.refresh_status()
+
+    def _x_opt(self, branch_id: str) -> Optional[List[float]]:
+        """M8-argmax рецепт ветки (рекомендация x*) или ``None``, если не считается
+        (пустой goal / нет суррогатов). Read-only: точка НЕ измеряется."""
+        br = self.runner.branches[branch_id]
+        if not br.goal or not getattr(self.runner, "surrogates", None):
+            return None
+        try:
+            res = self.runner.optimize_xbest(branch_id, **_XOPT_KW)
+            return [round(float(v), 4) for v in np.asarray(res.x, float).ravel()]
+        except Exception:  # noqa: BLE001 — рекомендация необязательна
+            return None
+
+    # -- общий каркас обратимой мутации -------------------------------
+    def _apply(self, op: str, branch_id: str, response: Optional[str],
+               mutate_fn) -> Dict[str, Any]:
+        if branch_id not in self.runner.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        n_hist_before = len(getattr(self.runner, "points", []) or [])
+        role_before = (self.runner.response_role(branch_id, response)
+                       if response else None)
+        x_before = self._x_opt(branch_id)
+        d_before = float(self.runner.branches[branch_id].d_best)
+
+        snap = self._snapshot(branch_id)
+        mutate_fn()                               # применяем намерение
+        self._rescore(branch_id)                  # переоценка под новый объектив
+        self._undo.append({"op": op, "branch_id": branch_id, "snap": snap})
+
+        x_after = self._x_opt(branch_id)
+        role_after = (self.runner.response_role(branch_id, response)
+                      if response else None)
+        # И-1/П-11: ни одна мутация не урезает историю.
+        assert len(getattr(self.runner, "points", []) or []) == n_hist_before
+        return self._result(op, branch_id, response, role_before, role_after,
+                            d_before, x_before, x_after)
+
+    def _result(self, op, branch_id, response, role_before, role_after,
+                d_before, x_before, x_after) -> Dict[str, Any]:
+        shift = None
+        if (x_before is not None and x_after is not None
+                and len(x_before) == len(x_after)):
+            shift = float(np.linalg.norm(np.asarray(x_after)
+                                         - np.asarray(x_before)))
+        return {
+            "op": op,
+            "branch_id": branch_id,
+            "response": response,
+            "role_before": role_before,
+            "role_after": role_after,
+            "price_channel_suppressed":
+                bool(self.runner.price_channel_suppressed(branch_id)),
+            "d_best_before": d_before,
+            "d_best_after": float(self.runner.branches[branch_id].d_best),
+            # Тр-4.2/Тр-5.3: «рекомендация сместилась X→Y» (M8-argmax x*).
+            "x_opt_before": x_before,
+            "x_opt_after": x_after,
+            "recommendation_shift": shift,
+            "undo_available": bool(self._undo),
+        }
+
+    # -- §4 ярус-1: веса целей ----------------------------------------
+    def set_weights(self, branch_id: str,
+                    weights: Dict[str, float]) -> Dict[str, Any]:
+        """Изменить веса целей ветки (ярус-1, re-score десирабилити)."""
+        br = self.runner.branches[branch_id]
+        for resp in weights:
+            if resp not in (br.goal or {}):
+                raise KeyError(f"'{resp}' не цель ветки '{branch_id}' "
+                               f"(вес можно менять только у цели).")
+
+        def _mut():
+            for resp, w in weights.items():
+                br.goal[resp] = replace(br.goal[resp], weight=float(w))
+
+        return self._apply("set_weights", branch_id, None, _mut)
+
+    # -- §4 ярус-1: форма десирабилити / TARGET / +цель над откликом ---
+    def set_desirability(self, branch_id: str, response: str,
+                         spec: DesirabilitySpec) -> Dict[str, Any]:
+        """Задать/заменить десирабилити-спеку отклика (форма/TARGET; +цель).
+
+        Если отклика ещё не было в goal — это +цель над ИЗМЕРЯЕМЫМ откликом
+        (роль становится OPTIMIZED). Отклик обязан быть свойством оракула.
+        """
+        if response not in self.runner.property_names:
+            raise KeyError(f"Отклик '{response}' не среди свойств оракула "
+                           f"{list(self.runner.property_names)}.")
+        br = self.runner.branches[branch_id]
+
+        def _mut():
+            br.goal[response] = spec
+
+        return self._apply("set_desirability", branch_id, response, _mut)
+
+    # -- §4 ярус-1: удалить цель --------------------------------------
+    def delete_goal(self, branch_id: str, response: str) -> Dict[str, Any]:
+        """Удалить цель из ветки (нога выпадает; история цела). Запрещено удалять
+        ПОСЛЕДНЮЮ цель — ветке нужен объектив (иначе re-score/argmax не определены).
+        """
+        br = self.runner.branches[branch_id]
+        if response not in (br.goal or {}):
+            raise KeyError(f"'{response}' не цель ветки '{branch_id}'.")
+        if len(br.goal) <= 1:
+            raise ValueError("Нельзя удалить последнюю цель ветки — объектив "
+                             "должен существовать (смените цель вместо удаления).")
+
+        def _mut():
+            del br.goal[response]
+
+        return self._apply("delete_goal", branch_id, response, _mut)
+
+    # -- §5: смена роли (ветка × отклик), per-branch -------------------
+    def switch_role(self, branch_id: str, response: str, to_role: str, *,
+                    spec: Optional[DesirabilitySpec] = None) -> Dict[str, Any]:
+        """Сменить роль ``response`` в ветке (§5) — переключает денежный канал ρ.
+
+        Допустимы переходы между ``OPTIMIZED`` и ``PRICE_INPUT`` (REFERENCE —
+        backlog). Предусловие: отклик — ρ ценовой ноги ветки (``feeds_price``),
+        иначе денежного канала нет и переключать нечего (сначала задайте цену
+        через ``set_branch_cost``). Переход:
+
+          * ``PRICE_INPUT → OPTIMIZED`` — добавить отклик в goal (нужен ``spec``);
+            канал ρ ZEROED (И-5/Гр-1);
+          * ``OPTIMIZED → PRICE_INPUT`` — убрать отклик из goal (остаётся ρ
+            ценовой ноги); канал ρ ALIVE.
+
+        Атомарно в пределах ветки (Тр-5.4); другие ветки не затронуты (Гр-3).
+        """
+        if to_role not in SWITCHABLE_ROLES:
+            raise ValueError(f"Сменить роль можно только между "
+                             f"{SWITCHABLE_ROLES} (REFERENCE — backlog §10).")
+        if branch_id not in self.runner.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        pcfg = branch_price_config(self.runner, branch_id)
+        if pcfg is None or pcfg["rho_property"] != response:
+            raise ValueError(
+                f"'{response}' не ρ ценовой ноги ветки '{branch_id}': денежного "
+                f"канала нет, переключать роль нечем. Сначала задайте цену "
+                f"(set_branch_cost с rho_property='{response}').")
+        role_now = self.runner.response_role(branch_id, response)
+        if role_now == to_role:
+            raise ValueError(f"Отклик '{response}' уже в роли '{to_role}'.")
+        br = self.runner.branches[branch_id]
+
+        if to_role == ROLE_OPTIMIZED:
+            if spec is None:
+                raise ValueError(
+                    "Переход PRICE_INPUT→OPTIMIZED требует DesirabilitySpec "
+                    "(вид/диапазон/вес цели для этого отклика).")
+
+            def _mut():
+                br.goal[response] = spec
+        else:  # ROLE_PRICE_INPUT — убрать из goal, ρ остаётся ценовой ногой
+            def _mut():
+                br.goal.pop(response, None)
+
+        return self._apply("switch_role", branch_id, response, _mut)
+
+    # -- undo (§7) ----------------------------------------------------
+    def can_undo(self) -> bool:
+        return bool(self._undo)
+
+    def undo(self) -> Dict[str, Any]:
+        """Откатить последнюю обратимую мутацию (§7). Откатывает ИНТЕРПРЕТАЦИЮ
+        (роль/веса/форму/цель), НЕ измеренную правду. Если стек пуст (дно =
+        последний снятый раунд) — :class:`IndexError`."""
+        if not self._undo:
+            raise IndexError("Стек undo пуст: дно — последний снятый раунд "
+                             "(измеренную правду откатить нельзя, И-1).")
+        entry = self._undo.pop()
+        bid = entry["branch_id"]
+        self._restore(bid, entry["snap"])
+        self._rescore(bid)
+        return {
+            "op": "undo", "undone": entry["op"], "branch_id": bid,
+            "price_channel_suppressed":
+                bool(self.runner.price_channel_suppressed(bid)),
+            "d_best": float(self.runner.branches[bid].d_best),
+            "undo_available": bool(self._undo),
+        }
+
+    # -- прогон раунда: ОБНУЛЯЕТ undo-стек (Тр-7.2/7.3) ----------------
+    def run_round(self, branch_id: str, **kw) -> Dict[str, Any]:
+        """Прогнать раунд ветки и ЗАПЕЧАТАТЬ дно undo: измеренная правда
+        неоткатываема (И-1), стек обратимых настроек обнуляется (Тр-7.2/7.3)."""
+        out = self.runner.run_branch_round(branch_id, **kw)
+        self._undo.clear()
+        return out
+
+    def run_portfolio_round(self, total_slots: int, **kw) -> Dict[str, Any]:
+        """Портфельный раунд (арбитр бюджета) + запечатывание дна undo."""
+        out = self.runner.run_portfolio_round(total_slots, **kw)
+        self._undo.clear()
+        return out
+
+

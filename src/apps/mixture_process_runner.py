@@ -65,7 +65,9 @@ from ..models.gp_expert import GPExpert
 from ..design.block_model import build_model_terms, model_matrix
 from ..design.augmented import build_moments
 from ..design.branches import (Branch, branch_scores, propose_by_score,
-                               allocate_budget)
+                               allocate_budget,
+                               ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
+                               ROLE_PRIORITY)
 from ..optimize.desirability import (Desirability, DesirabilitySpec,
                                      DesirabilityResult, optimize_desirability,
                                      make_item_cost_fn)
@@ -770,6 +772,65 @@ class MixtureProcessRunner:
         rho_pred = (lambda X, gp=self.surrogates[rho]: gp.predict(X).mean)
         cost_fn = make_item_cost_fn(cfg["price_fn"], rho_pred)
         return cost_fn, cfg["cost_name"], cfg["cost_spec"]
+
+    # ------------------------------------------------------------------
+    # §5/§12 РОЛЬ ОТКЛИКА в ветке — атрибут (ветка × отклик), ВЫВОДИТСЯ из
+    # текущего намерения (goal + ценовая конфигурация), а НЕ хранится отдельно
+    # (нет дубля состояния). Приоритет M2: OPTIMIZED > PRICE_INPUT > REFERENCE —
+    # роль всегда однозначна (XOR честности §5). Аналог _border_origin: политика
+    # раннера, НЕ во frozen-схеме. Атрибуция branch-local (Гр-3): эти методы
+    # читают ТОЛЬКО намерение запрошенной ветки.
+    # ------------------------------------------------------------------
+    def response_role(self, branch_id: str, response: str) -> str:
+        """Роль ``response`` В КОНТЕКСТЕ ветки ``branch_id`` (приоритет M2).
+
+        ``OPTIMIZED`` — отклик есть в ``branch.goal`` (нога качества d_i);
+        ``PRICE_INPUT`` — отклик НЕ цель, но это ρ ценовой ноги ветки
+        (``set_branch_cost`` ⇒ σ_ρ-разведка засчитывается в деньги, §3);
+        ``REFERENCE`` — меряется оракулом, но ни цель, ни ρ-цены (справочный).
+
+        Приоритет OPTIMIZED > PRICE_INPUT снимает двойную роль ρ (Гр-1): если
+        ρ одновременно в ``goal`` и питает цену, роль = ``OPTIMIZED`` (вся σ_ρ
+        ушла в качество), а ценовой σ_ρ-канал зануляется на шаге атрибуции — см.
+        :meth:`price_channel_suppressed`.
+        """
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if response not in self.property_names:
+            raise KeyError(f"Отклик '{response}' не среди свойств оракула "
+                           f"{self.property_names}.")
+        if response in self.branches[branch_id].goal:
+            return ROLE_OPTIMIZED
+        cfg = self._branch_cost.get(branch_id)
+        if cfg is not None and response == cfg["rho_property"]:
+            return ROLE_PRICE_INPUT
+        return ROLE_REFERENCE
+
+    def branch_roles(self, branch_id: str) -> Dict[str, str]:
+        """Карта ``{отклик → роль}`` по ВСЕМ свойствам оракула для ветки."""
+        return {p: self.response_role(branch_id, p) for p in self.property_names}
+
+    def responses_by_role(self, branch_id: str) -> Dict[str, List[str]]:
+        """Обратный индекс ``{роль → [отклики]}`` (порядок свойств оракула)."""
+        out: Dict[str, List[str]] = {r: [] for r in ROLE_PRIORITY}
+        for p in self.property_names:
+            out[self.response_role(branch_id, p)].append(p)
+        return out
+
+    def price_channel_suppressed(self, branch_id: str) -> bool:
+        """ρ ценовой ноги имеет роль OPTIMIZED ⇒ σ_ρ-ценовой канал занулён (Гр-1).
+
+        ``True`` только когда у ветки есть ценовая нога И её ``rho_property``
+        попал в ``goal`` (роль ρ = OPTIMIZED по приоритету M2). Это read-only
+        диагностика-крючок для атрибуции (шаг B): денежная нога от σ_ρ-разведки
+        в такой ветке = 0 (вся неопределённость ρ уже оправдана качеством),
+        ценовая выгода остаётся лишь от ВЫБОРА состава (детерминированный
+        price_состав·μ_ρ). ``False`` ⇒ либо нет цены, либо ρ — чистый PRICE_INPUT.
+        """
+        cfg = self._branch_cost.get(branch_id)
+        if cfg is None:
+            return False
+        return cfg["rho_property"] in self.branches[branch_id].goal
 
 
     def run_branch_round(self, branch_id: str, n_points: int = 2,

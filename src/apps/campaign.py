@@ -612,4 +612,120 @@ class CampaignController:
         self._undo.clear()
         return out
 
+    # -- §8: spawn ветки с НАСЛЕДОВАНИЕМ ролей -------------------------
+    # Дефолт = наследование намерения родителя (валидный XOR копируется ⇒ ребёнок
+    # честен by default, Тр-8.1). Наследование НЕ молчаливое: spawn отдаёт
+    # обзорную сводку (Тр-8.1а) с пометкой «унаследовано как есть» vs «изменено
+    # для ветки» (Тр-8.1б). Новый объектив ПЕРЕБИВАЕТ унаследованную роль
+    # (Тр-8.1в): цель над ρ ⇒ ρ в ребёнке OPTIMIZED (канал цены ZEROED, И-5).
+    def _merged_child_goal(self, parent_id: str,
+                           new_goals: Optional[Dict[str, DesirabilitySpec]]
+                           ) -> Dict[str, DesirabilitySpec]:
+        """Цель ребёнка = копия цели родителя, перекрытая ``new_goals``."""
+        parent = self.runner.branches[parent_id]
+        goal = {k: replace(v) for k, v in (parent.goal or {}).items()}
+        for resp, spec in (new_goals or {}).items():
+            if resp not in self.runner.property_names:
+                raise KeyError(f"Отклик '{resp}' не среди свойств оракула "
+                               f"{list(self.runner.property_names)}.")
+            goal[resp] = spec
+        return goal
+
+    def _spawn_summary(self, parent_id: str,
+                       merged_goal: Dict[str, DesirabilitySpec],
+                       new_goals: Optional[Dict[str, DesirabilitySpec]],
+                       inherit_cost: bool) -> Dict[str, Any]:
+        """Обзорная сводка ролей будущего ребёнка vs родитель (Тр-8.1а/б/в)."""
+        parent_roles = self.runner.branch_roles(parent_id)
+        pcfg = branch_price_config(self.runner, parent_id)
+        rho = pcfg["rho_property"] if (pcfg and inherit_cost) else None
+        child_suppressed = (rho is not None and rho in merged_goal)
+        ng = set(new_goals or {})
+
+        rows: List[Dict[str, Any]] = []
+        any_changed = False
+        for p in self.runner.property_names:
+            rp = parent_roles[p]
+            if p in merged_goal:
+                rc = ROLE_OPTIMIZED
+            elif rho is not None and p == rho:
+                rc = ROLE_PRICE_INPUT
+            else:
+                rc = ROLE_REFERENCE
+            overridden = p in ng
+            role_changed = rp != rc
+            if role_changed:
+                change = "changed_by_objective"   # Тр-8.1в: объектив перебил роль
+                any_changed = True
+            elif overridden:
+                change = "overridden_same_role"    # тронуто, но роль та же
+            else:
+                change = "inherited"               # унаследовано как есть
+            rows.append({
+                "response": p, "role_parent": rp, "role_child": rc,
+                "overridden": overridden, "role_changed": role_changed,
+                "change": change,
+                "money_channel_child": _money_channel(p, rho, child_suppressed),
+            })
+        return {
+            "parent_id": parent_id, "rho_property": rho,
+            "inherit_cost": bool(inherit_cost),
+            "any_role_changed_by_objective": any_changed,
+            "responses": rows,
+        }
+
+    def preview_spawn(self, parent_id: str, *,
+                      new_goals: Optional[Dict[str, DesirabilitySpec]] = None,
+                      inherit_cost: bool = True) -> Dict[str, Any]:
+        """Обзорная сводка наследования ролей БЕЗ создания ветки (Тр-8.1а).
+
+        Кладёт перед пользователем, что унаследовано как есть и что перебито
+        объективом ветки — для подтверждения «в один клик или правка». Ничего не
+        меняет (A0.6)."""
+        if parent_id not in self.runner.branches:
+            raise KeyError(f"Нет родительской ветки '{parent_id}'.")
+        merged = self._merged_child_goal(parent_id, new_goals)
+        return self._spawn_summary(parent_id, merged, new_goals, inherit_cost)
+
+    def spawn_branch(self, parent_id: str, child_name: str, *,
+                     child_id: Optional[str] = None,
+                     new_goals: Optional[Dict[str, DesirabilitySpec]] = None,
+                     budget: Optional[int] = None,
+                     satisfy_at: Optional[float] = None,
+                     inherit_cost: bool = True) -> Dict[str, Any]:
+        """Создать ветку-сиблинг на ОБЩЕМ пуле с наследованием ролей (§8).
+
+        Цель = цель родителя, перекрытая ``new_goals`` (приоритет объектива,
+        Тр-8.1в); ценовая нога наследуется (``inherit_cost``) — тот же ρ/цена, что
+        делает ρ в ребёнке либо PRICE_INPUT (унаследовано), либо OPTIMIZED+ZEROED
+        (если новый объектив ввёл цель над ρ). Возвращает ``review``-сводку
+        (Тр-8.1а/б). Модель физики общая (канон §5/§12) — отдельной модели у
+        ребёнка нет.
+        """
+        if parent_id not in self.runner.branches:
+            raise KeyError(f"Нет родительской ветки '{parent_id}'.")
+        parent = self.runner.branches[parent_id]
+        merged = self._merged_child_goal(parent_id, new_goals)
+        review = self._spawn_summary(parent_id, merged, new_goals, inherit_cost)
+
+        child = self.runner.add_branch(
+            child_name, merged,
+            budget=int(budget if budget is not None else parent.budget),
+            satisfy_at=float(satisfy_at if satisfy_at is not None
+                             else parent.satisfy_at),
+            branch_id=child_id)
+        pcfg = (self.runner._branch_cost.get(parent_id)
+                if hasattr(self.runner, "_branch_cost") else None)
+        if inherit_cost and pcfg is not None:
+            self.runner.set_branch_cost(
+                child.id, pcfg["price_fn"], pcfg["cost_spec"],
+                rho_property=pcfg["rho_property"], cost_name=pcfg["cost_name"])
+        return {
+            "op": "spawn", "parent_id": parent_id,
+            "child_id": child.id, "child_name": child.name,
+            "price_channel_suppressed":
+                bool(self.runner.price_channel_suppressed(child.id)),
+            "review": review,
+        }
+
 

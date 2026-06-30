@@ -32,8 +32,9 @@ from src.verification.mixture_process_truth import (MultiMixtureProcessTruth,
                                                     composite_random_points)
 from src.verification.branch_reference import branch_optimum, branch_optimum_masked
 from src.apps.mixture_process_runner import MixtureProcessRunner
+from src.design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 from src.optimize.economic_stop import (decide_stop, evaluate_stop,
-                                        ECON_ADVISORY,
+                                        ECON_ADVISORY, STOP_NOT_ECONOMICAL,
                                         expected_price_improvement,
                                         economic_value, price_attributed_value,
                                         price_attribution_alpha, best_of_n_value)
@@ -1745,6 +1746,100 @@ def test_battle_step7_b1_analog_displaces_b():
     assert counts.get("seed", 0) == 40
     for bid in goals:
         assert counts.get(f"branch:{bid}", 0) >= 5
+
+
+# ======================================================================
+# STEP 8 (REBUILD_SPEC §16.1 D): ДЕНЕЖНАЯ НОГА СТОПА, ЧИТАЮЩАЯ РОЛЬ ρ —
+# ПЕРЕПРОВЕРКА НА РЕАЛЬНЫХ БОЕВЫХ ДАННЫХ (тот же 4-комп econ-оракул step6).
+#
+# До сих пор §16.D проверялся на синтетике (test_iteration16_money_stop). Здесь —
+# на ТЕХ ЖЕ данных, где живёт экономика step6: ρ — полноценный отклик, цена
+# изделия = price_состав·ρ. Две ветки с ИДЕНТИЧНЫМИ качественными целями и
+# экономикой, различие ТОЛЬКО в роли ρ:
+#   * price_in — ρ питает цену, но НЕ цель -> PRICE_INPUT, ценовой σ_ρ-канал ЖИВ;
+#   * rho_goal — ρ ещё и min-цель          -> OPTIMIZED, σ_ρ-канал ЗАНУЛЁН (Гр-1).
+# Проверяем НОВЫМИ методами раннера branch_economic_value / branch_stop_decision
+# (а НЕ локальными хелперами step6): на одном оракуле и общих суррогатах
+# rho_goal даёт денежную ногу = 0 РОВНО (двойной счёт одной δρ убран), price_in
+# > 0; и двойной стоп §4 честен (rho_goal: not_economical + red-flag; price_in с
+# богатой экономикой: тех.прогресс НЕ ветируется). Опорную точку атрибуции берём
+# ЯВНО = baseline (заведомо неоптимальная: кандидаты её улучшают через цену).
+# ======================================================================
+def test_battle_step8_role_aware_money_stop_on_real_data():
+    """STEP 8 (§16.1 D): branch_economic_value/branch_stop_decision читают роль ρ
+    на РЕАЛЬНЫХ боевых данных — OPTIMIZED-ρ зануляет канал (₽=0), PRICE_INPUT-ρ
+    оставляет его живым (₽>0); стоп §4 честен и не фантомит."""
+    truth = _build_econ_truth()
+    plo, phi = _prop_range(truth, "price")
+    price_spec = DesirabilitySpec("min", low=plo, high=phi, weight=1.0)
+    quality = {"strength": DesirabilitySpec("max", low=2.0, high=12.0, weight=1.0),
+               "dry_time": DesirabilitySpec("min", low=-3.0, high=3.0, weight=1.0)}
+    X_REF = [0.25, 0.25, 0.25, 0.25, 0.5, 0.5]   # baseline-инкумбент (subopt)
+
+    runner = MixtureProcessRunner(_econ_model_schema(), truth,
+                                  baseline=X_REF, seed=33, n_restarts=2)
+    runner.begin_phase(mixture_free=_COMPS4, process_free=["T", "P"])
+    runner.seed_initial(n=28, seed=33)
+
+    # price_in: ρ -> цена (PRICE_INPUT); rho_goal: те же цели + ρ как min-цель
+    runner.add_branch("price_in", dict(quality), budget=30, satisfy_at=1.1,
+                      branch_id="price_in")
+    rho_goal_specs = dict(quality)
+    rho_goal_specs["rho"] = DesirabilitySpec("min", low=0.0, high=3.0, weight=1.0)
+    runner.add_branch("rho_goal", rho_goal_specs, budget=30, satisfy_at=1.1,
+                      branch_id="rho_goal")
+    for bid in ("price_in", "rho_goal"):
+        runner.set_branch_cost(bid, _comp_price, price_spec, rho_property="rho",
+                               cost_name="price")
+        br = runner.branches[bid]
+        br.volume, br.cost_exp, br.horizon = 1.0e4, 1.0e-3, 100.0
+
+    print("\n=== STEP 8: role-aware money leg on REAL battle data (§16.1 D) ===")
+    # роль ρ читается из НАМЕРЕНИЯ каждой ветки (branch-local, приоритет M2)
+    assert runner.response_role("price_in", "rho") == ROLE_PRICE_INPUT
+    assert runner.response_role("rho_goal", "rho") == ROLE_OPTIMIZED
+    assert runner.price_channel_suppressed("price_in") is False
+    assert runner.price_channel_suppressed("rho_goal") is True
+
+    # набираем РЕАЛЬНЫЕ точки на ОБЩЕЙ модели (несколько раундов каждой ветке)
+    for _ in range(3):
+        for bid in ("price_in", "rho_goal"):
+            runner.run_branch_round(bid, n_points=5, explore_frac=0.2,
+                                    n_candidates=400)
+
+    ev_price = runner.branch_economic_value("price_in", x_ref=X_REF, seed=909)
+    ev_rho = runner.branch_economic_value("rho_goal", x_ref=X_REF, seed=909)
+    print(f"  price_in (PRICE_INPUT, channel ALIVE): branch_economic_value="
+          f"{ev_price:.3f}")
+    print(f"  rho_goal (OPTIMIZED,  channel ZEROED): branch_economic_value="
+          f"{ev_rho:.3f}")
+
+    # OPTIMIZED-ρ: денежная нога занулена РОВНО (двойной счёт одной δρ убран)
+    assert ev_rho == 0.0, (
+        f"OPTIMIZED-ρ канал не занулён на реальных данных: ev={ev_rho:.4f}")
+    # PRICE_INPUT-ρ: канал жив -> деньги за удешевление есть (>0)
+    assert ev_price > 0.0, (
+        f"PRICE_INPUT-ρ канал не дал денег на реальных данных: ev={ev_price:.4f}")
+
+    # двойной стоп §4 честен (тот же evaluate_stop-движок, что step6):
+    common = dict(delta_d=0.1, ceil=1.5, x_ref=X_REF, seed=909)
+    dec_rho = runner.branch_stop_decision("rho_goal", **common)
+    dec_price = runner.branch_stop_decision("price_in", **common)
+    print(f"  rho_goal stop: reason={dec_rho.reason} "
+          f"red_flag={dec_rho.econ_red_flag}")
+    print(f"  price_in stop: reason={dec_price.reason} "
+          f"red_flag={dec_price.econ_red_flag}")
+    # занулённый канал НЕ фантомит: денег за σ_ρ нет -> not_economical + честный флаг
+    assert dec_rho.reason == STOP_NOT_ECONOMICAL
+    assert dec_rho.econ_red_flag is True
+    # живой канал с богатой экономикой: деньги реальны -> тех.прогресс не ветируется
+    assert dec_price.reason is None
+    assert dec_price.econ_red_flag is False
+
+    # общая база реально росла ОБЕИМИ ветками (branch-local на ОДНОМ оракуле)
+    counts = runner.origin_counts()
+    assert counts.get("branch:price_in", 0) >= 10
+    assert counts.get("branch:rho_goal", 0) >= 10
 
 
 

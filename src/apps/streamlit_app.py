@@ -30,9 +30,13 @@ from src.core.simplex import parts_ranges_to_fraction_bounds  # noqa: E402
 from src.models.moe import MixtureOfExperts  # noqa: E402
 
 from src.apps.pipeline_runner import (PipelineConfig, PipelineRunner,  # noqa: E402
-                                       list_projects)
+                                       list_projects, delete_project)
+from src.apps.battle_preset import battle_step6_snapshot  # noqa: E402
+
 from src.optimize.desirability import DesirabilitySpec  # noqa: E402
 from src.apps import assistant as ai  # noqa: E402
+from src.apps import admin  # noqa: E402
+
 from src.apps.campaign_ui import (render_campaign,  # noqa: E402
                                   campaign_assistant_overview)
 
@@ -359,7 +363,12 @@ def sidebar_config():
                          comp_mode=comp_meta["comp_mode"],
                          base_index=comp_meta["base_index"],
                          parts_min=comp_meta["parts_min"],
-                         parts_max=comp_meta["parts_max"])
+                         parts_max=comp_meta["parts_max"],
+                         # известная истина лаборатории (пресеты, напр. battle):
+                         # в форме не редактируется — переносится из defaults как
+                         # есть, чтобы синт.лаборатория осталась детерминированной
+                         truth_model=d.get("truth_model"),
+                         truth_coef_by_property=d.get("truth_coef_by_property"))
 
     project_dir = os.path.join(_REPO, "project_ui", name)
     return cfg, project_dir
@@ -417,6 +426,24 @@ def render_project_loader(root: str):
             st.rerun()
         except Exception as exc:  # noqa: BLE001
             st.sidebar.error(f"Не удалось загрузить '{sel}': {exc}")
+
+    # «Боевой» пресет STEP 6: загружает в форму готовый снимок (4 компонента,
+    # реальные цены, 5 свойств) с ИЗВЕСТНОЙ синт.истиной (cubic) — лаборатория
+    # детерминирована, можно сразу гонять M1…M8 и сверять с benchmark.
+    if st.sidebar.button("🥊 Боевой пресет (battle STEP 6)", key="load_battle",
+                         help="Заполняет форму конфигурацией STEP 6 из "
+                              "battle-теста: 4 компонента {A,B,C,D}, реальные "
+                              "цены, свойства strength/gloss/dry_time/"
+                              "whiteStrength/ρ и известная истина лаборатории."):
+        snap = battle_step6_snapshot()
+        st.session_state["cfg_defaults"] = snap
+        st.session_state["cfg_ver"] = _ver() + 1
+        st.session_state.pop("runner", None)   # пересоберётся из нового конфига
+        st.session_state["loaded_msg"] = (
+            "Боевой пресет STEP 6 загружен в форму (истина лаборатории задана). "
+            "Прогоняйте M1…M8 и сверяйте с Benchmark.")
+        st.rerun()
+
     if st.session_state.get("loaded_msg"):
         st.sidebar.success(st.session_state.pop("loaded_msg"))
 
@@ -429,6 +456,57 @@ def render_project_saver(runner: PipelineRunner):
             st.sidebar.success(f"Проект сохранён: {Path(path).parent.name}")
         except Exception as exc:  # noqa: BLE001
             st.sidebar.error(f"Не удалось сохранить: {exc}")
+
+
+def render_project_deleter(root: str):
+    """🗑 Danger zone: удаление проекта под подтверждением + паролём.
+
+    Это БАРЬЕР от случайного удаления обычным пользователем, а не криптозащита
+    (проверка серверная, репозиторий открытый). Удаление требует трёх условий:
+    выбрать проект, вписать его имя для подтверждения и ввести admin-пароль
+    (env ``DOE_ADMIN_PASSWORD``; дефолт см. :mod:`src.apps.admin`).
+    """
+    with st.sidebar.expander("🗑 Удалить проект (admin)", expanded=False):
+        if st.session_state.get("del_msg"):
+            st.success(st.session_state.pop("del_msg"))
+        projs = list_projects(root)
+        if not projs:
+            st.caption("Сохранённых проектов нет.")
+            return
+        st.caption("Удаление безвозвратно. Это барьер от случайного удаления "
+                   "(не криптозащита): нужен пароль администратора "
+                   "(переменная окружения `DOE_ADMIN_PASSWORD`).")
+        target = st.selectbox("Проект для удаления", projs, key="del_select")
+        confirm = st.text_input("Подтвердите: впишите имя проекта точно",
+                                key="del_confirm")
+        pwd = st.text_input("Пароль администратора", type="password",
+                            key="del_pwd")
+        if st.button("🗑 Удалить навсегда", key="del_button"):
+            if confirm != target:
+                st.error("Имя для подтверждения не совпадает с выбранным "
+                         "проектом — удаление отменено.")
+            elif not admin.check_admin_password(pwd):
+                st.error("Неверный пароль администратора — удаление отменено.")
+            else:
+                try:
+                    ok = delete_project(root, target)
+                except ValueError as exc:
+                    st.error(f"Удаление отклонено: {exc}")
+                else:
+                    if not ok:
+                        st.error(f"Проект '{target}' не найден.")
+                    else:
+                        # если удалён сейчас загруженный проект — сбросить сессию,
+                        # чтобы UI не работал с несуществующим каталогом
+                        runner = st.session_state.get("runner")
+                        cur = Path(getattr(runner, "project_dir", "")).name \
+                            if runner is not None else None
+                        if cur == target:
+                            for k in ("runner", "cfg_defaults"):
+                                st.session_state.pop(k, None)
+                        st.session_state["del_msg"] = f"Проект '{target}' удалён."
+                        st.rerun()
+
 
 
 
@@ -1096,19 +1174,23 @@ def render_branches(runner: PipelineRunner):
 
 
 # ----------------------------------------------------------------------
-def render_assistant(runner: PipelineRunner):
-    """💬 Встроенный ИИ-ассистент: видит контекст страниц + мост в trace.
+def render_assistant(runner: PipelineRunner, cfg=None):
+    """💬 Встроенный ИИ-ассистент: видит контекст страниц + ЖИВУЮ форму + мост.
 
     Ассистент читает живое состояние `runner` из session_state (метрики всех
-    стадий, ветки, benchmark) и отвечает через OpenRouter. Тот же снимок
-    пишется в trace, чтобы Cline в VS Code наблюдал данные через MCP
-    `doe-introspect`.
+    стадий, ветки, benchmark) ПЛЮС текущий срез формы сайдбара (`cfg` →
+    `ui.form`) — чтобы «видеть» интерфейс, который настраивает пользователь.
+    Тот же снимок пишется в trace, чтобы Cline в VS Code наблюдал данные через
+    MCP `doe-introspect`.
     """
     st.subheader("💬 Ассистент: интерпретация результатов и подсказки по шагам")
 
     # Сводка кампании (§16.1): per-branch роли + денежный канал ρ. Если демо-
     # кампания не создана — None (мост просто не добавит блок campaign).
     camp = campaign_assistant_overview()
+    # Срез ЖИВОЙ формы сайдбара → ассистент «видит» интерфейс (ui.form).
+    form_ctx = ai.form_context(cfg)
+
 
     # --- настройки подключения (ключ/модель вводятся прямо здесь) -------
 
@@ -1159,7 +1241,8 @@ def render_assistant(runner: PipelineRunner):
         try:
             info = ai.write_live_snapshot(
                 runner, chat_history=st.session_state.get("ai_history", []),
-                campaign=camp)
+                campaign=camp, form=form_ctx)
+
             st.session_state["ai_snapshot_msg"] = (
                 f"Снапшот записан в trace: run_id=`{info['run_id']}` "
                 f"(сообщений в чате: {info.get('n_messages', 0)}; каталог: "
@@ -1172,7 +1255,8 @@ def render_assistant(runner: PipelineRunner):
         st.info(st.session_state.pop("ai_snapshot_msg"))
 
     with st.expander("👁️ Что сейчас «видит» ассистент (контекст страниц)"):
-        st.json(ai.build_context(runner, campaign=camp))
+        st.json(ai.build_context(runner, extra=form_ctx, campaign=camp))
+
 
     if not ai.llm_available():
         st.caption("Чтобы включить чат, задайте переменную окружения "
@@ -1200,6 +1284,7 @@ def render_assistant(runner: PipelineRunner):
             with st.spinner("Думаю над контекстом…"):
                 try:
                     reply = ai.assistant_reply(runner, history[:-1], prompt,
+                                               extra_context=form_ctx,
                                                campaign=camp)
                 except Exception as exc:  # noqa: BLE001
                     reply = f"⚠️ Ошибка обращения к модели: {exc}"
@@ -1209,7 +1294,9 @@ def render_assistant(runner: PipelineRunner):
         # мост: фиксируем для Cline полный диалог (включая последний ответ),
         # чтобы переписку было видно через MCP get_stage `assistant_chat`.
         try:
-            ai.write_live_snapshot(runner, chat_history=history, campaign=camp)
+            ai.write_live_snapshot(runner, chat_history=history, campaign=camp,
+                                   form=form_ctx)
+
         except Exception:  # noqa: BLE001 — мост не должен ломать чат
             pass
 
@@ -1228,6 +1315,7 @@ def main():
 
     root = os.path.join(_REPO, "project_ui")
     render_project_loader(root)            # 📁 открыть сохранённый проект
+    render_project_deleter(root)           # 🗑 удалить проект (под паролём)
     cfg, project_dir = sidebar_config()
     if st.sidebar.button("🔧 Создать / сбросить проект"):
         get_runner(cfg, project_dir, reset=True)
@@ -1236,6 +1324,8 @@ def main():
     runner = _sync_runner(cfg, project_dir)
     render_project_saver(runner)           # 💾 сохранить проект целиком
     render_checkpoints(runner, cfg, project_dir)
+
+
 
     # индикатор пройденных стадий — по долговечному состоянию проекта
     # (учитывает загруженные проекты и кэш метрик, не только in-memory results)
@@ -1263,7 +1353,8 @@ def main():
     with tabs[n + 2]:
         render_benchmark(runner)
     with tabs[n + 3]:
-        render_assistant(runner)
+        render_assistant(runner, cfg)
+
 
 
 if __name__ == "__main__":

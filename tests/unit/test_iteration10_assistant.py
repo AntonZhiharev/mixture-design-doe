@@ -101,3 +101,67 @@ def test_call_llm_without_key_raises(monkeypatch):
     assert ai.llm_available() is False
     with pytest.raises(RuntimeError):
         ai.call_llm([{"role": "user", "content": "x"}])
+
+
+# ----------------------------------------------------------------------
+# Контекст ЖИВОЙ формы сайдбара (ui.form) — ассистент «видит» интерфейс
+# ----------------------------------------------------------------------
+def test_form_context_captures_sidebar_fields():
+    cfg = PipelineConfig(
+        name="form_proj", q=3, model="quadratic", noise_sd=0.15, seed=7,
+        names=["Вода", "Соль", "Сахар"], property_names=["A", "B"],
+        lower=[0.1, 0.0, 0.0], upper=[0.8, 0.5, 0.5],
+        comp_mode="parts", base_index=0, parts_min=[100.0, 0.0, 0.0],
+        parts_max=[100.0, 10.0, 5.0], cost_coeffs=[1.0, 2.0, 3.0],
+        cost_unit="₽/кг", batch_size=250.0, batch_unit="кг", n_blocks=2)
+    fc = ai.form_context(cfg)
+    form = fc["form"]
+    assert form["name"] == "form_proj" and form["q"] == 3
+    assert form["names"] == ["Вода", "Соль", "Сахар"]
+    assert form["property_names"] == ["A", "B"]
+    assert form["composition"]["mode"] == "parts"
+    assert form["composition"]["base_index"] == 0
+    assert form["composition"]["parts_max"] == [100.0, 10.0, 5.0]
+    assert form["composition"]["lower"] == [0.1, 0.0, 0.0]
+    assert form["cost_unit"] == "₽/кг" and form["cost_coeffs"] == [1.0, 2.0, 3.0]
+    assert form["batch_size"] == 250.0 and form["batch_unit"] == "кг"
+    assert form["n_blocks"] == 2
+    # None-cfg → пустой словарь (ассистент просто не получит блок формы)
+    assert ai.form_context(None) == {}
+
+
+def test_build_context_nests_form_under_ui(tmp_path):
+    r = _runner(tmp_path, name="ui_form_proj")
+    fc = ai.form_context(r.cfg)
+    ctx = ai.build_context(r, extra=fc)
+    json.dumps(ctx)                       # сериализуемость не ломается
+    assert ctx["ui"]["form"]["q"] == r.cfg.q
+    assert ctx["ui"]["form"]["property_names"] == list(r.cfg.property_names)
+
+
+def test_live_snapshot_carries_form_in_meta(tmp_path):
+    r = _runner(tmp_path, name="snap_form_proj")
+    fc = ai.form_context(r.cfg)
+    root = str(tmp_path / "trace")
+    info = ai.write_live_snapshot(r, root=root, form=fc)
+    overview = queries.run_overview(root, info["run_id"])
+    assert overview["meta"]["form"]["q"] == r.cfg.q
+    assert overview["meta"]["form"]["property_names"] == list(r.cfg.property_names)
+
+
+def test_context_includes_ui_guide_with_delete_button(tmp_path):
+    """ui_guide описывает интерфейс, чтобы ассистент отвечал «где нажать».
+
+    В частности — блок удаления проекта в сайдбаре (типовой вопрос).
+    """
+    r = _runner(tmp_path, name="guide_proj")
+    ctx = ai.build_context(r)
+    guide = ctx["ui_guide"]
+    assert "sidebar" in guide and "tabs" in guide
+    blob = json.dumps(guide, ensure_ascii=False).lower()
+    assert "удалить проект" in blob and "пароль" in blob
+    assert "benchmark" in blob and "ветки" in blob
+
+
+
+

@@ -106,21 +106,33 @@ class MultiSyntheticScheffe:
     def __init__(self, q: int, property_names: Sequence[str],
                  model: Union[str, int] = "quadratic",
                  noise_sd: float = 0.0, seed: int | None = 0,
-                 names: Sequence[str] | None = None):
+                 names: Sequence[str] | None = None,
+                 coef_by_property: "dict[str, Sequence[float]] | None" = None):
         self.q = int(q)
         self.model = model
         self.noise_sd = float(noise_sd)
         self.property_names = list(property_names)
         if len(self.property_names) == 0:
             raise ValueError("Need at least one property name.")
+        # ИЗВЕСТНЫЕ коэффициенты по свойствам (опц.): задают детерминированную
+        # «battle»-истину вместо случайной демо-генерации.
+        coef_by_property = dict(coef_by_property or {})
+        unknown = set(coef_by_property) - set(self.property_names)
+        if unknown:
+            raise ValueError(
+                f"coef_by_property содержит неизвестные свойства {sorted(unknown)}; "
+                f"известные: {self.property_names}")
         base = 0 if seed is None else int(seed)
-        # отдельная «истина» на каждое свойство (разные seed → разные функции).
-        # Свойство 0 использует базовый seed — совместимо с одно-откликовым
+        # отдельная «истина» на каждое свойство. Если для свойства заданы ЯВНЫЕ
+        # коэффициенты — используем их; иначе воспроизводимые случайные от seed.
+        # Свойство 0 без явных коэф. совместимо с одно-откликовым
         # SyntheticScheffe(seed=base).
         self.truths = [
-            SyntheticScheffe(q, model=model, noise_sd=noise_sd,
+            SyntheticScheffe(q, model=model,
+                             coefficients=coef_by_property.get(name),
+                             noise_sd=noise_sd,
                              seed=base + 1009 * i, names=names)
-            for i in range(len(self.property_names))
+            for i, name in enumerate(self.property_names)
         ]
 
 

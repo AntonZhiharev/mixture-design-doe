@@ -10,9 +10,11 @@
 """
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
+
 
 
 import numpy as np
@@ -67,6 +69,15 @@ class PipelineConfig:
     base_index: Optional[int] = None                # база (=100 частей) в режиме parts
     parts_min: Optional[Sequence[float]] = None     # min частей по компонентам
     parts_max: Optional[Sequence[float]] = None     # max частей по компонентам
+    # модель ИСТИНЫ синт.лаборатории (опц.): порядок Scheffé генератора отклика.
+    # Расцеплена с `model` (та — для D-опт/Scheffé-интерпретации M3): лаборатория
+    # может быть cubic (тройные термы), а конвейер аппроксимирует её quadratic —
+    # реальная математика на GP/MoE, порядок Scheffé им не важен. None → = model.
+    truth_model: Optional[str] = None
+    # известная истина синт.лаборатории (опц.): свойство → полный вектор коэф.
+    # Scheffé под (q, truth_model). Если задано — лаборатория детерминирована.
+    truth_coef_by_property: Optional[Dict[str, Sequence[float]]] = None
+
 
 
 
@@ -105,6 +116,8 @@ class PipelineConfig:
             base_index=d.get("base_index"),
             parts_min=d.get("parts_min"),
             parts_max=d.get("parts_max"),
+            truth_model=d.get("truth_model"),
+            truth_coef_by_property=d.get("truth_coef_by_property"),
         )
 
 
@@ -123,10 +136,14 @@ class PipelineRunner:
         # целевые свойства (P): мультиотклик (REBUILD_SPEC §12)
         self.property_names = (list(config.property_names)
                                if config.property_names else ["y"])
-        # синтетическая «лаборатория»: P независимых истин, мерит все свойства
+        # синтетическая «лаборатория»: P независимых истин, мерит все свойства.
+        # Модель ИСТИНЫ (truth_model) расцеплена с моделью конвейера (model):
+        # лаборатория может быть выше порядком (cubic), чем Scheffé-интерпретация.
+        truth_model = config.truth_model or config.model
         self.truth_multi = MultiSyntheticScheffe(
-            self.q, self.property_names, model=config.model,
-            noise_sd=config.noise_sd, seed=config.seed)
+            self.q, self.property_names, model=truth_model,
+            noise_sd=config.noise_sd, seed=config.seed,
+            coef_by_property=config.truth_coef_by_property)
         # первичная истина (свойство 0) — для M6/M7/benchmark (1D, совместимость)
         self.truth = self.truth_multi.truths[0]
         self.cost_coeffs = (np.asarray(config.cost_coeffs, float)
@@ -190,6 +207,11 @@ class PipelineRunner:
                           if self.cfg.parts_min is not None else None),
             "parts_max": (list(self.cfg.parts_max)
                           if self.cfg.parts_max is not None else None),
+            "truth_model": self.cfg.truth_model,
+            "truth_coef_by_property": (
+                {k: list(map(float, v))
+                 for k, v in self.cfg.truth_coef_by_property.items()}
+                if self.cfg.truth_coef_by_property is not None else None),
         }
 
 
@@ -1254,5 +1276,36 @@ def list_projects(root: str | Path) -> List[str]:
         return []
     return sorted(p.name for p in root.iterdir()
                   if p.is_dir() and (p / "state.json").exists())
+
+
+def delete_project(root: str | Path, name: str) -> bool:
+    """Удалить сохранённый проект (каталог ``root/name``) целиком.
+
+    Деструктивная операция — в UI закрыта подтверждением + паролём
+    (см. :mod:`src.apps.admin`). Здесь — только защита от ошибок:
+
+    - ``name`` непустой и не содержит разделителей пути/``..`` (анти-traversal);
+    - целевой каталог обязан лежать ВНУТРИ ``root`` и быть валидным проектом
+      (наличие ``state.json``), иначе ``ValueError`` — чтобы случайно не снести
+      постороннюю папку.
+
+    Возвращает ``True`` при успешном удалении, ``False`` — если проекта нет.
+    """
+    name = (name or "").strip()
+    if not name or name in (".", "..") or any(s in name for s in ("/", "\\")):
+        raise ValueError(f"Недопустимое имя проекта: {name!r}")
+    root = Path(root).resolve()
+    target = (root / name).resolve()
+    # target должен быть прямым потомком root (анти-traversal)
+    if target.parent != root:
+        raise ValueError(f"Проект вне каталога проектов: {target}")
+    if not target.exists():
+        return False
+    if not (target / "state.json").exists():
+        raise ValueError(f"'{name}' не похож на проект (нет state.json) — "
+                         f"удаление отклонено.")
+    shutil.rmtree(target)
+    return True
+
 
 

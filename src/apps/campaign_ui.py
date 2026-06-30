@@ -154,6 +154,27 @@ def get_campaign_controller() -> Optional["cv.CampaignController"]:
     return st.session_state.get("campaign_ctrl")
 
 
+def campaign_assistant_overview(
+        ctrl: Optional["cv.CampaignController"] = None) -> Optional[Dict[str, Any]]:
+    """Сводка кампании для ассистента/MCP (§16.1) или ``None``, если кампании нет.
+
+    Берёт контроллер из ``session_state`` (либо переданный) и отдаёт
+    ``campaign_overview`` с объяснением денежного канала ρ (``with_money=True``),
+    но БЕЗ дорогого econ-MC (``compute_value=False``) — нужны роли, занулённый/
+    живой канал и причина «почему за ρ есть/нет денег» (``reason_code``/``text``),
+    а не точная ₽-оценка. Read-only (A0.6); ошибки гасятся в ``None``, чтобы мост
+    к ассистенту/Cline никогда не ронял основной UI.
+    """
+    ctrl = ctrl if ctrl is not None else get_campaign_controller()
+    if ctrl is None:
+        return None
+    try:
+        return ctrl.overview(with_money=True, compute_value=False)
+    except Exception:  # noqa: BLE001 — мост не должен ломать UI
+        return None
+
+
+
 def _rho_of(runner, branch_id: str) -> Optional[str]:
     pcfg = cv.branch_price_config(runner, branch_id)
     return pcfg["rho_property"] if pcfg else None

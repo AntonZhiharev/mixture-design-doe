@@ -33,7 +33,8 @@ from src.apps.pipeline_runner import (PipelineConfig, PipelineRunner,  # noqa: E
                                        list_projects)
 from src.optimize.desirability import DesirabilitySpec  # noqa: E402
 from src.apps import assistant as ai  # noqa: E402
-from src.apps.campaign_ui import render_campaign  # noqa: E402
+from src.apps.campaign_ui import (render_campaign,  # noqa: E402
+                                  campaign_assistant_overview)
 
 
 STAGES = [
@@ -1105,7 +1106,12 @@ def render_assistant(runner: PipelineRunner):
     """
     st.subheader("💬 Ассистент: интерпретация результатов и подсказки по шагам")
 
+    # Сводка кампании (§16.1): per-branch роли + денежный канал ρ. Если демо-
+    # кампания не создана — None (мост просто не добавит блок campaign).
+    camp = campaign_assistant_overview()
+
     # --- настройки подключения (ключ/модель вводятся прямо здесь) -------
+
     with st.expander("⚙️ Подключение: API-ключ и модель",
                      expanded=not ai.llm_available()):
         st.caption("Ключ OpenRouter (sk-or-…) и имя модели. Кнопка «💾 Сохранить» "
@@ -1152,7 +1158,8 @@ def render_assistant(runner: PipelineRunner):
                        key="ai_snapshot", use_container_width=True):
         try:
             info = ai.write_live_snapshot(
-                runner, chat_history=st.session_state.get("ai_history", []))
+                runner, chat_history=st.session_state.get("ai_history", []),
+                campaign=camp)
             st.session_state["ai_snapshot_msg"] = (
                 f"Снапшот записан в trace: run_id=`{info['run_id']}` "
                 f"(сообщений в чате: {info.get('n_messages', 0)}; каталог: "
@@ -1165,7 +1172,7 @@ def render_assistant(runner: PipelineRunner):
         st.info(st.session_state.pop("ai_snapshot_msg"))
 
     with st.expander("👁️ Что сейчас «видит» ассистент (контекст страниц)"):
-        st.json(ai.build_context(runner))
+        st.json(ai.build_context(runner, campaign=camp))
 
     if not ai.llm_available():
         st.caption("Чтобы включить чат, задайте переменную окружения "
@@ -1192,7 +1199,8 @@ def render_assistant(runner: PipelineRunner):
         with st.chat_message("assistant"):
             with st.spinner("Думаю над контекстом…"):
                 try:
-                    reply = ai.assistant_reply(runner, history[:-1], prompt)
+                    reply = ai.assistant_reply(runner, history[:-1], prompt,
+                                               campaign=camp)
                 except Exception as exc:  # noqa: BLE001
                     reply = f"⚠️ Ошибка обращения к модели: {exc}"
                 st.markdown(reply)
@@ -1201,7 +1209,7 @@ def render_assistant(runner: PipelineRunner):
         # мост: фиксируем для Cline полный диалог (включая последний ответ),
         # чтобы переписку было видно через MCP get_stage `assistant_chat`.
         try:
-            ai.write_live_snapshot(runner, chat_history=history)
+            ai.write_live_snapshot(runner, chat_history=history, campaign=camp)
         except Exception:  # noqa: BLE001 — мост не должен ломать чат
             pass
 

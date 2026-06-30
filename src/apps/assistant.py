@@ -256,8 +256,16 @@ def completed_stages(runner) -> List[str]:
     return sorted(done)
 
 
-def build_context(runner, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """JSON-сериализуемый снимок состояния приложения для ассистента."""
+def build_context(runner, extra: Optional[Dict[str, Any]] = None,
+                  campaign: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """JSON-сериализуемый снимок состояния приложения для ассистента.
+
+    ``campaign`` (опц., §16.1) — сводка кампании MixtureProcessRunner
+    (``campaign.campaign_overview``): per-branch роли, занулённый/живой денежный
+    канал ρ (И-5/Гр-1) и объяснение «почему за ρ есть/нет денег». Прокидывается в
+    контекст, чтобы ассистент объяснял атрибуцию, не выдумывая.
+    """
+
     stages_done = completed_stages(runner)
     metrics = _stage_metrics(runner)
     # стадии, пройденные ранее (восстановлены из проекта), но без детальных
@@ -293,6 +301,8 @@ def build_context(runner, extra: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
     if extra:
         ctx["ui"] = extra
+    if campaign:
+        ctx["campaign"] = campaign
     return _jsonable(ctx)
 
 
@@ -370,7 +380,8 @@ def _normalize_chat(chat_history) -> List[Dict[str, str]]:
 
 def write_live_snapshot(runner, root: Optional[str] = None,
                         run_id: Optional[str] = None,
-                        chat_history=None) -> Dict[str, str]:
+                        chat_history=None,
+                        campaign: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """Записать живой снимок приложения в trace (мост к Cline в VS Code).
 
     Если передана ``chat_history`` (список ``{"role", "content"}`` из чата
@@ -406,6 +417,14 @@ def write_live_snapshot(runner, root: Optional[str] = None,
         tr.log("assistant_chat", inputs={},
                outputs={"history": chat},
                metrics={"n_messages": len(chat)})
+    if campaign:
+        # §16.1: per-branch роли + денежный канал ρ → Cline видит атрибуцию
+        # через MCP get_stage(run_id, "campaign") (И-5/Гр-1, не выдумано).
+        br = campaign.get("branches", []) if isinstance(campaign, dict) else []
+        tr.log("campaign", inputs={}, outputs=campaign,
+               metrics={"n_branches": len(br),
+                        "n_price_suppressed": sum(
+                            1 for b in br if b.get("price_channel_suppressed"))})
     path = tr.save()
     return {"run_id": rid, "path": path, "root": root,
             "n_messages": str(len(chat))}
@@ -439,7 +458,16 @@ def system_prompt() -> str:
         "пересчитаны — так и скажи и предложи перезапустить стадию ради цифр, "
         "но НЕ утверждай, что стадия «не выполнена»;\n"
         "• подсказывай следующий разумный шаг по конвейеру;\n"
-        "• не выдумывай метрики, которых нет в контексте."
+        "• не выдумывай метрики, которых нет в контексте.\n\n"
+        "Если в контексте есть блок `campaign` (кампания со ВЕТКАМИ и ролями "
+        "откликов): роль отклика — атрибут ПАРЫ (ветка × отклик), внутри ветки "
+        "строгий XOR (`OPTIMIZED` — цель/нога качества, либо `PRICE_INPUT` — "
+        "питает цену). Между ветками роли свободно различаются. Денежный канал ρ "
+        "role-aware (И-5): при `OPTIMIZED` ценовой σ_ρ-канал ЗАНУЛЁН (за ρ денег "
+        "нет — иначе двойной счёт одной δρ), при `PRICE_INPUT` — ЖИВОЙ. Объясняя "
+        "«почему за ρ есть/нет денег», опирайся на `campaign...money` "
+        "(`reason_code`/`text`) и `price_channel_suppressed`, НЕ путай ветки и НЕ "
+        "выдумывай: role-tag правдив только в контексте своей ветки."
 
     )
 
@@ -505,8 +533,14 @@ def call_llm(messages: List[Dict[str, str]], *, model: Optional[str] = None,
 
 def assistant_reply(runner, history: List[Dict[str, str]], user_msg: str, *,
                     extra_context: Optional[Dict[str, Any]] = None,
+                    campaign: Optional[Dict[str, Any]] = None,
                     model: Optional[str] = None) -> str:
-    """Собрать контекст страниц и получить ответ модели на сообщение."""
-    context = build_context(runner, extra=extra_context)
+    """Собрать контекст страниц и получить ответ модели на сообщение.
+
+    ``campaign`` (опц., §16.1) — сводка кампании (``campaign_overview``); попадает
+    в контекст блоком ``campaign``, чтобы ассистент объяснял per-branch роли и
+    денежный канал ρ по реальной атрибуции ядра, не выдумывая.
+    """
+    context = build_context(runner, extra=extra_context, campaign=campaign)
     messages = build_messages(context, history, user_msg)
     return call_llm(messages, model=model)

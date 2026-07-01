@@ -36,9 +36,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from ..core.schema_evolution import (KNOWN_CONSTANT, evolve_schema,
+                                      known_constant)
 from ..design.branches import (ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
                                 ROLE_PRIORITY)
 from ..optimize.desirability import Desirability, DesirabilitySpec
+
 
 # ----------------------------------------------------------------------
 # Ярлыки ролей и денежного канала (для UI/MCP; единый источник — без копий)
@@ -612,7 +615,143 @@ class CampaignController:
         self._undo.clear()
         return out
 
+    # ------------------------------------------------------------------
+    # §16.2 — Фасад эволюции схемы кампании (штатная операция живого проекта)
+    #
+    # Тонкая обёртка над runner.augment_phase_*/move_region/evolve_schema:
+    # выводит эволюцию схемы (добавление компонента смеси / процесс-переменной /
+    # отклика, движение границ) в ЯВНЫЙ контракт кампании (ТЗ §16.2) и жёстко
+    # требует политику миграции старых точек (A0.6 — миграция НЕ молча). Одна
+    # модель физики (канон §5/§12), общая база НЕ урезается (И-1): всё делает
+    # ядро; контроллер валидирует и делегирует. Эволюция схемы — структурная
+    # веха: как прогон раунда, она ЗАПЕЧАТЫВАЕТ дно undo (обратимая
+    # интерпретация до эволюции не откатывается сквозь смену версии, Тр-7.2/7.3).
+    # Переменная/компонент обязаны быть объявлены в ПОЛНОЙ схеме проекта — модель
+    # «прогрессивного раскрытия» (append совсем новой оси вне ядра, §16.6).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _require_migration_policy(name: str, migration: Any) -> Dict[str, Any]:
+        """A0.6: политика миграции старых точек ОБЯЗАНА быть задана явно.
+
+        Принимает dict одной из политик ``schema_evolution`` (``known_constant``/
+        ``unknown``/``recompute``). Молчаливого дефолта нет — добавление
+        переменной без явной политики отвергается.
+        """
+        if not isinstance(migration, dict) or "policy" not in migration:
+            raise ValueError(
+                f"A0.6: добавление '{name}' требует ЯВНОЙ политики миграции "
+                f"старых точек (known_constant(v) / unknown() / recompute(fn)) — "
+                f"молчаливой миграции нет.")
+        return dict(migration)
+
+    def add_process_var(self, name: str, migration: Dict[str, Any], *,
+                        lower: Optional[float] = None,
+                        upper: Optional[float] = None) -> Any:
+        """§16.2: APPEND process-переменной как ШТАТНАЯ операция кампании (v+1).
+
+        Делегирует ``runner.augment_phase_schema``. ``migration`` обязателен
+        (A0.6): политика для старых точек, мерившихся БЕЗ этой оси (обычно
+        ``known_constant(baseline)``). ``lower``/``upper`` переопределяют границы
+        (иначе — из полной схемы). Общая база не урезается (И-1); версия растёт.
+        """
+        proc = (list(self.runner._full_proc.names)
+                if getattr(self.runner, "_full_proc", None) else [])
+        if name not in proc:
+            raise KeyError(
+                f"process-переменная '{name}' не объявлена в полной схеме {proc} "
+                f"— фасад раскрывает объявленные оси (append новой вне ядра, §16.6).")
+        mig = self._require_migration_policy(name, migration)
+        bounds = ({name: (float(lower), float(upper))}
+                  if lower is not None and upper is not None else None)
+        out = self.runner.augment_phase_schema([name], migration={name: mig},
+                                               bounds=bounds)
+        self._undo.clear()
+        return out
+
+    def add_mixture_component(self, name: str,
+                              migration: Optional[Dict[str, Any]] = None, *,
+                              lower: Optional[float] = None,
+                              upper: Optional[float] = None) -> Any:
+        """§16.2: APPEND mixture-компонента как ШТАТНАЯ операция кампании (v+1).
+
+        Делегирует ``runner.augment_phase_mixture``. Σ переопределяется
+        (``A+B=1 → A+B+C=1``). Единственная Σ-совместимая политика миграции
+        старых точек — ``known_constant(0.0)`` (грань симплекса C=0), поэтому при
+        ``migration=None`` берётся именно она; иное отвергается (дефолт — не
+        «молчаливый средний», а физически вынужденная грань, §15.0.4).
+        """
+        mix = (list(self.runner._full_mix.names)
+               if getattr(self.runner, "_full_mix", None) else [])
+        if name not in mix:
+            raise KeyError(
+                f"mixture-компонент '{name}' не объявлен в полной схеме {mix} — "
+                f"фасад раскрывает объявленные компоненты (append нового вне ядра, "
+                f"§16.6).")
+        if migration is None:
+            mig = known_constant(0.0)
+        else:
+            mig = self._require_migration_policy(name, migration)
+            if not (mig.get("policy") == KNOWN_CONSTANT
+                    and float(mig.get("value", 1.0)) == 0.0):
+                raise ValueError(
+                    f"mixture-append '{name}': единственная Σ-совместимая "
+                    f"политика — known_constant(0.0) (грань симплекса C=0, "
+                    f"§15.0.4); дано {mig}.")
+        bounds = ({name: (float(lower), float(upper))}
+                  if lower is not None and upper is not None else None)
+        out = self.runner.augment_phase_mixture([name], migration={name: mig},
+                                                bounds=bounds)
+        self._undo.clear()
+        return out
+
+    def add_response(self, spec) -> Any:
+        """§16.2: ввести новый ОТКЛИК в схему (v+1); у старых точек Y[new]=MISSING.
+
+        Обёртка над ``evolve_schema(add_responses=…)``: эволюционирует СХЕМУ
+        (bump версии, change_log). Физические измерения даёт оракул
+        (``property_names``), поэтому суррогаты здесь не переобучаются — новый
+        отклик подхватится, когда оракул начнёт его отдавать (у исторических
+        точек значение честно MISSING, суррогат учится только на измеренных,
+        §13.7).
+        """
+        r = self.runner
+        new = evolve_schema(r.current_schema, add_responses=[spec])
+        r.schema_history.add(new)
+        r.current_schema = new
+        r.current_schema_version = int(new.version)
+        self._undo.clear()
+        return new
+
+    def relax_bounds(self, var: str, lower: float, upper: float,
+                     **kw) -> Any:
+        """§16.2: РАСШИРИТЬ область интереса по ``var`` (region-move, БЕЗ bump).
+
+        Делегирует ``runner.move_region`` (примитив move_bounds классифицирует
+        relax/restrict и проверяет симплекс-замкнутость). Это НЕ append-переменной:
+        состав схемы тот же, версия не растёт (§15.2.4). hard-граница (A0.5) —
+        :class:`RegionMoveError`. История цела; выпавшие точки восстановимы.
+        """
+        kw.setdefault("intent", "relax")
+        out = self.runner.move_region({var: (float(lower), float(upper))}, **kw)
+        self._undo.clear()
+        return out
+
+    def restrict_bounds(self, var: str, lower: float, upper: float,
+                        **kw) -> Any:
+        """§16.2: СУЗИТЬ область интереса по ``var`` (region-move, БЕЗ bump).
+
+        Обёртка-близнец :meth:`relax_bounds` (тот же примитив; направление
+        движения классифицирует move_bounds). Точки вне новой области легально
+        исключаются из активного pool по ``policy`` (дефолт ``exclude``), но
+        ОСТАЮТСЯ в истории (И-1). ``policy='error'`` запрещает потерю измеренной точки.
+        """
+        kw.setdefault("intent", "restrict")
+        out = self.runner.move_region({var: (float(lower), float(upper))}, **kw)
+        self._undo.clear()
+        return out
+
     # -- §8: spawn ветки с НАСЛЕДОВАНИЕМ ролей -------------------------
+
     # Дефолт = наследование намерения родителя (валидный XOR копируется ⇒ ребёнок
     # честен by default, Тр-8.1). Наследование НЕ молчаливое: spawn отдаёт
     # обзорную сводку (Тр-8.1а) с пометкой «унаследовано как есть» vs «изменено

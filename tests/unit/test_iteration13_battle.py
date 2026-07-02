@@ -38,6 +38,23 @@ from src.optimize.economic_stop import (decide_stop, evaluate_stop,
                                         expected_price_improvement,
                                         economic_value, price_attributed_value,
                                         price_attribution_alpha, best_of_n_value)
+# ЕДИНЫЙ ИСТОЧНИК истины battle-теста (без дубля коэффициентов, канон .clinerules):
+# схемы/коэффициенты/цены живут в src.verification.battle_truth, отсюда — тонкие
+# алиасы. Тот же модуль питает ручной хелпер откликов tools/response_helper.py.
+from src.verification.battle_truth import (
+    coef_from_terms as _coef,
+    truth_schema_3comp as _truth_schema,
+    model_schema_3comp as _model_schema,
+    truth_schema_econ as _econ_truth_schema,
+    model_schema_econ as _econ_model_schema,
+    build_truth_3comp,
+    build_truth_econ,
+    comp_price_3comp as _comp_price3,
+    comp_price_econ as _comp_price,
+    PRICE_3COMP as _PRICE3,
+    PRICE_ECON as _PRICE4,
+    COMPS_ECON as _COMPS4,
+)
 
 
 
@@ -51,33 +68,6 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 
 # ----------------------------------------------------------------------
-def _truth_schema():
-    """Истина: CUBIC mixture + quadratic process + полный кросс."""
-    mix = VariableBlock.mixture(["A", "B", "C"])
-    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
-    model = ModelSpec(cross_level="full-cross", mixture_order="cubic",
-                      process_order="quadratic")
-    return ProjectSchema.mixture_process(mix, proc, model=model)
-
-
-def _model_schema():
-    """Модель пайплайна: QUADRATIC mixture (тренд/скрининг); остаток ловит GP."""
-    mix = VariableBlock.mixture(["A", "B", "C"])
-    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
-    model = ModelSpec(cross_level="full-cross", mixture_order="quadratic",
-                      process_order="quadratic")
-    return ProjectSchema.mixture_process(mix, proc, model=model)
-
-
-def _coef(schema, contributions):
-    """Вектор коэффициентов истины по именам термов (остальные = 0)."""
-    terms = build_model_terms(schema)
-    v = np.zeros(terms.p)
-    for i, name in enumerate(terms.names):
-        v[i] = float(contributions.get(name, 0.0))
-    return v
-
-
 def _refloor_truth(truth, *, B_idx: int, lo: float):
     """Rebuild the truth on a mixture region with a lower bound floor on one
     component (e.g. B >= lo), reusing the SAME coefficient vectors. Used to get
@@ -95,76 +85,9 @@ def _refloor_truth(truth, *, B_idx: int, lo: float):
 
 
 def _build_truth():
-    s = _truth_schema()
-    # ИСТИННАЯ мисспецификация: термы ВНЕ Scheffé-quadratic тренда пайплайна,
-    # которые способен восстановить только GP-остаток (kernel), а не quadratic-mean:
-    #   A*B*C            — спецкубическая синергия состава (degree 3);
-    #   T^2, P^2         — ЧИСТЫЕ квадраты процесса (в Scheffé-quadratic их нет).
-    # Парные термы (A*B, A:T, T*P, …) — degree 2 и лежат ВНУТРИ тренда (не стресс).
-    # INTERIOR trade-off design: every branch optimum keeps A,B,C all > 0 (no
-    # recipe component degenerates to a vertex/edge). Achieved purely via truth
-    # coefficients (core untouched):
-    #   * concave composition synergies (A*B, A*C, B*C, A*B*C) build an interior
-    #     ridge so pure vertices are dominated by mixtures;
-    #   * equal linear price (A=B=C=2) removes the structural push of one cheap
-    #     vertex; trade-offs come from synergies, not from a linear price gradient;
-    #   * dry_time is COMPOSITION-DEPENDENT (A fast-drying -2, B/C slow +4) - the
-    #     old `3(A+B+C)` was constant on the simplex (Sum x=1) so `fast` ignored
-    #     the recipe and sat on an edge; now `fast` genuinely trades composition;
-    #   * gloss reaches its target=8 only through B-bearing ridges (no A*C bypass),
-    #     so `fast` must keep B > 0.
-    # Misspecification (truth richer than the pipeline's quadratic-Scheffe trend)
-    # is preserved by A*B*C (degree-3) and pure process squares T^2/P^2, which
-    # only the GP residual can recover.
-    # Process GATING makes unmasking pay off (ceilings grow across phases):
-    #   * C:T in strength and C:T in dry_time, P/-P^2 in gloss -> phase-1 (C=0,
-    #     T=P=0.5) cannot reach the optimum, so opening T (phase 2) and C+P
-    #     (phase 3) strictly raise the achievable desirability (premium+economy).
-    # premium and economy optima are strictly INTERIOR (A,B,C>0); `fast` lets one
-    # component (B) degenerate toward an edge - this is INTENTIONAL: STEP 4 below
-    # demonstrates the move_bounds primitive by bringing that degenerate component
-    # back into play via a lower-bound shift (anti-degeneracy floor, §15.0.3).
-    coef_by = {
-        # strength: synergies + process gating (A:T, C:T) so T-opening helps
-        "strength":  _coef(s, {"A": 6, "B": 6, "C": 5, "A:T": 5, "C:T": 6,
-                               "T^2": -3, "A*B": 8, "A*C": 9, "B*C": 9,
-                               "A*B*C": 8}),
-        # gloss: B*C/A*B*C-led ridge, concave in P (needs P off baseline)
-        "gloss":     _coef(s, {"A": 3, "B": 6, "C": 6, "P": 7, "P^2": -5,
-                               "A*B": 7, "B*C": 13, "A*C": 9, "A*B*C": 14}),
-        # dry_time (min): composition-dependent (A fast, B/C slow), T-gated (C:T)
-        "dry_time":  _coef(s, {"A": -1, "B": 3, "C": 3, "T": -4, "C:T": -5,
-                               "T^2": 2}),
-        # price (min): mild gradient + NEGATIVE pairwise "blend discount" (a mix
-        # of two components costs less than either pure). A *constant* price
-        # (A=B=C) would be 2*(A+B+C)=2 on the simplex (Sum x=1) -> always zero
-        # deviation, meaningless. A pure linear gradient minimises at a vertex
-        # (degenerate). The blend discount keeps price VARYING across the simplex
-        # (nonzero, branch-specific deviation) with an INTERIOR minimum.
-        "price":     _coef(s, {"A": 2.0, "B": 2.2, "C": 2.4,
-                               "A*B": -1.5, "A*C": -1.5, "B*C": -1.5}),
-        # rho = ПЛОТНОСТЬ (полноценный отклик опыта, GP) для ЭКОНОМИЧЕСКОГО стопа
-        # §4 в шагах 4-5; линейный бленд по {A,B,C} БЕЗ компонента D — множитель
-        # цены изделия price_состав(A,B,C)·ρ (см. _comp_price3 / _run_with_economic_stop).
-        "rho":       _coef(s, {"A": 0.7, "B": 1.0, "C": 1.7}),
-    }
-    return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
-
-
-# ----------------------------------------------------------------------
-# ЭКОНОМИКА для §4 decide_stop в ШАГАХ 4-5 (3-комп мир {A,B,C}, БЕЗ D/white).
-# ρ добавлена в истину как полноценный отклик; цена изделия собирается на лету
-# price_состав(A,B,C)·ρ — ровно как в step6, но без компонента D и без ветки
-# `white` (она D-зависима и здесь не нужна).
-# ----------------------------------------------------------------------
-_PRICE3 = {"A": 95.0, "B": 200.0, "C": 23.0}
-
-
-def _comp_price3(Xc):
-    """price_состав [усл.ед/кг] для 3-комп мира {A,B,C} (детерминирована, БЕЗ D)."""
-    Xc = np.atleast_2d(np.asarray(Xc, float))
-    w = np.array([_PRICE3["A"], _PRICE3["B"], _PRICE3["C"]], float)
-    return Xc[:, :3] @ w
+    # Коэффициенты вынесены в src.verification.battle_truth (единый источник).
+    # Полное обоснование интерьерных оптимумов/мисспецификации/гейтинга — там.
+    return build_truth_3comp()
 
 
 # ----------------------------------------------------------------------
@@ -950,63 +873,16 @@ def test_battle_branches_converge_to_analytic_optimum():
 # КАЖДОЙ ветки (с учётом цены), white держит D, а цена реально двигает рецепт
 # (аналитика с ценой дешевле аналитики без цены).
 # ======================================================================
-_COMPS4 = ["A", "B", "C", "D"]
-_PRICE4 = {"A": 95.0, "B": 200.0, "C": 23.0, "D": 315.0}
 # branch -> (объём т/мес, плотность-ориентир) — экономический контекст
 _BRANCH_ECON = {"premium": (1.0, 1.0), "economy": (5.0, 1.1),
                 "fast": (10.0, 1.4), "white": (1.0, 1.0)}
 _PRICE_W = {"premium": 0.3, "economy": 1.0, "fast": 0.5, "white": 0.5}
 
 
-def _econ_truth_schema():
-    mix = VariableBlock.mixture(_COMPS4)
-    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
-    model = ModelSpec(cross_level="full-cross", mixture_order="cubic",
-                      process_order="quadratic")
-    return ProjectSchema.mixture_process(mix, proc, model=model)
-
-
-def _econ_model_schema():
-    mix = VariableBlock.mixture(_COMPS4)
-    proc = VariableBlock.process(["T", "P"], lower=[0.0, 0.0], upper=[1.0, 1.0])
-    model = ModelSpec(cross_level="full-cross", mixture_order="quadratic",
-                      process_order="quadratic")
-    return ProjectSchema.mixture_process(mix, proc, model=model)
-
-
 def _build_econ_truth():
-    """4-комп истина {A,B,C,D}: 5 откликов (без свойства price — цена собирается
-    из price_состав·ρ). ρ — полноценный отклик. Коэффициенты подобраны так, чтобы
-    оптимумы веток были интерьерными (компоненты «в игре», не вырождаются)."""
-    s = _econ_truth_schema()
-    coef_by = {
-        # strength (max): B критичен через сильные B-синергии; чистый C слаб →
-        # выбрасывать B дорого (держит B в economy несмотря на дороговизну B)
-        "strength":  _coef(s, {"A": 6, "B": 10, "C": 2, "D": 2,
-                               "A:T": 5, "C:T": 3, "T^2": -3,
-                               "A*B": 9, "A*C": 5, "B*C": 16, "A*B*C": 12,
-                               "B*D": 4}),
-        # gloss (max/target): B-гряда; низкая база от A/C/P → target=8 требует B
-        "gloss":     _coef(s, {"A": 3, "B": 7, "C": 3, "D": 2, "P": 6, "P^2": -4,
-                               "A*B": 7, "B*C": 14, "A*C": 6, "A*B*C": 15}),
-        # dry_time (min): A быстрый, C медленный → fast держит A; T-гейт
-        "dry_time":  _coef(s, {"A": -4, "B": 2, "C": 4, "D": 1,
-                               "T": -4, "C:T": -5, "T^2": 2}),
-        # whiteStrength (MIN, меньше=лучше): D — отбеливатель; A,B,C белят в ПАРЕ
-        # с D (A*D/B*D/C*D < 0) → white хочет реальный БЛЕНД вокруг D (интерьер)
-        "whiteStrength": _coef(s, {"A": 5, "B": 6, "C": 3, "D": 1,
-                                   "C*D": -8, "A*D": -5, "B*D": -4}),
-        # rho = ПЛОТНОСТЬ (отклик опыта), линейный бленд — множитель цены изделия
-        "rho":       _coef(s, {"A": 0.7, "B": 1.0, "C": 1.7, "D": 0.6}),
-    }
-    return MultiMixtureProcessTruth(s, coef_by, noise_sd=0.0)
-
-
-def _comp_price(Xc):
-    """price_состав [усл.ед/кг]: детерминированная функция состава (НЕ свойство)."""
-    Xc = np.atleast_2d(np.asarray(Xc, float))
-    w = np.array([_PRICE4[k] for k in _COMPS4], float)
-    return Xc[:, :4] @ w
+    # Схема/коэффициенты STEP 6 вынесены в src.verification.battle_truth
+    # (единый источник — тот же, что питает хелпер откликов).
+    return build_truth_econ()
 
 
 def _item_price_truth_fn(truth):

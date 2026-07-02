@@ -758,8 +758,29 @@ class CampaignController:
         self._undo.clear()
         return out
 
+    # -- §17.4 (Ш3) ручной СТАРТОВЫЙ оракул: предложить seed → зафиксировать Y --
+    def propose_seed(self, n: int = 12, **kw) -> Any:
+        """§17.4: предложить стартовый seed-дизайн БЕЗ измерения (read-only).
+
+        Проброс в :meth:`MixtureProcessRunner.propose_seed`. Первая половина
+        ручного стартового цикла (ветки ещё нет): база и undo-стек не трогаются.
+        """
+        return self.runner.propose_seed(n, **kw)
+
+    def commit_seed(self, X: Any, Y: Any) -> Dict[str, Any]:
+        """§17.4: зафиксировать ВНЕСЁННЫЕ Y стартового seed-дизайна.
+
+        Проброс в :meth:`MixtureProcessRunner.commit_seed`: точки в ОБЩУЮ базу
+        (origin "seed", И-1), суррогаты обучаются. Стартовые измерения — правда,
+        поэтому дно undo запечатывается (как :meth:`commit_measured`).
+        """
+        out = self.runner.commit_seed(X, Y)
+        self._undo.clear()
+        return out
+
     # ------------------------------------------------------------------
     # §16.2 — Фасад эволюции схемы кампании (штатная операция живого проекта)
+
     #
     # Тонкая обёртка над runner.augment_phase_*/move_region/evolve_schema:
     # выводит эволюцию схемы (добавление компонента смеси / процесс-переменной /

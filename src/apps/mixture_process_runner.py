@@ -692,6 +692,57 @@ class MixtureProcessRunner:
         return {"n": int(len(X0)), "P": int(self.Y.shape[1])}
 
     # ------------------------------------------------------------------
+    # §17.4 (Ш3) РУЧНОЙ СТАРТОВЫЙ ОРАКУЛ: seed расщеплён на две половины, как
+    # branch-цикл §17.2 — propose_seed (предложить дизайн БЕЗ измерения, read-only)
+    # и commit_seed (дописать ВНЕСЁННЫЕ Y). :meth:`seed_initial` — авто-обёртка над
+    # ними для синт.оракула (мерит сам). Ветки на старте ещё нет, поэтому это
+    # отдельная от branch-цикла пара; origin точек = "seed".
+    # ------------------------------------------------------------------
+    def propose_seed(self, n: int = 12, *, seed: Optional[int] = None
+                     ) -> np.ndarray:
+        """§17.4: ПРЕДЛОЖИТЬ стартовый seed-дизайн БЕЗ измерения (read-only).
+
+        Возвращает ``n`` составных кандидатов ТЕКУЩЕЙ схемы (mixture-region ×
+        process-куб) как первую половину ручного стартового цикла: пользователь
+        измеряет их сам и фиксирует через :meth:`commit_seed`. НИЧЕГО не измеряет
+        и НЕ пишет в общую базу (A0.6). Детерминированно по ``seed``. Аналог
+        :meth:`propose_points`, но для стартового дизайна (ветки ещё нет)."""
+        s = self.seed if seed is None else int(seed)
+        return self._phase_candidates(int(n), s)
+
+    def commit_seed(self, X: Any, Y: Any) -> Dict[str, Any]:
+        """§17.4: ЗАФИКСИРОВАТЬ измеренные ``Y`` стартового seed-дизайна.
+
+        Вторая половина ручного стартового цикла: ``X`` — кандидаты из
+        :meth:`propose_seed` (координаты текущей схемы, ``n×dim``), ``Y`` —
+        измеренные отклики (``n×P`` в порядке ``property_names``; вносит
+        пользователь). Точки ДОПИСЫВАЮТСЯ в ОБЩУЮ базу с origin-тегом ``"seed"``
+        (И-1, без урезания истории), суррогаты переобучаются. В отличие от
+        :meth:`seed_initial` (авто-оракул), Y приходит от пользователя. Пустой
+        ``X`` — no-op. Возвращает ``{added, n_base, P}``.
+        """
+        newX = np.atleast_2d(np.asarray(X, float))
+        Ynew = np.atleast_2d(np.asarray(Y, float))
+        P = len(self.property_names)
+        if newX.shape[1] != self.dim:
+            raise ValueError(
+                f"X: ожидалось {self.dim} координат на точку, дано {newX.shape[1]}.")
+        if Ynew.shape[0] != newX.shape[0]:
+            raise ValueError(
+                f"Y: строк {Ynew.shape[0]} ≠ числу точек {newX.shape[0]}.")
+        if Ynew.shape[1] != P:
+            raise ValueError(
+                f"Y: ожидалось {P} свойств на строку ({list(self.property_names)}), "
+                f"дано {Ynew.shape[1]}.")
+        if newX.shape[0] == 0:
+            return {"added": 0, "n_base": len(self.points), "P": P}
+        for i in range(len(newX)):
+            self.points.append(self._make_point(newX[i], Ynew[i], "seed"))
+        self.fit_surrogates()
+        return {"added": int(len(newX)), "n_base": len(self.points), "P": P}
+
+
+    # ------------------------------------------------------------------
     # Генерация кандидатов фазы: область кодируется СХЕМОЙ (без маски)
     # ------------------------------------------------------------------
     def _mixture_region(self, schema: Optional[ProjectSchema] = None

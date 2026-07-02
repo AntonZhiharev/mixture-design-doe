@@ -20,10 +20,15 @@
 """
 import numpy as np
 
+import json
+
 from src.core.linalg import scheffe_term_indices
 from src.apps.battle_preset import (battle_step6_snapshot,
-                                     battle_step6_coef_by_property)
+                                     battle_step6_coef_by_property,
+                                     battle_step6_description,
+                                     battle_step6_truth_readable)
 from src.apps.pipeline_runner import PipelineConfig, PipelineRunner
+
 
 
 def test_snapshot_has_known_truth_for_all_properties():
@@ -74,3 +79,46 @@ def test_truth_survives_config_roundtrip(tmp_path):
     i = runner2.property_names.index("rho")
     np.testing.assert_allclose(runner2.truth_multi.truths[i].true(v),
                                [0.7, 1.0, 1.7, 0.6], atol=1e-9)
+
+
+def test_truth_readable_matches_sparse_truth():
+    """Читаемая раскладка истины отражает разреженные термы STEP 6."""
+    readable = battle_step6_truth_readable()
+    # rho — чисто линейное: 4 линейных терма, без взаимодействий
+    rho = readable["rho"]
+    assert {t["term"] for t in rho} == {"A", "B", "C", "D"}
+    assert all(t["order"] == 1 for t in rho)
+    assert {t["term"]: t["coef"] for t in rho} == {
+        "A": 0.7, "B": 1.0, "C": 1.7, "D": 0.6}
+    # strength несёт тройной терм A·B·C (order=3, coef=12)
+    strength = {t["term"]: t for t in readable["strength"]}
+    assert strength["A·B·C"]["order"] == 3
+    assert strength["A·B·C"]["coef"] == 12.0
+    assert strength["B·C"]["coef"] == 16.0
+
+
+def test_description_is_json_serializable_and_complete():
+    """Карточка для ассистента сериализуема и несёт ключевые поля набора."""
+    desc = battle_step6_description()
+    json.dumps(desc, ensure_ascii=False)  # сериализуемость без падений
+
+    assert desc["button_label"] == "🧪 Заполнить тестовыми данными"
+    # компоненты с ценами совпадают со снимком
+    comps = {c["name"]: c["price"] for c in desc["components"]}
+    assert comps == {"A": 95.0, "B": 200.0, "C": 23.0, "D": 315.0}
+    # свойства перечислены с пояснениями
+    prop_names = [p["name"] for p in desc["properties"]]
+    assert prop_names == ["strength", "gloss", "dry_time", "whiteStrength", "rho"]
+    # параметры лаборатории совпадают с дефолтами снимка
+    snap = battle_step6_snapshot()
+    assert desc["seed"] == snap["seed"]
+    assert desc["noise_sd"] == snap["noise_sd"]
+    assert desc["truth_model"] == snap["truth_model"]
+    # известная истина включена в читаемом виде по каждому свойству
+    terms = desc["known_truth"]["terms_by_property"]
+    assert set(terms) == set(prop_names)
+    assert terms["rho"] == battle_step6_truth_readable()["rho"]
+    # порядок работы — непустой список шагов
+    assert isinstance(desc["how_to_use"], list) and desc["how_to_use"]
+
+

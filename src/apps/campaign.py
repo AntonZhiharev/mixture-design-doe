@@ -318,9 +318,117 @@ def campaign_overview(runner, *, with_money: bool = False,
     }
 
 
+# ----------------------------------------------------------------------
+# §17.3 (Ш2) — Валидация «не хватает данных» ПЕРЕД пересчётом/argmax/стопом
+# ----------------------------------------------------------------------
+# A0.6 / чистота проводника: система НЕ считает молча на дырах. Перед любым
+# пересчётом (re-score / M8-argmax / §4-стоп) единая проверка называет, ЧЕГО
+# именно не хватает, и возвращает ``{ok, missing, text}``; UI показывает отказ и
+# НЕ запускает пересчёт. Каждая ветка отказа именована (``code``) и воспроизводима
+# (гейт-тест §17.7). Read-only: ничего не измеряет и не меняет (И-1).
+READINESS_EMPTY_OBJECTIVE = "empty_objective"
+READINESS_UNMEASURED_GOAL = "unmeasured_goal_properties"
+READINESS_PRICE_LEG_INCOMPLETE = "price_leg_incomplete"
+READINESS_MIGRATION_PENDING = "migration_pending"
+
+
+def validate_branch_ready(runner, branch_id: str) -> Dict[str, Any]:
+    """Готова ли ветка к пересчёту (§17.3) — единая проверка «не хватает данных».
+
+    Возвращает ``{ok, branch_id, missing, text}``. ``missing`` — список
+    ``{code, responses, text}`` по каждой обнаруженной дыре; ``ok = not missing``.
+    Проверяются ЧЕТЫРЕ ветки отказа §17.3 (все накапливаются, а не первая-же):
+
+      1. **пустой объектив** — у ветки нет ни одной цели ⇒ desirability/argmax и
+         §4-стоп не определены;
+      2. **недомеренные свойства** — свойства целей (и ρ ценовой ноги) без единого
+         конечного измерения в ОБЩЕЙ базе (``runner.points`` не урезается, И-1);
+      3. **неполная ценовая нога** — ``set_branch_cost`` объявлен, но ρ / функция
+         цены состава / десирабилити цены отсутствуют;
+      4. **несмигрированные точки** — в базе есть точки без валидной миграции к
+         текущей схеме (§16.2: добавили ось/компонент без применимой политики).
+
+    Read-only (A0.6): не измеряет и не меняет состояние. Пункт 4 читает сигнал
+    ядра (``_migrated_points`` → ``RuntimeError``) и переводит его в мягкий отказ
+    UI вместо сырого исключения.
+    """
+    if branch_id not in getattr(runner, "branches", {}):
+        raise KeyError(f"Нет ветки '{branch_id}'.")
+    br = runner.branches[branch_id]
+    goal = dict(getattr(br, "goal", None) or {})
+    prop_names = list(runner.property_names)
+    cfg = (getattr(runner, "_branch_cost", {}) or {}).get(branch_id)
+    missing: List[Dict[str, Any]] = []
+
+    # (1) пустой объектив — без целей argmax/стоп/re-score не определены
+    if not goal:
+        missing.append({
+            "code": READINESS_EMPTY_OBJECTIVE,
+            "responses": [],
+            "text": ("У ветки нет ни одной цели: desirability/argmax и §4-стоп "
+                     "не определены — задайте хотя бы одну цель."),
+        })
+
+    # (3) ценовая нога объявлена, но неполна
+    rho = None
+    if cfg is not None:
+        rho = cfg.get("rho_property")
+        problems: List[str] = []
+        if not rho or rho not in prop_names:
+            problems.append("ρ-свойство не задано или не среди свойств оракула")
+        if not callable(cfg.get("price_fn")):
+            problems.append("функция цены состава (price_fn) не задана")
+        if cfg.get("cost_spec") is None:
+            problems.append("десирабилити цены (cost_spec) не задана")
+        if problems:
+            missing.append({
+                "code": READINESS_PRICE_LEG_INCOMPLETE,
+                "responses": ([rho] if rho else []),
+                "text": ("Ценовая нога объявлена, но неполна: "
+                         + "; ".join(problems) + "."),
+            })
+
+    # (2) нет измеренных откликов по свойствам целей (+ ρ ценовой ноги)
+    required = set(goal)
+    if rho and rho in prop_names:
+        required.add(rho)
+    if required:
+        cov = response_coverage(runner)
+        unmeasured = sorted(r for r in required
+                            if int(cov.get(r, {}).get("measured", 0)) == 0)
+        if unmeasured:
+            missing.append({
+                "code": READINESS_UNMEASURED_GOAL,
+                "responses": unmeasured,
+                "text": ("Нет ни одного измерения в общей базе по свойствам: "
+                         + ", ".join(unmeasured)
+                         + " — внесите Y (§17.2) до пересчёта."),
+            })
+
+    # (4) несмигрированные точки (§16.2): ядро сигналит сбой миграции RuntimeError
+    try:
+        runner._migrated_points()
+    except RuntimeError as exc:
+        missing.append({
+            "code": READINESS_MIGRATION_PENDING,
+            "responses": [],
+            "text": ("В базе есть точки без валидной миграции к текущей схеме "
+                     f"(§16.2): {exc}"),
+        })
+
+    ok = not missing
+    if ok:
+        text = "Ветка готова к пересчёту: данных достаточно."
+    else:
+        text = ("Не хватает данных для пересчёта:\n"
+                + "\n".join(f"• {m['text']}" for m in missing))
+    return {"ok": ok, "branch_id": branch_id, "missing": missing, "text": text}
+
+
 # ======================================================================
 # ШАГ 2 — Контроллер кампании: обратимые мутации (§4) + смена роли (§5) +
 # undo-стек (§7). Поверх того же MixtureProcessRunner. Канон:
+
 #
 #   * Мутации меняют ОЦЕНКУ/АКТИВНЫЙ ПУЛ/ОБЪЕКТИВ, НЕ измеренную правду (И-1):
 #     история (``runner.points``) не урезается ни одной операцией (П-11).
@@ -369,7 +477,18 @@ class CampaignController:
     def overview(self, **kw) -> Dict[str, Any]:
         return campaign_overview(self.runner, **kw)
 
+    # -- §17.3 (Ш2) валидация готовности ветки к пересчёту (read-only) --
+    def validate_ready(self, branch_id: str) -> Dict[str, Any]:
+        """§17.3: единая проверка «не хватает данных» ПЕРЕД пересчётом/argmax/стопом.
+
+        Тонкий проброс в :func:`validate_branch_ready` (read-only, A0.6). UI обязан
+        вызывать её перед :meth:`run_round`/:meth:`commit_measured`/argmax и НЕ
+        запускать пересчёт при ``ok == False`` — вместо молчаливого счёта на дырах
+        показать перечень недостающего (``missing``/``text``)."""
+        return validate_branch_ready(self.runner, branch_id)
+
     # -- snapshot / restore намерения ветки (для undo) ----------------
+
     def _snapshot(self, branch_id: str) -> Dict[str, Any]:
         br = self.runner.branches[branch_id]
         cost = (self.runner._branch_cost.get(branch_id)

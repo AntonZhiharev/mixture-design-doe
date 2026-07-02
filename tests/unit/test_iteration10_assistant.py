@@ -149,6 +149,22 @@ def test_live_snapshot_carries_form_in_meta(tmp_path):
     assert overview["meta"]["form"]["property_names"] == list(r.cfg.property_names)
 
 
+def test_live_snapshot_meta_carries_test_data_preset(tmp_path):
+    """Описание набора «Заполнить тестовыми данными» попадает в trace.meta.
+
+    Тогда Cline через MCP `doe-introspect` (run_overview.meta.test_data_preset)
+    видит те же сведения, что и встроенный ассистент в build_context.
+    """
+    r = _runner(tmp_path, name="snap_preset_proj")
+    root = str(tmp_path / "trace")
+    info = ai.write_live_snapshot(r, root=root)
+    overview = queries.run_overview(root, info["run_id"])
+    preset = overview["meta"]["test_data_preset"]
+    assert preset["button_label"] == "🧪 Заполнить тестовыми данными"
+    assert "rho" in preset["known_truth"]["terms_by_property"]
+
+
+
 def test_context_includes_ui_guide_with_delete_button(tmp_path):
     """ui_guide описывает интерфейс, чтобы ассистент отвечал «где нажать».
 
@@ -161,6 +177,28 @@ def test_context_includes_ui_guide_with_delete_button(tmp_path):
     blob = json.dumps(guide, ensure_ascii=False).lower()
     assert "удалить проект" in blob and "пароль" in blob
     assert "benchmark" in blob and "ветки" in blob
+    # кнопка тестовых данных тоже описана в карте интерфейса
+    assert "заполнить тестовыми данными" in blob
+
+
+def test_context_includes_test_data_preset(tmp_path):
+    """Ассистент «видит» развёрнутое описание кнопки «Заполнить тестовыми данными».
+
+    Без этого ИИ-помощник не мог рассказать пользователю, что это за набор:
+    компоненты, цены, свойства и известную истину лаборатории.
+    """
+    r = _runner(tmp_path, name="preset_proj")
+    ctx = ai.build_context(r)
+    json.dumps(ctx)                          # сериализуемость не ломается
+    preset = ctx["test_data_preset"]
+    assert preset["button_label"] == "🧪 Заполнить тестовыми данными"
+    # компоненты с ценами и свойства доступны ассистенту
+    assert [c["name"] for c in preset["components"]] == ["A", "B", "C", "D"]
+    assert [p["name"] for p in preset["properties"]] == [
+        "strength", "gloss", "dry_time", "whiteStrength", "rho"]
+    # известная истина лаборатории в читаемом виде — по каждому свойству
+    assert "rho" in preset["known_truth"]["terms_by_property"]
+
 
 
 

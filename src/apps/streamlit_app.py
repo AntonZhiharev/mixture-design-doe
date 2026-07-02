@@ -427,21 +427,26 @@ def render_project_loader(root: str):
         except Exception as exc:  # noqa: BLE001
             st.sidebar.error(f"Не удалось загрузить '{sel}': {exc}")
 
-    # «Боевой» пресет STEP 6: загружает в форму готовый снимок (4 компонента,
-    # реальные цены, 5 свойств) с ИЗВЕСТНОЙ синт.истиной (cubic) — лаборатория
-    # детерминирована, можно сразу гонять M1…M8 и сверять с benchmark.
-    if st.sidebar.button("🥊 Боевой пресет (battle STEP 6)", key="load_battle",
-                         help="Заполняет форму конфигурацией STEP 6 из "
-                              "battle-теста: 4 компонента {A,B,C,D}, реальные "
-                              "цены, свойства strength/gloss/dry_time/"
-                              "whiteStrength/ρ и известная истина лаборатории."):
+    # Пресет «Заполнить тестовыми данными» (STEP 6): грузит в форму готовый
+    # снимок (4 компонента, реальные цены, 5 свойств) с ИЗВЕСТНОЙ синт.истиной
+    # (cubic) — лаборатория детерминирована, можно сразу гонять M1…M8 и сверять
+    # с benchmark. Развёрнутое описание набора доступно ИИ-ассистенту
+    # (assistant.build_context → test_data_preset = battle_step6_description()).
+    if st.sidebar.button("🧪 Заполнить тестовыми данными", key="load_battle",
+                         help="Заполняет форму эталонным тестовым набором "
+                              "(STEP 6 из battle-теста): 4 компонента {A,B,C,D}, "
+                              "реальные цены, свойства strength/gloss/dry_time/"
+                              "whiteStrength/ρ и известная истина лаборатории. "
+                              "Подробнее про набор расскажет ИИ-ассистент."):
+
         snap = battle_step6_snapshot()
         st.session_state["cfg_defaults"] = snap
         st.session_state["cfg_ver"] = _ver() + 1
         st.session_state.pop("runner", None)   # пересоберётся из нового конфига
         st.session_state["loaded_msg"] = (
-            "Боевой пресет STEP 6 загружен в форму (истина лаборатории задана). "
-            "Прогоняйте M1…M8 и сверяйте с Benchmark.")
+            "Тестовые данные (STEP 6) загружены в форму — истина лаборатории "
+            "задана. Прогоняйте M1…M8 и сверяйте с Benchmark.")
+
         st.rerun()
 
     if st.session_state.get("loaded_msg"):

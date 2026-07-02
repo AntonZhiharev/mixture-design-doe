@@ -20,11 +20,13 @@ A0.6: всё, что меняет состояние (смена роли, spawn
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import zlib
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+
 
 from ..core.schema import ModelSpec, ProjectSchema, VariableBlock
 from ..optimize.desirability import DesirabilitySpec
@@ -107,8 +109,95 @@ def build_demo_campaign_runner(*, seed: int = 7, n_seed: int = 14
 
 
 # ----------------------------------------------------------------------
+# §17.4 (Ш3b) — РЕАЛЬНЫЙ сетап: ручной оракул + сборка раннера из формы
+# ----------------------------------------------------------------------
+class ManualOracle:
+    """Оракул РУЧНОГО сетапа (§17.4): несёт имена свойств; истинные Y — от пользователя.
+
+    Реальная лаборатория меряет ВНЕ системы, поэтому :meth:`evaluate` НЕ выдаёт
+    себя за настоящую истину — это лишь ДЕТЕРМИНИРОВАННЫЙ демо-генератор для кнопки
+    «Заполнить тестовыми» (прогоны без лаборатории). Коэффициенты стабильно
+    выводятся из имени свойства (``crc32`` — воспроизводимо между процессами), но
+    это синтетика: реальные отклики всегда вносит пользователь (``commit_seed`` /
+    ``commit_measured``, A0.6). ``evaluate`` принимает ПОЛНЫЙ составной вектор
+    ``Xc`` (n×dim) — как того требует контракт раннера.
+    """
+
+    def __init__(self, property_names: Sequence[str]):
+        self.property_names: List[str] = list(property_names)
+
+    def evaluate(self, Xc) -> np.ndarray:
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        n, dim = Xc.shape
+        cols: List[np.ndarray] = []
+        for name in self.property_names:
+            rng = np.random.default_rng(zlib.crc32(str(name).encode("utf-8")))
+            w = rng.uniform(0.5, 2.0, size=dim)
+            b = float(rng.uniform(0.0, 1.0))
+            cols.append(Xc @ w + b)
+        return np.column_stack(cols) if cols else np.empty((n, 0), float)
+
+
+def build_setup_runner(*, mixture_names: Sequence[str],
+                       process_names: Sequence[str],
+                       process_lower: Sequence[float],
+                       process_upper: Sequence[float],
+                       response_names: Sequence[str],
+                       mixture_lower: Optional[Sequence[float]] = None,
+                       mixture_upper: Optional[Sequence[float]] = None,
+                       baseline: Optional[Sequence[float]] = None,
+                       seed: int = 0, n_restarts: int = 2
+                       ) -> MixtureProcessRunner:
+    """§17.4: собрать ``MixtureProcessRunner`` РЕАЛЬНОГО сетапа (ручной оракул).
+
+    Составная область — симплекс {mixture} × куб {process} СРАЗУ (процесс-параметры
+    с самого старта, §17.4); отклики — имена пользователя. Оракул —
+    :class:`ManualOracle` (Y вносится вручную через seed/branch-циклы §17.2/§17.4;
+    ``evaluate`` — лишь демо-заполнение). База ПУСТА, суррогатов нет: стартовый
+    дизайн предлагается (``propose_seed``) и меряется пользователем
+    (``commit_seed``). ``baseline`` по умолчанию — равномерная смесь (1/q) +
+    середина каждого процесс-интервала.
+    """
+    mixture_names = [str(s) for s in mixture_names]
+    process_names = [str(s) for s in process_names]
+    response_names = [str(s) for s in response_names]
+    if not mixture_names:
+        raise ValueError("Нужен хотя бы один компонент смеси.")
+    if not process_names:
+        raise ValueError("Нужен хотя бы один процесс-параметр "
+                         "(§17.4: процесс-параметры задаются сразу).")
+    if not response_names:
+        raise ValueError("Нужен хотя бы один отклик (свойство).")
+    pl = [float(v) for v in process_lower]
+    pu = [float(v) for v in process_upper]
+    if len(pl) != len(process_names) or len(pu) != len(process_names):
+        raise ValueError("Число границ процесса не совпадает с числом параметров "
+                         f"({len(process_names)}).")
+
+    mix = VariableBlock.mixture(mixture_names, lower=mixture_lower,
+                                upper=mixture_upper)
+    proc = VariableBlock.process(process_names, lower=pl, upper=pu)
+    model = ModelSpec(cross_level="full-cross", mixture_order="quadratic",
+                      process_order="quadratic")
+    schema = ProjectSchema.mixture_process(mix, proc, model=model)
+    oracle = ManualOracle(response_names)
+    if baseline is None:
+        q = len(mixture_names)
+        baseline = [1.0 / q] * q + [(lo + hi) / 2.0 for lo, hi in zip(pl, pu)]
+    return MixtureProcessRunner(schema, oracle, baseline=list(baseline),
+                                seed=int(seed), n_restarts=int(n_restarts))
+
+
+def setup_coord_names(runner) -> List[str]:
+    """Имена составных координат ТЕКУЩЕЙ схемы: mixture-компоненты + process-оси."""
+    sch = runner.current_schema
+    return list(sch.mixture_names) + list(sch.process_names)
+
+
+# ----------------------------------------------------------------------
 # Чистые таблицы для показа (без Streamlit) — тестируемы напрямую
 # ----------------------------------------------------------------------
+
 _MONEY_RU = {cv.MONEY_ZEROED: "занулён (ZEROED)", cv.MONEY_ALIVE: "живой (ALIVE)",
              None: "—"}
 _CHANGE_RU = {"inherited": "унаследовано как есть",
@@ -224,15 +313,144 @@ def _rho_of(runner, branch_id: str) -> Optional[str]:
     return pcfg["rho_property"] if pcfg else None
 
 
+def _parse_names(text: str) -> List[str]:
+    """Разобрать имена через запятую/точку-с-запятой в список (без пустых)."""
+    return [t.strip() for t in str(text).replace(";", ",").split(",") if t.strip()]
+
+
+def _parse_floats(text: str) -> Optional[List[float]]:
+    """Разобрать числа через запятую/точку-с-запятой; ``None`` при нечисловом вводе."""
+    try:
+        return [float(v) for v in str(text).replace(";", ",").split(",")
+                if str(v).strip()]
+    except ValueError:
+        return None
+
+
+def render_setup_form() -> None:
+    """§17.4 (Ш3b): форма РЕАЛЬНОГО сетапа — mixture + процесс + отклики.
+
+    По кнопке строит :class:`MixtureProcessRunner` (:class:`ManualOracle`, пустая
+    база) и кладёт :class:`CampaignController` в ``session_state`` под тем же
+    ключом, что и демо-кампания (главный поток §17 — один движок). Реального
+    оракула нет: стартовые отклики вносит пользователь в ручном seed-цикле ниже.
+    """
+    with st.expander("🆕 Новый проект кампании — реальный сетап (§17.4)",
+                     expanded=get_campaign_controller() is None):
+        st.caption(
+            "Составная область СРАЗУ: симплекс компонентов смеси (Σ=1) × куб "
+            "процесс-параметров (реальные единицы). Отклики (свойства) меряются "
+            "вручную — оракула-симулятора нет (кнопка «Заполнить тестовыми» в "
+            "seed-цикле оставлена для прогонов без лаборатории, A0.6).")
+        c = st.columns(2)
+        mix_txt = c[0].text_input("Компоненты смеси (через запятую)",
+                                  value="A, B, C", key="setup_mix")
+        resp_txt = c[1].text_input("Отклики / свойства (через запятую)",
+                                   value="strength, gloss, rho", key="setup_resp")
+        proc_txt = st.text_input("Процесс-параметры (через запятую)",
+                                 value="T, P", key="setup_proc")
+        pc = st.columns(2)
+        plo_txt = pc[0].text_input("Нижние границы процесса (через запятую)",
+                                   value="0, 0", key="setup_proc_lo")
+        phi_txt = pc[1].text_input("Верхние границы процесса (через запятую)",
+                                   value="1, 1", key="setup_proc_hi")
+        seed_v = st.number_input("Seed раннера", value=1, step=1, key="setup_seed")
+        if st.button("🏗 Построить проект кампании", key="setup_build"):
+            try:
+                mix = _parse_names(mix_txt)
+                proc = _parse_names(proc_txt)
+                resp = _parse_names(resp_txt)
+                plo = _parse_floats(plo_txt)
+                phi = _parse_floats(phi_txt)
+                if plo is None or phi is None:
+                    raise ValueError("Границы процесса — числа через запятую.")
+                runner = build_setup_runner(
+                    mixture_names=mix, process_names=proc,
+                    process_lower=plo, process_upper=phi,
+                    response_names=resp, seed=int(seed_v))
+                st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
+                for k in ("setup_seed_X", "setup_seed_Y"):
+                    st.session_state.pop(k, None)
+                st.success(
+                    f"Проект собран: смесь {mix} × процесс {proc}, отклики {resp}. "
+                    "База пуста — предложите и измерьте стартовый дизайн ниже.")
+            except (ValueError, KeyError) as exc:
+                st.error(str(exc))
+
+
+def render_seed_entry(ctrl: "cv.CampaignController") -> None:
+    """§17.4: ручной СТАРТОВЫЙ цикл «предложить seed → внести Y → зафиксировать».
+
+    Пока стартовый дизайн не измерен (база пуста), это единственная активная
+    секция вкладки: ``propose_seed`` (read-only) → таблица ввода Y (по всем P) →
+    ``commit_seed`` (доливает в общую базу origin=seed, обучает суррогаты).
+    «Заполнить тестовыми» берёт Y из демо-оракула (``_measure``) — ЯВНОЕ действие
+    (A0.6). Составные координаты заблокированы; правятся только столбцы «(lab)».
+    """
+    runner = ctrl.runner
+    props = list(runner.property_names)
+    coord_names = setup_coord_names(runner)
+    st.markdown("### 🌱 Стартовый дизайн (seed) — ручной ввод откликов (§17.4)")
+    st.caption(
+        f"Отклики проекта: {', '.join(props)}. Предложите N точек по составной "
+        "области, внесите измеренные Y по каждому свойству и зафиксируйте — точки "
+        "лягут в ОБЩУЮ базу (origin=seed), суррогаты обучатся (И-1).")
+    sc = st.columns([1, 1, 1])
+    seed_n = sc[0].number_input("N seed-точек", min_value=2, max_value=60,
+                                value=12, step=1, key="setup_seed_n")
+    seed_design = sc[1].number_input("seed дизайна", value=1, step=1,
+                                     key="setup_seed_design")
+    if sc[2].button("📐 Предложить seed-дизайн", key="setup_propose_seed"):
+        X = np.asarray(ctrl.propose_seed(int(seed_n), seed=int(seed_design)), float)
+        st.session_state["setup_seed_X"] = X
+        st.session_state.pop("setup_seed_Y", None)
+
+    Xs = st.session_state.get("setup_seed_X")
+    if Xs is None:
+        return
+    Xs = np.atleast_2d(np.asarray(Xs, float))
+
+    if st.button("🧪 Заполнить тестовыми (демо-оракул)", key="setup_fill_demo"):
+        st.session_state["setup_seed_Y"] = np.vstack(
+            [runner._measure(np.asarray(x, float)) for x in Xs])
+
+    Ys = st.session_state.get("setup_seed_Y")
+    df = pd.DataFrame(np.round(Xs, 4), columns=coord_names[:Xs.shape[1]])
+    lab_cols = [f"{p} (lab)" for p in props]
+    for j, col in enumerate(lab_cols):
+        df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
+                   if Ys is not None else np.nan)
+    st.caption("Составные координаты заблокированы; заполняются только столбцы "
+               "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
+    edited = st.data_editor(df, use_container_width=True, height=320,
+                            disabled=coord_names[:Xs.shape[1]],
+                            key="setup_seed_editor")
+    if st.button("💾 Зафиксировать seed (commit_seed)", key="setup_commit_seed"):
+        try:
+            Y = np.column_stack([np.asarray(edited[c], float) for c in lab_cols])
+            out = ctrl.commit_seed(Xs, Y)
+            for k in ("setup_seed_X", "setup_seed_Y"):
+                st.session_state.pop(k, None)
+            st.success(
+                f"Seed зафиксирован: +{out['added']} точек (origin=seed), общая "
+                f"база = {out['n_base']}, суррогаты обучены. Дальше — создание "
+                "веток (Ш4, §17.5).")
+        except (ValueError, KeyError) as exc:
+            st.error(str(exc))
+
+
 def render_campaign() -> None:
-    """Вкладка «🧬 Кампания»: роли + мультицель §16.3 + рабочий стол §16.4 +
-    смена роли §5 + spawn §8 + undo §7 (read-only показ, мутации — по кнопке)."""
+    """Вкладка «🧬 Кампания»: реальный сетап §17.4 + роли + мультицель §16.3 +
+    рабочий стол §16.4 + смена роли §5 + spawn §8 + undo §7 (мутации — по кнопке)."""
     st.subheader("🧬 Кампания: per-branch роли откликов и эволюция (ТЗ v1.1)")
     st.caption(
         "Роль отклика — атрибут пары (ветка × отклик): один и тот же ρ может быть "
         "ЦЕЛЬЮ в одной ветке и ЦЕНОЙ-ВХОДОМ в другой. Денежный канал ρ читается из "
         "РЕАЛЬНОЙ атрибуции ядра (И-5/Гр-1): OPTIMIZED ⇒ занулён, PRICE_INPUT ⇒ "
         "живой. Всё, что меняет состояние, делает только ваша кнопка (A0.6).")
+
+    # §17.4 (Ш3b): форма реального сетапа проекта (mixture + процесс + отклики).
+    render_setup_form()
 
     if st.button("🧬 Создать / сбросить демо-кампанию", key="camp_create"):
         with st.spinner("Сборка демо-кампании (общий пул + 2 ветки)…"):
@@ -243,13 +461,26 @@ def render_campaign() -> None:
 
     ctrl = get_campaign_controller()
     if ctrl is None:
-        st.info("Нажмите «Создать демо-кампанию», чтобы начать "
-                "(синтетический оракул {A,B,C}×{T,P}, ρ=плотность).")
+        st.info("Соберите проект в форме «🆕 Новый проект кампании» или нажмите "
+                "«Создать демо-кампанию» (синтетический оракул {A,B,C}×{T,P}).")
         return
     runner = ctrl.runner
+
+    # §17.4 (Ш3b): пока стартовый дизайн НЕ измерен (база пуста) — единственная
+    # активная секция это ручной seed-цикл; ветко-UI ниже требует измеренных данных.
+    if len(runner.points) == 0:
+        render_seed_entry(ctrl)
+        return
+
     bids = list(runner.branches)
+    if not bids:
+        st.info("Стартовый дизайн измерен, суррогаты обучены (общая база = "
+                f"{len(runner.points)} точек). Создание веток (цели/роли/ценовая "
+                "нога) — следующий шаг Ш4 (§17.5).")
+        return
 
     # --- линза ветки (Тр-3.3): роли В КОНТЕКСТЕ выбранной ветки ----------
+
     bsel = st.selectbox("Ветка (линза контекста — Тр-3.3)", bids,
                         key="camp_branch")
     rep = ctrl.role_report(bsel)

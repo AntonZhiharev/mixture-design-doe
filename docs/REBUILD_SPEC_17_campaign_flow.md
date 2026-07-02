@@ -132,11 +132,13 @@ process_free)` + `add_branch` по мере надобности:
 |---|---|---|---|
 | Ш1 | ручной оракул `propose_points`/`commit_measured` | `MixtureProcessRunner` (+ `CampaignController` фасад) | `test_iteration20_manual_oracle.py` |
 | Ш2 | валидация «не хватает данных» перед пересчётом | `CampaignController` | `test_iteration20_validation.py` |
-| Ш3 | стартовый сетап (mixture+процесс+отклики+baseline+seed) | `campaign_ui` (реальный, не демо) | headless AppTest |
+| Ш3a | ручной СТАРТОВЫЙ оракул `propose_seed`/`commit_seed` | `MixtureProcessRunner` (+ `CampaignController` фасад) | ✅ `test_iteration20_manual_seed.py` |
+| Ш3b | стартовый сетап (mixture+процесс+отклики+baseline+seed) | `campaign_ui.build_setup_runner`/`render_setup_form`/`render_seed_entry` (`ManualOracle`) | ✅ `test_iteration20_setup_ui.py` |
 | Ш4 | ручные мультицелевые ветки + роли + ограничения | `campaign_ui.render_campaign` | AppTest |
 | Ш5 | рабочий стол с РУЧНЫМ вводом Y (цикл §17.2) | `campaign_ui.render_campaign` | AppTest |
 | Ш6 | эволюция схемы в любой момент + пересчёт с валидацией | `CampaignController` (есть) + UI | `test_iteration20_evolution_ui.py` |
 | финал | снести старый M1–M8 UI, перенести ИИ-помощник/проект/Excel | `streamlit_app.py` | регрессия AppTest |
+
 
 **Анти-объём:** не заводить вторую модель физики на ветку (§5/§12); единственный
 критерий стопа — двойной §4; при миграции историю не урезать (И-1); демо-оракул

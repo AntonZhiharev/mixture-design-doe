@@ -126,6 +126,32 @@ process_free)` + `add_branch` по мере надобности:
 - Решение по незакоммиченным правкам: мои (`campaign_ui.py`, новый тест) —
   отдельным коммитом; чужие (`assistant.py`, `battle_preset.py`, тесты) не трогаю.
 
+### §17.6.1 Порядок финала: СНАЧАЛА перенести salvage, ПОТОМ сносить (решение 2026-07-02)
+
+Находка при реализации: salvage-части (ИИ-помощник, проект save/load/delete,
+Excel, доли↔части/расход сырья) СЕЙЧАС жёстко завязаны на `PipelineRunner` и
+M1–M8-конфиг сайдбара — `assistant.build_context(runner)` читает снимок именно
+`PipelineRunner` (стадии M1…M8, benchmark); проект/Excel вызываются только из
+M1–M8-рендера. Поток кампании (`render_campaign`) имеет СВОЙ сетап и этих вещей не
+использует. Значит «снести M1–M8» и «сохранить salvage» — НЕ одно движение.
+
+Канон («сначала логика+тест, потом UI»; не ломать работающее): финал делается
+поэтапно — сперва каждую salvage-функцию ПЕРЕНОСИМ на движок кампании
+(`CampaignController`/`MixtureProcessRunner`) с logic+тестом, и лишь потом
+удаляем M1–M8 UI и `PipelineRunner` из главного потока.
+
+Шаги миграции salvage (каждый — отдельный коммит, зелёные тесты):
+- **C1 (сделано)** — ассистент campaign-native: `assistant.build_campaign_context`
+  + `assistant.campaign_ui_guide` строят контекст ПРЯМО из `campaign_overview`
+  (без `PipelineRunner`/стадий). Тест `test_iteration20_assistant_campaign.py`.
+- **C2** — персистентность кампании: save/load/delete проекта на
+  `MixtureProcessRunner` (сериализация схемы+точек+веток+ценовой конфигурации).
+- **C3** — выгрузка Excel общей базы/рецепта кампании; доли↔части в сетапе §17.4.
+- **C4 (собственно снос)** — `streamlit_app.py`: кампания = ЕДИНЫЙ главный поток;
+  удалить `render_stage`/`_render_m2`/`_render_result`/`_render_m3/4`, авто-M7,
+  mixture-only `render_branches`, synthetic-benchmark, сайдбар M1–M8 и
+  `PipelineRunner` из UI; ассистент/проект/Excel — на перенесённых C1–C3.
+
 ## §17.7 Карта шагов и гейты (для реализации)
 
 | Ш | Что | Где | Гейт-тест |
@@ -137,7 +163,13 @@ process_free)` + `add_branch` по мере надобности:
 | Ш4 | ручные мультицелевые ветки + роли + ценовая нога | `CampaignController.create_branch` + `campaign_ui.render_branch_creation` | ✅ `test_iteration20_branch_ui.py` |
 | Ш5 | рабочий стол с РУЧНЫМ вводом Y (цикл §17.2) | `campaign_ui.render_workbench` (propose→Y→commit, не авто-оракул) | ✅ `test_iteration20_branch_ui.py` |
 | Ш6 | эволюция схемы в любой момент + пересчёт с валидацией | `CampaignController` (есть) + `campaign_ui.render_schema_evolution` | ✅ `test_iteration20_evolution_ui.py` |
-| финал | снести старый M1–M8 UI, перенести ИИ-помощник/проект/Excel | `streamlit_app.py` | регрессия AppTest |
+| хелпер | ручной оракул откликов battle (ввод точек → отклики истины) | `tools/response_helper.py` + `src/verification/battle_truth.py` (единый источник) | ✅ `test_iteration20_response_helper.py`; battle `test_iteration13_battle.py` (4 passed) |
+| battle-план | развёрнутый РУЧНОЙ прогон единого UI с исходными данными по шагам | `docs/BATTLE_PLAN_17.md` | (ручной прогон) |
+| C1 | ассистент campaign-native (без PipelineRunner) | `assistant.build_campaign_context`/`campaign_ui_guide` | ✅ `test_iteration20_assistant_campaign.py` |
+| C2 | персистентность кампании (save/load/delete на MixtureProcessRunner) | `campaign`/`campaign_ui` | ⏳ TODO |
+| C3 | Excel общей базы/рецепта + доли↔части в сетапе | `campaign_ui` | ⏳ TODO |
+| C4/финал | снос M1–M8 UI + PipelineRunner из UI, кампания = единый поток | `streamlit_app.py` | ⏳ регрессия AppTest |
+
 
 
 

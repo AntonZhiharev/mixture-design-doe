@@ -5,7 +5,8 @@
 кнопки. Разделение:
 
   * ЧИСТЫЕ хелперы (``build_demo_campaign_runner``, ``role_table_dataframe``,
-    ``spawn_review_dataframe``) НЕ зовут Streamlit — тестируются напрямую;
+    ``spawn_review_dataframe``, ``goal_editor_dataframe``,
+    ``workbench_points_dataframe``) НЕ зовут Streamlit — тестируются напрямую;
   * :func:`render_campaign` рисует вкладку через ``st`` (тест — headless AppTest).
 
 UI работает с :class:`CampaignController` поверх ОТДЕЛЬНОГО
@@ -14,8 +15,8 @@ UI работает с :class:`CampaignController` поверх ОТДЕЛЬНО
 одна модель физики на проект). Демо-оракул синтетический и детерминированный —
 чтобы вкладку можно было запустить без реальной лаборатории.
 
-A0.6: всё, что меняет состояние (смена роли, spawn, раунд), делает ТОЛЬКО явная
-кнопка пользователя; роли и денежный канал показываются read-only.
+A0.6: всё, что меняет состояние (смена роли, spawn, раунд, правка целей), делает
+ТОЛЬКО явная кнопка пользователя; роли и денежный канал показываются read-only.
 """
 from __future__ import annotations
 
@@ -114,6 +115,14 @@ _CHANGE_RU = {"inherited": "унаследовано как есть",
               "overridden_same_role": "тронуто, роль та же",
               "changed_by_objective": "изменено объективом ветки"}
 
+# Легенда §4-стопа: причина остановки раунда (двойной критерий §4/§6).
+_STOP_RU: Dict[Optional[str], str] = {
+    None: "▶ продолжать (есть куда и выгодно)",
+    "ceil_reached": "🎯 потолок достигнут (ceil_reached)",
+    "stagnation": "🛑 прогресс встал (stagnation)",
+    "not_economical": "💸 невыгодно (not_economical)",
+}
+
 
 def role_table_dataframe(report: Dict[str, Any]) -> pd.DataFrame:
     """Role-репорт ветки → таблица для показа (контекст ветки уже зашит в report)."""
@@ -146,6 +155,42 @@ def spawn_review_dataframe(review: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def goal_editor_dataframe(runner, branch_id: str) -> pd.DataFrame:
+    """Текущие цели ветки → таблица (§16.3): отклик, вид, диапазон, target, вес.
+
+    Ветка — это НАБОР целей (мультицель): каждая цель несёт свой вид
+    (``min``/``max``/``target``), диапазон ``[low, high]`` (и ``target`` для
+    target-типа) и вес геом-среднего. Читает ``branch.goal`` (read-only)."""
+    br = runner.branches[branch_id]
+    rows = []
+    for resp, spec in (br.goal or {}).items():
+        rows.append({
+            "цель (отклик)": resp,
+            "вид": spec.kind,
+            "low": round(float(spec.low), 4),
+            "high": round(float(spec.high), 4),
+            "target": (round(float(spec.target), 4)
+                       if spec.target is not None else "—"),
+            "вес": round(float(spec.weight), 4),
+        })
+    return pd.DataFrame(rows)
+
+
+def workbench_points_dataframe(runner, result: Dict[str, Any]) -> pd.DataFrame:
+    """Долитые за раунд точки → таблица измеренных откликов (§16.4).
+
+    ``result`` — выхлоп ``run_branch_round`` (через ``CampaignController.run_round``):
+    берём ``y_new`` (n×P, порядок ``property_names``) и помечаем origin-тегом ветки
+    (И-1: точки уже в общей базе, здесь только показ)."""
+    y = np.atleast_2d(np.asarray(result.get("y_new"), float))
+    if y.size == 0:
+        return pd.DataFrame()
+    cols = list(runner.property_names)
+    df = pd.DataFrame(y[:, [runner.prop_index[c] for c in cols]], columns=cols)
+    df.insert(0, "origin", f"branch:{result.get('branch')}")
+    return df
+
+
 # ----------------------------------------------------------------------
 # Streamlit-рендер вкладки (тест — headless AppTest)
 # ----------------------------------------------------------------------
@@ -174,14 +219,14 @@ def campaign_assistant_overview(
         return None
 
 
-
 def _rho_of(runner, branch_id: str) -> Optional[str]:
     pcfg = cv.branch_price_config(runner, branch_id)
     return pcfg["rho_property"] if pcfg else None
 
 
 def render_campaign() -> None:
-    """Вкладка «🧬 Кампания»: read-only роли + смена роли §5 + spawn §8 + undo §7."""
+    """Вкладка «🧬 Кампания»: роли + мультицель §16.3 + рабочий стол §16.4 +
+    смена роли §5 + spawn §8 + undo §7 (read-only показ, мутации — по кнопке)."""
     st.subheader("🧬 Кампания: per-branch роли откликов и эволюция (ТЗ v1.1)")
     st.caption(
         "Роль отклика — атрибут пары (ветка × отклик): один и тот же ρ может быть "
@@ -215,6 +260,118 @@ def render_campaign() -> None:
     with st.expander("💰 Почему за ρ есть/нет денег (§16.1)"):
         ex = ctrl.money_explanation(bsel, n_candidates=200, n_mc=128, seed=0)
         st.markdown(ex["text"])
+
+    # --- §16.3: мультицелевой редактор ветки (несколько целей/диапазонов/весов)
+    with st.expander("🎯 Редактор целей ветки (§16.3 — мультицель)"):
+        st.caption(
+            "Ветка — это НАБОР целей: несколько откликов, каждый со своим видом "
+            "(min/max/target), диапазоном и весом (снято ограничение «одна ветка — "
+            "одна цель»). Цель над откликом делает его роль OPTIMIZED (§16.0); "
+            "удаление ПОСЛЕДНЕЙ цели запрещено — ветке нужен объектив. Правки "
+            "обратимы (undo, §7) и НЕ трогают измеренную правду (И-1).")
+        st.dataframe(goal_editor_dataframe(runner, bsel), use_container_width=True)
+
+        st.markdown("**➕/✏️ Задать или заменить цель над откликом**")
+        gc = st.columns([2, 2, 2, 2, 2])
+        g_resp = gc[0].selectbox("отклик", list(runner.property_names),
+                                 key="camp_goal_resp")
+        g_kind = gc[1].selectbox("вид", ["max", "min", "target"],
+                                 key="camp_goal_kind")
+        g_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_goal_lo")
+        g_hi = gc[3].number_input("high", value=10.0, step=0.5, key="camp_goal_hi")
+        g_w = gc[4].number_input("вес", min_value=0.01, value=1.0, step=0.5,
+                                 key="camp_goal_w")
+        g_tgt = st.number_input("target (только для вида target; low<target<high)",
+                                value=5.0, step=0.5, key="camp_goal_tgt")
+        if st.button("💾 Задать / заменить цель", key="camp_goal_set"):
+            try:
+                tgt = float(g_tgt) if g_kind == "target" else None
+                spec = DesirabilitySpec(g_kind, low=float(g_lo), high=float(g_hi),
+                                        target=tgt, weight=float(g_w))
+                res = ctrl.set_desirability(bsel, g_resp, spec)
+                shift = res["recommendation_shift"]
+                st.success(
+                    f"Цель «{g_resp}» ({g_kind}) задана; d_best "
+                    f"{res['d_best_before']:.3f} → {res['d_best_after']:.3f}"
+                    + (f"; рекомендация x* сместилась на ≈{shift:.3f}."
+                       if shift is not None else "; x* пересчитана."))
+            except (ValueError, KeyError) as exc:
+                st.error(str(exc))
+
+        goals_now = list(runner.branches[bsel].goal or {})
+        if goals_now:
+            st.markdown("**⚖️ Веса целей (экспоненты геом-среднего d_i)**")
+            wcols = st.columns(len(goals_now))
+            new_w: Dict[str, float] = {}
+            for i, resp in enumerate(goals_now):
+                cur_w = float(runner.branches[bsel].goal[resp].weight)
+                new_w[resp] = wcols[i].number_input(
+                    f"вес «{resp}»", min_value=0.01, value=cur_w, step=0.5,
+                    key=f"camp_goal_w_{resp}")
+            if st.button("⚖️ Применить веса", key="camp_goal_weights"):
+                try:
+                    res = ctrl.set_weights(
+                        bsel, {r: float(v) for r, v in new_w.items()})
+                    st.success(f"Веса обновлены; d_best → "
+                               f"{res['d_best_after']:.3f} (re-score, И-1).")
+                except (ValueError, KeyError) as exc:
+                    st.error(str(exc))
+
+            st.markdown("**🗑 Удалить цель** (последняя — отказ)")
+            dc = st.columns([3, 2])
+            del_resp = dc[0].selectbox("цель на удаление", goals_now,
+                                       key="camp_goal_del_sel")
+            if dc[1].button("🗑 Удалить цель", key="camp_goal_del"):
+                try:
+                    ctrl.delete_goal(bsel, del_resp)
+                    st.success(f"Цель «{del_resp}» удалена (роль → REFERENCE).")
+                except (ValueError, KeyError) as exc:
+                    st.error(str(exc))
+
+    # --- §16.4: рабочий стол ветки — раунд добора точек (внутриветочный цикл)
+    with st.expander("🛠 Рабочий стол ветки (§16.4 — раунд добора)"):
+        st.caption(
+            "Полный внутриветочный цикл: предложить N точек (acquisition/argmax по "
+            "области) → измерить (демо-оракул) → долить в общую базу с origin-тегом "
+            "ветки → переобучить суррогаты → x*/d_best → §4-стоп. A0.6: мерим "
+            "только по кнопке; раунд запечатывает undo (измеренную правду не "
+            "откатить, Тр-7.2/7.3).")
+        br_now = runner.branches[bsel]
+        st.caption(f"Ветка «{br_now.name}»: бюджет {br_now.budget}, потрачено "
+                   f"{br_now.spent}, осталось {br_now.remaining()}, "
+                   f"d_best={br_now.d_best:.3f}, статус {br_now.status}.")
+        wc = st.columns([1, 1, 1])
+        wb_n = wc[0].number_input("N точек", min_value=1, max_value=20, value=3,
+                                  step=1, key="camp_wb_n")
+        wb_expl = wc[1].slider("explore", 0.0, 1.0, 0.3, 0.05, key="camp_wb_expl")
+        if wc[2].button("▶ Прогнать раунд добора", key="camp_wb_run"):
+            try:
+                d_before = float(br_now.d_best)
+                res = ctrl.run_round(bsel, n_points=int(wb_n),
+                                     explore_frac=float(wb_expl),
+                                     n_candidates=200)
+                st.success(
+                    f"Долито {res['added']} точек (origin=branch:{bsel}); d_best "
+                    f"{d_before:.3f} → {res['d_best']:.3f} (монотонно не убывает); "
+                    f"общая база = {res['n_base']} точек.")
+                st.caption("Измеренные отклики долитых точек (по ВСЕМ P свойствам):")
+                st.dataframe(workbench_points_dataframe(runner, res),
+                             use_container_width=True)
+                oc = pd.DataFrame(
+                    {"точек": runner.origin_counts()}).rename_axis("origin")
+                st.dataframe(oc, use_container_width=True)
+                # §4-стоп (двойной): технический И экономический, читает роль ρ
+                delta_d = float(res["d_best"]) - d_before
+                dec = runner.branch_stop_decision(
+                    bsel, delta_d=delta_d, ceil=br_now.satisfy_at,
+                    n_round=int(wb_n), n_candidates=200, n_mc=128, seed=0)
+                st.caption(
+                    f"§4-стоп: **{_STOP_RU.get(dec.reason, dec.reason)}** "
+                    f"(Δd={delta_d:+.4f}, d_best={res['d_best']:.3f}, "
+                    f"ceil={br_now.satisfy_at:.3f}, "
+                    f"econ_red_flag={dec.econ_red_flag}).")
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
 
     # --- смена роли ρ (§5) ----------------------------------------------
     st.markdown("**🔁 Сменить роль ρ (§5) — переключает денежный канал**")

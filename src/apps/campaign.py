@@ -615,6 +615,30 @@ class CampaignController:
         self._undo.clear()
         return out
 
+    # -- §17.2 (Ш1) ручной оракул: предложить (read-only) → зафиксировать Y --
+    def propose_points(self, branch_id: str, n_points: int = 2,
+                       **kw) -> Any:
+        """§17.2: предложить точки ветки БЕЗ измерения (read-only, база не меняется).
+
+        Тонкий проброс в :meth:`MixtureProcessRunner.propose_points`. Ни общая база
+        (``runner.points``), ни undo-стек НЕ трогаются: это лишь предложение
+        кандидатов, которое пользователь затем измеряет и фиксирует через
+        :meth:`commit_measured` (первая половина ручного цикла, A0.6).
+        """
+        return self.runner.propose_points(branch_id, n_points=n_points, **kw)
+
+    def commit_measured(self, branch_id: str, X: Any, Y: Any) -> Dict[str, Any]:
+        """§17.2: зафиксировать ВНЕСЁННЫЕ Y предложенных точек ветки.
+
+        Доливает измеренные точки в ОБЩУЮ базу (origin=branch:{id}, И-1) через
+        :meth:`MixtureProcessRunner.commit_measured` и ЗАПЕЧАТЫВАЕТ дно undo:
+        измеренная правда откату не подлежит (как :meth:`run_round`, Тр-7.2/7.3).
+        Вторая половина ручного цикла «предложить → зафиксировать Y».
+        """
+        out = self.runner.commit_measured(branch_id, X, Y)
+        self._undo.clear()
+        return out
+
     # ------------------------------------------------------------------
     # §16.2 — Фасад эволюции схемы кампании (штатная операция живого проекта)
     #
@@ -866,5 +890,3 @@ class CampaignController:
                 bool(self.runner.price_channel_suppressed(child.id)),
             "review": review,
         }
-
-

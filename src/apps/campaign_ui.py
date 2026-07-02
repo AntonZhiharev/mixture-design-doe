@@ -194,6 +194,26 @@ def setup_coord_names(runner) -> List[str]:
     return list(sch.mixture_names) + list(sch.process_names)
 
 
+def make_linear_price_fn(prices: Sequence[float]):
+    """§17.5: ЦЕНА СОСТАВА ₽/кг из цен компонентов — линейная нога ρ (Ш4).
+
+    Возвращает callable ``Xc → цена состава`` = Σ(доля_i·цена_i) по mixture-долям
+    (первые ``len(prices)`` координат составного вектора; процесс-оси на цену
+    состава не влияют, как в демо). Детерминирована и чиста (без Streamlit) —
+    тестируется напрямую. Используется как ``composition_price_fn`` в
+    :meth:`CampaignController.create_branch` (item-цена = состав·ρ, §3/§15.6).
+    """
+    w = np.asarray(list(prices), float)
+
+    def _fn(Xc):
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        q = min(w.shape[0], Xc.shape[1])
+        return Xc[:, :q] @ w[:q]
+
+    return _fn
+
+
+
 # ----------------------------------------------------------------------
 # Чистые таблицы для показа (без Streamlit) — тестируемы напрямую
 # ----------------------------------------------------------------------
@@ -439,9 +459,336 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
             st.error(str(exc))
 
 
+def render_branch_creation(ctrl: "cv.CampaignController") -> None:
+    """§17.5 (Ш4): ВРУЧНУЮ создать ветку — мультицель + роли + ценовая нога.
+
+    Замена авто-M7 (§17.0): пользователь объявляет намерение ветки сам. Цели
+    набираются по одной в session_state (мультицель §16.3, каждая — вид/диапазон/
+    вес); опционально включается ценовая нога (ρ-отклик + цены компонентов →
+    ``make_linear_price_fn`` + desirability цены) и экономика (V/c_exp/H). Роли
+    выводятся ядром из намерения (цель ⇒ OPTIMIZED, ρ без цели ⇒ PRICE_INPUT).
+    Всё мутирующее — по кнопке (A0.6); логика/валидация — в
+    :meth:`CampaignController.create_branch` (§17.3).
+    """
+    runner = ctrl.runner
+    props = list(runner.property_names)
+    mix_names = list(runner.current_schema.mixture_names)
+    draft: List[Dict[str, Any]] = st.session_state.setdefault(
+        "camp_new_goals", [])
+
+    with st.expander("➕ Создать ветку вручную (§17.5 — цели/роли/ценовая нога)",
+                     expanded=not list(runner.branches)):
+        st.caption(
+            "Ветка — контейнер НАМЕРЕНИЯ (канон §5/§12): несколько целей "
+            "(мультицель §16.3) + опц. ценовая нога ρ. Модели у ветки нет — "
+            "физика общая. Роли выводятся из намерения: цель ⇒ OPTIMIZED, ρ "
+            "ценовой ноги без цели ⇒ PRICE_INPUT (И-5).")
+        c = st.columns([2, 2, 1])
+        name = c[0].text_input("Имя ветки",
+                               value=f"branch{len(runner.branches) + 1}",
+                               key="camp_nb_name")
+        budget = c[1].number_input("Бюджет (слотов)", min_value=1, max_value=200,
+                                   value=20, step=1, key="camp_nb_budget")
+        satisfy = c[2].number_input("ceil (satisfy_at)", min_value=0.1,
+                                    value=1.0, step=0.1, key="camp_nb_ceil")
+
+        # --- набор целей (мультицель) ---
+        st.markdown("**🎯 Цели ветки (добавляйте по одной — мультицель §16.3)**")
+        gc = st.columns([2, 2, 2, 2, 2])
+        ng_resp = gc[0].selectbox("отклик", props, key="camp_nb_resp")
+        ng_kind = gc[1].selectbox("вид", ["max", "min", "target"],
+                                  key="camp_nb_kind")
+        ng_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_nb_lo")
+        ng_hi = gc[3].number_input("high", value=10.0, step=0.5, key="camp_nb_hi")
+        ng_w = gc[4].number_input("вес", min_value=0.01, value=1.0, step=0.5,
+                                  key="camp_nb_w")
+        ng_tgt = st.number_input("target (для вида target; low<target<high)",
+                                 value=5.0, step=0.5, key="camp_nb_tgt")
+        ac = st.columns([2, 2])
+        if ac[0].button("➕ Добавить цель в ветку", key="camp_nb_add_goal"):
+            draft.append({"resp": ng_resp, "kind": ng_kind, "low": float(ng_lo),
+                          "high": float(ng_hi), "weight": float(ng_w),
+                          "target": float(ng_tgt) if ng_kind == "target" else None})
+            st.session_state["camp_new_goals"] = draft
+        if ac[1].button("🧹 Очистить цели", key="camp_nb_clear_goals"):
+            st.session_state["camp_new_goals"] = []
+            draft = []
+        if draft:
+            st.dataframe(pd.DataFrame(draft), use_container_width=True)
+        else:
+            st.caption("Пока ни одной цели — ветке нужен минимум один объектив "
+                       "(§17.3).")
+
+        # --- ценовая нога (опц.) ---
+        st.markdown("**💰 Ценовая нога (опц., §3/§15.6)**")
+        use_price = st.checkbox("Задать ценовую ногу (ρ-отклик + цены состава)",
+                                key="camp_nb_use_price")
+        rho_prop = None
+        prices_txt = ""
+        cost_hi = 300.0
+        if use_price:
+            pc = st.columns([2, 3, 2])
+            rho_prop = pc[0].selectbox("ρ-отклик (цена-вход)", props,
+                                       key="camp_nb_rho")
+            prices_txt = pc[1].text_input(
+                f"Цены компонентов {mix_names} ₽/кг (через запятую)",
+                value=", ".join(["100"] * len(mix_names)), key="camp_nb_prices")
+            cost_hi = pc[2].number_input("верх цены (min→0)", min_value=0.0,
+                                         value=300.0, step=10.0,
+                                         key="camp_nb_cost_hi")
+        st.markdown("**📈 Экономика ветки (опц., для §4-стопа/§6)**")
+        ec = st.columns(3)
+        vol = ec[0].number_input("V (изд/период)", min_value=0.0, value=0.0,
+                                 step=100.0, key="camp_nb_vol")
+        cexp = ec[1].number_input("c_exp (₽/опыт)", min_value=0.0, value=0.0,
+                                  step=10.0, key="camp_nb_cexp")
+        hor = ec[2].number_input("H (период)", min_value=0.0, value=0.0,
+                                 step=1.0, key="camp_nb_hor")
+
+        if st.button("🌿 Создать ветку", key="camp_nb_create"):
+            try:
+                if not draft:
+                    raise ValueError("Добавьте хотя бы одну цель (§17.3).")
+                goals = {}
+                for g in draft:
+                    goals[g["resp"]] = DesirabilitySpec(
+                        g["kind"], low=g["low"], high=g["high"],
+                        target=g["target"], weight=g["weight"])
+                price_fn = cost_spec = None
+                if use_price:
+                    prices = _parse_floats(prices_txt)
+                    if prices is None or len(prices) != len(mix_names):
+                        raise ValueError(
+                            f"Нужно {len(mix_names)} цен компонентов "
+                            f"{mix_names} (через запятую).")
+                    price_fn = make_linear_price_fn(prices)
+                    cost_spec = DesirabilitySpec("min", low=0.0,
+                                                 high=float(cost_hi), weight=0.5)
+                out = ctrl.create_branch(
+                    str(name), goals, budget=int(budget),
+                    satisfy_at=float(satisfy), price_fn=price_fn,
+                    cost_spec=cost_spec, rho_property=rho_prop,
+                    volume=(float(vol) if vol > 0 else None),
+                    cost_exp=(float(cexp) if cexp > 0 else None),
+                    horizon=(float(hor) if hor > 0 else None))
+                st.session_state["camp_new_goals"] = []
+                st.success(
+                    f"Ветка «{out['branch_name']}» (`{out['branch_id']}`) создана: "
+                    f"{out['n_goals']} цел., ценовая нога = {out['has_price_leg']}"
+                    + (f" (ρ={out['rho_property']}, канал занулён="
+                       f"{out['price_channel_suppressed']})"
+                       if out['has_price_leg'] else "")
+                    + f"; d_best={out['d_best']:.3f}.")
+            except (ValueError, KeyError) as exc:
+                st.error(str(exc))
+
+
+def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
+    """§17.5 (Ш5): рабочий стол ветки на РУЧНОМ цикле §17.2 (предложить → Y → долить).
+
+    Замена авто-оракула (`run_branch_round`) реальным лабораторным циклом:
+    ``validate_ready`` (§17.3 гейт) → ``propose_points`` (read-only) → таблица
+    ввода измеренных Y по всем P → ``commit_measured`` (долив в общую базу
+    origin=branch:{id}, переобучение суррогатов, §4-стоп). «Заполнить тестовыми»
+    (демо-оракул ``_measure``) остаётся ЯВНОЙ кнопкой (A0.6). Составные координаты
+    заблокированы; правятся только столбцы «свойство (lab)». Ключи session_state
+    привязаны к ветке — смена ветки не тащит чужих кандидатов.
+    """
+    runner = ctrl.runner
+    props = list(runner.property_names)
+    coord_names = setup_coord_names(runner)
+    kx, ky = f"camp_wb_X_{bsel}", f"camp_wb_Y_{bsel}"
+    with st.expander("🛠 Рабочий стол ветки (§17.2/§16.4 — ручной добор)",
+                     expanded=True):
+        st.caption(
+            "Реальный лабораторный цикл (§17.2): предложить N точек (read-only) → "
+            "внести измеренные Y по всем свойствам → долить в ОБЩУЮ базу "
+            "(origin=branch:{id}, И-1) → переобучить суррогаты → x*/d_best → "
+            "§4-стоп. Мерим только по кнопке (A0.6); долив запечатывает undo.")
+        br_now = runner.branches[bsel]
+        st.caption(f"Ветка «{br_now.name}»: бюджет {br_now.budget}, потрачено "
+                   f"{br_now.spent}, осталось {br_now.remaining()}, "
+                   f"d_best={br_now.d_best:.3f}, статус {br_now.status}.")
+
+        # §17.3 (Ш2) гейт: перед предложением/пересчётом — проверка полноты данных
+        ready = ctrl.validate_ready(bsel)
+        if not ready["ok"]:
+            st.error("Не хватает данных для добора (§17.3):\n" + ready["text"])
+
+        wc = st.columns([1, 1, 1])
+        wb_n = wc[0].number_input("N точек", min_value=1, max_value=20, value=3,
+                                  step=1, key=f"camp_wb_n_{bsel}")
+        wb_expl = wc[1].slider("explore", 0.0, 1.0, 0.3, 0.05,
+                               key=f"camp_wb_expl_{bsel}")
+        if wc[2].button("📐 Предложить точки (read-only)",
+                        key=f"camp_wb_propose_{bsel}", disabled=not ready["ok"]):
+            X = np.asarray(ctrl.propose_points(bsel, n_points=int(wb_n),
+                                               explore_frac=float(wb_expl),
+                                               n_candidates=200), float)
+            st.session_state[kx] = X
+            st.session_state.pop(ky, None)
+
+        Xs = st.session_state.get(kx)
+        if Xs is None:
+            return
+        Xs = np.atleast_2d(np.asarray(Xs, float))
+        if Xs.shape[0] == 0:
+            st.info("Бюджет ветки исчерпан — предложить нечего.")
+            return
+
+        if st.button("🧪 Заполнить тестовыми (демо-оракул)",
+                     key=f"camp_wb_fill_{bsel}"):
+            st.session_state[ky] = np.vstack(
+                [runner._measure(np.asarray(x, float)) for x in Xs])
+
+        Ys = st.session_state.get(ky)
+        df = pd.DataFrame(np.round(Xs, 4), columns=coord_names[:Xs.shape[1]])
+        lab_cols = [f"{p} (lab)" for p in props]
+        for j, col in enumerate(lab_cols):
+            df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
+                       if Ys is not None else np.nan)
+        st.caption("Предложенные точки: координаты заблокированы, заполняются "
+                   "только столбцы «свойство (lab)» (вручную или демо-кнопкой):")
+        edited = st.data_editor(df, use_container_width=True, height=280,
+                                disabled=coord_names[:Xs.shape[1]],
+                                key=f"camp_wb_editor_{bsel}")
+        if st.button("💾 Долить измеренные (commit_measured)",
+                     key=f"camp_wb_commit_{bsel}"):
+            try:
+                d_before = float(br_now.d_best)
+                Y = np.column_stack([np.asarray(edited[c], float)
+                                     for c in lab_cols])
+                res = ctrl.commit_measured(bsel, Xs, Y)
+                st.session_state.pop(kx, None)
+                st.session_state.pop(ky, None)
+                st.success(
+                    f"Долито {res['added']} точек (origin=branch:{bsel}); d_best "
+                    f"{d_before:.3f} → {res['d_best']:.3f} (монотонно не убывает); "
+                    f"общая база = {res['n_base']} точек.")
+                st.caption("Измеренные отклики долитых точек (по всем P):")
+                st.dataframe(workbench_points_dataframe(runner, res),
+                             use_container_width=True)
+                oc = pd.DataFrame(
+                    {"точек": runner.origin_counts()}).rename_axis("origin")
+                st.dataframe(oc, use_container_width=True)
+                # §4-стоп (двойной): технический И экономический, читает роль ρ
+                delta_d = float(res["d_best"]) - d_before
+                dec = runner.branch_stop_decision(
+                    bsel, delta_d=delta_d, ceil=br_now.satisfy_at,
+                    n_round=int(res["added"]) or 1, n_candidates=200,
+                    n_mc=128, seed=0)
+                st.caption(
+                    f"§4-стоп: **{_STOP_RU.get(dec.reason, dec.reason)}** "
+                    f"(Δd={delta_d:+.4f}, d_best={res['d_best']:.3f}, "
+                    f"ceil={br_now.satisfy_at:.3f}, "
+                    f"econ_red_flag={dec.econ_red_flag}).")
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
+
+
+def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
+    """§17.6 / §16.2 (Ш6): эволюция схемы В ЛЮБОЙ МОМЕНТ + пересчёт (UI).
+
+    Штатная операция живого проекта: добавить процесс-переменную / компонент
+    смеси / отклик, подвинуть границы области. Миграция старых точек — по ЯВНОЙ
+    политике (A0.6: молчаливой миграции нет). Всё делегируется фасаду
+    :class:`CampaignController` (логика/валидация там); общая база не урезается
+    (И-1), версия схемы растёт (кроме region-move). Read/rare-write — по кнопке.
+    """
+    from ..core.schema_evolution import known_constant
+
+    runner = ctrl.runner
+    full_proc = (list(runner._full_proc.names)
+                 if getattr(runner, "_full_proc", None) else [])
+    full_mix = (list(runner._full_mix.names)
+                if getattr(runner, "_full_mix", None) else [])
+    cur_proc = list(runner.current_schema.process_names)
+    cur_mix = list(runner.current_schema.mixture_names)
+    hidden_proc = [p for p in full_proc if p not in cur_proc]
+    hidden_mix = [m for m in full_mix if m not in cur_mix]
+
+    with st.expander("🧬 Эволюция схемы (§16.2 — раскрыть ось/отклик, подвинуть "
+                     "границы)"):
+        st.caption(
+            "Живой проект меняется: раскрыть объявленную процесс-ось/компонент, "
+            "ввести новый отклик, подвинуть границы области. Миграция старых точек "
+            "— по ЯВНОЙ политике (A0.6). База не урезается (И-1); версия растёт.")
+
+        # --- раскрыть процесс-переменную (known_constant baseline) ---
+        st.markdown("**➕ Раскрыть процесс-переменную** (из полной схемы)")
+        if hidden_proc:
+            pc = st.columns([2, 2, 2])
+            pv = pc[0].selectbox("переменная", hidden_proc, key="camp_ev_proc")
+            pconst = pc[1].number_input("константа у старых точек (миграция)",
+                                        value=0.0, step=0.1, key="camp_ev_proc_c")
+            if pc[2].button("➕ Добавить процесс-ось", key="camp_ev_proc_btn"):
+                try:
+                    ctrl.add_process_var(pv, known_constant(float(pconst)))
+                    st.success(f"Процесс-ось «{pv}» раскрыта (миграция "
+                               f"known_constant={pconst}); версия схемы поднята.")
+                except (ValueError, KeyError, RuntimeError) as exc:
+                    st.error(str(exc))
+        else:
+            st.caption("Все объявленные процесс-оси уже в схеме.")
+
+        # --- раскрыть компонент смеси (Σ-совместимо: known_constant(0)) ---
+        st.markdown("**➕ Раскрыть компонент смеси** (грань симплекса C=0)")
+        if hidden_mix:
+            mc = st.columns([3, 2])
+            mv = mc[0].selectbox("компонент", hidden_mix, key="camp_ev_mix")
+            if mc[1].button("➕ Добавить компонент", key="camp_ev_mix_btn"):
+                try:
+                    ctrl.add_mixture_component(mv)
+                    st.success(f"Компонент «{mv}» раскрыт (миграция "
+                               "known_constant(0.0), грань симплекса); версия "
+                               "поднята.")
+                except (ValueError, KeyError, RuntimeError) as exc:
+                    st.error(str(exc))
+        else:
+            st.caption("Все объявленные компоненты смеси уже в схеме.")
+
+        # --- ввести новый отклик ---
+        st.markdown("**➕ Ввести новый отклик** (у старых точек Y=MISSING)")
+        rc = st.columns([3, 2])
+        new_resp = rc[0].text_input("имя отклика", value="", key="camp_ev_resp")
+        if rc[1].button("➕ Добавить отклик", key="camp_ev_resp_btn"):
+            try:
+                from ..core.schema import ResponseSpec
+                if not new_resp.strip():
+                    raise ValueError("Задайте имя отклика.")
+                ctrl.add_response(ResponseSpec(name=new_resp.strip()))
+                st.success(f"Отклик «{new_resp.strip()}» введён в схему (версия "
+                           "поднята; у старых точек значение MISSING, §13.7).")
+            except (ValueError, KeyError, TypeError) as exc:
+                st.error(str(exc))
+
+        # --- подвинуть границы (region-move, без bump) ---
+        st.markdown("**↔ Подвинуть границы области** (relax/restrict, без bump)")
+        bc = st.columns([2, 2, 2, 2])
+        axes = cur_mix + cur_proc
+        mv_ax = bc[0].selectbox("ось", axes, key="camp_ev_bound_ax")
+        mv_lo = bc[1].number_input("нижняя", value=0.0, step=0.05,
+                                   key="camp_ev_bound_lo")
+        mv_hi = bc[2].number_input("верхняя", value=1.0, step=0.05,
+                                   key="camp_ev_bound_hi")
+        mv_intent = bc[3].selectbox("намерение", ["relax", "restrict"],
+                                    key="camp_ev_bound_intent")
+        if st.button("↔ Применить движение границ", key="camp_ev_bound_btn"):
+            try:
+                if mv_intent == "relax":
+                    ctrl.relax_bounds(mv_ax, float(mv_lo), float(mv_hi))
+                else:
+                    ctrl.restrict_bounds(mv_ax, float(mv_lo), float(mv_hi))
+                st.success(f"Границы «{mv_ax}» → [{mv_lo}, {mv_hi}] ({mv_intent}); "
+                           "область обновлена (история цела, И-1).")
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
+
+
 def render_campaign() -> None:
     """Вкладка «🧬 Кампания»: реальный сетап §17.4 + роли + мультицель §16.3 +
     рабочий стол §16.4 + смена роли §5 + spawn §8 + undo §7 (мутации — по кнопке)."""
+
     st.subheader("🧬 Кампания: per-branch роли откликов и эволюция (ТЗ v1.1)")
     st.caption(
         "Роль отклика — атрибут пары (ветка × отклик): один и тот же ρ может быть "
@@ -472,12 +819,18 @@ def render_campaign() -> None:
         render_seed_entry(ctrl)
         return
 
+    # §17.5 (Ш4): ручное создание веток — доступно после измеренного seed.
+    render_branch_creation(ctrl)
+    # §17.6/§16.2 (Ш6): эволюция схемы в любой момент (штатная операция проекта).
+    render_schema_evolution(ctrl)
+
     bids = list(runner.branches)
     if not bids:
         st.info("Стартовый дизайн измерен, суррогаты обучены (общая база = "
-                f"{len(runner.points)} точек). Создание веток (цели/роли/ценовая "
-                "нога) — следующий шаг Ш4 (§17.5).")
+                f"{len(runner.points)} точек). Создайте ветку в форме "
+                "«➕ Создать ветку вручную» выше (Ш4, §17.5).")
         return
+
 
     # --- линза ветки (Тр-3.3): роли В КОНТЕКСТЕ выбранной ветки ----------
 
@@ -559,52 +912,11 @@ def render_campaign() -> None:
                 except (ValueError, KeyError) as exc:
                     st.error(str(exc))
 
-    # --- §16.4: рабочий стол ветки — раунд добора точек (внутриветочный цикл)
-    with st.expander("🛠 Рабочий стол ветки (§16.4 — раунд добора)"):
-        st.caption(
-            "Полный внутриветочный цикл: предложить N точек (acquisition/argmax по "
-            "области) → измерить (демо-оракул) → долить в общую базу с origin-тегом "
-            "ветки → переобучить суррогаты → x*/d_best → §4-стоп. A0.6: мерим "
-            "только по кнопке; раунд запечатывает undo (измеренную правду не "
-            "откатить, Тр-7.2/7.3).")
-        br_now = runner.branches[bsel]
-        st.caption(f"Ветка «{br_now.name}»: бюджет {br_now.budget}, потрачено "
-                   f"{br_now.spent}, осталось {br_now.remaining()}, "
-                   f"d_best={br_now.d_best:.3f}, статус {br_now.status}.")
-        wc = st.columns([1, 1, 1])
-        wb_n = wc[0].number_input("N точек", min_value=1, max_value=20, value=3,
-                                  step=1, key="camp_wb_n")
-        wb_expl = wc[1].slider("explore", 0.0, 1.0, 0.3, 0.05, key="camp_wb_expl")
-        if wc[2].button("▶ Прогнать раунд добора", key="camp_wb_run"):
-            try:
-                d_before = float(br_now.d_best)
-                res = ctrl.run_round(bsel, n_points=int(wb_n),
-                                     explore_frac=float(wb_expl),
-                                     n_candidates=200)
-                st.success(
-                    f"Долито {res['added']} точек (origin=branch:{bsel}); d_best "
-                    f"{d_before:.3f} → {res['d_best']:.3f} (монотонно не убывает); "
-                    f"общая база = {res['n_base']} точек.")
-                st.caption("Измеренные отклики долитых точек (по ВСЕМ P свойствам):")
-                st.dataframe(workbench_points_dataframe(runner, res),
-                             use_container_width=True)
-                oc = pd.DataFrame(
-                    {"точек": runner.origin_counts()}).rename_axis("origin")
-                st.dataframe(oc, use_container_width=True)
-                # §4-стоп (двойной): технический И экономический, читает роль ρ
-                delta_d = float(res["d_best"]) - d_before
-                dec = runner.branch_stop_decision(
-                    bsel, delta_d=delta_d, ceil=br_now.satisfy_at,
-                    n_round=int(wb_n), n_candidates=200, n_mc=128, seed=0)
-                st.caption(
-                    f"§4-стоп: **{_STOP_RU.get(dec.reason, dec.reason)}** "
-                    f"(Δd={delta_d:+.4f}, d_best={res['d_best']:.3f}, "
-                    f"ceil={br_now.satisfy_at:.3f}, "
-                    f"econ_red_flag={dec.econ_red_flag}).")
-            except (ValueError, KeyError, RuntimeError) as exc:
-                st.error(str(exc))
+    # --- §17.5 (Ш5): рабочий стол ветки на РУЧНОМ цикле §17.2 (не авто-оракул)
+    render_workbench(ctrl, bsel)
 
     # --- смена роли ρ (§5) ----------------------------------------------
+
     st.markdown("**🔁 Сменить роль ρ (§5) — переключает денежный канал**")
     rho = _rho_of(runner, bsel)
     if rho is None:

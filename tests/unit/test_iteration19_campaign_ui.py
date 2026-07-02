@@ -93,20 +93,28 @@ def test_campaign_tab_multigoal_editor_adds_goal():
 
 
 def test_campaign_tab_workbench_round_grows_shared_base():
+    # §17.5 (Ш5): рабочий стол — РУЧНОЙ цикл §17.2 (предложить → Y → долить),
+    # а не авто-оракул. Демо-ветка «premium» уже создана build_demo_campaign_runner.
     at = AppTest.from_file(APP, default_timeout=240).run()
     assert not at.exception
     _click(at, "camp_create")
     ctrl = at.session_state["campaign_ctrl"]
     n_hist0 = len(ctrl.runner.points)
 
-    at.session_state["camp_wb_n"] = 3
+    at.session_state["camp_wb_n_premium"] = 3
     at.run()
-    _click(at, "camp_wb_run")
+    _click(at, "camp_wb_propose_premium")          # предложить (read-only)
+    assert not at.exception
+    assert len(at.session_state["campaign_ctrl"].runner.points) == n_hist0
+    _click(at, "camp_wb_fill_premium")             # Y от демо-оракула (A0.6)
+    _click(at, "camp_wb_commit_premium")           # долить в общую базу
     assert not at.exception
 
     ctrl = at.session_state["campaign_ctrl"]
-    # база выросла на N; у долитых точек origin-тег ветки (§16.4, И-1)
+    # база выросла на N; у долитых точек origin-тег ветки (§17.2/§16.4, И-1)
     assert len(ctrl.runner.points) == n_hist0 + 3
     assert ctrl.runner.origin_counts().get("branch:premium", 0) == 3
-    # раунд запечатал дно undo (измеренную правду не откатить, Тр-7.2/7.3)
+    # долив запечатал дно undo (измеренную правду не откатить, Тр-7.2/7.3)
     assert ctrl.can_undo() is False
+
+

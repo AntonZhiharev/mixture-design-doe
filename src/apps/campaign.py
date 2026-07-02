@@ -778,8 +778,82 @@ class CampaignController:
         self._undo.clear()
         return out
 
+    # -- §17.5 (Ш4) РУЧНОЕ создание ветки: мультицель + роли + ценовая нога --
+    def create_branch(self, name: str,
+                      goals: Dict[str, DesirabilitySpec], *,
+                      branch_id: Optional[str] = None,
+                      budget: int = 10, satisfy_at: float = 0.9,
+                      price_fn: Optional[Any] = None,
+                      cost_spec: Optional[DesirabilitySpec] = None,
+                      rho_property: Optional[str] = None,
+                      cost_name: str = "price",
+                      volume: Optional[float] = None,
+                      cost_exp: Optional[float] = None,
+                      horizon: Optional[float] = None) -> Dict[str, Any]:
+        """§17.5 (Ш4): ВРУЧНУЮ создать ветку на ОБЩЕМ пуле — цели + опц. ценовая нога.
+
+        Замена авто-M7 (§17.0): пользователь сам объявляет намерение ветки —
+        НЕСКОЛЬКО целей (``goals``: отклик → DesirabilitySpec, мультицель §16.3),
+        роли выводятся из намерения ядром (цель ⇒ OPTIMIZED, ρ ценовой ноги без
+        цели ⇒ PRICE_INPUT). Ценовая нога опциональна: если задан ``price_fn``, то
+        ОБЯЗАТЕЛЬНЫ ``cost_spec`` и ``rho_property`` — иначе отказ (§17.3, A0.6: не
+        собираем неполную цену молча). ``volume``/``cost_exp``/``horizon`` — экономика
+        ветки для §4-стопа/§6-триады (необязательна). Модель физики общая (канон
+        §5/§12): своей модели у ветки нет. После создания ветка переоценивается по
+        ТЕКУЩЕЙ измеренной базе (``_rescore``); дно undo запечатывается — структурная
+        веха, как раунд (Тр-7.2/7.3).
+        """
+        if not goals:
+            raise ValueError("Ветке нужен хотя бы один объектив: задайте минимум "
+                             "одну цель (отклик → desirability, §17.3).")
+        unknown = set(goals) - set(self.runner.property_names)
+        if unknown:
+            raise KeyError(f"Цели ссылаются на неизвестные свойства {sorted(unknown)} "
+                           f"(есть: {list(self.runner.property_names)}).")
+        has_price = price_fn is not None
+        if has_price:
+            if cost_spec is None or not rho_property:
+                raise ValueError(
+                    "Ценовая нога неполна (§17.3): при заданном price_fn нужны и "
+                    "cost_spec (desirability цены), и rho_property (ρ-отклик).")
+            if rho_property not in self.runner.property_names:
+                raise KeyError(
+                    f"ρ-свойство '{rho_property}' не среди свойств оракула "
+                    f"{list(self.runner.property_names)}.")
+
+        br = self.runner.add_branch(name, dict(goals), budget=int(budget),
+                                    satisfy_at=float(satisfy_at),
+                                    branch_id=branch_id)
+        if has_price:
+            self.runner.set_branch_cost(br.id, price_fn, cost_spec,
+                                        rho_property=str(rho_property),
+                                        cost_name=str(cost_name))
+        if volume is not None:
+            br.volume = float(volume)
+        if cost_exp is not None:
+            br.cost_exp = float(cost_exp)
+        if horizon is not None:
+            br.horizon = float(horizon)
+
+        # переоценка под ТЕКУЩУЮ измеренную базу (если seed уже снят)
+        self._rescore(br.id)
+        # структурная веха: обратимая интерпретация до создания не откатывается.
+        self._undo.clear()
+        return {
+            "op": "create_branch",
+            "branch_id": br.id,
+            "branch_name": br.name,
+            "n_goals": len(br.goal or {}),
+            "has_price_leg": has_price,
+            "rho_property": (str(rho_property) if has_price else None),
+            "price_channel_suppressed":
+                bool(self.runner.price_channel_suppressed(br.id)),
+            "d_best": float(br.d_best),
+        }
+
     # ------------------------------------------------------------------
     # §16.2 — Фасад эволюции схемы кампании (штатная операция живого проекта)
+
 
     #
     # Тонкая обёртка над runner.augment_phase_*/move_region/evolve_schema:

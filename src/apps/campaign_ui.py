@@ -32,7 +32,9 @@ from ..core.schema import ModelSpec, ProjectSchema, VariableBlock
 from ..optimize.desirability import DesirabilitySpec
 from ..apps.mixture_process_runner import MixtureProcessRunner
 from ..apps import campaign as cv
+from ..apps import campaign_state as cs
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
+
 
 
 # ----------------------------------------------------------------------
@@ -202,15 +204,12 @@ def make_linear_price_fn(prices: Sequence[float]):
     состава не влияют, как в демо). Детерминирована и чиста (без Streamlit) —
     тестируется напрямую. Используется как ``composition_price_fn`` в
     :meth:`CampaignController.create_branch` (item-цена = состав·ρ, §3/§15.6).
+    Единый источник — :func:`campaign_state.linear_price_fn`: результат несёт
+    сериализуемый дескриптор ``price_spec``, поэтому ценовая нога переживает
+    save/load кампании (C2, §17.6.1).
     """
-    w = np.asarray(list(prices), float)
+    return cs.linear_price_fn(prices)
 
-    def _fn(Xc):
-        Xc = np.atleast_2d(np.asarray(Xc, float))
-        q = min(w.shape[0], Xc.shape[1])
-        return Xc[:, :q] @ w[:q]
-
-    return _fn
 
 
 

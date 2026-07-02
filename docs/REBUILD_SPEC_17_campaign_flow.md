@@ -144,8 +144,16 @@ M1–M8-рендера. Поток кампании (`render_campaign`) имее
 - **C1 (сделано)** — ассистент campaign-native: `assistant.build_campaign_context`
   + `assistant.campaign_ui_guide` строят контекст ПРЯМО из `campaign_overview`
   (без `PipelineRunner`/стадий). Тест `test_iteration20_assistant_campaign.py`.
-- **C2** — персистентность кампании: save/load/delete проекта на
-  `MixtureProcessRunner` (сериализация схемы+точек+веток+ценовой конфигурации).
+- **C2 (сделано)** — персистентность кампании: `campaign_state.save_campaign`/
+  `load_campaign`/`list_campaigns`/`delete_campaign` на `MixtureProcessRunner`
+  (JSON: полная схема + история версий + текущая схема, общая база точек с
+  origin-тегами, ветки целиком через `Branch.to_state`, ценовая нога через
+  СЕРИАЛИЗУЕМЫЙ дескриптор `price_spec`). Суррогаты НЕ сохраняются — физика в
+  измеренных точках (§5/§12), детерминированно переобучается из базы при загрузке.
+  `make_linear_price_fn` теперь делегирует в `campaign_state.linear_price_fn`
+  (единый источник, price_fn несёт `price_spec`). A0.6: price_fn без дескриптора —
+  явный отказ, не тихая потеря цены. Тест `test_iteration20_campaign_persistence.py`.
+
 - **C3** — выгрузка Excel общей базы/рецепта кампании; доли↔части в сетапе §17.4.
 - **C4 (собственно снос)** — `streamlit_app.py`: кампания = ЕДИНЫЙ главный поток;
   удалить `render_stage`/`_render_m2`/`_render_result`/`_render_m3/4`, авто-M7,
@@ -166,9 +174,10 @@ M1–M8-рендера. Поток кампании (`render_campaign`) имее
 | хелпер | ручной оракул откликов battle (ввод точек → отклики истины) | `tools/response_helper.py` + `src/verification/battle_truth.py` (единый источник) | ✅ `test_iteration20_response_helper.py`; battle `test_iteration13_battle.py` (4 passed) |
 | battle-план | развёрнутый РУЧНОЙ прогон единого UI с исходными данными по шагам | `docs/BATTLE_PLAN_17.md` | (ручной прогон) |
 | C1 | ассистент campaign-native (без PipelineRunner) | `assistant.build_campaign_context`/`campaign_ui_guide` | ✅ `test_iteration20_assistant_campaign.py` |
-| C2 | персистентность кампании (save/load/delete на MixtureProcessRunner) | `campaign`/`campaign_ui` | ⏳ TODO |
+| C2 | персистентность кампании (save/load/delete на MixtureProcessRunner) | `campaign_state` (+ `campaign_ui.make_linear_price_fn` делегирует) | ✅ `test_iteration20_campaign_persistence.py` |
 | C3 | Excel общей базы/рецепта + доли↔части в сетапе | `campaign_ui` | ⏳ TODO |
 | C4/финал | снос M1–M8 UI + PipelineRunner из UI, кампания = единый поток | `streamlit_app.py` | ⏳ регрессия AppTest |
+
 
 
 

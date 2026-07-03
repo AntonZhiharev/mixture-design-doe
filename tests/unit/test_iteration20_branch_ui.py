@@ -120,12 +120,14 @@ def test_campaign_manual_branch_and_workbench_flow():
     at.run()
     _click(at, "setup_propose_seed")
     _click(at, "setup_fill_demo")
-    _click(at, "setup_commit_seed")
-    at.run()                                       # реран: теперь база измерена
+    _click(at, "setup_commit_seed")                # commit → st.rerun → база измерена
     assert not at.exception
     ctrl = at.session_state["campaign_ctrl"]
     assert len(ctrl.runner.points) == 10
     assert not ctrl.runner.branches                # веток ещё нет
+    # §17.4→§17.5: после ОДНОГО коммита сразу открыто создание веток (без 2-го клика)
+    assert any(w.key == "camp_nb_add_goal" for w in at.button)
+
 
 
     # 2) Ш4: собрать цель и создать ветку вручную (дефолт отклик=strength)

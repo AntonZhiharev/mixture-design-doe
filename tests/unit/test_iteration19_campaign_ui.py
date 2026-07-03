@@ -25,8 +25,9 @@ from sklearn.exceptions import ConvergenceWarning
 from src.design.branches import ROLE_OPTIMIZED
 from src.apps import campaign as cv
 from src.apps.campaign_ui import (build_demo_campaign_runner,
-                                   goal_editor_dataframe,
+                                   goal_editor_dataframe, origin_label,
                                    workbench_points_dataframe)
+
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
@@ -55,9 +56,23 @@ def test_workbench_points_dataframe_has_all_properties_and_origin():
     assert set(df["origin"]) == {"branch:premium"}
 
 
+def test_origin_label_maps_branch_tag_to_name_keeping_tag_stable():
+    # Канон И-1: origin-тег точки завязан на id ("branch:{id}"). origin_label —
+    # UI-only: показывает «Имя (id)», НЕ трогая канонический тег в данных.
+    r = build_demo_campaign_runner(n_seed=12)
+    assert origin_label(r, "branch:premium") == "premium (premium)"
+    assert origin_label(r, "seed") == "seed"          # прочие теги — как есть
+    assert origin_label(r, "M2") == "M2"
+    assert origin_label(r, "branch:ghost") == "branch:ghost"  # нет ветки — тег
+    # переименование ветки меняет ЯРЛЫК, но не сам тег
+    r.branches["premium"].name = "Premium"
+    assert origin_label(r, "branch:premium") == "Premium (premium)"
+
+
 # ======================================================================
 # headless AppTest — вкладка «Кампания»: мультицель (§16.3) + стол (§16.4)
 # ======================================================================
+
 pytest.importorskip("streamlit")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 

@@ -328,6 +328,23 @@ def experiment_index(base_count: int, n: int) -> pd.Index:
     return pd.Index(range(start, start + int(n)), name="№ опыта")
 
 
+def origin_label(runner, origin: str) -> str:
+    """Человекочитаемый ярлык origin-тега для ПОКАЗА (сам тег не меняется).
+
+    Origin-тег точки в общей базе каноничен и завязан на id ветки
+    (``"seed"`` / ``"M2"`` / ``"branch:{id}"``, И-1): id стабилен, а имя ветки
+    можно переименовать, поэтому в ДАННЫХ хранится id. Для таблиц UI подменяем
+    ``"branch:{id}"`` на ``"{имя} ({id})"``; прочие теги — как есть.
+    """
+    if isinstance(origin, str) and origin.startswith("branch:"):
+        bid = origin.split(":", 1)[1]
+        br = runner.branches.get(bid)
+        if br is not None:
+            return f"{br.name} ({bid})"
+    return str(origin)
+
+
+
 # ----------------------------------------------------------------------
 # Streamlit-рендер вкладки (тест — headless AppTest)
 # ----------------------------------------------------------------------
@@ -799,11 +816,17 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                     # вид с редакторами выше, без служебного индекса).
                     wdf.insert(0, "№ опыта", list(experiment_index(
                         len(runner.points) - len(wdf), len(wdf))))
+                    # origin-тег канонично хранится как branch:{id}; для показа —
+                    # человекочитаемое «Имя (id)» (см. origin_label).
+                    wdf["origin"] = [origin_label(runner, o) for o in wdf["origin"]]
+                    wdf = wdf.rename(columns={"origin": "ветка"})
                 st.dataframe(wdf, use_container_width=True, hide_index=True)
 
                 oc = pd.DataFrame(
-                    {"точек": runner.origin_counts()}).rename_axis("origin")
-                st.dataframe(oc, use_container_width=True)
+                    [{"источник": origin_label(runner, k), "точек": v}
+                     for k, v in runner.origin_counts().items()])
+                st.dataframe(oc, use_container_width=True, hide_index=True)
+
                 # §4-стоп (двойной): технический И экономический, читает роль ρ
                 delta_d = float(res["d_best"]) - d_before
                 dec = runner.branch_stop_decision(

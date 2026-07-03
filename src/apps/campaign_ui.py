@@ -458,8 +458,47 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
             st.error(str(exc))
 
 
+# ----------------------------------------------------------------------
+# Чистые хелперы черновика целей ветки (без Streamlit — тестируются напрямую)
+# ----------------------------------------------------------------------
+def draft_add_goal(draft: Sequence[Dict[str, Any]], *, resp: str, kind: str,
+                   low: float, high: float, weight: float,
+                   target: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Добавить цель в черновик ветки (§17.5). Возвращает НОВЫЙ список.
+
+    Цель по одному и тому же отклику НЕ дублируется: повторное добавление того же
+    ``resp`` ЗАМЕНЯЕТ прежнюю запись (иначе при создании ветки дубли молча
+    схлопнулись бы в ``goals[resp]`` — тихая потеря, A0.6). ``target`` хранится
+    только для вида ``target``.
+    """
+    entry = {"resp": resp, "kind": kind, "low": float(low), "high": float(high),
+             "weight": float(weight),
+             "target": (float(target) if kind == "target" and target is not None
+                        else None)}
+    out = [dict(g) for g in draft]
+    for i, g in enumerate(out):
+        if g["resp"] == resp:
+            out[i] = entry
+            return out
+    out.append(entry)
+    return out
+
+
+def draft_remove_goal(draft: Sequence[Dict[str, Any]],
+                      index: int) -> List[Dict[str, Any]]:
+    """Убрать цель по индексу из черновика ветки. Возвращает НОВЫЙ список.
+
+    Индекс вне диапазона — список возвращается без изменений (идемпотентно).
+    """
+    out = [dict(g) for g in draft]
+    if 0 <= index < len(out):
+        del out[index]
+    return out
+
+
 def render_branch_creation(ctrl: "cv.CampaignController") -> None:
     """§17.5 (Ш4): ВРУЧНУЮ создать ветку — мультицель + роли + ценовая нога.
+
 
     Замена авто-M7 (§17.0): пользователь объявляет намерение ветки сам. Цели
     набираются по одной в session_state (мультицель §16.3, каждая — вид/диапазон/
@@ -493,8 +532,13 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
 
         # --- набор целей (мультицель) ---
         st.markdown("**🎯 Цели ветки (добавляйте по одной — мультицель §16.3)**")
+        st.caption(
+            "Ниже — конструктор ОДНОЙ цели. Настройте параметры и нажмите "
+            "«➕ Добавить цель в ветку»: цель войдёт в ветку ТОЛЬКО после нажатия "
+            "(до этого черновик пуст). Повторное добавление того же отклика "
+            "ЗАМЕНЯЕТ прежнюю цель; удалить цель поштучно — кнопкой 🗑 ниже.")
         gc = st.columns([2, 2, 2, 2, 2])
-        ng_resp = gc[0].selectbox("отклик", props, key="camp_nb_resp")
+        ng_resp = gc[0].selectbox("Цель (отклик)", props, key="camp_nb_resp")
         ng_kind = gc[1].selectbox("вид", ["max", "min", "target"],
                                   key="camp_nb_kind")
         ng_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_nb_lo")
@@ -505,18 +549,30 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                                  value=5.0, step=0.5, key="camp_nb_tgt")
         ac = st.columns([2, 2])
         if ac[0].button("➕ Добавить цель в ветку", key="camp_nb_add_goal"):
-            draft.append({"resp": ng_resp, "kind": ng_kind, "low": float(ng_lo),
-                          "high": float(ng_hi), "weight": float(ng_w),
-                          "target": float(ng_tgt) if ng_kind == "target" else None})
-            st.session_state["camp_new_goals"] = draft
+            st.session_state["camp_new_goals"] = draft_add_goal(
+                draft, resp=ng_resp, kind=ng_kind, low=float(ng_lo),
+                high=float(ng_hi), weight=float(ng_w),
+                target=(float(ng_tgt) if ng_kind == "target" else None))
+            draft = st.session_state["camp_new_goals"]
         if ac[1].button("🧹 Очистить цели", key="camp_nb_clear_goals"):
             st.session_state["camp_new_goals"] = []
             draft = []
         if draft:
-            st.dataframe(pd.DataFrame(draft), use_container_width=True)
+            st.caption("Цели ветки (черновик) — 🗑 удаляет цель поштучно:")
+            for i, g in enumerate(draft):
+                rc = st.columns([9, 1])
+                tgt_txt = (f", target={g['target']}"
+                           if g.get("target") is not None else "")
+                rc[0].markdown(
+                    f"{i + 1}. **{g['resp']}** — {g['kind']} "
+                    f"[{g['low']}, {g['high']}]{tgt_txt}, вес {g['weight']}")
+                if rc[1].button("🗑", key=f"camp_nb_del_goal_{i}"):
+                    st.session_state["camp_new_goals"] = draft_remove_goal(draft, i)
+                    st.rerun()
         else:
             st.caption("Пока ни одной цели — ветке нужен минимум один объектив "
                        "(§17.3).")
+
 
         # --- ценовая нога (опц.) ---
         st.markdown("**💰 Ценовая нога (опц., §3/§15.6)**")
@@ -856,8 +912,9 @@ def render_campaign() -> None:
 
         st.markdown("**➕/✏️ Задать или заменить цель над откликом**")
         gc = st.columns([2, 2, 2, 2, 2])
-        g_resp = gc[0].selectbox("отклик", list(runner.property_names),
+        g_resp = gc[0].selectbox("Цель (отклик)", list(runner.property_names),
                                  key="camp_goal_resp")
+
         g_kind = gc[1].selectbox("вид", ["max", "min", "target"],
                                  key="camp_goal_kind")
         g_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_goal_lo")

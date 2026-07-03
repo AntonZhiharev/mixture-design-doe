@@ -23,7 +23,9 @@ from sklearn.exceptions import ConvergenceWarning
 
 from src.optimize.desirability import DesirabilitySpec
 from src.apps.campaign import CampaignController
-from src.apps.campaign_ui import (build_setup_runner, make_linear_price_fn)
+from src.apps.campaign_ui import (build_setup_runner, make_linear_price_fn,
+                                  draft_add_goal, draft_remove_goal)
+
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
@@ -150,3 +152,65 @@ def test_campaign_manual_branch_and_workbench_flow():
     assert len(r.points) > n_base                  # общий пул вырос (И-1)
     tags = {p.origin_tag.get("origin") for p in r.points}
     assert f"branch:{bid}" in tags                 # origin-тег ветки
+
+
+# ======================================================================
+# §17.5 — черновик целей: добавление/замена/поштучное удаление (чистая логика)
+# ======================================================================
+def test_draft_add_goal_appends_distinct_and_replaces_same_resp():
+    d = draft_add_goal([], resp="strength", kind="max", low=2, high=12, weight=1)
+    assert len(d) == 1
+    d = draft_add_goal(d, resp="gloss", kind="max", low=1, high=13, weight=2)
+    assert len(d) == 2                              # разный отклик ⇒ 2 цели
+    # тот же отклик ⇒ ЗАМЕНА (без дубля, без тихого схлопывания при создании)
+    d = draft_add_goal(d, resp="strength", kind="min", low=0, high=5, weight=3)
+    assert len(d) == 2
+    s = [g for g in d if g["resp"] == "strength"][0]
+    assert s["kind"] == "min" and s["weight"] == 3.0
+    # target хранится только для вида target
+    dt = draft_add_goal([], resp="rho", kind="target", low=0, high=2,
+                        weight=1, target=1.0)
+    assert dt[0]["target"] == 1.0
+
+
+def test_draft_remove_goal_by_index_is_pure_and_idempotent():
+    d = draft_add_goal([], resp="strength", kind="max", low=0, high=1, weight=1)
+    d = draft_add_goal(d, resp="gloss", kind="max", low=0, high=1, weight=1)
+    d2 = draft_remove_goal(d, 0)
+    assert len(d) == 2 and len(d2) == 1             # вход не мутирован
+    assert d2[0]["resp"] == "gloss"
+    assert draft_remove_goal(d2, 5) == d2           # вне диапазона — без изменений
+
+
+def test_campaign_branch_draft_two_goals_delete_and_relabel():
+    """headless: 2 цели (смена отклика), поштучное 🗑, ярлык «Цель (отклик)»."""
+    at = AppTest.from_file(APP, default_timeout=360).run()
+    assert not at.exception
+    _click(at, "setup_build")
+    at.session_state["setup_seed_n"] = 10
+    at.run()
+    _click(at, "setup_propose_seed")
+    _click(at, "setup_fill_demo")
+    _click(at, "setup_commit_seed")
+    at.run()
+
+    # ярлык переименован единообразно в «Цель (отклик)» (не «отклик»)
+    labels = {w.label for w in at.selectbox}
+    assert "Цель (отклик)" in labels
+    assert "отклик" not in labels
+
+    # 1-я цель (strength), затем смена отклика на gloss и 2-я цель
+    _click(at, "camp_nb_add_goal")
+    assert len(at.session_state["camp_new_goals"]) == 1
+    sb = [w for w in at.selectbox if w.key == "camp_nb_resp"][0]
+    sb.select("gloss").run()
+    _click(at, "camp_nb_add_goal")
+    assert len(at.session_state["camp_new_goals"]) == 2
+
+    # поштучное удаление первой цели → в черновике остаётся 1 (gloss)
+    _click(at, "camp_nb_del_goal_0")
+    draft = at.session_state["camp_new_goals"]
+    assert len(draft) == 1 and draft[0]["resp"] == "gloss"
+    assert not at.exception
+
+

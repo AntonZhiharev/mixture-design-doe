@@ -476,13 +476,17 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
                    if Ys is not None else np.nan)
     # Сквозная нумерация опытов проекта: seed-точки ещё не в базе — показываем их
-    # будущие номера (база пуста ⇒ 1…N).
-    df.index = experiment_index(len(runner.points), len(df))
+    # будущие номера (база пуста ⇒ 1…N). Явный столбец, а НЕ индекс DataFrame:
+    # st.data_editor рисует позиционный номер строки и игнорирует кастомный
+    # индекс, поэтому номер несём отдельной read-only колонкой + hide_index.
+    df.insert(0, "№ опыта", list(experiment_index(len(runner.points), len(df))))
     st.caption("Составные координаты заблокированы; заполняются только столбцы "
                "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
     edited = st.data_editor(df, use_container_width=True, height=320,
-                            disabled=coord_names[:Xs.shape[1]],
+                            hide_index=True,
+                            disabled=["№ опыта", *coord_names[:Xs.shape[1]]],
                             key="setup_seed_editor")
+
     if st.button("💾 Зафиксировать seed (commit_seed)", key="setup_commit_seed"):
         try:
             Y = np.column_stack([np.asarray(edited[c], float) for c in lab_cols])
@@ -756,13 +760,17 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
             df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
                        if Ys is not None else np.nan)
         # Сквозная нумерация: предложенные точки ещё не залиты — показываем их
-        # будущие номера в общей базе (len(points)+1 … +N).
-        df.index = experiment_index(len(runner.points), len(df))
+        # будущие номера в общей базе (len(points)+1 … +N). Явный read-only
+        # столбец (st.data_editor игнорирует кастомный индекс — см. seed выше).
+        df.insert(0, "№ опыта",
+                  list(experiment_index(len(runner.points), len(df))))
         st.caption("Предложенные точки: координаты заблокированы, заполняются "
                    "только столбцы «свойство (lab)» (вручную или демо-кнопкой):")
         edited = st.data_editor(df, use_container_width=True, height=280,
-                                disabled=coord_names[:Xs.shape[1]],
+                                hide_index=True,
+                                disabled=["№ опыта", *coord_names[:Xs.shape[1]]],
                                 key=f"camp_wb_editor_{bsel}")
+
         if st.button("💾 Долить измеренные (commit_measured)",
                      key=f"camp_wb_commit_{bsel}"):
             try:
@@ -787,10 +795,12 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                 wdf = workbench_points_dataframe(runner, res)
                 if not wdf.empty:
                     # Те же сквозные номера, что точки получили в общей базе:
-                    # последние len(wdf) опытов проекта.
-                    wdf.index = experiment_index(
-                        len(runner.points) - len(wdf), len(wdf))
-                st.dataframe(wdf, use_container_width=True)
+                    # последние len(wdf) опытов проекта — явным столбцом (единый
+                    # вид с редакторами выше, без служебного индекса).
+                    wdf.insert(0, "№ опыта", list(experiment_index(
+                        len(runner.points) - len(wdf), len(wdf))))
+                st.dataframe(wdf, use_container_width=True, hide_index=True)
+
                 oc = pd.DataFrame(
                     {"точек": runner.origin_counts()}).rename_axis("origin")
                 st.dataframe(oc, use_container_width=True)

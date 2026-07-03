@@ -447,8 +447,14 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     sc = st.columns([1, 1, 1])
     seed_n = sc[0].number_input("N seed-точек", min_value=2, max_value=60,
                                 value=12, step=1, key="setup_seed_n")
-    seed_design = sc[1].number_input("seed дизайна", value=1, step=1,
-                                     key="setup_seed_design")
+    seed_design = sc[1].number_input(
+        "зерно ГСЧ (воспроизводимость)", value=1, step=1,
+        key="setup_seed_design",
+        help="Зерно генератора случайных чисел для построения стартового "
+             "дизайна. Одно и то же значение → тот же набор из N точек "
+             "(воспроизводимо); другое значение → другой случайный вариант. "
+             "К числу «seed-точек» отношения не имеет — это разные «seed».")
+
     if sc[2].button("📐 Предложить seed-дизайн", key="setup_propose_seed"):
         X = np.asarray(ctrl.propose_seed(int(seed_n), seed=int(seed_design)), float)
         st.session_state["setup_seed_X"] = X

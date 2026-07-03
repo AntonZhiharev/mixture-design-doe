@@ -27,7 +27,7 @@ from src.apps import campaign as cv
 from src.apps.campaign_ui import (build_setup_runner, make_linear_price_fn,
                                   draft_add_goal, draft_remove_goal,
                                   build_demo_campaign_runner,
-                                  role_table_dataframe)
+                                  role_table_dataframe, experiment_index)
 
 
 
@@ -251,6 +251,31 @@ def test_commit_seed_without_Y_shows_friendly_error_not_nan_crash():
     assert "Заполните измеренные отклики" in msgs     # понятная подсказка
     assert "NaN" not in msgs                          # без сырого sklearn-текста
     assert len(at.session_state["campaign_ctrl"].runner.points) == 0  # база пуста
+
+
+# ======================================================================
+# Сквозная нумерация опытов проекта (№ опыта = позиция в общей базе)
+# ======================================================================
+def test_experiment_index_is_sequential_after_base():
+    """Предложенные точки нумеруются сквозным № опыта проекта (1-based).
+
+    Если в общей базе уже ``base_count`` опытов, N новых получают их БУДУЩИЕ
+    номера ``base_count+1 … base_count+N`` (порядок добавления в ``runner.points``).
+    Индекс именован «№ опыта» — так он и показывается слева в таблицах UI.
+    """
+    idx = experiment_index(12, 3)
+    assert list(idx) == [13, 14, 15]
+    assert idx.name == "№ опыта"
+    # пустая база ⇒ нумерация с 1 (стартовый seed-дизайн)
+    assert list(experiment_index(0, 5)) == [1, 2, 3, 4, 5]
+    # вырожденный случай: ноль новых точек ⇒ пустой индекс (без падения)
+    assert list(experiment_index(7, 0)) == []
+    # номера непрерывны и продолжают базу от ветки к ветке (общий пул, И-1)
+    prev = experiment_index(10, 3)          # seed(10) → ветка добрала 3 (№ 11..13)
+    nxt = experiment_index(13, 2)           # следующее предложение (№ 14..15)
+    assert prev[-1] + 1 == nxt[0]
+
+
 
 
 

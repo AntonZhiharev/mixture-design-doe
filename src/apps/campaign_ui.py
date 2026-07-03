@@ -315,9 +315,23 @@ def workbench_points_dataframe(runner, result: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+def experiment_index(base_count: int, n: int) -> pd.Index:
+    """Сквозные 1-based номера опытов проекта для ``n`` новых точек.
+
+    «Номер опыта» = позиция точки в ЕДИНОЙ общей базе (``runner.points``),
+    куда опыты добавляются по порядку (seed, затем commit'ы веток). Для ещё
+    не залитых предложенных точек это их БУДУЩИЕ номера: если в базе уже
+    ``base_count`` опытов, новые получат ``base_count+1 … base_count+n``.
+    Возвращает именованный (``«№ опыта»``) индекс для показа в таблицах.
+    """
+    start = int(base_count) + 1
+    return pd.Index(range(start, start + int(n)), name="№ опыта")
+
+
 # ----------------------------------------------------------------------
 # Streamlit-рендер вкладки (тест — headless AppTest)
 # ----------------------------------------------------------------------
+
 def get_campaign_controller() -> Optional["cv.CampaignController"]:
     """Контроллер демо-кампании из session_state (или ``None``, если не создан)."""
     return st.session_state.get("campaign_ctrl")
@@ -455,6 +469,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     for j, col in enumerate(lab_cols):
         df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
                    if Ys is not None else np.nan)
+    # Сквозная нумерация опытов проекта: seed-точки ещё не в базе — показываем их
+    # будущие номера (база пуста ⇒ 1…N).
+    df.index = experiment_index(len(runner.points), len(df))
     st.caption("Составные координаты заблокированы; заполняются только столбцы "
                "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
     edited = st.data_editor(df, use_container_width=True, height=320,
@@ -732,6 +749,9 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         for j, col in enumerate(lab_cols):
             df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
                        if Ys is not None else np.nan)
+        # Сквозная нумерация: предложенные точки ещё не залиты — показываем их
+        # будущие номера в общей базе (len(points)+1 … +N).
+        df.index = experiment_index(len(runner.points), len(df))
         st.caption("Предложенные точки: координаты заблокированы, заполняются "
                    "только столбцы «свойство (lab)» (вручную или демо-кнопкой):")
         edited = st.data_editor(df, use_container_width=True, height=280,
@@ -758,8 +778,13 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                     f"{d_before:.3f} → {res['d_best']:.3f} (монотонно не убывает); "
                     f"общая база = {res['n_base']} точек.")
                 st.caption("Измеренные отклики долитых точек (по всем P):")
-                st.dataframe(workbench_points_dataframe(runner, res),
-                             use_container_width=True)
+                wdf = workbench_points_dataframe(runner, res)
+                if not wdf.empty:
+                    # Те же сквозные номера, что точки получили в общей базе:
+                    # последние len(wdf) опытов проекта.
+                    wdf.index = experiment_index(
+                        len(runner.points) - len(wdf), len(wdf))
+                st.dataframe(wdf, use_container_width=True)
                 oc = pd.DataFrame(
                     {"точек": runner.origin_counts()}).rename_axis("origin")
                 st.dataframe(oc, use_container_width=True)
@@ -926,8 +951,13 @@ def render_campaign() -> None:
 
     # --- линза ветки (Тр-3.3): роли В КОНТЕКСТЕ выбранной ветки ----------
 
+    def _branch_label(bid: str) -> str:
+        """Показать имя ветки (+id) в селекторе; значение опции остаётся id."""
+        br = runner.branches.get(bid)
+        return f"{br.name} ({bid})" if br is not None else str(bid)
+
     bsel = st.selectbox("Ветка (линза контекста — Тр-3.3)", bids,
-                        key="camp_branch")
+                        key="camp_branch", format_func=_branch_label)
     rep = ctrl.role_report(bsel)
     st.caption(f"Линза ветки: **{rep['branch_name']}** (`{bsel}`). Role-tag "
                "валиден ТОЛЬКО в этом контексте; смена ветки меняет теги.")
@@ -1064,7 +1094,8 @@ def render_campaign() -> None:
     # --- spawn ветки (§8) с наследованием ролей -------------------------
     st.markdown("**🌱 Spawn ветки (§8) — наследование ролей + review-сводка**")
     cs = st.columns([2, 2, 2])
-    parent = cs[0].selectbox("Родитель", bids, key="camp_spawn_parent")
+    parent = cs[0].selectbox("Родитель", bids, key="camp_spawn_parent",
+                             format_func=_branch_label)
     cname = cs[1].text_input("Имя ребёнка", value="child", key="camp_spawn_name")
     over = cs[2].checkbox("новая цель над ρ (перебьёт роль, Тр-8.1в)",
                           key="camp_spawn_over")

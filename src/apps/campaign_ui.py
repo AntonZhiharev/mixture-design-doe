@@ -463,7 +463,13 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     if st.button("💾 Зафиксировать seed (commit_seed)", key="setup_commit_seed"):
         try:
             Y = np.column_stack([np.asarray(edited[c], float) for c in lab_cols])
+            if np.isnan(Y).any():
+                raise ValueError(
+                    "Заполните измеренные отклики (столбцы «… (lab)») для ВСЕХ "
+                    "точек — вручную в таблице или кнопкой «🧪 Заполнить "
+                    "тестовыми». Пустые ячейки (None) фиксировать нельзя.")
             out = ctrl.commit_seed(Xs, Y)
+
             for k in ("setup_seed_X", "setup_seed_Y"):
                 st.session_state.pop(k, None)
             st.success(
@@ -737,7 +743,14 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                 d_before = float(br_now.d_best)
                 Y = np.column_stack([np.asarray(edited[c], float)
                                      for c in lab_cols])
+                if np.isnan(Y).any():
+                    raise ValueError(
+                        "Заполните измеренные отклики (столбцы «… (lab)») для "
+                        "ВСЕХ предложенных точек — вручную или кнопкой "
+                        "«🧪 Заполнить тестовыми». Пустые ячейки (None) "
+                        "доливать нельзя.")
                 res = ctrl.commit_measured(bsel, Xs, Y)
+
                 st.session_state.pop(kx, None)
                 st.session_state.pop(ky, None)
                 st.success(

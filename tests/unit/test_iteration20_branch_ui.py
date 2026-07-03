@@ -240,4 +240,18 @@ def test_role_table_weight_column_is_arrow_safe_uniform_str():
     pa.Table.from_pandas(df)                             # без ArrowInvalid
 
 
+def test_commit_seed_without_Y_shows_friendly_error_not_nan_crash():
+    """commit_seed с пустыми Y → внятное сообщение (не сырое «Input y contains NaN»)."""
+    at = AppTest.from_file(APP, default_timeout=360).run()
+    _click(at, "setup_build")
+    _click(at, "setup_propose_seed")                 # предложили, НО не заполнили Y
+    _click(at, "setup_commit_seed")
+    assert not at.exception                          # UI не упал
+    msgs = " ".join(e.value for e in at.error)
+    assert "Заполните измеренные отклики" in msgs     # понятная подсказка
+    assert "NaN" not in msgs                          # без сырого sklearn-текста
+    assert len(at.session_state["campaign_ctrl"].runner.points) == 0  # база пуста
+
+
+
 

@@ -23,8 +23,12 @@ from sklearn.exceptions import ConvergenceWarning
 
 from src.optimize.desirability import DesirabilitySpec
 from src.apps.campaign import CampaignController
+from src.apps import campaign as cv
 from src.apps.campaign_ui import (build_setup_runner, make_linear_price_fn,
-                                  draft_add_goal, draft_remove_goal)
+                                  draft_add_goal, draft_remove_goal,
+                                  build_demo_campaign_runner,
+                                  role_table_dataframe)
+
 
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
@@ -214,5 +218,26 @@ def test_campaign_branch_draft_two_goals_delete_and_relabel():
     draft = at.session_state["camp_new_goals"]
     assert len(draft) == 1 and draft[0]["resp"] == "gloss"
     assert not at.exception
+
+
+# ======================================================================
+# Регресс: колонка «вес» role-таблицы Arrow-совместима (однотипно строковая)
+# ======================================================================
+def test_role_table_weight_column_is_arrow_safe_uniform_str():
+    """У целей — число, у нецелевых — «—»; смешение float/str ломало Arrow.
+
+    Ранее колонка «вес» несла float у целей и строку «—» у нецелевых откликов —
+    st.dataframe писал «Serialization … unsuccessful» и авто-приводил тип. Теперь
+    колонка строго строковая ⇒ Arrow сериализует без ошибки/варнинга.
+    """
+    pa = pytest.importorskip("pyarrow")
+    r = build_demo_campaign_runner(n_seed=12)
+    rep = cv.branch_role_report(r, "premium")   # strength/gloss — цели, rho — нет
+    df = role_table_dataframe(rep)
+    col = list(df["вес"])
+    assert all(isinstance(v, str) for v in col)          # без смешения типов
+    assert any(v == "—" for v in col) and any(v != "—" for v in col)
+    pa.Table.from_pandas(df)                             # без ArrowInvalid
+
 
 

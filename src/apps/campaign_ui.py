@@ -231,6 +231,18 @@ _STOP_RU: Dict[Optional[str], str] = {
     "not_economical": "💸 невыгодно (not_economical)",
 }
 
+# Подсказка к полю «Значимость цели» (ядровый вес взвеш. геом-среднего d_i).
+# Только текст UI — сам параметр в ядре остаётся ``DesirabilitySpec.weight``.
+_WEIGHT_HELP = (
+    "Значимость цели — её относительный приоритет в компромиссе между откликами. "
+    "Итог ветки = взвешенное геометрическое среднее желательностей d_i: "
+    "d_overall = (Π d_i^w)^(1/Σw). Больше значимость → оптимум сильнее тянется "
+    "выполнить именно эту цель, жертвуя другими. Важны только ОТНОШЕНИЯ "
+    "значимостей (равные = равная важность; умножить все на число — без эффекта). "
+    "Не спасает от veto: если хоть одна d_i=0, итог=0 при любой значимости."
+)
+
+
 
 def role_table_dataframe(report: Dict[str, Any]) -> pd.DataFrame:
     """Role-репорт ветки → таблица для показа (контекст ветки уже зашит в report)."""
@@ -241,8 +253,12 @@ def role_table_dataframe(report: Dict[str, Any]) -> pd.DataFrame:
             "роль": r["role_label"],
             "код": r["role_code"],
             "в цели": "да" if r["in_goal"] else "—",
-            "вес": (r["weight"] if r["weight"] is not None else "—"),
+            # Колонка строго строковая: у целей — число, у нецелевых — «—».
+            # Смешение float/str ломает Arrow-сериализацию st.dataframe (варнинг
+            # «Serialization … unsuccessful» и авто-приведение типа колонки «вес»).
+            "вес": (f'{float(r["weight"]):g}' if r["weight"] is not None else "—"),
             "ден. канал ρ": _MONEY_RU.get(r["money_channel"], "—"),
+
             "покрытие": f'{r["coverage_measured"]}/{r["coverage_total"]}',
             "низк. покрытие": "⚠️" if r["low_coverage"] else "",
         })
@@ -548,8 +564,9 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                                   key="camp_nb_kind")
         ng_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_nb_lo")
         ng_hi = gc[3].number_input("high", value=10.0, step=0.5, key="camp_nb_hi")
-        ng_w = gc[4].number_input("вес", min_value=0.01, value=1.0, step=0.5,
-                                  key="camp_nb_w")
+        ng_w = gc[4].number_input("Значимость цели", min_value=0.01, value=1.0,
+                                  step=0.5, key="camp_nb_w", help=_WEIGHT_HELP)
+
         ng_tgt = st.number_input("target (для вида target; low<target<high)",
                                  value=5.0, step=0.5, key="camp_nb_tgt")
         ac = st.columns([2, 2])
@@ -570,7 +587,9 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                            if g.get("target") is not None else "")
                 rc[0].markdown(
                     f"{i + 1}. **{g['resp']}** — {g['kind']} "
-                    f"[{g['low']}, {g['high']}]{tgt_txt}, вес {g['weight']}")
+                    f"[{g['low']}, {g['high']}]{tgt_txt}, "
+                    f"значимость {g['weight']}")
+
                 if rc[1].button("🗑", key=f"camp_nb_del_goal_{i}"):
                     st.session_state["camp_new_goals"] = draft_remove_goal(draft, i)
                     st.rerun()
@@ -924,8 +943,9 @@ def render_campaign() -> None:
                                  key="camp_goal_kind")
         g_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_goal_lo")
         g_hi = gc[3].number_input("high", value=10.0, step=0.5, key="camp_goal_hi")
-        g_w = gc[4].number_input("вес", min_value=0.01, value=1.0, step=0.5,
-                                 key="camp_goal_w")
+        g_w = gc[4].number_input("Значимость цели", min_value=0.01, value=1.0,
+                                 step=0.5, key="camp_goal_w", help=_WEIGHT_HELP)
+
         g_tgt = st.number_input("target (только для вида target; low<target<high)",
                                 value=5.0, step=0.5, key="camp_goal_tgt")
         if st.button("💾 Задать / заменить цель", key="camp_goal_set"):
@@ -945,14 +965,16 @@ def render_campaign() -> None:
 
         goals_now = list(runner.branches[bsel].goal or {})
         if goals_now:
-            st.markdown("**⚖️ Веса целей (экспоненты геом-среднего d_i)**")
+            st.markdown("**⚖️ Значимость целей (относительный приоритет в "
+                        "геом-среднем d_i)**")
             wcols = st.columns(len(goals_now))
             new_w: Dict[str, float] = {}
             for i, resp in enumerate(goals_now):
                 cur_w = float(runner.branches[bsel].goal[resp].weight)
                 new_w[resp] = wcols[i].number_input(
-                    f"вес «{resp}»", min_value=0.01, value=cur_w, step=0.5,
-                    key=f"camp_goal_w_{resp}")
+                    f"Значимость «{resp}»", min_value=0.01, value=cur_w,
+                    step=0.5, key=f"camp_goal_w_{resp}", help=_WEIGHT_HELP)
+
             if st.button("⚖️ Применить веса", key="camp_goal_weights"):
                 try:
                     res = ctrl.set_weights(

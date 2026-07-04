@@ -685,11 +685,58 @@ def system_prompt() -> str:
     )
 
 
+def campaign_system_prompt() -> str:
+    """Системный промпт ассистента для ЕДИНОГО потока кампании (§17, C4).
+
+    Замена :func:`system_prompt` после сноса M1…M8 UI (REBUILD_SPEC_17 §17.6):
+    главный поток — сетап (mixture+процесс+отклики) → ручной seed → ручные
+    мультицелевые ветки → рабочий стол (ручной ввод Y) → эволюция схемы.
+    Стадий M1…M8 и PipelineRunner больше нет — не упоминать их пользователю.
+    """
+    return (
+        "Ты — встроенный ИИ-ассистент инженерного приложения для планирования "
+        "экспериментов со смесями (mixture DOE). Единственный рабочий поток — "
+        "КАМПАНИЯ (§17): 1) сетап проекта (компоненты смеси Σ=1, процесс-"
+        "параметры, отклики); 2) ручной стартовый дизайн (seed) с внесением "
+        "измеренных откликов пользователем; 3) ручное создание веток — каждая "
+        "ветка это НАБОР целей (мультицель: min/max/target, диапазон, вес) + "
+        "опциональная модель себестоимости изделия (ρ-отклик × цена состава); "
+        "4) рабочий стол ветки: предложить точки → внести измеренные Y → "
+        "долить в общую базу → §4-стоп (технический И экономический); "
+        "5) эволюция схемы в любой момент (раскрыть ось/компонент/отклик, "
+        "подвинуть границы) с явной политикой миграции старых точек. Единая "
+        "модель физики на проект (общие суррогаты GP+MoE на каждое свойство); "
+        "ветка — лишь контейнер намерения, своей модели не имеет.\n\n"
+        "Тебе передаётся JSON с актуальным состоянием кампании: property_names, "
+        "n_points (размер общей базы), origin_counts (откуда точки — seed/ветки), "
+        "branches (id/статус/бюджет/d_best/роли/денежный канал ρ по каждой "
+        "ветке). Опирайся на эти ЧИСЛА, а не на догадки. В блоке `ui_guide` — "
+        "КАРТА интерфейса (шаги потока и кнопки); когда пользователь спрашивает "
+        "«что нажать дальше» — отвечай по `ui_guide`.\n\n"
+        "Роль отклика — атрибут ПАРЫ (ветка × отклик), внутри ветки строгий XOR "
+        "(`OPTIMIZED` — цель качества, либо `PRICE_INPUT` — питает цену). Между "
+        "ветками роли свободно различаются. Денежный канал ρ role-aware (И-5): "
+        "при `OPTIMIZED` ценовой σ_ρ-канал ЗАНУЛЁН (иначе двойной счёт одной δρ), "
+        "при `PRICE_INPUT` — ЖИВОЙ. Объясняя «почему за ρ есть/нет денег», "
+        "опирайся на `price_channel_suppressed` и не путай ветки.\n\n"
+        "Правила ответа:\n"
+        "• отвечай по-русски, кратко и по делу, техническим языком;\n"
+        "• чётко отделяй факт (из контекста) от интерпретации и предположения;\n"
+        "• если данных не хватает — прямо скажи об этом и предложи следующий шаг "
+        "потока (§17.4 сетап → §17.4 seed → §17.5 ветки → §17.2 рабочий стол);\n"
+        "• не выдумывай метрики, которых нет в контексте;\n"
+        "• стадий M1…M8 и PipelineRunner в этом приложении больше НЕТ — не "
+        "упоминай их, если пользователь явно не спросит про историю проекта."
+    )
+
+
 def build_messages(context: Dict[str, Any], history: List[Dict[str, str]],
-                   user_msg: str) -> List[Dict[str, str]]:
+                   user_msg: str, *, system: Optional[str] = None
+                   ) -> List[Dict[str, str]]:
     ctx_json = json.dumps(context, ensure_ascii=False, indent=2)
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt()},
+        {"role": "system", "content": system if system is not None
+                                      else system_prompt()},
         {"role": "system",
          "content": "Актуальный контекст приложения (JSON):\n```json\n"
                     + ctx_json + "\n```"},
@@ -700,6 +747,7 @@ def build_messages(context: Dict[str, Any], history: List[Dict[str, str]],
             messages.append({"role": role, "content": str(m["content"])})
     messages.append({"role": "user", "content": str(user_msg)})
     return messages
+
 
 
 def call_llm(messages: List[Dict[str, str]], *, model: Optional[str] = None,
@@ -757,3 +805,23 @@ def assistant_reply(runner, history: List[Dict[str, str]], user_msg: str, *,
     context = build_context(runner, extra=extra_context, campaign=campaign)
     messages = build_messages(context, history, user_msg)
     return call_llm(messages, model=model)
+
+
+def campaign_assistant_reply(overview: Optional[Dict[str, Any]],
+                             history: List[Dict[str, str]], user_msg: str, *,
+                             extra: Optional[Dict[str, Any]] = None,
+                             model: Optional[str] = None) -> str:
+    """§17.6/C4: ответ ассистента в режиме КАМПАНИИ (без PipelineRunner).
+
+    ``overview`` — сводка ``campaign.campaign_overview`` (см.
+    ``campaign_ui.campaign_assistant_overview``): property_names, n_points,
+    origin_counts, per-branch роли/статус/d_best/денежный канал ρ. Контекст
+    строится campaign-native (:func:`build_campaign_context`), системный промпт —
+    :func:`campaign_system_prompt` (стадий M1…M8 в этом приложении больше нет).
+    """
+    context = build_campaign_context(overview or {}, extra=extra)
+    messages = build_messages(context, history, user_msg,
+                              system=campaign_system_prompt())
+    return call_llm(messages, model=model)
+
+

@@ -83,5 +83,7 @@ data/
 # Generated runtime project state (UI/demo runs, checkpoints, models, traces)
 project_ui/
 project_demo/
+project_campaigns/
+
 
 

@@ -155,10 +155,18 @@ M1–M8-рендера. Поток кампании (`render_campaign`) имее
   явный отказ, не тихая потеря цены. Тест `test_iteration20_campaign_persistence.py`.
 
 - **C3** — выгрузка Excel общей базы/рецепта кампании; доли↔части в сетапе §17.4.
-- **C4 (собственно снос)** — `streamlit_app.py`: кампания = ЕДИНЫЙ главный поток;
-  удалить `render_stage`/`_render_m2`/`_render_result`/`_render_m3/4`, авто-M7,
+- **C4 (сделано, собственно снос)** — `streamlit_app.py` переписан на ЕДИНЫЙ
+  поток кампании: `main()` строит только сетап→seed→ветки→рабочий стол→эволюцию
+  (`render_campaign`) + сайдбар персистентности кампании (C2) + вкладку
+  ассистента campaign-native (C1: `campaign_assistant_reply`/
+  `build_campaign_context`/`campaign_system_prompt`). Удалены из UI:
+  `render_stage`/`_render_m2`/`_render_result`/`_render_m3/4`, авто-M7,
   mixture-only `render_branches`, synthetic-benchmark, сайдбар M1–M8 и
-  `PipelineRunner` из UI; ассистент/проект/Excel — на перенесённых C1–C3.
+  `PipelineRunner` (сам `PipelineRunner` оставлен в `src/` как библиотека/для
+  юнит-тестов ядра). Устаревшие M1–M8 AppTest-файлы удалены (логические аналоги
+  сохранены). Тест `test_iteration23_campaign_app.py` (единый поток, отсутствие
+  pipeline-UI, save/load кампании).
+
 
 ## §17.7 Карта шагов и гейты (для реализации)
 
@@ -177,7 +185,8 @@ M1–M8-рендера. Поток кампании (`render_campaign`) имее
 | C2 | персистентность кампании (save/load/delete на MixtureProcessRunner) | `campaign_state` (+ `campaign_ui.make_linear_price_fn` делегирует) | ✅ `test_iteration20_campaign_persistence.py` |
 | C3 | Excel общей базы/рецепта + доли↔части в сетапе | `campaign_ui` | ✅ `test_iteration21_campaign_setup_ux.py` (+ UX-правки замечаний 1–10) |
 
-| C4/финал | снос M1–M8 UI + PipelineRunner из UI, кампания = единый поток | `streamlit_app.py` | ⏳ регрессия AppTest |
+| C4/финал | снос M1–M8 UI + PipelineRunner из UI, кампания = единый поток | `streamlit_app.py` (+ `assistant.campaign_assistant_reply`, персистентность/ассистент в сайдбаре/вкладке) | ✅ `test_iteration23_campaign_app.py` |
+
 
 
 

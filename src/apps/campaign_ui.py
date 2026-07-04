@@ -348,6 +348,60 @@ def campaign_base_excel_bytes(runner, *, batch_kg: Optional[float] = None
     return buf.getvalue()
 
 
+def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = None
+                          ) -> pd.DataFrame:
+    """§17.4 (C3): предложенный СТАРТОВЫЙ дизайн → таблица для показа/Excel.
+
+    По строке на предложенную seed-точку: будущий «№ опыта» (база пока пуста ⇒
+    1…N), заблокированные составные координаты (mixture-доли + процесс в РЕАЛЬНЫХ
+    единицах) и столбцы откликов ``{свойство} (lab)`` (пустые — места под ручной
+    ввод в лаборатории, либо уже внесённые ``Ys``). При заданном ``batch_kg``
+    добавляются столбцы расхода сырья ``{компонент} ({кг})`` = доля·batch —
+    сколько взвесить на опыт (замечание 7). Чистый хелпер — тестируется напрямую.
+    """
+    coord_names = setup_coord_names(runner)
+    props = list(runner.property_names)
+    Xs = np.atleast_2d(np.asarray(Xs, float))
+    ncoord = Xs.shape[1]
+    mix_names = list(runner.current_schema.mixture_names)
+    Ya = np.atleast_2d(np.asarray(Ys, float)) if Ys is not None else None
+
+    nums = list(experiment_index(len(runner.points), len(Xs)))
+    rows: List[Dict[str, Any]] = []
+    for i in range(len(Xs)):
+        row: Dict[str, Any] = {"№ опыта": nums[i]}
+        for j, cn in enumerate(coord_names[:ncoord]):
+            row[cn] = round(float(Xs[i, j]), 4)
+        if batch_kg is not None and float(batch_kg) > 0:
+            for j, cn in enumerate(mix_names):
+                row[f"{cn} ({MASS_UNIT})"] = round(
+                    float(Xs[i, j]) * float(batch_kg), 4)
+        for k, pn in enumerate(props):
+            row[f"{pn} (lab)"] = (round(float(Ya[i, k]), 4)
+                                  if Ya is not None and k < Ya.shape[1]
+                                  else np.nan)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def seed_design_excel_bytes(runner, Xs, Ys=None, *,
+                            batch_kg: Optional[float] = None) -> bytes:
+    """§17.4 (C3): предложенный стартовый дизайн → xlsx-байты (кнопка скачивания).
+
+    Лист «Стартовый дизайн» = :func:`seed_design_dataframe` (с расходом сырья, если
+    задан ``batch_kg``; пустые «(lab)» — места под ручной ввод откликов). Чистый
+    хелпер (без Streamlit) — тестируется напрямую; отдаёт готовые байты .xlsx."""
+    import io
+    df = seed_design_dataframe(runner, Xs, Ys, batch_kg=batch_kg)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        (df if not df.empty else pd.DataFrame({"инфо": ["дизайн пуст"]})).to_excel(
+            xw, sheet_name="Стартовый дизайн", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+
 # ----------------------------------------------------------------------
 # Чистые таблицы для показа (без Streamlit) — тестируемы напрямую
 # ----------------------------------------------------------------------
@@ -732,25 +786,44 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         st.session_state["setup_seed_Y"] = np.vstack(
             [runner._measure(np.asarray(x, float)) for x in Xs])
 
+    # Замечание 7: размер ПРОБЫ (партии) — добавляет столбцы расхода сырья
+    # {компонент} (кг) = доля·batch, чтобы понимать, сколько взвесить на опыт.
+    mix_names = list(runner.current_schema.mixture_names)
+    batch = st.number_input(
+        f"Размер пробы, {MASS_UNIT}/опыт (для расхода сырья и Excel)",
+        min_value=0.0, value=0.0, step=0.1, key="setup_seed_batch",
+        help="0 — только состав в долях; >0 — добавит столбцы расхода сырья "
+             f"({MASS_UNIT}) = доля компонента × размер пробы (замечание 7). "
+             "На сам дизайн (координаты) не влияет — только показ и выгрузка.")
+    batch_kg = float(batch) if batch > 0 else None
+    mass_cols = ([f"{c} ({MASS_UNIT})" for c in mix_names]
+                 if batch_kg is not None else [])
+
     Ys = st.session_state.get("setup_seed_Y")
-    df = pd.DataFrame(np.round(Xs, 4), columns=coord_names[:Xs.shape[1]])
     lab_cols = [f"{p} (lab)" for p in props]
-    for j, col in enumerate(lab_cols):
-        df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
-                   if Ys is not None else np.nan)
-    # Сквозная нумерация опытов проекта: seed-точки ещё не в базе — показываем их
-    # будущие номера (база пуста ⇒ 1…N). Явный столбец, а НЕ индекс DataFrame:
-    # st.data_editor рисует позиционный номер строки и игнорирует кастомный
-    # индекс, поэтому номер несём отдельной read-only колонкой + hide_index.
-    df.insert(0, "№ опыта", list(experiment_index(len(runner.points), len(df))))
+    # Единый источник таблицы (показ = редактор = Excel): чистый хелпер строит
+    # «№ опыта» + заблокированные координаты (+ расход сырья) + столбцы «(lab)».
+    df = seed_design_dataframe(runner, Xs, Ys, batch_kg=batch_kg)
     st.caption("Составные координаты заблокированы; заполняются только столбцы "
                "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
     edited = st.data_editor(df, use_container_width=True, height=320,
                             hide_index=True,
-                            disabled=["№ опыта", *coord_names[:Xs.shape[1]]],
+                            disabled=["№ опыта", *coord_names[:Xs.shape[1]],
+                                      *mass_cols],
                             key="setup_seed_editor")
 
+    # C3: сохранить ПЛАН стартового эксперимента в Excel (ещё до фиксации) —
+    # экспортируем внесённые в редакторе значения (пустые «(lab)» — под ручной
+    # ввод в лаборатории), с расходом сырья, если задан размер пробы.
+    st.download_button(
+        "⬇️ Сохранить план в Excel (.xlsx)",
+        data=seed_design_excel_bytes(runner, Xs, Ys, batch_kg=batch_kg),
+        file_name="seed_design.xlsx", key="setup_seed_dl",
+        mime="application/vnd.openxmlformats-officedocument."
+             "spreadsheetml.sheet")
+
     if st.button("💾 Зафиксировать seed (commit_seed)", key="setup_commit_seed"):
+
         try:
             Y = np.column_stack([np.asarray(edited[c], float) for c in lab_cols])
             if np.isnan(Y).any():

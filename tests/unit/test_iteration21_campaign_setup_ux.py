@@ -144,8 +144,66 @@ def test_campaign_base_dataframe_empty_when_no_points():
 
 
 # ======================================================================
+# C3 — стартовый ДИЗАЙН (seed): таблица/Excel + размер пробы (расход сырья)
+# ======================================================================
+def _empty_setup_runner():
+    return ui.build_setup_runner(
+        mixture_names=["A", "B", "C"], process_names=["T", "P"],
+        process_lower=[150.0, 1.0], process_upper=[200.0, 5.0],
+        response_names=["strength", "gloss", "rho"], seed=0)
+
+
+def _seed_X(n=4):
+    # n точек составного вектора [A,B,C,T,P]; доли произвольные (хелпер их не
+    # валидирует — только раскладывает по колонкам), процесс в [0,1] коде.
+    rng = np.random.default_rng(0)
+    mix = rng.dirichlet([1, 1, 1], size=n)
+    proc = rng.uniform(0.0, 1.0, size=(n, 2))
+    return np.hstack([mix, proc])
+
+
+def test_seed_design_dataframe_columns_and_future_numbers():
+    r = _empty_setup_runner()
+    Xs = _seed_X(5)
+    df = ui.seed_design_dataframe(r, Xs)
+    assert len(df) == 5
+    # база пуста ⇒ будущие номера 1..N
+    assert list(df["№ опыта"]) == [1, 2, 3, 4, 5]
+    for cn in ui.setup_coord_names(r):
+        assert cn in df.columns
+    # столбцы откликов — «(lab)», пустые (None/NaN), без Y
+    for p in r.property_names:
+        col = f"{p} (lab)"
+        assert col in df.columns
+        assert df[col].isna().all()
+
+
+def test_seed_design_dataframe_batch_adds_kg_and_lab_values():
+    r = _empty_setup_runner()
+    Xs = _seed_X(3)
+    Ys = np.arange(3 * len(r.property_names), dtype=float).reshape(3, -1)
+    df = ui.seed_design_dataframe(r, Xs, Ys, batch_kg=100.0)
+    mix = list(r.current_schema.mixture_names)
+    for cn in mix:
+        assert f"{cn} ({ui.MASS_UNIT})" in df.columns
+    # расход = доля × размер пробы; сумма по компонентам ≈ размер пробы
+    total = sum(float(df[f"{cn} ({ui.MASS_UNIT})"].iloc[0]) for cn in mix)
+    assert np.isclose(total, 100.0, atol=1e-2)
+    # внесённые Y попали в «(lab)»-колонки
+    assert not df[f"{r.property_names[0]} (lab)"].isna().any()
+
+
+def test_seed_design_excel_bytes_nonempty_xlsx():
+    r = _empty_setup_runner()
+    data = ui.seed_design_excel_bytes(r, _seed_X(4), batch_kg=50.0)
+    assert isinstance(data, (bytes, bytearray)) and len(data) > 0
+    assert bytes(data[:2]) == b"PK"  # .xlsx = zip-контейнер (сигнатура PK)
+
+
+# ======================================================================
 # Замечания 6/10 — научный операционный текст денежного канала
 # ======================================================================
+
 def test_money_text_price_input_is_operational_no_jargon():
     r = _demo_runner()
     ex = cv.branch_money_explanation(r, "premium", n_candidates=120, n_mc=64,

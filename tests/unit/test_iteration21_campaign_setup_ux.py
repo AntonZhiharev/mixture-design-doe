@@ -167,3 +167,56 @@ def test_money_text_rho_optimized_zeroed_operational():
     assert ex["reason_code"] == "rho_optimized_zeroed"
     assert ex["economic_value"] == 0.0
     assert "дважды" in ex["text"].lower()
+
+
+# ======================================================================
+# Замечание 1 (форма ограничений состава) — доли/массовые части, L·/U·
+# ======================================================================
+def test_render_composition_bounds_empty_names_no_streamlit():
+    # q == 0 — ранний выход БЕЗ обращения к Streamlit (чистая ветка)
+    assert ui.render_composition_bounds([]) == (None, None)
+
+
+def test_parts_form_math_matches_core_tightest_box():
+    """Форма массовых частей делегирует в каноничную parts_ranges_to_fraction_bounds
+    (tightest box), а не в приблизительную нормировку — фиксируем математику."""
+    from src.core.simplex import parts_ranges_to_fraction_bounds
+    # база A=100, B/C по 0..50 частей
+    lo, hi = parts_ranges_to_fraction_bounds([100, 0, 0], [100, 50, 50])
+    # A: min=100/(100+50+50)=0.5; max=100/(100+0+0)=1.0
+    assert np.isclose(lo[0], 0.5) and np.isclose(hi[0], 1.0)
+    # B: min=0; max=50/(50+100+0)=1/3
+    assert np.isclose(lo[1], 0.0) and np.isclose(hi[1], 1.0 / 3.0)
+
+
+# ======================================================================
+# headless AppTest — форма ограничений состава рендерится и сетап строится
+# ======================================================================
+try:  # AppTest доступен только при установленном streamlit
+    import os
+    from streamlit.testing.v1 import AppTest
+
+    _REPO = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    _APP = os.path.join(_REPO, "src", "apps", "streamlit_app.py")
+    _HAS_APPTEST = True
+except Exception:  # noqa: BLE001
+    _HAS_APPTEST = False
+
+
+@pytest.mark.skipif(not _HAS_APPTEST, reason="streamlit AppTest недоступен")
+def test_setup_composition_form_renders_and_builds():
+    at = AppTest.from_file(_APP, default_timeout=240).run()
+    assert not at.exception
+    # радио «Способ ввода» из формы ограничений состава присутствует
+    radio_labels = {w.label for w in at.radio}
+    assert "Способ ввода" in radio_labels
+    # сборка проекта в режиме «Доли» по умолчанию (границы 0…1 → полный симплекс)
+    b = [w for w in at.button if w.key == "setup_build"]
+    assert b, "кнопка setup_build не найдена"
+    b[0].click().run()
+    assert not at.exception
+    r = at.session_state["campaign_ctrl"].runner
+    assert r.q == 3 and r.dim == 5
+
+

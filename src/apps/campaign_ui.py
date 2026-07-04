@@ -30,6 +30,7 @@ import streamlit as st
 
 
 from ..core.schema import ModelSpec, ProjectSchema, VariableBlock
+from ..core.simplex import parts_ranges_to_fraction_bounds
 from ..optimize.desirability import DesirabilitySpec
 from ..apps.mixture_process_runner import MixtureProcessRunner
 from ..apps import campaign as cv
@@ -528,8 +529,86 @@ def _parse_floats(text: str) -> Optional[List[float]]:
         return None
 
 
+def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
+    """§17.4 (замечание 1): ограничения состава — «Доли (0…1)» ИЛИ «Массовые части
+    (база = 100)». Возвращает ``(lower, upper)`` в ДОЛЯХ или ``(None, None)``.
+
+    Форма-близнец сайдбара pipeline (`streamlit_app._composition_bounds`):
+    экспандер с радио «Способ ввода» и попарными полями ``L·X`` / ``U·X`` по
+    каждому компоненту (а не «через запятую»). В режиме «Массовые части» базовый
+    компонент = 100 частей, остальные задаются диапазоном частей → доли считает
+    каноничная :func:`core.simplex.parts_ranges_to_fraction_bounds` (tightest box,
+    та же математика, что в pipeline). Пустой список компонентов — ``(None, None)``.
+    """
+    q = len(names)
+    if q == 0:
+        return None, None
+    # NB: без st.expander — форма зовётся ВНУТРИ экспандера сетапа, а Streamlit
+    # запрещает вложенные экспандеры; используем контейнер с заголовком.
+    st.markdown("**📐 Ограничения состава (опц.)**")
+    with st.container():
+        mode = st.radio(
+            "Способ ввода", ["Доли (0…1)", "Массовые части (база = 100)"],
+            key=f"{key_prefix}_comp_mode",
+            help="«Массовые части»: базовый компонент = 100 частей, остальные "
+                 "задаются диапазоном частей, а доли (и плавающий диапазон доли "
+                 "базы) считаются автоматически. «Доли»: границы доли каждого "
+                 "компонента 0…1.")
+        if mode.startswith("Доли"):
+            st.caption("Доли каждого компонента (0…1). Сумма нижних ≤ 1 ≤ сумма "
+                       "верхних. Оставьте 0…1, если ограничений нет.")
+            lower: List[float] = []
+            upper: List[float] = []
+            for i in range(q):
+                cc = st.columns(2)
+                lo_i = cc[0].number_input(
+                    f"L · {names[i]}", min_value=0.0, max_value=1.0, value=0.0,
+                    step=0.01, format="%.4f", key=f"{key_prefix}_lo_{q}_{i}")
+                hi_i = cc[1].number_input(
+                    f"U · {names[i]}", min_value=0.0, max_value=1.0, value=1.0,
+                    step=0.01, format="%.4f", key=f"{key_prefix}_hi_{q}_{i}")
+                lower.append(float(lo_i))
+                upper.append(float(hi_i))
+            nontrivial = any(l > 0 for l in lower) or any(u < 1 for u in upper)
+            return (lower, upper) if nontrivial else (None, None)
+
+        # --- режим массовых частей (база = 100) ---
+        base_i = st.selectbox(
+            "Базовый компонент (= 100 частей)", list(range(q)),
+            format_func=lambda i: names[i], key=f"{key_prefix}_base_{q}")
+        st.caption("Диапазон массовых частей для остальных компонентов "
+                   "(база фиксирована = 100 частей):")
+        pmin = [0.0] * q
+        pmax = [0.0] * q
+        for i in range(q):
+            if i == base_i:
+                pmin[i] = pmax[i] = 100.0
+                st.markdown(f"**{names[i]}** — база: 100 частей (фиксировано)")
+                continue
+            cc = st.columns(2)
+            pmin[i] = cc[0].number_input(
+                f"min частей · {names[i]}", min_value=0.0, value=0.0, step=1.0,
+                key=f"{key_prefix}_pmin_{q}_{i}")
+            pmax[i] = cc[1].number_input(
+                f"max частей · {names[i]}", min_value=0.0, value=100.0, step=1.0,
+                key=f"{key_prefix}_pmax_{q}_{i}")
+        try:
+            lo_arr, hi_arr = parts_ranges_to_fraction_bounds(pmin, pmax)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Не удалось пересчитать части в доли: {exc}")
+            return None, None
+        tbl = pd.DataFrame(
+            {"min частей": pmin, "max частей": pmax,
+             "доля L": np.round(lo_arr, 4), "доля U": np.round(hi_arr, 4)},
+            index=list(names)[:q])
+        st.caption("Рассчитанные диапазоны долей для алгоритма:")
+        st.dataframe(tbl, use_container_width=True)
+        return lo_arr.tolist(), hi_arr.tolist()
+
+
 def render_setup_form() -> None:
     """§17.4 (Ш3b): форма РЕАЛЬНОГО сетапа — mixture + процесс + отклики.
+
 
     По кнопке строит :class:`MixtureProcessRunner` (:class:`ManualOracle`, пустая
     база) и кладёт :class:`CampaignController` в ``session_state`` под тем же
@@ -549,23 +628,11 @@ def render_setup_form() -> None:
         resp_txt = c[1].text_input("Отклики / свойства (через запятую)",
                                    value="strength, gloss, rho", key="setup_resp")
 
-        # Замечание 1: состав задаётся в ДОЛЯХ (Σ=1) ИЛИ в ЧАСТЯХ — программа
-        # хранит и переводит одно в другое (доли = части / Σчастей).
-        mix_mode_label = st.radio(
-            "Единицы состава", ["доли (Σ=1)", "части"], horizontal=True,
-            key="setup_mix_mode",
-            help="Границы состава можно вводить в долях (0…1, сумма 1) или в "
-                 "частях (любые ≥0) — программа переведёт части в доли сама "
-                 "(доли = части / Σчастей). Оставьте границы пустыми для полного "
-                 "симплекса.")
-        mix_mode = "parts" if mix_mode_label.startswith("части") else "fractions"
-        mb = st.columns(2)
-        mlo_txt = mb[0].text_input(
-            "Нижние границы состава (опц., через запятую)", value="",
-            key="setup_mix_lo")
-        mhi_txt = mb[1].text_input(
-            "Верхние границы состава (опц., через запятую)", value="",
-            key="setup_mix_hi")
+        # Замечание 1: ограничения состава — форма «Доли / Массовые части» с
+        # попарными полями L·X / U·X по каждому компоненту (форма-близнец сайдбара
+        # pipeline). Части → доли каноничной parts_ranges_to_fraction_bounds.
+        mix_live = _parse_names(mix_txt)
+        mlo, mhi = render_composition_bounds(mix_live, key_prefix="setup")
 
         proc_txt = st.text_input("Процесс-параметры (через запятую)",
                                  value="T, P", key="setup_proc")
@@ -595,8 +662,8 @@ def render_setup_form() -> None:
                 phi = _parse_floats(phi_txt)
                 if plo is None or phi is None:
                     raise ValueError("Границы процесса — числа через запятую.")
-                mlo, mhi = resolve_mixture_bounds(
-                    len(mix), mlo_txt, mhi_txt, mode=mix_mode)
+                # mlo/mhi уже посчитаны формой render_composition_bounds выше
+                # (доли; None — полный симплекс).
                 runner = build_setup_runner(
                     mixture_names=mix, process_names=proc,
                     process_lower=plo, process_upper=phi,

@@ -20,6 +20,7 @@ A0.6: всё, что меняет состояние (смена роли, spawn
 """
 from __future__ import annotations
 
+import math
 import zlib
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -211,11 +212,145 @@ def make_linear_price_fn(prices: Sequence[float]):
     return cs.linear_price_fn(prices)
 
 
+# ----------------------------------------------------------------------
+# §17.4 — научная терминология UI (замена жаргона; единый источник ярлыков)
+# ----------------------------------------------------------------------
+# «Ценовая нога» — внутренний жаргон; в UI показываем операционный термин.
+COST_MODEL_LABEL = "Модель себестоимости изделия (плотность ρ → ₽/изд)"
+# Единицы по умолчанию (замечание 7): валюта и масса выносятся в подписи/Excel.
+CURRENCY_UNIT = "₽"
+MASS_UNIT = "кг"
+
+
+def recommended_seed_size(q: int, d: int) -> int:
+    """§17.4 (замечание 4): рекомендуемый размер стартового (скрининг) дизайна.
+
+    Универсальная формула от числа компонентов смеси ``q`` и числа
+    процесс-параметров ``d``. Первый этап — СКРИНИНГ: оцениваем главные эффекты и
+    смесь-процессные взаимодействия кросс-модели «смесь-линейно × процесс-линейно»,
+    число членов которой ``P = q·(1 + d)``. Добавляем ~50 % запаса на остаточную
+    дисперсию/lack-of-fit: ``N = P + ⌈P/2⌉``, но не меньше ``q + d + 1`` (иначе
+    даже главные эффекты не разрешимы). Пример: q=3, d=2 → P=9 → N=14.
+    """
+    q = int(q)
+    d = int(d)
+    if q < 1:
+        raise ValueError("Нужен хотя бы один компонент смеси (q ≥ 1).")
+    if d < 0:
+        raise ValueError("Число процесс-параметров не может быть отрицательным.")
+    p_terms = q * (1 + d)
+    n = p_terms + math.ceil(p_terms / 2)
+    return int(max(n, q + d + 1))
+
+
+def mixture_amounts_to_fractions(amounts: Sequence[float]) -> np.ndarray:
+    """Части (любые ≥0) → доли состава (Σ=1) нормировкой по сумме (замечание 1).
+
+    Программа умеет хранить состав и в ЧАСТЯХ, и в ДОЛЯХ и переводить одно в
+    другое: доли = части / Σ(части). Пустой/отрицательный/нулевой ввод — явный
+    отказ (A0.6: не нормируем молча мусор)."""
+    a = np.asarray(amounts, float).ravel()
+    if a.size == 0:
+        raise ValueError("Ожидается непустой вектор количеств компонентов.")
+    if np.any(a < 0):
+        raise ValueError("Количества компонентов не могут быть отрицательными.")
+    s = float(a.sum())
+    if s <= 0:
+        raise ValueError("Сумма количеств должна быть положительной.")
+    return a / s
+
+
+def resolve_mixture_bounds(n: int, lower_txt: str, upper_txt: str, *,
+                           mode: str = "fractions"):
+    """Границы состава в ДОЛЯХ [0,1] из ввода в долях ИЛИ частях (замечание 1).
+
+    ``mode='fractions'`` — границы уже доли; ``mode='parts'`` — части, переводятся
+    в доли через :func:`mixture_utils.convert_parts_to_proportions` (нормировка по
+    сумме верхних границ). Если границы не заданы (пусто) — возвращает
+    ``(None, None)`` (полный симплекс). Число границ обязано совпасть с ``n``.
+    """
+    lo = _parse_floats(lower_txt)
+    hi = _parse_floats(upper_txt)
+    if not lo and not hi:
+        return None, None
+    if lo is None or hi is None:
+        raise ValueError("Границы состава — числа через запятую.")
+    if len(lo) != int(n) or len(hi) != int(n):
+        raise ValueError(f"Границ состава должно быть по {int(n)} "
+                         "(по числу компонентов смеси).")
+    if mode == "parts":
+        from ..utils.mixture_utils import convert_parts_to_proportions
+        pairs = convert_parts_to_proportions(list(zip(lo, hi)))
+        lo = [float(p[0]) for p in pairs]
+        hi = [float(p[1]) for p in pairs]
+    return lo, hi
+
+
+# ----------------------------------------------------------------------
+# C3 (§17.6.1) — выгрузка ОБЩЕЙ базы кампании + расход сырья (доли↔части)
+# ----------------------------------------------------------------------
+def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
+                            ) -> pd.DataFrame:
+    """§17.6.1 (C3): ОБЩАЯ база кампании → таблица для показа/Excel (read-only).
+
+    По строке на опыт общей базы (``runner.points``, И-1): сквозной «№ опыта»,
+    человекочитаемый origin, составные координаты (mixture-доли + процесс в
+    РЕАЛЬНЫХ единицах) и измеренные отклики по всем P. При заданном ``batch_kg``
+    добавляются столбцы расхода сырья ``{компонент} ({кг})`` = доля·batch —
+    сколько взвесить на партию (замечание 7: единицы нужны лаборатории). Пустая
+    база → пустой DataFrame.
+    """
+    coord_names = setup_coord_names(runner)
+    props = list(runner.property_names)
+    X = getattr(runner, "X", None)
+    if X is None or len(X) == 0:
+        return pd.DataFrame()
+    X = np.atleast_2d(np.asarray(X, float))
+    Y = np.atleast_2d(np.asarray(getattr(runner, "Y", np.empty((len(X), 0))),
+                                 float))
+    origins = list(getattr(runner, "origin", []) or [])
+    mix_names = list(runner.current_schema.mixture_names)
+    n_mix = len(mix_names)
+
+    rows: List[Dict[str, Any]] = []
+    for i in range(len(X)):
+        row: Dict[str, Any] = {"№ опыта": i + 1}
+        og = origins[i] if i < len(origins) else ""
+        row["источник"] = origin_label(runner, og)
+        for j, cn in enumerate(coord_names[:X.shape[1]]):
+            row[cn] = round(float(X[i, j]), 4)
+        if batch_kg is not None and float(batch_kg) > 0:
+            for j, cn in enumerate(mix_names):
+                row[f"{cn} ({MASS_UNIT})"] = round(
+                    float(X[i, j]) * float(batch_kg), 4)
+        for k, pn in enumerate(props):
+            row[f"{pn} (изм.)"] = (round(float(Y[i, k]), 4)
+                                   if k < Y.shape[1] else np.nan)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def campaign_base_excel_bytes(runner, *, batch_kg: Optional[float] = None
+                              ) -> bytes:
+    """§17.6.1 (C3): ОБЩАЯ база кампании → xlsx-байты (для кнопки скачивания).
+
+    Лист «База опытов» = :func:`campaign_base_dataframe` (с расходом сырья, если
+    задан ``batch_kg``). Чистый хелпер (без Streamlit) — тестируется напрямую;
+    возвращает готовые к отдаче байты .xlsx (openpyxl)."""
+    import io
+    df = campaign_base_dataframe(runner, batch_kg=batch_kg)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        (df if not df.empty else pd.DataFrame({"инфо": ["база пуста"]})).to_excel(
+            xw, sheet_name="База опытов", index=False)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 # ----------------------------------------------------------------------
 # Чистые таблицы для показа (без Streamlit) — тестируемы напрямую
 # ----------------------------------------------------------------------
+
 
 _MONEY_RU = {cv.MONEY_ZEROED: "занулён (ZEROED)", cv.MONEY_ALIVE: "живой (ALIVE)",
              None: "—"}
@@ -413,14 +548,44 @@ def render_setup_form() -> None:
                                   value="A, B, C", key="setup_mix")
         resp_txt = c[1].text_input("Отклики / свойства (через запятую)",
                                    value="strength, gloss, rho", key="setup_resp")
+
+        # Замечание 1: состав задаётся в ДОЛЯХ (Σ=1) ИЛИ в ЧАСТЯХ — программа
+        # хранит и переводит одно в другое (доли = части / Σчастей).
+        mix_mode_label = st.radio(
+            "Единицы состава", ["доли (Σ=1)", "части"], horizontal=True,
+            key="setup_mix_mode",
+            help="Границы состава можно вводить в долях (0…1, сумма 1) или в "
+                 "частях (любые ≥0) — программа переведёт части в доли сама "
+                 "(доли = части / Σчастей). Оставьте границы пустыми для полного "
+                 "симплекса.")
+        mix_mode = "parts" if mix_mode_label.startswith("части") else "fractions"
+        mb = st.columns(2)
+        mlo_txt = mb[0].text_input(
+            "Нижние границы состава (опц., через запятую)", value="",
+            key="setup_mix_lo")
+        mhi_txt = mb[1].text_input(
+            "Верхние границы состава (опц., через запятую)", value="",
+            key="setup_mix_hi")
+
         proc_txt = st.text_input("Процесс-параметры (через запятую)",
                                  value="T, P", key="setup_proc")
+        st.caption(
+            "Границы процесса — в РЕАЛЬНЫХ абсолютных единицах (например, "
+            "T = 150…200 °C, P = 1…5 бар). Нормировку в код [0,1] программа "
+            "делает сама — нормированные значения вводить НЕ нужно (замечание 2).")
         pc = st.columns(2)
-        plo_txt = pc[0].text_input("Нижние границы процесса (через запятую)",
-                                   value="0, 0", key="setup_proc_lo")
-        phi_txt = pc[1].text_input("Верхние границы процесса (через запятую)",
-                                   value="1, 1", key="setup_proc_hi")
-        seed_v = st.number_input("Seed раннера", value=1, step=1, key="setup_seed")
+        plo_txt = pc[0].text_input(
+            "Нижние границы процесса (реальные единицы)", value="150, 1",
+            key="setup_proc_lo")
+        phi_txt = pc[1].text_input(
+            "Верхние границы процесса (реальные единицы)", value="200, 5",
+            key="setup_proc_hi")
+        seed_v = st.number_input(
+            "Seed раннера (зерно ГСЧ проекта)", value=1, step=1, key="setup_seed",
+            help="Зерно генератора случайных чисел движка проекта: фиксирует "
+                 "воспроизводимость стартового дизайна и внутренних рестартов "
+                 "оптимизатора. Одно и то же значение → тот же результат; на "
+                 "состав и границы НЕ влияет.")
         if st.button("🏗 Построить проект кампании", key="setup_build"):
             try:
                 mix = _parse_names(mix_txt)
@@ -430,10 +595,13 @@ def render_setup_form() -> None:
                 phi = _parse_floats(phi_txt)
                 if plo is None or phi is None:
                     raise ValueError("Границы процесса — числа через запятую.")
+                mlo, mhi = resolve_mixture_bounds(
+                    len(mix), mlo_txt, mhi_txt, mode=mix_mode)
                 runner = build_setup_runner(
                     mixture_names=mix, process_names=proc,
                     process_lower=plo, process_upper=phi,
-                    response_names=resp, seed=int(seed_v))
+                    response_names=resp, mixture_lower=mlo, mixture_upper=mhi,
+                    seed=int(seed_v))
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
                 for k in ("setup_seed_X", "setup_seed_Y"):
                     st.session_state.pop(k, None)
@@ -461,9 +629,20 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         f"Отклики проекта: {', '.join(props)}. Предложите N точек по составной "
         "области, внесите измеренные Y по каждому свойству и зафиксируйте — точки "
         "лягут в ОБЩУЮ базу (origin=seed), суррогаты обучатся (И-1).")
+    # Замечание 4: рекомендуемый N скрининга считаем от q компонентов и d
+    # процесс-параметров — предлагаем сразу как значение по умолчанию.
+    q = len(runner.current_schema.mixture_names)
+    d = len(runner.current_schema.process_names)
+    rec_n = recommended_seed_size(q, d)
     sc = st.columns([1, 1, 1])
-    seed_n = sc[0].number_input("N seed-точек", min_value=2, max_value=60,
-                                value=12, step=1, key="setup_seed_n")
+    seed_n = sc[0].number_input(
+        "N seed-точек", min_value=2, max_value=200, value=int(rec_n), step=1,
+        key="setup_seed_n",
+        help=f"Рекомендация для скрининга: N = q·(1+d) + ⌈q·(1+d)/2⌉ = {rec_n} "
+             f"(q={q} компонентов, d={d} процесс-параметров) — число членов "
+             "кросс-модели «смесь-линейно × процесс-линейно» плюс ~50% запаса на "
+             "остаточную дисперсию. Значение можно изменить вручную.")
+
     seed_design = sc[1].number_input(
         "зерно ГСЧ (воспроизводимость)", value=1, step=1,
         key="setup_seed_design",
@@ -596,10 +775,19 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
         name = c[0].text_input("Имя ветки",
                                value=f"branch{len(runner.branches) + 1}",
                                key="camp_nb_name")
-        budget = c[1].number_input("Бюджет (слотов)", min_value=1, max_value=200,
-                                   value=20, step=1, key="camp_nb_budget")
-        satisfy = c[2].number_input("ceil (satisfy_at)", min_value=0.1,
-                                    value=1.0, step=0.1, key="camp_nb_ceil")
+        budget = c[1].number_input(
+            "Бюджет ветки (число опытов)", min_value=1, max_value=200,
+            value=20, step=1, key="camp_nb_budget",
+            help="Максимум лабораторных опытов (точек добора), которые ветка "
+                 "может потратить на достижение цели: 1 слот = 1 измеренная "
+                 "точка. По исчерпании бюджета ветка останавливается.")
+        satisfy = c[2].number_input(
+            "Порог достаточности ceil (d_overall)", min_value=0.1,
+            value=1.0, step=0.1, key="camp_nb_ceil",
+            help="Уровень общей желательности d_overall (0…1+), по достижении "
+                 "которого цель считается выполненной и раунды можно "
+                 "останавливать (технический критерий §4).")
+
 
         # --- набор целей (мультицель) ---
         st.markdown("**🎯 Цели ветки (добавляйте по одной — мультицель §16.3)**")
@@ -648,31 +836,59 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                        "(§17.3).")
 
 
-        # --- ценовая нога (опц.) ---
-        st.markdown("**💰 Ценовая нога (опц., §3/§15.6)**")
-        use_price = st.checkbox("Задать ценовую ногу (ρ-отклик + цены состава)",
-                                key="camp_nb_use_price")
+        # --- модель себестоимости изделия (опц.) — замечания 6, 7 ---
+        st.markdown(f"**💰 {COST_MODEL_LABEL} (опц., §3/§15.6)**")
+        st.caption(
+            f"Себестоимость изделия = цена состава ({CURRENCY_UNIT}/{MASS_UNIT}) × "
+            "плотность ρ. Плотность ρ — отдельный отклик (роль «вход "
+            "себестоимости»): чем точнее ρ, тем точнее себестоимость. Задайте цены "
+            "компонентов и верхний приемлемый порог себестоимости.")
+        use_price = st.checkbox(
+            "Учитывать себестоимость изделия (ρ-отклик + цены компонентов)",
+            key="camp_nb_use_price")
         rho_prop = None
         prices_txt = ""
         cost_hi = 300.0
+        cur_unit = CURRENCY_UNIT
         if use_price:
-            pc = st.columns([2, 3, 2])
-            rho_prop = pc[0].selectbox("ρ-отклик (цена-вход)", props,
-                                       key="camp_nb_rho")
-            prices_txt = pc[1].text_input(
-                f"Цены компонентов {mix_names} ₽/кг (через запятую)",
+            uc = st.columns([1, 2])
+            cur_unit = uc[0].text_input(
+                "Валюта", value=CURRENCY_UNIT, key="camp_nb_cur",
+                help="Обозначение денежной единицы (₽, $, €…). Используется в "
+                     "подписях цен, экономики и в Excel-выгрузке.")
+            rho_prop = uc[1].selectbox(
+                "Плотность ρ (отклик — вход себестоимости)", props,
+                key="camp_nb_rho")
+            pc = st.columns([3, 2])
+            prices_txt = pc[0].text_input(
+                f"Цены компонентов {mix_names}, {cur_unit}/{MASS_UNIT} "
+                "(через запятую)",
                 value=", ".join(["100"] * len(mix_names)), key="camp_nb_prices")
-            cost_hi = pc[2].number_input("верх цены (min→0)", min_value=0.0,
-                                         value=300.0, step=10.0,
-                                         key="camp_nb_cost_hi")
-        st.markdown("**📈 Экономика ветки (опц., для §4-стопа/§6)**")
+            cost_hi = pc[1].number_input(
+                f"Верхний порог себестоимости, {cur_unit}/изд (выше → d=0)",
+                min_value=0.0, value=300.0, step=10.0, key="camp_nb_cost_hi")
+        st.markdown("**📈 Экономика ветки (опц., для двойного стопа §4/§6)**")
+        st.caption(
+            "Нужна, чтобы взвесить пользу уточнения против стоимости опытов "
+            f"(денежный критерий остановки). Все суммы — в валюте «{cur_unit}».")
         ec = st.columns(3)
-        vol = ec[0].number_input("V (изд/период)", min_value=0.0, value=0.0,
-                                 step=100.0, key="camp_nb_vol")
-        cexp = ec[1].number_input("c_exp (₽/опыт)", min_value=0.0, value=0.0,
-                                  step=10.0, key="camp_nb_cexp")
-        hor = ec[2].number_input("H (период)", min_value=0.0, value=0.0,
-                                 step=1.0, key="camp_nb_hor")
+        vol = ec[0].number_input(
+            "Объём выпуска V, изд/период", min_value=0.0, value=0.0,
+            step=100.0, key="camp_nb_vol",
+            help="Плановый выпуск изделий за один период. Масштабирует денежный "
+                 "эффект снижения себестоимости (эффект = Δсебестоимости × V).")
+        cexp = ec[1].number_input(
+            f"Стоимость одного опыта, {cur_unit}/опыт", min_value=0.0, value=0.0,
+            step=10.0, key="camp_nb_cexp",
+            help="Во сколько обходится один лабораторный опыт (реагенты, время). "
+                 "Сравнивается с денежной пользой уточнения: если опыт дороже "
+                 "ожидаемой пользы — срабатывает экономический стоп.")
+        hor = ec[2].number_input(
+            "Горизонт планирования H, периодов", min_value=0.0, value=0.0,
+            step=1.0, key="camp_nb_hor",
+            help="Сколько периодов выпуска учитываем при оценке эффекта: денежная "
+                 "польза накапливается за H периодов.")
+
 
         if st.button("🌿 Создать ветку", key="camp_nb_create"):
             try:
@@ -980,7 +1196,31 @@ def render_campaign() -> None:
     # §17.6/§16.2 (Ш6): эволюция схемы в любой момент (штатная операция проекта).
     render_schema_evolution(ctrl)
 
+    # C3 (§17.6.1): выгрузка ОБЩЕЙ базы опытов кампании в Excel (+ расход сырья).
+    with st.expander("⬇️ Выгрузить общую базу опытов в Excel (C3)"):
+        st.caption(
+            "Общая база всех измеренных опытов (И-1): № опыта, источник, состав "
+            "(доли) + процесс (реальные единицы) и измеренные отклики. Укажите "
+            f"размер партии ({MASS_UNIT}) — добавится расход каждого компонента на "
+            "опыт, чтобы понимать, сколько сырья взвесить (замечание 7).")
+        bc = st.columns([1, 2])
+        batch = bc[0].number_input(
+            f"Размер партии, {MASS_UNIT}/опыт", min_value=0.0, value=0.0,
+            step=0.1, key="camp_base_batch",
+            help="0 — только состав в долях; >0 — добавит столбцы расхода сырья "
+                 f"({MASS_UNIT}) = доля компонента × размер партии.")
+        batch_kg = float(batch) if batch > 0 else None
+        base_df = campaign_base_dataframe(runner, batch_kg=batch_kg)
+        st.dataframe(base_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Скачать .xlsx",
+            data=campaign_base_excel_bytes(runner, batch_kg=batch_kg),
+            file_name="campaign_base.xlsx", key="camp_base_dl",
+            mime="application/vnd.openxmlformats-officedocument."
+                 "spreadsheetml.sheet")
+
     bids = list(runner.branches)
+
     if not bids:
         st.info("Стартовый дизайн измерен, суррогаты обучены (общая база = "
                 f"{len(runner.points)} точек). Создайте ветку в форме "

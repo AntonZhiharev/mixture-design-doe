@@ -199,7 +199,9 @@ def test_money_explanation_rho_optimized_zeroed():
     assert ex["reason_code"] == "rho_optimized_zeroed"
     # денежная нога занулена (Гр-1): economic_value == 0
     assert ex["economic_value"] == 0.0
-    assert "занул" in ex["text"].lower()
+    # научный операционный текст (§16.1): не учитываем одну ρ дважды
+    assert "дважды" in ex["text"].lower()
+    assert "себестоимост" in ex["text"].lower()
 
 
 def test_money_explanation_price_input_alive():
@@ -209,7 +211,9 @@ def test_money_explanation_price_input_alive():
     assert ex["has_price_leg"] is True
     assert ex["price_channel_suppressed"] is False
     assert ex["reason_code"] == "price_input_alive"
-    assert "ALIVE" in ex["text"]
+    # научный операционный текст (§16.1): ценность уточнения учитывается в деньгах
+    assert "УЧИТЫВАЕТСЯ" in ex["text"]
+    assert "себестоимост" in ex["text"].lower()
 
 
 # ======================================================================

@@ -175,7 +175,8 @@ M1–M8-рендера. Поток кампании (`render_campaign`) имее
 | battle-план | развёрнутый РУЧНОЙ прогон единого UI с исходными данными по шагам | `docs/BATTLE_PLAN_17.md` | (ручной прогон) |
 | C1 | ассистент campaign-native (без PipelineRunner) | `assistant.build_campaign_context`/`campaign_ui_guide` | ✅ `test_iteration20_assistant_campaign.py` |
 | C2 | персистентность кампании (save/load/delete на MixtureProcessRunner) | `campaign_state` (+ `campaign_ui.make_linear_price_fn` делегирует) | ✅ `test_iteration20_campaign_persistence.py` |
-| C3 | Excel общей базы/рецепта + доли↔части в сетапе | `campaign_ui` | ⏳ TODO |
+| C3 | Excel общей базы/рецепта + доли↔части в сетапе | `campaign_ui` | ✅ `test_iteration21_campaign_setup_ux.py` (+ UX-правки замечаний 1–10) |
+
 | C4/финал | снос M1–M8 UI + PipelineRunner из UI, кампания = единый поток | `streamlit_app.py` | ⏳ регрессия AppTest |
 
 

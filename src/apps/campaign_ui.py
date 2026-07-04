@@ -430,10 +430,62 @@ def seed_design_excel_bytes(runner, Xs, Ys=None, *,
     return buf.getvalue()
 
 
+def branch_recipe_dataframe(runner, branch_id, *, batch_kg: Optional[float] = None,
+                            n_candidates: int = 2000, refine_iters: int = 200,
+                            n_starts: int = 5) -> pd.DataFrame:
+    """§17.6.1 (C3): рекомендованный РЕЦЕПТ ветки x* → одна строка (показ/Excel).
+
+    Запускает M8-argmax (:meth:`MixtureProcessRunner.optimize_xbest`) по ОБЩИМ
+    суррогатам (GP+MoE): максимум desirability целей ветки над составной областью.
+    Строка несёт: имя ветки, состав-доли + процесс в РЕАЛЬНЫХ единицах (замечание
+    2), предсказанные свойства целей ``{свойство} (прогноз)``, итог ``d_overall`` и
+    по-целевые ``d[{свойство}]``; при ``batch_kg`` — расход сырья на пробу. Чистый
+    хелпер (без Streamlit) — тестируется напрямую."""
+    res = runner.optimize_xbest(branch_id, n_candidates=int(n_candidates),
+                                refine_iters=int(refine_iters),
+                                n_starts=int(n_starts))
+    coord_names = setup_coord_names(runner)
+    mix_names = list(runner.current_schema.mixture_names)
+    x = np.atleast_2d(np.asarray(res.x, float))
+    xr = process_code_to_real(runner, x)[0]  # процесс → реальные единицы
+    row: Dict[str, Any] = {"ветка": runner.branches[branch_id].name}
+    for j, cn in enumerate(coord_names[:x.shape[1]]):
+        row[cn] = round(float(xr[j]), 4)
+    if batch_kg is not None and float(batch_kg) > 0:
+        for j, cn in enumerate(mix_names):
+            row[f"{cn} ({MASS_UNIT})"] = round(float(x[0, j]) * float(batch_kg), 4)
+    for pn, val in (res.properties or {}).items():
+        row[f"{pn} (прогноз)"] = round(float(val), 4)
+    row["d_overall"] = round(float(res.d_overall), 4)
+    for pn, dv in (res.d_individual or {}).items():
+        row[f"d[{pn}]"] = round(float(dv), 4)
+    return pd.DataFrame([row])
+
+
+def branch_recipe_excel_bytes(runner, branch_id, *,
+                              batch_kg: Optional[float] = None,
+                              n_candidates: int = 2000, refine_iters: int = 200,
+                              n_starts: int = 5) -> bytes:
+    """§17.6.1 (C3): рекомендованный рецепт ветки → xlsx-байты (кнопка скачивания).
+
+    Лист «Рецепт» = :func:`branch_recipe_dataframe`. Чистый хелпер (без Streamlit)
+    — тестируется напрямую; отдаёт готовые байты .xlsx (openpyxl)."""
+    import io
+    df = branch_recipe_dataframe(runner, branch_id, batch_kg=batch_kg,
+                                 n_candidates=n_candidates,
+                                 refine_iters=refine_iters, n_starts=n_starts)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="Рецепт", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 
 # ----------------------------------------------------------------------
 # Чистые таблицы для показа (без Streamlit) — тестируемы напрямую
 # ----------------------------------------------------------------------
+
 
 
 _MONEY_RU = {cv.MONEY_ZEROED: "занулён (ZEROED)", cv.MONEY_ALIVE: "живой (ALIVE)",
@@ -1159,8 +1211,48 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                    f"{br_now.spent}, осталось {br_now.remaining()}, "
                    f"d_best={br_now.d_best:.3f}, статус {br_now.status}.")
 
+        # §17.6.1 (C3): рекомендованный РЕЦЕПТ ветки x* + скачивание в Excel.
+        # M8-argmax по ОБЩИМ суррогатам (GP+MoE) дорогой → считаем ТОЛЬКО по
+        # кнопке (A0.6), результат кешируем в session_state (df + готовые
+        # xlsx-байты), чтобы rerun не пересчитывал оптимизацию.
+        st.markdown("**📋 Рекомендованный рецепт ветки (x*) — по общим суррогатам "
+                    "GP+MoE**")
+        st.caption(
+            "Итог ветки одной строкой: рецепт-состав + процесс в РЕАЛЬНЫХ единицах, "
+            "предсказанные свойства целей, общий d_overall и по-целевые d[·]. "
+            "Считается по кнопке (M8-argmax дорогой); при размере пробы > 0 "
+            "добавляется расход сырья на пробу.")
+        rec_batch = st.number_input(
+            f"Размер пробы, {MASS_UNIT}/опыт (для расхода сырья и Excel)",
+            min_value=0.0, value=0.0, step=0.1, key=f"camp_wb_recipe_batch_{bsel}")
+        rkey = f"camp_wb_recipe_{bsel}"
+        if st.button("📋 Рассчитать рецепт ветки (x*)",
+                     key=f"camp_wb_recipe_btn_{bsel}"):
+            import io
+            try:
+                bk = float(rec_batch) if float(rec_batch) > 0 else None
+                df_rec = branch_recipe_dataframe(runner, bsel, batch_kg=bk)
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+                    df_rec.to_excel(xw, sheet_name="Рецепт", index=False)
+                st.session_state[rkey] = (df_rec, buf.getvalue())
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.session_state.pop(rkey, None)
+                st.error(f"Не удалось рассчитать рецепт ветки: {exc}")
+        cached_rec = st.session_state.get(rkey)
+        if cached_rec is not None:
+            df_rec, xls_bytes = cached_rec
+            st.dataframe(df_rec, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Скачать рецепт ветки в Excel (.xlsx)", data=xls_bytes,
+                file_name=f"branch_{bsel}_recipe.xlsx",
+                key=f"camp_wb_recipe_dl_{bsel}",
+                mime="application/vnd.openxmlformats-officedocument."
+                     "spreadsheetml.sheet")
+
         # §17.3 (Ш2) гейт: перед предложением/пересчётом — проверка полноты данных
         ready = ctrl.validate_ready(bsel)
+
         if not ready["ok"]:
             st.error("Не хватает данных для добора (§17.3):\n" + ready["text"])
 

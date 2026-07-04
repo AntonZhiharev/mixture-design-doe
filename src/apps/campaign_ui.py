@@ -34,7 +34,9 @@ from ..core.simplex import parts_ranges_to_fraction_bounds
 from ..optimize.desirability import DesirabilitySpec
 from ..apps.mixture_process_runner import MixtureProcessRunner
 from ..apps import campaign as cv
+from ..apps import campaign_screening as csx
 from ..apps import campaign_state as cs
+
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 
 
@@ -1453,9 +1455,91 @@ def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
                 st.error(str(exc))
 
 
+def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
+    """M3-минималка (UI): интерпретируемый анализ скрининга после измеренного seed.
+
+    Показывает «что дали опыты» ДО построения веток: (1) сводную матрицу влияний
+    «компонент × свойство» (ARD-важность 0…1) и (2) детальный разбор выбранного
+    свойства — Scheffé-quadratic по составу: R²/adj-R²/RMSE/q_eff, коэффициенты,
+    ANOVA, значимые термы и bar-chart важности компонентов. Анализ — ТОЛЬКО по
+    составу (mixture-only, объём минималки); физика в целом остаётся за общими
+    суррогатами GP+MoE (канон §5/§12). Дорогие ARD-фиты считаются ТОЛЬКО по кнопке
+    (A0.6), результат кешируется в session_state; вся математика — в чистом слое
+    :mod:`campaign_screening` (тестируется без Streamlit).
+    """
+    runner = ctrl.runner
+    props = list(runner.property_names)
+    with st.expander("📊 Анализ скрининга (M3 — Scheffé + ARD по составу)"):
+        st.caption(
+            "Интерпретируемая сводка сразу после измеренного стартового дизайна: "
+            "какой компонент на какое свойство влияет (ARD-важность) и насколько "
+            "квадратичная модель Шеффе по составу объясняет данные (R²). Процесс "
+            "здесь не участвует — его роль за общими суррогатами GP+MoE. Считается "
+            "по кнопке (ARD-фиты дорогие).")
+
+        # --- сводная матрица влияний (главный итог скрининга) ---
+        if st.button("📊 Рассчитать матрицу влияний (компонент × свойство)",
+                     key="camp_m3_overview_btn"):
+            with st.spinner("ARD-скрининг по каждому свойству…"):
+                try:
+                    st.session_state["camp_m3_matrix"] = csx.influence_matrix(
+                        runner, n_restarts=4, seed=0)
+                except (ValueError, KeyError, RuntimeError) as exc:
+                    st.session_state.pop("camp_m3_matrix", None)
+                    st.error(f"Не удалось построить матрицу влияний: {exc}")
+        mat = st.session_state.get("camp_m3_matrix")
+        if mat is not None:
+            st.caption("ARD-важность компонентов (0…1; максимум по свойству = 1) "
+                       "— чем ближе к 1, тем сильнее компонент влияет на свойство:")
+            st.dataframe(mat, use_container_width=True)
+
+        # --- детальный разбор одного свойства ---
+        st.markdown("**🔬 Детальный разбор свойства (Scheffé-quadratic по составу)**")
+        prop = st.selectbox("Свойство", props, key="camp_m3_prop")
+        if st.button("🔬 Разобрать свойство (Scheffé-fit + ANOVA + ARD)",
+                     key="camp_m3_fit_btn"):
+            with st.spinner(f"Фит Шеффе + ARD для «{prop}»…"):
+                try:
+                    st.session_state["camp_m3_report"] = csx.screening_report(
+                        runner, prop, n_restarts=4, seed=0)
+                except (ValueError, KeyError, RuntimeError) as exc:
+                    st.session_state.pop("camp_m3_report", None)
+                    st.error(f"Не удалось разобрать свойство: {exc}")
+        rep = st.session_state.get("camp_m3_report")
+        if rep is not None and rep.get("property") in props:
+            s = rep["summary"]
+            mc = st.columns(4)
+            mc[0].metric("R²", f"{s['r2']:.3f}")
+            adj = s.get("adj_r2")
+            mc[1].metric("adj-R²",
+                         f"{adj:.3f}" if isinstance(adj, (int, float)) else "—")
+            mc[2].metric("RMSE", f"{s['rmse']:.3g}")
+            mc[3].metric("q_eff", rep["q_eff"])
+            if s.get("underdetermined"):
+                st.warning("n < p: модель недоопределена — R² вводит в "
+                           "заблуждение, добавьте опыты (§17.4).")
+            st.caption(f"Свойство «{rep['property']}» — коэффициенты Шеффе "
+                       f"(mixture-only, {rep['model']}):")
+            st.dataframe(pd.DataFrame(rep["coefficients"]),
+                         use_container_width=True, hide_index=True)
+            st.caption("ANOVA (значимость регрессии в целом, F-тест):")
+            st.dataframe(pd.DataFrame(rep["anova"]),
+                         use_container_width=True, hide_index=True)
+            rank = pd.DataFrame(rep["component_ranking"])
+            if not rank.empty and "importance" in rank.columns:
+                st.caption("Важность компонентов (ARD, 0…1):")
+                st.bar_chart(rank.set_index("component")["importance"])
+            st.caption(f"Значимых термов (p < {rep['alpha']}): "
+                       f"{rep['n_significant']}.")
+            if rep["n_significant"]:
+                st.dataframe(pd.DataFrame(rep["significant_terms"]),
+                             use_container_width=True, hide_index=True)
+
+
 def render_campaign() -> None:
     """Вкладка «🧬 Кампания»: реальный сетап §17.4 + роли + мультицель §16.3 +
     рабочий стол §16.4 + смена роли §5 + spawn §8 + undo §7 (мутации — по кнопке)."""
+
 
     st.subheader("🧬 Кампания: per-branch роли откликов и эволюция (ТЗ v1.1)")
     st.caption(
@@ -1492,7 +1576,12 @@ def render_campaign() -> None:
     # §17.6/§16.2 (Ш6): эволюция схемы в любой момент (штатная операция проекта).
     render_schema_evolution(ctrl)
 
+    # M3-минималка: интерпретируемый анализ скрининга сразу после измеренного seed
+    # (Scheffé + ARD по составу) — «что дали опыты» до построения веток.
+    render_screening_analysis(ctrl)
+
     # C3 (§17.6.1): выгрузка ОБЩЕЙ базы опытов кампании в Excel (+ расход сырья).
+
     with st.expander("⬇️ Выгрузить общую базу опытов в Excel (C3)"):
         st.caption(
             "Общая база всех измеренных опытов (И-1): № опыта, источник, состав "

@@ -198,6 +198,26 @@ def setup_coord_names(runner) -> List[str]:
     return list(sch.mixture_names) + list(sch.process_names)
 
 
+def process_code_to_real(runner, X):
+    """Составной ``X`` (процесс в коде [0,1]) → копия с процесс-осями в РЕАЛЬНЫХ
+    единицах (замечание 2). Mixture-доли остаются как есть (они уже физические).
+
+    Раннер хранит точки в внутреннем коде [0,1] по каждой процесс-оси; для показа
+    и Excel пользователю нужны абсолютные величины (T=150…200 °C, а не 0…1).
+    Денормализация — покомпонентная :meth:`VariableBlock.from_code` процесс-блока
+    ТЕКУЩЕЙ схемы (обратимо к нормировке движка). Чистая (без Streamlit)."""
+    X = np.atleast_2d(np.asarray(X, float)).copy()
+    pb = runner.current_schema.process_block()
+    q = len(runner.current_schema.mixture_names)
+    if pb is not None:
+        d = len(pb.names)
+        if X.shape[1] >= q + d and d > 0:
+            for i in range(len(X)):
+                X[i, q:q + d] = pb.from_code(X[i, q:q + d])
+    return X
+
+
+
 def make_linear_price_fn(prices: Sequence[float]):
     """§17.5: ЦЕНА СОСТАВА ₽/кг из цен компонентов — линейная нога ρ (Ш4).
 
@@ -312,6 +332,9 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
     origins = list(getattr(runner, "origin", []) or [])
     mix_names = list(runner.current_schema.mixture_names)
     n_mix = len(mix_names)
+    # Показ процесса в АБСОЛЮТНЫХ единицах (замечание 2): mixture-доли не трогаем,
+    # процесс-оси денормализуем из внутреннего кода [0,1]. Расход сырья — по долям.
+    Xreal = process_code_to_real(runner, X)
 
     rows: List[Dict[str, Any]] = []
     for i in range(len(X)):
@@ -319,7 +342,8 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
         og = origins[i] if i < len(origins) else ""
         row["источник"] = origin_label(runner, og)
         for j, cn in enumerate(coord_names[:X.shape[1]]):
-            row[cn] = round(float(X[i, j]), 4)
+            row[cn] = round(float(Xreal[i, j]), 4)
+
         if batch_kg is not None and float(batch_kg) > 0:
             for j, cn in enumerate(mix_names):
                 row[f"{cn} ({MASS_UNIT})"] = round(
@@ -365,13 +389,17 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
     ncoord = Xs.shape[1]
     mix_names = list(runner.current_schema.mixture_names)
     Ya = np.atleast_2d(np.asarray(Ys, float)) if Ys is not None else None
+    # Показ процесса в АБСОЛЮТНЫХ единицах (замечание 2): mixture-доли не трогаем,
+    # процесс-оси денормализуем из внутреннего кода [0,1]. Расход сырья считаем по
+    # ДОЛЯМ (mixture), поэтому берём их из исходного Xs (real == code для mixture).
+    Xreal = process_code_to_real(runner, Xs)
 
     nums = list(experiment_index(len(runner.points), len(Xs)))
     rows: List[Dict[str, Any]] = []
     for i in range(len(Xs)):
         row: Dict[str, Any] = {"№ опыта": nums[i]}
         for j, cn in enumerate(coord_names[:ncoord]):
-            row[cn] = round(float(Xs[i, j]), 4)
+            row[cn] = round(float(Xreal[i, j]), 4)
         if batch_kg is not None and float(batch_kg) > 0:
             for j, cn in enumerate(mix_names):
                 row[f"{cn} ({MASS_UNIT})"] = round(
@@ -382,6 +410,7 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
                                   else np.nan)
         rows.append(row)
     return pd.DataFrame(rows)
+
 
 
 def seed_design_excel_bytes(runner, Xs, Ys=None, *,
@@ -660,7 +689,43 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
         return lo_arr.tolist(), hi_arr.tolist()
 
 
+def render_process_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
+    """§17.4 (замечание 2): границы процесс-параметров — попарные поля L/U на КАЖДЫЙ
+    параметр в РЕАЛЬНЫХ единицах (интерфейс-близнец ограничений состава).
+
+    Заменяет ввод «через запятую»: для каждого параметра — своя строка с нижней и
+    верхней РЕАЛЬНОЙ границей (T=150…200 °C, P=1…5 бар); понятнее и меньше ошибок.
+    Нормировку в код [0,1] делает движок сам. Возвращает ``(lower, upper)``
+    списками реальных величин или ``(None, None)``, если параметров нет. Первые
+    две оси получают осмысленные дефолты (T=150…200, P=1…5), остальные — 0…1.
+    """
+    d = len(names)
+    if d == 0:
+        return None, None
+    st.markdown("**⚙️ Границы процесс-параметров (реальные единицы)**")
+    st.caption("Для каждого параметра — нижняя и верхняя РЕАЛЬНАЯ граница "
+               "(например, T = 150…200 °C, P = 1…5 бар). Нормировку в код [0,1] "
+               "программа делает сама (замечание 2).")
+    _defaults = {0: (150.0, 200.0), 1: (1.0, 5.0)}
+    lower: List[float] = []
+    upper: List[float] = []
+    for i in range(d):
+        dlo, dhi = _defaults.get(i, (0.0, 1.0))
+        cc = st.columns([1, 2, 2])
+        cc[0].markdown(f"**{names[i]}**")
+        lo_i = cc[1].number_input(
+            f"нижняя · {names[i]}", value=float(dlo), step=1.0, format="%.4f",
+            key=f"{key_prefix}_plo_{d}_{i}")
+        hi_i = cc[2].number_input(
+            f"верхняя · {names[i]}", value=float(dhi), step=1.0, format="%.4f",
+            key=f"{key_prefix}_phi_{d}_{i}")
+        lower.append(float(lo_i))
+        upper.append(float(hi_i))
+    return lower, upper
+
+
 def render_setup_form() -> None:
+
     """§17.4 (Ш3b): форма РЕАЛЬНОГО сетапа — mixture + процесс + отклики.
 
 
@@ -690,18 +755,14 @@ def render_setup_form() -> None:
 
         proc_txt = st.text_input("Процесс-параметры (через запятую)",
                                  value="T, P", key="setup_proc")
-        st.caption(
-            "Границы процесса — в РЕАЛЬНЫХ абсолютных единицах (например, "
-            "T = 150…200 °C, P = 1…5 бар). Нормировку в код [0,1] программа "
-            "делает сама — нормированные значения вводить НЕ нужно (замечание 2).")
-        pc = st.columns(2)
-        plo_txt = pc[0].text_input(
-            "Нижние границы процесса (реальные единицы)", value="150, 1",
-            key="setup_proc_lo")
-        phi_txt = pc[1].text_input(
-            "Верхние границы процесса (реальные единицы)", value="200, 5",
-            key="setup_proc_hi")
+        # Замечание 2: границы процесса — попарные поля L/U на каждый параметр в
+        # РЕАЛЬНЫХ единицах (форма-близнец ограничений состава), а не «через
+        # запятую» — понятнее и меньше ошибок. Нормировку в код [0,1] движок
+        # делает сам.
+        proc_live = _parse_names(proc_txt)
+        plo, phi = render_process_bounds(proc_live, key_prefix="setup")
         seed_v = st.number_input(
+
             "Seed раннера (зерно ГСЧ проекта)", value=1, step=1, key="setup_seed",
             help="Зерно генератора случайных чисел движка проекта: фиксирует "
                  "воспроизводимость стартового дизайна и внутренних рестартов "
@@ -712,12 +773,15 @@ def render_setup_form() -> None:
                 mix = _parse_names(mix_txt)
                 proc = _parse_names(proc_txt)
                 resp = _parse_names(resp_txt)
-                plo = _parse_floats(plo_txt)
-                phi = _parse_floats(phi_txt)
+                # plo/phi уже собраны формой render_process_bounds выше (реальные
+                # единицы, попарно L/U). Пустой список процесс-параметров → форма
+                # вернула (None, None); build_setup_runner отвергнет пустой proc.
                 if plo is None or phi is None:
-                    raise ValueError("Границы процесса — числа через запятую.")
+                    raise ValueError("Добавьте хотя бы один процесс-параметр "
+                                     "и задайте его границы (§17.4).")
                 # mlo/mhi уже посчитаны формой render_composition_bounds выше
                 # (доли; None — полный симплекс).
+
                 runner = build_setup_runner(
                     mixture_names=mix, process_names=proc,
                     process_lower=plo, process_upper=phi,

@@ -201,6 +201,35 @@ def test_seed_design_excel_bytes_nonempty_xlsx():
 
 
 # ======================================================================
+# Замечание 2 — процесс в АБСОЛЮТНЫХ единицах (денормализация code→real)
+# ======================================================================
+def test_process_code_to_real_denormalizes_only_process():
+    # setup: смесь A,B,C + процесс T∈[150,200], P∈[1,5]
+    r = _empty_setup_runner()
+    # точка в коде: доли (0.2,0.3,0.5) + процесс код (0,1) → T=150, P=5
+    X = np.array([[0.2, 0.3, 0.5, 0.0, 1.0]])
+    Xr = ui.process_code_to_real(r, X)
+    # mixture-доли не тронуты
+    assert np.allclose(Xr[0, :3], [0.2, 0.3, 0.5])
+    # процесс развёрнут в реальные единицы
+    assert np.isclose(Xr[0, 3], 150.0) and np.isclose(Xr[0, 4], 5.0)
+    # середина кода 0.5 → середина интервала
+    Xr2 = ui.process_code_to_real(r, np.array([[0.2, 0.3, 0.5, 0.5, 0.5]]))
+    assert np.isclose(Xr2[0, 3], 175.0) and np.isclose(Xr2[0, 4], 3.0)
+
+
+def test_seed_design_dataframe_shows_process_in_real_units():
+    r = _empty_setup_runner()
+    X = np.array([[0.2, 0.3, 0.5, 0.0, 1.0],
+                  [0.4, 0.4, 0.2, 1.0, 0.0]])
+    df = ui.seed_design_dataframe(r, X)
+    # столбцы процесса T,P показаны в реальных единицах, а не в коде [0,1]
+    assert float(df["T"].iloc[0]) == 150.0 and float(df["P"].iloc[0]) == 5.0
+    assert float(df["T"].iloc[1]) == 200.0 and float(df["P"].iloc[1]) == 1.0
+
+
+
+# ======================================================================
 # Замечания 6/10 — научный операционный текст денежного канала
 # ======================================================================
 

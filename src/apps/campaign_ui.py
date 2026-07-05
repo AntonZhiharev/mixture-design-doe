@@ -144,6 +144,17 @@ class ManualOracle:
         return np.column_stack(cols) if cols else np.empty((n, 0), float)
 
 
+def is_manual_campaign(runner) -> bool:
+    """True, если истину кампании вносит пользователь (:class:`ManualOracle`).
+
+    P0: для таких кампаний авто-оракульные действия (прогон раунда демо-оракулом)
+    скрываются — ``ManualOracle.evaluate`` лишь синтетический демо-генератор, и
+    авто-раунд молча записал бы в РЕАЛЬНУЮ базу выдуманные Y (A0.6). Загруженные
+    с диска кампании тоже manual (``campaign_state`` реконструирует ManualOracle).
+    Чистая (без Streamlit)."""
+    return isinstance(getattr(runner, "oracle", None), ManualOracle)
+
+
 def build_setup_runner(*, mixture_names: Sequence[str],
                        process_names: Sequence[str],
                        process_lower: Sequence[float],
@@ -353,6 +364,33 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
         for k, pn in enumerate(props):
             row[f"{pn} (изм.)"] = (round(float(Y[i, k]), 4)
                                    if k < Y.shape[1] else np.nan)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def measured_responses_editor_df(runner) -> pd.DataFrame:
+    """§17.2.1: общая база → таблица-редактор ИЗМЕРЕННЫХ откликов (правка ошибок ввода).
+
+    Строка на точку ``runner.points`` В ПОРЯДКЕ базы (индекс строки = «№ опыта» − 1
+    = ``point_index`` для :meth:`MixtureProcessRunner.correct_measured`): сквозной
+    номер, человекочитаемый источник и ТЕКУЩЕЕ измеренное значение каждого свойства
+    (по ``property_names``). Редактируются только столбцы-отклики; координаты и
+    происхождение неизменны (И-1). Чистый хелпер (без Streamlit) — тестируется
+    напрямую и служит эталоном сравнения «старое↔новое» для коррекции."""
+    props = list(runner.property_names)
+    rows: List[Dict[str, Any]] = []
+    for i, p in enumerate(getattr(runner, "points", []) or []):
+        y = getattr(p, "Y", {}) or {}
+        og = (p.origin_tag.get("origin", "seed")
+              if getattr(p, "origin_tag", None) else "seed")
+        row: Dict[str, Any] = {"№ опыта": i + 1,
+                               "источник": origin_label(runner, og)}
+        for pn in props:
+            val = y.get(pn, None)
+            try:
+                row[pn] = float(val) if val is not None else None
+            except (TypeError, ValueError):
+                row[pn] = None
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -625,6 +663,32 @@ def origin_label(runner, origin: str) -> str:
 def get_campaign_controller() -> Optional["cv.CampaignController"]:
     """Контроллер демо-кампании из session_state (или ``None``, если не создан)."""
     return st.session_state.get("campaign_ctrl")
+
+
+def _flash(msg: str, kind: str = "success") -> None:
+    """P0: отложенное уведомление — переживает ``st.rerun`` мутации.
+
+    Мутации состояния завершаются ``st.rerun()`` (иначе таблицы ВЫШЕ кнопки
+    показывали устаревшее состояние до следующего клика), а rerun стирает вывод
+    текущего прогона. Сообщение складывается в session_state и показывается в
+    начале следующего прогона (:func:`_show_flashes`)."""
+    st.session_state.setdefault("camp_flash", []).append((str(kind), str(msg)))
+
+
+def _show_flashes() -> None:
+    """Показать и очистить отложенные уведомления (:func:`_flash`)."""
+    for kind, msg in st.session_state.pop("camp_flash", []):
+        getattr(st, kind, st.info)(msg)
+
+
+def _invalidate_branch_caches() -> None:
+    """P0: сбросить кеши дорогих расчётов после мутаций состояния.
+
+    Кеши результатов (₽-объяснение канала ρ, рецепт x*) живут под ключами
+    ``cache_*`` в session_state; после смены целей/весов/ролей/точек они
+    устаревают и должны пересчитываться по кнопке заново."""
+    for k in [k for k in st.session_state if str(k).startswith("cache_")]:
+        st.session_state.pop(k, None)
 
 
 def campaign_assistant_overview(
@@ -953,7 +1017,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
 
             for k in ("setup_seed_X", "setup_seed_Y"):
                 st.session_state.pop(k, None)
-            st.success(
+            # P0: уведомление через _flash — st.success перед st.rerun не
+            # доживал до глаз пользователя (rerun стирает вывод прогона).
+            _flash(
                 f"Seed зафиксирован: +{out['added']} точек (origin=seed), общая "
                 f"база = {out['n_base']}, суррогаты обучены. Дальше — создание "
                 "веток (Ш4, §17.5).")
@@ -1175,13 +1241,15 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                     cost_exp=(float(cexp) if cexp > 0 else None),
                     horizon=(float(hor) if hor > 0 else None))
                 st.session_state["camp_new_goals"] = []
-                st.success(
+                _invalidate_branch_caches()
+                _flash(
                     f"Ветка «{out['branch_name']}» (`{out['branch_id']}`) создана: "
                     f"{out['n_goals']} цел., ценовая нога = {out['has_price_leg']}"
                     + (f" (ρ={out['rho_property']}, канал занулён="
                        f"{out['price_channel_suppressed']})"
                        if out['has_price_leg'] else "")
                     + f"; d_best={out['d_best']:.3f}.")
+                st.rerun()
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
 
@@ -1227,7 +1295,7 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         rec_batch = st.number_input(
             f"Размер пробы, {MASS_UNIT}/опыт (для расхода сырья и Excel)",
             min_value=0.0, value=0.0, step=0.1, key=f"camp_wb_recipe_batch_{bsel}")
-        rkey = f"camp_wb_recipe_{bsel}"
+        rkey = f"cache_recipe_{bsel}"
         if st.button("📋 Рассчитать рецепт ветки (x*)",
                      key=f"camp_wb_recipe_btn_{bsel}"):
             import io
@@ -1270,6 +1338,21 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                                                n_candidates=200), float)
             st.session_state[kx] = X
             st.session_state.pop(ky, None)
+
+        # P0: сводка ПОСЛЕДНЕГО долива живёт в session_state — переживает
+        # st.rerun и остаётся видимой до следующего раунда этой ветки.
+        last = st.session_state.get(f"camp_wb_last_{bsel}")
+        if last is not None:
+            # NB: без вложенного st.expander — рабочий стол сам живёт в
+            # экспандере, а Streamlit запрещает вложенные экспандеры.
+            st.success(last["msg"])
+            st.caption("Измеренные отклики долитых точек (по всем P):")
+            st.dataframe(last["points"], use_container_width=True,
+                         hide_index=True)
+            st.caption("Сводка источников общей базы:")
+            st.dataframe(last["origins"], use_container_width=True,
+                         hide_index=True)
+            st.caption(last["stop"])
 
         Xs = st.session_state.get(kx)
         if Xs is None:
@@ -1318,11 +1401,6 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
 
                 st.session_state.pop(kx, None)
                 st.session_state.pop(ky, None)
-                st.success(
-                    f"Долито {res['added']} точек (origin=branch:{bsel}); d_best "
-                    f"{d_before:.3f} → {res['d_best']:.3f} (монотонно не убывает); "
-                    f"общая база = {res['n_base']} точек.")
-                st.caption("Измеренные отклики долитых точек (по всем P):")
                 wdf = workbench_points_dataframe(runner, res)
                 if not wdf.empty:
                     # Те же сквозные номера, что точки получили в общей базе:
@@ -1334,24 +1412,33 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                     # человекочитаемое «Имя (id)» (см. origin_label).
                     wdf["origin"] = [origin_label(runner, o) for o in wdf["origin"]]
                     wdf = wdf.rename(columns={"origin": "ветка"})
-                st.dataframe(wdf, use_container_width=True, hide_index=True)
-
                 oc = pd.DataFrame(
                     [{"источник": origin_label(runner, k), "точек": v}
                      for k, v in runner.origin_counts().items()])
-                st.dataframe(oc, use_container_width=True, hide_index=True)
-
                 # §4-стоп (двойной): технический И экономический, читает роль ρ
                 delta_d = float(res["d_best"]) - d_before
                 dec = runner.branch_stop_decision(
                     bsel, delta_d=delta_d, ceil=br_now.satisfy_at,
                     n_round=int(res["added"]) or 1, n_candidates=200,
                     n_mc=128, seed=0)
-                st.caption(
-                    f"§4-стоп: **{_STOP_RU.get(dec.reason, dec.reason)}** "
-                    f"(Δd={delta_d:+.4f}, d_best={res['d_best']:.3f}, "
-                    f"ceil={br_now.satisfy_at:.3f}, "
-                    f"econ_red_flag={dec.econ_red_flag}).")
+                # P0: сводка раунда — в session_state (переживает st.rerun и
+                # остаётся видимой), а rerun сразу обновляет капшены/таблицы
+                # ВЫШЕ по странице (бюджет, d_best, роли, база).
+                st.session_state[f"camp_wb_last_{bsel}"] = {
+                    "msg": (f"Долито {res['added']} точек "
+                            f"(origin=branch:{bsel}); d_best {d_before:.3f} → "
+                            f"{res['d_best']:.3f} (монотонно не убывает); "
+                            f"общая база = {res['n_base']} точек."),
+                    "points": wdf,
+                    "origins": oc,
+                    "stop": (
+                        f"§4-стоп: **{_STOP_RU.get(dec.reason, dec.reason)}** "
+                        f"(Δd={delta_d:+.4f}, d_best={res['d_best']:.3f}, "
+                        f"ceil={br_now.satisfy_at:.3f}, "
+                        f"econ_red_flag={dec.econ_red_flag})."),
+                }
+                _invalidate_branch_caches()
+                st.rerun()
             except (ValueError, KeyError, RuntimeError) as exc:
                 st.error(str(exc))
 
@@ -1548,15 +1635,37 @@ def render_campaign() -> None:
         "РЕАЛЬНОЙ атрибуции ядра (И-5/Гр-1): OPTIMIZED ⇒ занулён, PRICE_INPUT ⇒ "
         "живой. Всё, что меняет состояние, делает только ваша кнопка (A0.6).")
 
+    # P0: уведомления мутаций (переживают st.rerun) — показ в начале прогона.
+    _show_flashes()
+
     # §17.4 (Ш3b): форма реального сетапа проекта (mixture + процесс + отклики).
     render_setup_form()
 
-    if st.button("🧬 Создать / сбросить демо-кампанию", key="camp_create"):
-        with st.spinner("Сборка демо-кампании (общий пул + 2 ветки)…"):
-            runner = build_demo_campaign_runner()
-            st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
-        st.success("Демо-кампания создана: ветки **premium** (ρ=PRICE_INPUT, канал "
-                   "живой) и **rho_focus** (ρ=OPTIMIZED, канал занулён).")
+    # P0: демо-кампания — в экспандере и с явным подтверждением, если кампания
+    # уже есть (раньше кнопка молча ЗАТИРАЛА текущую кампанию одним кликом).
+    _ctrl_now = get_campaign_controller()
+    with st.expander("🧪 Демо-кампания (синтетический оракул {A,B,C}×{T,P})",
+                     expanded=_ctrl_now is None):
+        st.caption("Готовая кампания для знакомства с интерфейсом: общий пул + "
+                   "две контрастные ветки (premium: ρ=PRICE_INPUT, канал живой; "
+                   "rho_focus: ρ=OPTIMIZED, канал занулён).")
+        if _ctrl_now is not None:
+            st.warning("Кампания уже есть в сессии: создание демо ЗАМЕНИТ её. "
+                       "Несохранённые изменения пропадут — сначала сохраните "
+                       "кампанию в сайдбаре («📁 Кампания»).")
+            demo_ok = st.checkbox(
+                "Понимаю: заменить текущую кампанию демо-кампанией",
+                key="camp_create_confirm")
+        else:
+            demo_ok = True
+        if st.button("🧬 Создать / сбросить демо-кампанию", key="camp_create",
+                     disabled=not demo_ok):
+            with st.spinner("Сборка демо-кампании (общий пул + 2 ветки)…"):
+                runner = build_demo_campaign_runner()
+                st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
+            _flash("Демо-кампания создана: ветки **premium** (ρ=PRICE_INPUT, "
+                   "канал живой) и **rho_focus** (ρ=OPTIMIZED, канал занулён).")
+            st.rerun()
 
     ctrl = get_campaign_controller()
     if ctrl is None:
@@ -1604,6 +1713,44 @@ def render_campaign() -> None:
             mime="application/vnd.openxmlformats-officedocument."
                  "spreadsheetml.sheet")
 
+    # §17.2.1: КОРРЕКЦИЯ ошибки ввода измеренных откликов (правка опечатки Y).
+    with st.expander("✏️ Исправить измеренные отклики (коррекция ошибок ввода, "
+                     "§17.2.1)"):
+        st.caption(
+            "Опечатку/ошибку ВВОДА отклика можно исправить: правятся только "
+            "значения откликов, состав и «№ опыта» сохраняются (И-1 — история не "
+            "урезается и не переупорядочивается). После сохранения суррогаты "
+            "переобучаются, ветки переоцениваются. Координаты не редактируются.")
+        props_corr = list(runner.property_names)
+        edit_df = measured_responses_editor_df(runner)
+        edited_corr = st.data_editor(
+            edit_df, use_container_width=True, hide_index=True,
+            disabled=["№ опыта", "источник"], key="camp_correct_editor")
+        if st.button("💾 Сохранить исправления откликов", key="camp_correct_save"):
+            try:
+                n_fixed = 0
+                for ridx in range(len(edited_corr)):
+                    changes: Dict[str, float] = {}
+                    for pn in props_corr:
+                        ov = edit_df.iloc[ridx][pn]
+                        nv = edited_corr.iloc[ridx][pn]
+                        if pd.isna(nv):
+                            continue
+                        if pd.isna(ov) or not np.isclose(float(ov), float(nv)):
+                            changes[pn] = float(nv)
+                    if changes:
+                        ctrl.correct_measured_point(ridx, changes)
+                        n_fixed += 1
+                if n_fixed:
+                    _invalidate_branch_caches()
+                    _flash(f"Исправлено опытов: {n_fixed}. Суррогаты "
+                           "переобучены, ветки переоценены (И-1).")
+                    st.rerun()
+                else:
+                    st.info("Изменений не обнаружено — редактировать нечего.")
+            except (ValueError, KeyError, IndexError, RuntimeError) as exc:
+                st.error(str(exc))
+
     bids = list(runner.branches)
 
     if not bids:
@@ -1628,8 +1775,23 @@ def render_campaign() -> None:
     st.dataframe(role_table_dataframe(rep), use_container_width=True)
 
     with st.expander("💰 Почему за ρ есть/нет денег (§16.1)"):
-        ex = ctrl.money_explanation(bsel, n_candidates=200, n_mc=128, seed=0)
-        st.markdown(ex["text"])
+        # P0: MC-оценка (n_mc=128) раньше считалась на КАЖДЫЙ rerun страницы
+        # (любой клик по любому виджету) — теперь только по кнопке + кеш
+        # (сбрасывается _invalidate_branch_caches после мутаций ветки).
+        st.caption("Объяснение денежного канала ρ (MC-оценка) считается по "
+                   "кнопке и кешируется до следующего изменения ветки.")
+        mkey = f"cache_money_{bsel}"
+        if st.button("💰 Объяснить денежный канал ρ",
+                     key=f"camp_money_btn_{bsel}"):
+            with st.spinner("MC-оценка денежного канала ρ…"):
+                try:
+                    st.session_state[mkey] = ctrl.money_explanation(
+                        bsel, n_candidates=200, n_mc=128, seed=0)["text"]
+                except (ValueError, KeyError, RuntimeError) as exc:
+                    st.session_state.pop(mkey, None)
+                    st.error(f"Не удалось оценить денежный канал: {exc}")
+        if st.session_state.get(mkey):
+            st.markdown(st.session_state[mkey])
 
     # --- §16.3: мультицелевой редактор ветки (несколько целей/диапазонов/весов)
     with st.expander("🎯 Редактор целей ветки (§16.3 — мультицель)"):
@@ -1662,11 +1824,13 @@ def render_campaign() -> None:
                                         target=tgt, weight=float(g_w))
                 res = ctrl.set_desirability(bsel, g_resp, spec)
                 shift = res["recommendation_shift"]
-                st.success(
+                _invalidate_branch_caches()
+                _flash(
                     f"Цель «{g_resp}» ({g_kind}) задана; d_best "
                     f"{res['d_best_before']:.3f} → {res['d_best_after']:.3f}"
                     + (f"; рекомендация x* сместилась на ≈{shift:.3f}."
                        if shift is not None else "; x* пересчитана."))
+                st.rerun()
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
 
@@ -1686,8 +1850,10 @@ def render_campaign() -> None:
                 try:
                     res = ctrl.set_weights(
                         bsel, {r: float(v) for r, v in new_w.items()})
-                    st.success(f"Веса обновлены; d_best → "
-                               f"{res['d_best_after']:.3f} (re-score, И-1).")
+                    _invalidate_branch_caches()
+                    _flash(f"Веса обновлены; d_best → "
+                           f"{res['d_best_after']:.3f} (re-score, И-1).")
+                    st.rerun()
                 except (ValueError, KeyError) as exc:
                     st.error(str(exc))
 
@@ -1698,7 +1864,9 @@ def render_campaign() -> None:
             if dc[1].button("🗑 Удалить цель", key="camp_goal_del"):
                 try:
                     ctrl.delete_goal(bsel, del_resp)
-                    st.success(f"Цель «{del_resp}» удалена (роль → REFERENCE).")
+                    _invalidate_branch_caches()
+                    _flash(f"Цель «{del_resp}» удалена (роль → REFERENCE).")
+                    st.rerun()
                 except (ValueError, KeyError) as exc:
                     st.error(str(exc))
 
@@ -1733,11 +1901,13 @@ def render_campaign() -> None:
                     spec = DesirabilitySpec(kind, low=lo, high=hi, target=tgt)
                 res = ctrl.switch_role(bsel, rho, target, spec=spec)
                 shift = res["recommendation_shift"]
-                st.success(
+                _invalidate_branch_caches()
+                _flash(
                     f"Роль ρ: {res['role_before']} → {res['role_after']}; "
                     f"канал занулён = {res['price_channel_suppressed']}; "
                     + (f"рекомендация x* сместилась на ≈{shift:.3f}."
                        if shift is not None else "рекомендация x* пересчитана."))
+                st.rerun()
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
 
@@ -1746,23 +1916,38 @@ def render_campaign() -> None:
     if ctrl.can_undo():
         if cu[0].button("↩️ Undo последней настройки (§7)", key="camp_undo"):
             u = ctrl.undo()
-            st.info(f"Откат «{u['undone']}» ветки {u['branch_id']} "
-                    f"(undo_available={u['undo_available']}).")
+            _invalidate_branch_caches()
+            _flash(f"Откат «{u['undone']}» ветки {u['branch_id']} "
+                   f"(undo_available={u['undo_available']}).", kind="info")
+            st.rerun()
     else:
         cu[0].caption("Undo пуст: дно — последний снятый раунд (И-1).")
-    if cu[1].button("▶ Прогнать раунд ветки (запечатает undo, Тр-7.2/7.3)",
-                    key="camp_run_round"):
-        ctrl.run_round(bsel, n_points=2, explore_frac=0.2, n_candidates=150)
-        st.success("Раунд снят: новые измерения в общей базе, дно undo обновлено.")
+    # P0: авто-раунд зовёт оракул раннера; в РУЧНОЙ кампании (ManualOracle) это
+    # записало бы в реальную базу СИНТЕТИЧЕСКИЕ Y — кнопка скрыта (A0.6).
+    if is_manual_campaign(runner):
+        cu[1].caption("Авто-прогон раунда недоступен: отклики этой кампании "
+                      "вносятся ВРУЧНУЮ — используйте «🛠 Рабочий стол ветки» "
+                      "выше (предложить → внести Y → долить).")
+    elif cu[1].button("▶ Прогнать раунд ветки (демо-оракул; запечатает undo, "
+                      "Тр-7.2/7.3)", key="camp_run_round"):
+        try:
+            ctrl.run_round(bsel, n_points=2, explore_frac=0.2, n_candidates=150)
+            _invalidate_branch_caches()
+            _flash("Раунд снят: новые измерения в общей базе, дно undo "
+                   "обновлено.")
+            st.rerun()
+        except (ValueError, KeyError, RuntimeError) as exc:
+            st.error(str(exc))
 
     # --- spawn ветки (§8) с наследованием ролей -------------------------
     st.markdown("**🌱 Spawn ветки (§8) — наследование ролей + review-сводка**")
-    cs = st.columns([2, 2, 2])
-    parent = cs[0].selectbox("Родитель", bids, key="camp_spawn_parent",
-                             format_func=_branch_label)
-    cname = cs[1].text_input("Имя ребёнка", value="child", key="camp_spawn_name")
-    over = cs[2].checkbox("новая цель над ρ (перебьёт роль, Тр-8.1в)",
-                          key="camp_spawn_over")
+    # NB: локальная переменная НЕ «cs» — иначе затеняется модуль campaign_state.
+    spc = st.columns([2, 2, 2])
+    parent = spc[0].selectbox("Родитель", bids, key="camp_spawn_parent",
+                              format_func=_branch_label)
+    cname = spc[1].text_input("Имя ребёнка", value="child", key="camp_spawn_name")
+    over = spc[2].checkbox("новая цель над ρ (перебьёт роль, Тр-8.1в)",
+                           key="camp_spawn_over")
     prho = _rho_of(runner, parent)
     new_goals = ({prho: DesirabilitySpec("min", low=0.5, high=1.5)}
                  if over and prho else None)
@@ -1779,10 +1964,17 @@ def render_campaign() -> None:
             cid = f"{parent}_child{len(bids)}"
             res = ctrl.spawn_branch(parent, cname, child_id=cid,
                                     new_goals=new_goals)
-            st.success(
+            _invalidate_branch_caches()
+            # P0: review-сводка — в session_state (переживает st.rerun); rerun
+            # нужен, чтобы селектор веток/таблицы сразу увидели ребёнка.
+            st.session_state["camp_spawn_last"] = res["review"]
+            _flash(
                 f"Ветка «{res['child_name']}» создана (`{res['child_id']}`); "
                 f"канал ρ занулён = {res['price_channel_suppressed']}.")
-            st.dataframe(spawn_review_dataframe(res["review"]),
-                         use_container_width=True)
+            st.rerun()
         except (ValueError, KeyError) as exc:
             st.error(str(exc))
+    if st.session_state.get("camp_spawn_last") is not None:
+        st.caption("Review-сводка наследования ролей последнего spawn:")
+        st.dataframe(spawn_review_dataframe(st.session_state["camp_spawn_last"]),
+                     use_container_width=True)

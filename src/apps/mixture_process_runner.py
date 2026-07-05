@@ -741,6 +741,63 @@ class MixtureProcessRunner:
         self.fit_surrogates()
         return {"added": int(len(newX)), "n_base": len(self.points), "P": P}
 
+    # ------------------------------------------------------------------
+    # §17.2.1 КОРРЕКЦИЯ ОШИБКИ ВВОДА: исправить измеренные Y уже зафиксированной
+    # точки общей базы (И-1: правка опечатки отклика, НЕ переписывание истории —
+    # координаты/origin/№ опыта не меняются, суррогаты переобучаются).
+    # ------------------------------------------------------------------
+    def correct_measured(self, point_index: int,
+                         values: Mapping[str, float]) -> Dict[str, Any]:
+        """§17.2.1: ИСПРАВИТЬ измеренные отклики точки общей базы (правка ошибки ввода).
+
+        ``point_index`` — 0-based индекс точки в ``self.points`` (в UI «№ опыта» − 1).
+        ``values`` — ``{имя_свойства: новое_значение}``; правятся ТОЛЬКО перечисленные
+        отклики. Координаты, origin-тег и порядок точек сохраняются (И-1). После
+        правки суррогаты переобучаются. Возвращает
+        ``{point_index, origin, changed:{name:{old,new}}, n_base, P}``. Явные отказы
+        (A0.6): индекс вне диапазона (``IndexError``); пустой ``values`` /
+        нечисло / не-конечное (``ValueError``); неизвестный отклик (``KeyError``).
+        """
+        n = len(self.points)
+        idx = int(point_index)
+        if not (0 <= idx < n):
+            raise IndexError(
+                f"point_index={point_index} вне диапазона [0, {n}) общей базы.")
+        if not values:
+            raise ValueError(
+                "Нет значений для коррекции: передайте {отклик: значение}.")
+        unknown = [k for k in values if k not in self.prop_index]
+        if unknown:
+            raise KeyError(
+                f"Отклики {sorted(unknown)} не среди свойств оракула "
+                f"{list(self.property_names)}.")
+        clean: Dict[str, float] = {}
+        for k, v in values.items():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                raise ValueError(f"Значение отклика '{k}' не число: {v!r}.")
+            if not np.isfinite(fv):
+                raise ValueError(f"Значение отклика '{k}' не конечно: {v!r}.")
+            clean[k] = fv
+
+        pt = self.points[idx]
+        changed: Dict[str, Dict[str, Optional[float]]] = {}
+        for k, fv in clean.items():
+            old = pt.Y.get(k, None)
+            try:
+                old_f = float(old) if old is not None else None
+            except (TypeError, ValueError):
+                old_f = None
+            pt.Y[k] = fv
+            changed[k] = {"old": old_f, "new": fv}
+
+        origin = (pt.origin_tag.get("origin", "seed")
+                  if getattr(pt, "origin_tag", None) else "seed")
+        self.fit_surrogates()
+        return {"point_index": idx, "origin": origin, "changed": changed,
+                "n_base": len(self.points), "P": len(self.property_names)}
+
 
     # ------------------------------------------------------------------
     # Генерация кандидатов фазы: область кодируется СХЕМОЙ (без маски)

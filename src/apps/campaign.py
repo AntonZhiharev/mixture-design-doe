@@ -785,6 +785,18 @@ class CampaignController:
         self._undo.clear()
         return out
 
+    # -- §17.2.1 КОРРЕКЦИЯ ошибки ввода измеренных Y (правка опечатки) --------
+    def correct_measured_point(self, point_index: int,
+                               values: Dict[str, float]) -> Dict[str, Any]:
+        """§17.2.1: исправить ошибку ВВОДА измеренных откликов точки общей базы.
+
+        Тонкий проброс в :meth:`MixtureProcessRunner.correct_measured` (правится ТОЛЬКО ошибочно внесённое значение; координаты, происхождение и номер опыта сохраняются, И-1). После правки все ветки ПЕРЕОЦЕНИВАЮТСЯ (``_rescore``), дно undo ЗАПЕЧАТЫВАЕТСЯ (Тр-7.2/7.3)."""
+        out = self.runner.correct_measured(point_index, values)
+        for bid in list(getattr(self.runner, "branches", {}) or {}):
+            self._rescore(bid)
+        self._undo.clear()
+        return out
+
     # -- §17.5 (Ш4) РУЧНОЕ создание ветки: мультицель + роли + ценовая нога --
     def create_branch(self, name: str,
                       goals: Dict[str, DesirabilitySpec], *,

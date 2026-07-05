@@ -21,11 +21,14 @@
 Координаты:
   * доли компонентов смеси — как в форме (Σ=1; хелпер предупредит, если сумма
     заметно отличается от 1, но посчитает как введено);
-  * процесс-оси T,P — истина живёт в КОДЕ [0,1]. UI кампании показывает процесс
-    в РЕАЛЬНЫХ единицах (сетап §17.4, дефолты T=150…200, P=1…5) — тогда передай
-    границы через ``--proc-bounds``, и хелпер сам нормирует реальные значения в
-    код: ``code = (real − lo) / (hi − lo)``. Без ``--proc-bounds`` значения T,P
-    трактуются как уже кодовые [0,1] (границы процесса в сетапе 0…1 → код=реал).
+  * процесс-оси T,P — истина живёт в КОДЕ [0,1]. UI кампании сохраняет процесс
+    в таблицах дизайна АБСОЛЮТНЫМИ (реальными) значениями (сетап §17.4, дефолты
+    T=150…200, P=1…5). Хелпер нормирует их в код сам:
+    ``code = (real − lo) / (hi − lo)``. Границы берутся из ``--proc-bounds``;
+    без него значение в [0,1] трактуется как уже кодовое, а значение ВНЕ [0,1]
+    автоматически нормируется ДЕФОЛТНЫМИ границами сетапа (T=150…200, P=1…5)
+    с предупреждением. Если границы в вашем сетапе другие — передайте их
+    явно через ``--proc-bounds``.
 
 Использование (одна точка, ОДНОЙ строкой — cmd/PowerShell не понимают '\\'):
     python tools/response_helper.py --world econ A=0.25 B=0.25 C=0.25 D=0.25 T=0.5 P=0.5
@@ -47,6 +50,7 @@ from __future__ import annotations
 import csv
 import os
 import sys
+import warnings
 from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
@@ -62,6 +66,14 @@ from src.verification import battle_truth as bt  # noqa: E402
 _PROC_DEFAULT = 0.5   # середина куба [0,1] для не заданных процесс-осей (код)
 _ROUND = 4            # знаков после запятой (как столбцы «свойство (lab)»)
 _CODE_TOL = 1e-6      # допуск на выход кода за [0,1] (огрехи округления таблиц)
+
+# Дефолтные РЕАЛЬНЫЕ границы процесс-осей формы сетапа кампании (§17.4,
+# campaign_ui.render_process_bounds): ими автонормируем абсолютные значения из
+# таблиц дизайна, если пользователь не передал --proc-bounds явно.
+_UI_DEFAULT_PROC_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "T": (150.0, 200.0),
+    "P": (1.0, 5.0),
+}
 
 ProcBounds = Mapping[str, Tuple[float, float]]
 
@@ -84,25 +96,45 @@ def _proc_to_code(name: str, value: float,
                   proc_bounds: Optional[ProcBounds]) -> float:
     """Значение процесс-оси → код [0,1].
 
-    С ``proc_bounds[name] = (lo, hi)`` значение считается РЕАЛЬНЫМ и нормируется
-    ``(value − lo) / (hi − lo)``; без границ — уже кодовым. Выход за [0,1] сверх
-    допуска — явная ошибка (подсказывает передать/поправить ``--proc-bounds``).
+    Приоритет: (1) явные ``proc_bounds[name] = (lo, hi)`` — значение РЕАЛЬНОЕ,
+    нормируем ``(value − lo)/(hi − lo)``; (2) значение уже в [0,1] — кодовое,
+    берём как есть; (3) значение вне [0,1], а ось есть в дефолтах формы сетапа
+    (``_UI_DEFAULT_PROC_BOUNDS``: T=150…200, P=1…5) — АВТОнормируем дефолтами
+    с предупреждением (таблицы дизайна UI хранят абсолютные значения);
+    (4) иначе — явная ошибка с подсказкой про ``--proc-bounds``.
     """
+    v = float(value)
     if proc_bounds and name in proc_bounds:
         lo, hi = float(proc_bounds[name][0]), float(proc_bounds[name][1])
         if not hi > lo:
             raise ValueError(f"Границы процесс-оси {name} некорректны: "
                              f"lo={lo:g} ≥ hi={hi:g}.")
-        code = (float(value) - lo) / (hi - lo)
-    else:
-        code = float(value)
-    if code < -_CODE_TOL or code > 1.0 + _CODE_TOL:
-        raise ValueError(
-            f"Процесс-ось {name}={value:g} вне области: код {code:g} ∉ [0,1]. "
-            "Если значение в РЕАЛЬНЫХ единицах (как в таблицах UI кампании) — "
-            "передайте границы сетапа через --proc-bounds, напр. "
-            "--proc-bounds T=150:200,P=1:5.")
-    return min(max(code, 0.0), 1.0)
+        code = (v - lo) / (hi - lo)
+        if code < -_CODE_TOL or code > 1.0 + _CODE_TOL:
+            raise ValueError(
+                f"Процесс-ось {name}={v:g} вне границ --proc-bounds "
+                f"[{lo:g};{hi:g}] (код {code:g} ∉ [0,1]) — проверьте границы.")
+        return min(max(code, 0.0), 1.0)
+
+    if -_CODE_TOL <= v <= 1.0 + _CODE_TOL:
+        return min(max(v, 0.0), 1.0)
+
+    if name in _UI_DEFAULT_PROC_BOUNDS:
+        lo, hi = _UI_DEFAULT_PROC_BOUNDS[name]
+        code = (v - lo) / (hi - lo)
+        if -_CODE_TOL <= code <= 1.0 + _CODE_TOL:
+            warnings.warn(
+                f"{name}={v:g} вне [0,1] — принято за АБСОЛЮТНОЕ значение и "
+                f"нормировано дефолтными границами сетапа {name}∈[{lo:g};{hi:g}]"
+                f" → код {code:.4f}. Если границы в сетапе другие — передайте "
+                "их явно: --proc-bounds T=lo:hi,P=lo:hi.", stacklevel=2)
+            return min(max(code, 0.0), 1.0)
+
+    raise ValueError(
+        f"Процесс-ось {name}={v:g} вне области: не код [0,1] и не попадает в "
+        "дефолтные границы сетапа "
+        f"{_UI_DEFAULT_PROC_BOUNDS.get(name, '—')}. Передайте реальные границы "
+        "вашего сетапа через --proc-bounds, напр. --proc-bounds T=150:200,P=1:5.")
 
 
 def evaluate_point(coords: Mapping[str, float], *, world_key: str = "econ",
@@ -110,10 +142,12 @@ def evaluate_point(coords: Mapping[str, float], *, world_key: str = "econ",
     """Отклики синтетической истины battle-теста в точке ``coords`` (БЕЗ шума).
 
     ``coords`` — словарь ``{имя координаты: значение}``: доли компонентов смеси
-    (обязательны) и процесс-оси T,P (по умолчанию середина интервала). Процесс
-    по умолчанию в коде [0,1]; при заданном ``proc_bounds`` (``{имя: (lo, hi)}``,
-    реальные границы сетапа §17.4) значения T,P считаются РЕАЛЬНЫМИ и нормируются
-    в код. Лишние ключи ``coords`` игнорируются. Возвращает словарь
+    (обязательны) и процесс-оси T,P (по умолчанию середина интервала). Процесс:
+    при заданном ``proc_bounds`` (``{имя: (lo, hi)}``, реальные границы сетапа
+    §17.4) значения T,P считаются РЕАЛЬНЫМИ и нормируются в код; без него
+    значение в [0,1] — кодовое, вне [0,1] — автонормировка дефолтами формы
+    сетапа (T=150…200, P=1…5) с предупреждением (см. :func:`_proc_to_code`).
+    Лишние ключи ``coords`` игнорируются. Возвращает словарь
     ``{свойство: значение, ..., "price_состав": ..., "price_изд": ...,
     "Σmixture": ...}`` — все числа округлены до 4 знаков (как столбцы «(lab)»).
     ``price_изд = price_состав·ρ`` (§15.6 §3) считается по ρ той же истины.
@@ -208,10 +242,18 @@ def _fmt(out: Dict[str, float]) -> str:
 
 def _print_point(coords: Dict[str, float], world_key: str,
                  proc_bounds: Optional[ProcBounds]) -> None:
-    out = evaluate_point(coords, world_key=world_key, proc_bounds=proc_bounds)
+    # Предупреждения автонормировки показываем ЧИТАЕМО в stdout (stderr Windows
+    # PowerShell уродует unicode-эскейпами), не глуша их для библиотечных
+    # пользователей evaluate_point.
+    with warnings.catch_warnings(record=True) as wlist:
+        warnings.simplefilter("always")
+        out = evaluate_point(coords, world_key=world_key,
+                             proc_bounds=proc_bounds)
     order = coord_order(world_key)
     pt = "  ".join(f"{nm}={coords[nm]:g}" for nm in order if nm in coords)
     print(f"  точка: {pt}")
+    for wm in wlist:
+        print(f"  ℹ️  {wm.message}")
     print(f"  отклики: {_fmt(out)}")
     sm = out.get("Σmixture", 0.0)
     if abs(sm - 1.0) > 1e-3:
@@ -277,7 +319,9 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"(процесс в РЕАЛЬНЫХ единицах: {pb} → код [0,1]).")
     else:
         print(f"Порядок координат: {', '.join(coord_order(world_key))} "
-              f"(процесс T,P — код [0,1]; реальные единицы → --proc-bounds).")
+              f"(процесс T,P: [0,1] — код; вне [0,1] — автонормировка "
+              f"дефолтами сетапа T=150:200, P=1:5; иные границы → "
+              f"--proc-bounds).")
     print(f"Отклики: {', '.join(w['responses'])} (+ price_состав/price_изд).")
     print()
 

@@ -72,12 +72,24 @@ def test_helper_proc_bounds_real_units():
     assert code == real
 
 
-def test_helper_proc_out_of_cube_raises():
-    """Процесс вне [0,1] без --proc-bounds — явная ошибка с подсказкой."""
+def test_helper_auto_default_bounds():
+    """АБСОЛЮТНЫЕ T,P из таблиц дизайна (вне [0,1]) без --proc-bounds
+    автонормируются дефолтами формы сетапа (T=150…200, P=1…5) с warning."""
+    import pytest
+    mix = {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
+    code = evaluate_point({**mix, "T": 0.5, "P": 0.5}, world_key="econ")
+    with pytest.warns(UserWarning, match="proc-bounds"):
+        auto = evaluate_point({**mix, "T": 175.0, "P": 3.0}, world_key="econ")
+    assert code == auto
+
+
+def test_helper_proc_out_of_default_bounds_raises():
+    """Значение вне [0,1] И вне дефолтных границ сетапа — явная ошибка
+    с подсказкой про --proc-bounds (никакой молчаливой экстраполяции)."""
     import pytest
     mix = {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
     with pytest.raises(ValueError, match="proc-bounds"):
-        evaluate_point({**mix, "T": 175.0, "P": 3.0}, world_key="econ")
+        evaluate_point({**mix, "T": 999.0, "P": 3.0}, world_key="econ")
 
 
 def test_cli_tolerates_backslash_tokens(capsys):

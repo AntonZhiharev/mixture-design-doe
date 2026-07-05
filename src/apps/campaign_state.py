@@ -120,7 +120,8 @@ def _region_move_to_dict(mv: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def runner_to_state(runner: MixtureProcessRunner) -> Dict[str, Any]:
+def runner_to_state(runner: MixtureProcessRunner, *,
+                    draft: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Сериализовать состояние кампании в JSON-native словарь (без суррогатов).
 
     Сохраняет: полную схему проекта, историю версий + текущую версию/схему,
@@ -128,6 +129,11 @@ def runner_to_state(runner: MixtureProcessRunner) -> Dict[str, Any]:
     конфигурацию (через сериализуемый дескриптор ``price_spec``), происхождение
     границ и журнал движений области. Суррогаты и numpy-кэши (X/Y/origin) —
     производные, восстанавливаются переобучением из точек при загрузке.
+
+    ``draft`` — необязательный JSON-native черновик UI (например, предложенный,
+    но ещё НЕ зафиксированный стартовый дизайн: ``{"seed_X": [[...]],
+    "seed_Y": [[...|null]]}``). Без него проект, сохранённый до ``commit_seed``,
+    терял стартовый план — пользователь видел «пустую» загрузку (A0.6).
     """
     branch_cost: Dict[str, Any] = {}
     for bid, cfg in (getattr(runner, "_branch_cost", {}) or {}).items():
@@ -138,7 +144,7 @@ def runner_to_state(runner: MixtureProcessRunner) -> Dict[str, Any]:
             "rho_property": str(cfg["rho_property"]),
         }
 
-    return {
+    state: Dict[str, Any] = {
         "format": FORMAT_VERSION,
         "oracle": {"kind": "manual",
                    "property_names": list(runner.property_names)},
@@ -162,6 +168,9 @@ def runner_to_state(runner: MixtureProcessRunner) -> Dict[str, Any]:
             "drop_policy": str(getattr(runner, "_drop_policy", "exclude")),
         },
     }
+    if draft:
+        state["draft"] = dict(draft)
+    return state
 
 
 def _default_oracle(property_names: Sequence[str]):
@@ -240,21 +249,23 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
 def _validate_name(name: str) -> str:
     name = (name or "").strip()
     if not name or name in (".", "..") or any(s in name for s in ("/", "\\")):
-        raise ValueError(f"Недопустимое имя кампании: {name!r}")
+        raise ValueError(f"Недопустимое имя проекта: {name!r}")
     return name
 
 
 def save_campaign(runner: MixtureProcessRunner, root: str | Path,
-                  name: str) -> str:
-    """Сохранить кампанию в ``root/<name>/campaign.json``; вернуть путь к файлу.
+                  name: str, *, draft: Optional[Dict[str, Any]] = None) -> str:
+    """Сохранить проект (кампанию) в ``root/<name>/campaign.json``; вернуть путь.
 
     Каталог создаётся при необходимости; существующий файл перезаписывается
-    (сохранение — идемпотентно по имени)."""
+    (сохранение — идемпотентно по имени). ``draft`` — необязательный черновик
+    UI (см. :func:`runner_to_state`): например, предложенный, но ещё не
+    зафиксированный стартовый дизайн."""
     name = _validate_name(name)
     target = Path(root) / name
     target.mkdir(parents=True, exist_ok=True)
     path = target / _STATE_FILE
-    state = runner_to_state(runner)
+    state = runner_to_state(runner, draft=draft)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2),
                     encoding="utf-8")
     return str(path)
@@ -263,14 +274,28 @@ def save_campaign(runner: MixtureProcessRunner, root: str | Path,
 def load_campaign(root: str | Path, name: str, *, oracle: Any = None,
                   price_fn_registry: Optional[Dict[str, Callable]] = None
                   ) -> MixtureProcessRunner:
-    """Загрузить кампанию по имени из ``root`` (обратное к :func:`save_campaign`)."""
+    """Загрузить проект по имени из ``root`` (обратное к :func:`save_campaign`)."""
     name = _validate_name(name)
     path = Path(root) / name / _STATE_FILE
     if not path.exists():
-        raise FileNotFoundError(f"Кампания '{name}' не найдена в {root}.")
+        raise FileNotFoundError(f"Проект '{name}' не найден в {root}.")
     state = json.loads(path.read_text(encoding="utf-8"))
     return runner_from_state(state, oracle=oracle,
                              price_fn_registry=price_fn_registry)
+
+
+def load_campaign_draft(root: str | Path, name: str) -> Optional[Dict[str, Any]]:
+    """Черновик UI сохранённого проекта (ключ ``draft``) или ``None``.
+
+    Обратное к ``save_campaign(..., draft=...)``: возвращает словарь черновика
+    (например, стартовый дизайн до фиксации) без реконструкции раннера."""
+    name = _validate_name(name)
+    path = Path(root) / name / _STATE_FILE
+    if not path.exists():
+        raise FileNotFoundError(f"Проект '{name}' не найден в {root}.")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    draft = state.get("draft")
+    return dict(draft) if isinstance(draft, dict) else None
 
 
 def list_campaigns(root: str | Path) -> List[str]:
@@ -283,21 +308,21 @@ def list_campaigns(root: str | Path) -> List[str]:
 
 
 def delete_campaign(root: str | Path, name: str) -> bool:
-    """Удалить сохранённую кампанию (каталог ``root/<name>``) целиком.
+    """Удалить сохранённый проект (каталог ``root/<name>``) целиком.
 
     Защита от ошибок (как ``pipeline_runner.delete_project``): анти-traversal по
-    имени, целевой каталог обязан быть прямым потомком ``root`` и валидной
-    кампанией (наличие ``campaign.json``), иначе :class:`ValueError`. Возвращает
-    ``True`` при удалении, ``False`` — если кампании нет."""
+    имени, целевой каталог обязан быть прямым потомком ``root`` и валидным
+    проектом (наличие ``campaign.json``), иначе :class:`ValueError`. Возвращает
+    ``True`` при удалении, ``False`` — если проекта нет."""
     name = _validate_name(name)
     root = Path(root).resolve()
     target = (root / name).resolve()
     if target.parent != root:
-        raise ValueError(f"Кампания вне каталога кампаний: {target}")
+        raise ValueError(f"Проект вне каталога проектов: {target}")
     if not target.exists():
         return False
     if not (target / _STATE_FILE).exists():
-        raise ValueError(f"'{name}' не похож на кампанию (нет {_STATE_FILE}) — "
+        raise ValueError(f"'{name}' не похож на проект (нет {_STATE_FILE}) — "
                          f"удаление отклонено.")
     shutil.rmtree(target)
     return True

@@ -24,12 +24,14 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 # repo root в sys.path (Streamlit запускает файл напрямую)
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+import numpy as np  # noqa: E402
 import streamlit as st  # noqa: E402
 
 from src.apps import admin  # noqa: E402
@@ -46,17 +48,57 @@ CAMPAIGN_ROOT = os.path.join(_REPO, "project_campaigns")
 
 
 # ----------------------------------------------------------------------
-# Сайдбар: персистентность кампании (C2, §17.6.1)
+# Сайдбар: персистентность проекта (C2, §17.6.1)
 # ----------------------------------------------------------------------
+def _seed_draft_from_session() -> Optional[Dict[str, Any]]:
+    """Черновик стартового дизайна из session_state → JSON-native словарь.
+
+    Пока seed НЕ зафиксирован (``commit_seed``), предложенный план и частично
+    внесённые Y живут только в ``setup_seed_X`` / ``setup_seed_Y`` — без этого
+    черновика сохранение до фиксации давало «пустой» проект (0 точек), а
+    загрузка выглядела как потеря данных. NaN кодируется как null."""
+    X = st.session_state.get("setup_seed_X")
+    if X is None:
+        return None
+    X = np.atleast_2d(np.asarray(X, float))
+    draft: Dict[str, Any] = {
+        "seed_X": [[float(v) for v in row] for row in X]}
+    Y = st.session_state.get("setup_seed_Y")
+    if Y is not None:
+        Y = np.atleast_2d(np.asarray(Y, float))
+        draft["seed_Y"] = [
+            [(float(v) if np.isfinite(v) else None) for v in row] for row in Y]
+    return draft
+
+
+def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
+    """Восстановить черновик seed в session_state (обратное к сбору выше).
+
+    Возвращает True, если черновик был и восстановлен. Ключ виджета-редактора
+    Y сбрасывается, чтобы data_editor не наложил старые правки ячеек; сайдбар
+    рендерится ДО редактора, поэтому чистить ключ здесь безопасно."""
+    for k in ("setup_seed_X", "setup_seed_Y", "setup_seed_editor"):
+        st.session_state.pop(k, None)
+    if not draft or draft.get("seed_X") is None:
+        return False
+    st.session_state["setup_seed_X"] = np.asarray(draft["seed_X"], float)
+    if draft.get("seed_Y") is not None:
+        st.session_state["setup_seed_Y"] = np.asarray(
+            [[(np.nan if v is None else float(v)) for v in row]
+             for row in draft["seed_Y"]], float)
+    return True
+
+
 def render_campaign_persistence(root: str) -> None:
-    """📁 Сохранить/загрузить кампанию целиком (схема + база точек + ветки).
+    """📁 Сохранить/загрузить проект целиком (схема + база точек + ветки).
 
     Опирается на C2 (``campaign_state``): одна модель физики на проект,
-    суррогаты НЕ сохраняются (переобучаются из измеренных точек при загрузке).
+    суррогаты НЕ сохраняются (переобучаются из измеренных точек при загрузке);
+    незафиксированный стартовый дизайн сохраняется черновиком (``draft``).
     """
-    st.sidebar.header("📁 Кампания")
-    st.session_state.setdefault("campaign_name", "my_campaign")
-    # Отложенное имя (выставляется при загрузке кампании): применяем ДО
+    st.sidebar.header("📁 Проект")
+    st.session_state.setdefault("campaign_name", "my_project")
+    # Отложенное имя (выставляется при загрузке проекта): применяем ДО
     # инстанцирования виджета text_input — Streamlit запрещает менять
     # session_state ключа виджета после его создания в том же прогоне.
     pending = st.session_state.pop("campaign_name_pending", None)
@@ -64,25 +106,27 @@ def render_campaign_persistence(root: str) -> None:
         st.session_state["campaign_name"] = pending
     ctrl = get_campaign_controller()
 
-    name = st.sidebar.text_input("Имя кампании", key="campaign_name")
-    if st.sidebar.button("💾 Сохранить кампанию", key="save_campaign"):
+    name = st.sidebar.text_input("Имя проекта", key="campaign_name")
+    if st.sidebar.button("💾 Сохранить проект", key="save_campaign"):
         if ctrl is None:
-            st.sidebar.error("Кампания ещё не собрана — соберите проект во "
-                             "вкладке «🧬 Кампания» или создайте демо-кампанию.")
+            st.sidebar.error("Проект ещё не собран — соберите его во "
+                             "вкладке «🧬 Проект» или создайте демо-проект.")
         else:
             try:
-                path = cs.save_campaign(ctrl.runner, root, name)
-                st.sidebar.success(f"Кампания сохранена: {Path(path).parent.name}")
+                path = cs.save_campaign(ctrl.runner, root, name,
+                                        draft=_seed_draft_from_session())
+                st.sidebar.success(f"Проект сохранён: {Path(path).parent.name}")
             except Exception as exc:  # noqa: BLE001
                 st.sidebar.error(f"Не удалось сохранить: {exc}")
 
     camps = cs.list_campaigns(root)
-    sel = st.sidebar.selectbox("Открыть сохранённую кампанию",
+    sel = st.sidebar.selectbox("Открыть сохранённый проект",
                                ["— нет —"] + camps, key="campaign_select")
-    if st.sidebar.button("📂 Загрузить кампанию", key="load_campaign") \
+    if st.sidebar.button("📂 Загрузить проект", key="load_campaign") \
             and sel != "— нет —":
         try:
             runner = cs.load_campaign(root, sel)
+            draft = cs.load_campaign_draft(root, sel)
         except Exception as exc:  # noqa: BLE001
             st.sidebar.error(f"Не удалось загрузить '{sel}': {exc}")
         else:
@@ -90,10 +134,13 @@ def render_campaign_persistence(root: str) -> None:
             # иначе управляющий сигнал перерисовки был бы проглочен except'ом
             # и показан как «Не удалось загрузить».
             st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
+            has_draft = _restore_seed_draft(draft)
             st.session_state["campaign_name_pending"] = sel
             st.session_state["camp_loaded_msg"] = (
-                f"Кампания '{sel}' загружена (общая база: "
-                f"{len(runner.points)} точек, веток: {len(runner.branches)}).")
+                f"Проект '{sel}' загружен (общая база: "
+                f"{len(runner.points)} точек, веток: {len(runner.branches)}"
+                + ("; восстановлен черновик стартового дизайна"
+                   if has_draft else "") + ").")
             st.rerun()
 
     if st.session_state.get("camp_loaded_msg"):
@@ -101,30 +148,30 @@ def render_campaign_persistence(root: str) -> None:
 
 
 def render_campaign_deleter(root: str) -> None:
-    """🗑 Danger zone: удаление сохранённой кампании под паролём администратора.
+    """🗑 Danger zone: удаление сохранённого проекта под паролём администратора.
 
-    Барьер от случайного удаления (не криптозащита): нужны выбор кампании,
+    Барьер от случайного удаления (не криптозащита): нужны выбор проекта,
     подтверждение имени и admin-пароль (env ``DOE_ADMIN_PASSWORD``).
     """
-    with st.sidebar.expander("🗑 Удалить кампанию (admin)", expanded=False):
+    with st.sidebar.expander("🗑 Удалить проект (admin)", expanded=False):
         if st.session_state.get("camp_del_msg"):
             st.success(st.session_state.pop("camp_del_msg"))
         camps = cs.list_campaigns(root)
         if not camps:
-            st.caption("Сохранённых кампаний нет.")
+            st.caption("Сохранённых проектов нет.")
             return
         st.caption("Удаление безвозвратно. Это барьер от случайного удаления "
                    "(не криптозащита): нужен пароль администратора "
                    "(переменная окружения `DOE_ADMIN_PASSWORD`).")
-        target = st.selectbox("Кампания для удаления", camps, key="camp_del_select")
-        confirm = st.text_input("Подтвердите: впишите имя кампании точно",
+        target = st.selectbox("Проект для удаления", camps, key="camp_del_select")
+        confirm = st.text_input("Подтвердите: впишите имя проекта точно",
                                 key="camp_del_confirm")
         pwd = st.text_input("Пароль администратора", type="password",
                             key="camp_del_pwd")
         if st.button("🗑 Удалить навсегда", key="camp_del_button"):
             if confirm != target:
-                st.error("Имя для подтверждения не совпадает с выбранной "
-                         "кампанией — удаление отменено.")
+                st.error("Имя для подтверждения не совпадает с выбранным "
+                         "проектом — удаление отменено.")
             elif not admin.check_admin_password(pwd):
                 st.error("Неверный пароль администратора — удаление отменено.")
             else:
@@ -134,13 +181,13 @@ def render_campaign_deleter(root: str) -> None:
                     st.error(f"Удаление отклонено: {exc}")
                 else:
                     if not ok:
-                        st.error(f"Кампания '{target}' не найдена.")
+                        st.error(f"Проект '{target}' не найден.")
                     else:
-                        # если удалена загруженная сейчас кампания — сбросить сессию
+                        # если удалён загруженный сейчас проект — сбросить сессию
                         if st.session_state.get("campaign_name") == target:
                             st.session_state.pop("campaign_ctrl", None)
                         st.session_state["camp_del_msg"] = \
-                            f"Кампания '{target}' удалена."
+                            f"Проект '{target}' удалён."
                         st.rerun()
 
 
@@ -154,7 +201,7 @@ def render_campaign_assistant() -> None:
     → ``build_campaign_context``), системный промпт — ``campaign_system_prompt``.
     Стадий M1…M8 и ``PipelineRunner`` больше нет (§17.6).
     """
-    st.subheader("💬 Ассистент кампании: интерпретация состояния и подсказки")
+    st.subheader("💬 Ассистент проекта: интерпретация состояния и подсказки")
     overview = campaign_assistant_overview()
 
     # --- настройки подключения (ключ/модель вводятся прямо здесь) -------
@@ -197,12 +244,12 @@ def render_campaign_assistant() -> None:
         cstat[0].warning("Нет OPENROUTER_API_KEY")
     cstat[1].caption(f"Модель: `{ai.model_name()}`")
 
-    with st.expander("👁️ Что сейчас «видит» ассистент (контекст кампании)"):
+    with st.expander("👁️ Что сейчас «видит» ассистент (контекст проекта)"):
         st.json(ai.build_campaign_context(overview or {}))
 
     if overview is None:
-        st.info("Кампания ещё не собрана — соберите проект во вкладке "
-                "«🧬 Кампания» (или создайте демо-кампанию), чтобы ассистент "
+        st.info("Проект ещё не собран — соберите его во вкладке "
+                "«🧬 Проект» (или создайте демо-проект), чтобы ассистент "
                 "видел реальное состояние: ветки, роли, денежный канал ρ.")
 
     if not ai.llm_available():
@@ -221,14 +268,14 @@ def render_campaign_assistant() -> None:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
 
-    prompt = st.chat_input("Спросите про кампанию, ветки, роли или следующий шаг…",
+    prompt = st.chat_input("Спросите про проект, ветки, роли или следующий шаг…",
                            key="ai_input", disabled=not ai.llm_available())
     if prompt:
         history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant"):
-            with st.spinner("Думаю над контекстом кампании…"):
+            with st.spinner("Думаю над контекстом проекта…"):
                 try:
                     reply = ai.campaign_assistant_reply(overview or {},
                                                         history[:-1], prompt)
@@ -241,21 +288,21 @@ def render_campaign_assistant() -> None:
 
 # ----------------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="DOE — Кампания (mixture×process)",
+    st.set_page_config(page_title="DOE — Проект (mixture×process)",
                        layout="wide")
     # Подхватываем сохранённый ключ/модель из локального .env (если есть).
     # Внешние переменные окружения имеют приоритет (override=False).
     ai.load_env_file()
-    st.title("🧬 DOE — Кампания (смесь × процесс)")
+    st.title("🧬 DOE — Проект (смесь × процесс)")
     st.caption("Единый поток (§17): сетап → стартовый дизайн (seed) → ветки → "
                "рабочий стол (ручной ввод откликов) → эволюция схемы. ОДНА модель "
                "физики на проект; отклики вносит пользователь (реальная "
                "лаборатория), демо-оракул — для прогонов без лаборатории.")
 
-    render_campaign_persistence(CAMPAIGN_ROOT)   # 📁 сохранить/загрузить кампанию
-    render_campaign_deleter(CAMPAIGN_ROOT)       # 🗑 удалить кампанию (под паролём)
+    render_campaign_persistence(CAMPAIGN_ROOT)   # 📁 сохранить/загрузить проект
+    render_campaign_deleter(CAMPAIGN_ROOT)       # 🗑 удалить проект (под паролём)
 
-    tab_camp, tab_ai = st.tabs(["🧬 Кампания", "💬 Ассистент"])
+    tab_camp, tab_ai = st.tabs(["🧬 Проект", "💬 Ассистент"])
     with tab_camp:
         render_campaign()
     with tab_ai:

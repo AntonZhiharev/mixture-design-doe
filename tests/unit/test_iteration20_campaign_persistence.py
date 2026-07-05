@@ -156,6 +156,30 @@ def test_load_missing_raises(tmp_path):
         cst.load_campaign(str(tmp_path), "nope")
 
 
+def test_seed_draft_roundtrip(tmp_path):
+    """Черновик seed (X + частичный Y c null) переживает save/load (C2/A0.6).
+
+    Проект, сохранённый ДО commit_seed, обязан вернуть стартовый план и уже
+    внесённые отклики — иначе пользователь видит «пустую» загрузку."""
+    r = build_setup_runner(
+        mixture_names=["A", "B", "C"], process_names=["T", "P"],
+        process_lower=[0.0, 0.0], process_upper=[1.0, 1.0],
+        response_names=["strength", "gloss", "rho"], seed=1)
+    root = str(tmp_path)
+    draft = {"seed_X": [[0.2, 0.3, 0.5, 0.4, 0.6],
+                        [0.5, 0.25, 0.25, 0.1, 0.9]],
+             "seed_Y": [[1.5, None, 0.9], [None, None, None]]}
+    cst.save_campaign(r, root, "draft_camp", draft=draft)
+    assert cst.load_campaign_draft(root, "draft_camp") == draft
+    # раннер грузится как обычно (schema-only, база пуста)
+    r1 = cst.load_campaign(root, "draft_camp")
+    assert len(r1.points) == 0
+
+    # сохранение БЕЗ черновика — ключа draft нет, загрузка отдаёт None
+    cst.save_campaign(r, root, "no_draft")
+    assert cst.load_campaign_draft(root, "no_draft") is None
+
+
 def test_name_and_traversal_guards(tmp_path):
     r0 = _live_campaign().runner
     for bad in ("", "..", "a/b", "a\\b"):

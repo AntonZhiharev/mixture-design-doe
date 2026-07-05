@@ -852,7 +852,7 @@ def render_setup_form() -> None:
     ключом, что и демо-кампания (главный поток §17 — один движок). Реального
     оракула нет: стартовые отклики вносит пользователь в ручном seed-цикле ниже.
     """
-    with st.expander("🆕 Новый проект кампании — реальный сетап (§17.4)",
+    with st.expander("🆕 Новый проект — реальный сетап (§17.4)",
                      expanded=get_campaign_controller() is None):
         st.caption(
             "Составная область СРАЗУ: симплекс компонентов смеси (Σ=1) × куб "
@@ -886,7 +886,7 @@ def render_setup_form() -> None:
                  "воспроизводимость стартового дизайна и внутренних рестартов "
                  "оптимизатора. Одно и то же значение → тот же результат; на "
                  "состав и границы НЕ влияет.")
-        if st.button("🏗 Построить проект кампании", key="setup_build"):
+    if st.button("🏗 Построить проект", key="setup_build"):
             try:
                 mix = _parse_names(mix_txt)
                 proc = _parse_names(proc_txt)
@@ -958,6 +958,10 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         X = np.asarray(ctrl.propose_seed(int(seed_n), seed=int(seed_design)), float)
         st.session_state["setup_seed_X"] = X
         st.session_state.pop("setup_seed_Y", None)
+        # Новый дизайн — сброс состояния редактора Y (иначе data_editor наложит
+        # СТАРЫЕ правки ячеек на новые строки); кнопка выше редактора, поэтому
+        # виджет ещё не создан в этом прогоне и ключ можно чистить.
+        st.session_state.pop("setup_seed_editor", None)
 
     Xs = st.session_state.get("setup_seed_X")
     if Xs is None:
@@ -967,6 +971,7 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     if st.button("🧪 Заполнить тестовыми (демо-оракул)", key="setup_fill_demo"):
         st.session_state["setup_seed_Y"] = np.vstack(
             [runner._measure(np.asarray(x, float)) for x in Xs])
+        st.session_state.pop("setup_seed_editor", None)
 
     # Замечание 7: размер ПРОБЫ (партии) — добавляет столбцы расхода сырья
     # {компонент} (кг) = доля·batch, чтобы понимать, сколько взвесить на опыт.
@@ -993,6 +998,14 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                             disabled=["№ опыта", *coord_names[:Xs.shape[1]],
                                       *mass_cols],
                             key="setup_seed_editor")
+    # C2: черновик Y из редактора живёт в session_state (setup_seed_Y), чтобы
+    # частично внесённые отклики можно было сохранить в проект ДО фиксации
+    # (commit_seed) и восстановить при загрузке. NaN допустимы (пустые ячейки).
+    try:
+        st.session_state["setup_seed_Y"] = np.column_stack(
+            [np.asarray(edited[c], float) for c in lab_cols])
+    except (KeyError, TypeError, ValueError):
+        pass
 
     # C3: сохранить ПЛАН стартового эксперимента в Excel (ещё до фиксации) —
     # экспортируем внесённые в редакторе значения (пустые «(lab)» — под ручной
@@ -1628,7 +1641,7 @@ def render_campaign() -> None:
     рабочий стол §16.4 + смена роли §5 + spawn §8 + undo §7 (мутации — по кнопке)."""
 
 
-    st.subheader("🧬 Кампания: per-branch роли откликов и эволюция (ТЗ v1.1)")
+    st.subheader("🧬 Проект: per-branch роли откликов и эволюция (ТЗ v1.1)")
     st.caption(
         "Роль отклика — атрибут пары (ветка × отклик): один и тот же ρ может быть "
         "ЦЕЛЬЮ в одной ветке и ЦЕНОЙ-ВХОДОМ в другой. Денежный канал ρ читается из "
@@ -1644,33 +1657,33 @@ def render_campaign() -> None:
     # P0: демо-кампания — в экспандере и с явным подтверждением, если кампания
     # уже есть (раньше кнопка молча ЗАТИРАЛА текущую кампанию одним кликом).
     _ctrl_now = get_campaign_controller()
-    with st.expander("🧪 Демо-кампания (синтетический оракул {A,B,C}×{T,P})",
+    with st.expander("🧪 Демо-проект (синтетический оракул {A,B,C}×{T,P})",
                      expanded=_ctrl_now is None):
-        st.caption("Готовая кампания для знакомства с интерфейсом: общий пул + "
+        st.caption("Готовый проект для знакомства с интерфейсом: общий пул + "
                    "две контрастные ветки (premium: ρ=PRICE_INPUT, канал живой; "
                    "rho_focus: ρ=OPTIMIZED, канал занулён).")
         if _ctrl_now is not None:
-            st.warning("Кампания уже есть в сессии: создание демо ЗАМЕНИТ её. "
+            st.warning("Проект уже есть в сессии: создание демо ЗАМЕНИТ его. "
                        "Несохранённые изменения пропадут — сначала сохраните "
-                       "кампанию в сайдбаре («📁 Кампания»).")
+                       "проект в сайдбаре («📁 Проект»).")
             demo_ok = st.checkbox(
-                "Понимаю: заменить текущую кампанию демо-кампанией",
+                "Понимаю: заменить текущий проект демо-проектом",
                 key="camp_create_confirm")
         else:
             demo_ok = True
-        if st.button("🧬 Создать / сбросить демо-кампанию", key="camp_create",
+        if st.button("🧬 Создать / сбросить демо-проект", key="camp_create",
                      disabled=not demo_ok):
-            with st.spinner("Сборка демо-кампании (общий пул + 2 ветки)…"):
+            with st.spinner("Сборка демо-проекта (общий пул + 2 ветки)…"):
                 runner = build_demo_campaign_runner()
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
-            _flash("Демо-кампания создана: ветки **premium** (ρ=PRICE_INPUT, "
+            _flash("Демо-проект создан: ветки **premium** (ρ=PRICE_INPUT, "
                    "канал живой) и **rho_focus** (ρ=OPTIMIZED, канал занулён).")
             st.rerun()
 
     ctrl = get_campaign_controller()
     if ctrl is None:
-        st.info("Соберите проект в форме «🆕 Новый проект кампании» или нажмите "
-                "«Создать демо-кампанию» (синтетический оракул {A,B,C}×{T,P}).")
+        st.info("Соберите проект в форме «🆕 Новый проект» или нажмите "
+                "«Создать демо-проект» (синтетический оракул {A,B,C}×{T,P}).")
         return
     runner = ctrl.runner
 
@@ -1925,7 +1938,7 @@ def render_campaign() -> None:
     # P0: авто-раунд зовёт оракул раннера; в РУЧНОЙ кампании (ManualOracle) это
     # записало бы в реальную базу СИНТЕТИЧЕСКИЕ Y — кнопка скрыта (A0.6).
     if is_manual_campaign(runner):
-        cu[1].caption("Авто-прогон раунда недоступен: отклики этой кампании "
+        cu[1].caption("Авто-прогон раунда недоступен: отклики этого проекта "
                       "вносятся ВРУЧНУЮ — используйте «🛠 Рабочий стол ветки» "
                       "выше (предложить → внести Y → долить).")
     elif cu[1].button("▶ Прогнать раунд ветки (демо-оракул; запечатает undo, "

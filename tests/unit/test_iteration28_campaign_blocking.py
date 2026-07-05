@@ -220,3 +220,83 @@ def test_base_blocking_caption_after_commit_and_round():
     r1 = _runner(n_blocks=1)
     r1.seed_initial(n=8)
     assert ui.base_blocking_caption(r1) == ""       # 1 партия — не показываем
+
+
+# ----------------------------------------------------------------------
+# Названия блоков (block_factor / block_names): таблицы, подписи, Excel, save/load
+# ----------------------------------------------------------------------
+def _xlsx_to_df(data: bytes):
+    import io
+    import pandas as pd
+    return pd.read_excel(io.BytesIO(data))
+
+
+def test_block_display_and_named_tables():
+    from src.apps import campaign_ui as ui
+    r = _runner(n_blocks=2)
+    r.block_factor = "рабочая смена"
+    r.block_names = {1: "смена А", 2: "смена Б"}
+    assert ui.block_display(r, 1) == "смена А"
+    assert ui.block_display(r, 3) == "3"            # без имени — номер
+
+    X = r.propose_seed(10)
+    df = ui.seed_design_dataframe(r, X)
+    assert "Партия" in df.columns                   # имена → столбец «Партия»
+    lab = [int(v) for v in r.seed_block_labels(X)]
+    assert list(df["Партия"]) == [{1: "смена А", 2: "смена Б"}[b] for b in lab]
+
+    cap = ui.seed_blocking_caption(r, X)
+    assert "смена А" in cap and "рабочая смена" in cap
+
+    # без имён столбца «Партия» нет (старое поведение не тронуто)
+    r0 = _runner(n_blocks=2)
+    assert "Партия" not in ui.seed_design_dataframe(r0, r0.propose_seed(10)).columns
+
+
+def test_block_names_in_base_and_excel():
+    """Имена блоков доезжают до общей базы и ОБЕИХ Excel-выгрузок."""
+    from src.apps import campaign_ui as ui
+    r = _runner_with_branch(n_blocks=2)
+    r.block_factor = "оператор"
+    r.block_names = {1: "Иванов", 2: "Петров"}
+    r.run_branch_round("b1", n_points=2, n_candidates=100)   # добор → блок 3
+
+    df = ui.campaign_base_dataframe(r)
+    assert "Партия" in df.columns
+    assert set(df["Партия"]) == {"Иванов", "Петров", "3"}    # добор без имени
+
+    xdf = _xlsx_to_df(ui.campaign_base_excel_bytes(r))
+    assert "Блок" in xdf.columns and "Партия" in xdf.columns
+    assert list(xdf["Блок"]) == list(r.point_blocks())
+    assert set(xdf["Партия"].astype(str)) == {"Иванов", "Петров", "3"}
+
+    X = r.propose_seed(6)
+    sdf = _xlsx_to_df(ui.seed_design_excel_bytes(r, X))
+    assert "Блок" in sdf.columns and "Партия" in sdf.columns
+
+    cap = ui.base_blocking_caption(r)
+    assert "Иванов" in cap and "оператор" in cap
+
+
+def test_block_names_survive_save_load(tmp_path):
+    r = _runner(n_blocks=2)
+    r.seed_initial(n=8)
+    r.block_factor = "партия сырья"
+    r.block_names = {1: "сырьё №101", 2: "сырьё №102"}
+    cs.save_campaign(r, tmp_path, "blk_names")
+
+    r2 = cs.load_campaign(tmp_path, "blk_names", oracle=_Oracle())
+    assert r2.block_factor == "партия сырья"
+    assert r2.block_names == {1: "сырьё №101", 2: "сырьё №102"}  # int-ключи
+
+
+def test_setup_prefill_carries_blocking():
+    """Загрузка проекта префиллит и число партий, и фактор, и имена блоков."""
+    from src.apps import campaign_ui as ui
+    r = _runner(n_blocks=3)
+    r.block_factor = "смена"
+    r.block_names = {2: "ночная"}
+    out = ui.setup_prefill_from_runner(r)
+    assert out["setup_seed_blocks"] == 3
+    assert out["setup_block_factor"] == "смена"
+    assert out["setup_block_name_2"] == "ночная"

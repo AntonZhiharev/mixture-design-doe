@@ -159,6 +159,11 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             "gp_mean_model": str(runner.gp_mean_model),
             "gp_kernel": str(runner.gp_kernel),
             "n_blocks_start": int(getattr(runner, "n_blocks_start", 1)),
+            # blocking-метаданные (показ/Excel): фактор блокировки + имена блоков
+            # (JSON-ключи — строки; при загрузке возвращаем int-номера).
+            "block_factor": str(getattr(runner, "block_factor", "") or ""),
+            "block_names": {str(int(k)): str(v) for k, v in
+                            (getattr(runner, "block_names", {}) or {}).items()},
             "points": [p.to_dict() for p in runner.points],
             "branches": {bid: br.to_state()
                          for bid, br in runner.branches.items()},
@@ -235,6 +240,9 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
             rho_property=str(cfg["rho_property"]),
             cost_name=str(cfg.get("cost_name", "price")))
 
+    runner.block_factor = str(r.get("block_factor", "") or "")
+    runner.block_names = {int(k): str(v) for k, v in
+                          (r.get("block_names", {}) or {}).items()}
     runner._border_origin = dict(r.get("border_origin", {}) or {})
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))

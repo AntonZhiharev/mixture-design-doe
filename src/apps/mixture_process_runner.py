@@ -127,6 +127,11 @@ class MixtureProcessRunner:
         self.gp_kernel = gp_kernel
         # blocking: число партий (блоков) СТАРТОВОГО дизайна (1 = без блоков)
         self.n_blocks_start = max(1, int(n_blocks_start))
+        # blocking-метаданные (показ/Excel; на математику не влияют):
+        #   block_factor — ЧТО различает партии (оператор / партия сырья / смена);
+        #   block_names  — имена конкретных блоков {номер: имя} (опц.).
+        self.block_factor: str = ""
+        self.block_names: Dict[int, str] = {}
 
         # baseline ПОЛНЫХ составных координат (mixture-доли + process-КОД [0,1]).
         if baseline is not None:

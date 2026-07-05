@@ -349,6 +349,7 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
         blocks = list(runner.point_blocks())
     except Exception:  # noqa: BLE001 — блоки не критичны для показа базы
         blocks = []
+    has_block_names = bool(getattr(runner, "block_names", {}) or {})
     mix_names = list(runner.current_schema.mixture_names)
     n_mix = len(mix_names)
     # Показ процесса в АБСОЛЮТНЫХ единицах (замечание 2): mixture-доли не трогаем,
@@ -361,6 +362,8 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
         og = origins[i] if i < len(origins) else ""
         row["источник"] = origin_label(runner, og)
         row["Блок"] = int(blocks[i]) if i < len(blocks) else 1
+        if has_block_names:
+            row["Партия"] = block_display(runner, row["Блок"])
         for j, cn in enumerate(coord_names[:X.shape[1]]):
             row[cn] = round(float(Xreal[i, j]), 4)
 
@@ -450,12 +453,15 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
         except Exception:  # noqa: BLE001 — блоки не критичны для показа
             seed_blocks = None
 
+    has_block_names = bool(getattr(runner, "block_names", {}) or {})
     nums = list(experiment_index(len(runner.points), len(Xs)))
     rows: List[Dict[str, Any]] = []
     for i in range(len(Xs)):
         row: Dict[str, Any] = {"№ опыта": nums[i]}
         if seed_blocks is not None:
             row["Блок"] = int(seed_blocks[i])
+            if has_block_names:
+                row["Партия"] = block_display(runner, int(seed_blocks[i]))
         for j, cn in enumerate(coord_names[:ncoord]):
             row[cn] = round(float(Xreal[i, j]), 4)
         if batch_kg is not None and float(batch_kg) > 0:
@@ -469,6 +475,17 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
         rows.append(row)
     return pd.DataFrame(rows)
 
+
+
+def block_display(runner, b: int) -> str:
+    """Отображаемое имя блока: пользовательское имя или номер (чистая).
+
+    Имена блоков (:attr:`MixtureProcessRunner.block_names`) — метаданные показа
+    (оператор / партия сырья / смена): помогают понять ПРИНЦИП блокировки, на
+    математику не влияют. Нет имени → строка с номером."""
+    names = getattr(runner, "block_names", {}) or {}
+    nm = str(names.get(int(b), "")).strip()
+    return nm if nm else str(int(b))
 
 
 def seed_blocking_caption(runner, Xs) -> str:
@@ -493,17 +510,21 @@ def seed_blocking_caption(runner, Xs) -> str:
                 "партией / за один день — увеличьте «Партий (блоков)» выше: "
                 "план оптимально разобьётся на партии и появится столбец "
                 "«Блок».")
+    factor = str(getattr(runner, "block_factor", "") or "").strip()
+    factor_txt = f" Фактор блокировки: {factor}." if factor else ""
     try:
         lab = np.asarray(runner.seed_block_labels(Xs), int)
         q = len(runner.current_schema.mixture_names)
         diag = blocking_diagnostics(
             Xs[:, :q], lab, model=getattr(runner, "gp_mean_model", "quadratic"))
-        sizes = ", ".join(f"блок {b}: {c} оп."
-                          for b, c in sorted(diag["block_sizes"].items()))
+        sizes = ", ".join(
+            f"блок {b} «{block_display(runner, b)}»: {c} оп."
+            if block_display(runner, b) != str(b) else f"блок {b}: {c} оп."
+            for b, c in sorted(diag["block_sizes"].items()))
         return (f"🧱 Блокировка включена: {nb} партий ({sizes}); потеря "
                 f"D-информации модельных термов ≈ {diag['d_loss_pct']:.1f}% "
                 "(метки — в столбце «Блок»; показ = фиксация: при "
-                "commit_seed точки получат ЭТИ ЖЕ блоки).")
+                f"commit_seed точки получат ЭТИ ЖЕ блоки).{factor_txt}")
     except Exception:  # noqa: BLE001 — подпись не должна ломать seed-цикл
         return (f"🧱 Блокировка включена: {nb} партий — метки в столбце "
                 "«Блок».")
@@ -520,13 +541,17 @@ def base_blocking_caption(runner) -> str:
         bs = runner.blocking_summary()
         if int(bs.get("n_blocks", 0)) <= 1:
             return ""
-        sizes = ", ".join(f"блок {b}: {c} оп."
-                          for b, c in sorted(bs["block_sizes"].items()))
+        sizes = ", ".join(
+            f"блок {b} «{block_display(runner, b)}»: {c} оп."
+            if block_display(runner, b) != str(b) else f"блок {b}: {c} оп."
+            for b, c in sorted(bs["block_sizes"].items()))
         loss = bs.get("d_loss_pct")
         loss_txt = (f"; потеря D-информации ≈ {float(loss):.1f}%"
                     if loss is not None and np.isfinite(float(loss)) else "")
+        factor = str(getattr(runner, "block_factor", "") or "").strip()
+        factor_txt = f" Фактор блокировки: {factor}." if factor else ""
         return (f"🧱 Партии (блоки) базы: {bs['n_blocks']} ({sizes}){loss_txt}. "
-                "Каждый добор ветки автоматически получает НОВЫЙ блок.")
+                f"Каждый добор ветки автоматически получает НОВЫЙ блок.{factor_txt}")
     except Exception:  # noqa: BLE001 — подпись не должна ломать показ базы
         return ""
 
@@ -707,6 +732,9 @@ def workbench_points_dataframe(runner, result: Dict[str, Any]) -> pd.DataFrame:
         bl = list(runner.point_blocks())
         if len(bl) >= len(df):
             df.insert(1, "Блок", [int(b) for b in bl[-len(df):]])
+            if getattr(runner, "block_names", {}) or {}:
+                df.insert(2, "Партия", [block_display(runner, int(b))
+                                        for b in bl[-len(df):]])
     except Exception:  # noqa: BLE001 — блок не критичен для показа
         pass
     return df
@@ -961,6 +989,11 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
         for i in range(d):
             out[f"setup_plo_{d}_{i}"] = float(pb.lower[i])
             out[f"setup_phi_{d}_{i}"] = float(pb.upper[i])
+    # blocking: число партий + фактор/имена блоков (виджеты seed-секции)
+    out["setup_seed_blocks"] = int(getattr(runner, "n_blocks_start", 1))
+    out["setup_block_factor"] = str(getattr(runner, "block_factor", "") or "")
+    for b, nm in (getattr(runner, "block_names", {}) or {}).items():
+        out[f"setup_block_name_{int(b)}"] = str(nm)
     return out
 
 
@@ -1128,9 +1161,15 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
              "(воспроизводимо); другое значение → другой случайный вариант. "
              "К числу «seed-точек» отношения не имеет — это разные «seed».")
 
+    # P0-багфикс «+/− срабатывает со второго клика»: НЕ передаём value= вместе
+    # с key — меняющийся default конфликтует со state виджета, и Streamlit
+    # проглатывает первое нажатие. Ключ инициализируется ОДИН раз из раннера
+    # (до создания виджета), дальше состоянием владеет сам ключ.
+    if "setup_seed_blocks" not in st.session_state:
+        st.session_state["setup_seed_blocks"] = int(
+            getattr(runner, "n_blocks_start", 1))
     nb_blocks = sc[2].number_input(
-        "Партий (блоков)", min_value=1, max_value=20,
-        value=int(getattr(runner, "n_blocks_start", 1)), step=1,
+        "Партий (блоков)", min_value=1, max_value=20, step=1,
         key="setup_seed_blocks",
         help="Blocking стартового дизайна: если опыты нельзя поставить одной "
              "партией / за один день, план ОПТИМАЛЬНО разбивается на блоки "
@@ -1150,6 +1189,36 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         st.session_state.pop("setup_seed_editor", None)
         st.session_state.pop("setup_seed_df", None)
         st.session_state.pop("setup_seed_df_sig", None)
+
+    # Названия блоков (опц.): фактор блокировки + имя каждой партии — чтобы был
+    # понятен ПРИНЦИП блокировки (оператор / партия сырья / рабочая смена).
+    # Метаданные показа/Excel; на оптимальное разбиение не влияют; персистятся
+    # в campaign.json (block_factor / block_names).
+    nb_now = int(getattr(runner, "n_blocks_start", 1))
+    if nb_now > 1:
+        with st.expander("🧱 Названия партий (блоков) — что их различает (опц.)"):
+            st.caption(
+                "Блок — группа опытов, поставленных в одинаковых условиях "
+                "(одна партия сырья / один оператор / одна смена). Назовите "
+                "фактор и сами партии — имена попадут в таблицы и Excel "
+                "(столбец «Партия»); на расчёт блокировки они не влияют.")
+            bf = st.text_input(
+                "Что различает партии (фактор блокировки)",
+                value=str(getattr(runner, "block_factor", "") or ""),
+                key="setup_block_factor",
+                placeholder="например: оператор / партия сырья / рабочая смена")
+            runner.block_factor = bf.strip()
+            names_now = dict(getattr(runner, "block_names", {}) or {})
+            ncols = st.columns(min(nb_now, 4))
+            new_names: Dict[int, str] = {}
+            for b in range(1, nb_now + 1):
+                nm = ncols[(b - 1) % len(ncols)].text_input(
+                    f"Имя блока {b}", value=str(names_now.get(b, "")),
+                    key=f"setup_block_name_{b}",
+                    placeholder=f"например: смена {b}")
+                if nm.strip():
+                    new_names[b] = nm.strip()
+            runner.block_names = new_names
 
     Xs = st.session_state.get("setup_seed_X")
     if Xs is None:
@@ -1190,7 +1259,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # при её смене / явном заполнении (демо-кнопка, новый дизайн, загрузка
     # проекта) — черновик Y вливается в кэш в этот момент, правки не теряются.
     sig = (Xs.tobytes(), Xs.shape, batch_kg,
-           int(getattr(runner, "n_blocks_start", 1)))
+           int(getattr(runner, "n_blocks_start", 1)),
+           tuple(sorted((getattr(runner, "block_names", {}) or {}).items())))
     if (st.session_state.get("setup_seed_df_sig") != sig
             or "setup_seed_df" not in st.session_state):
         st.session_state["setup_seed_df"] = seed_design_dataframe(
@@ -1202,8 +1272,7 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     df = st.session_state["setup_seed_df"]
     st.caption("Составные координаты заблокированы; заполняются только столбцы "
                "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
-    blk_cols = (["Блок"] if int(getattr(runner, "n_blocks_start", 1)) > 1
-                else [])
+    blk_cols = [c for c in ("Блок", "Партия") if c in df.columns]
     edited = st.data_editor(df, use_container_width=True, height=320,
                             hide_index=True,
                             disabled=["№ опыта", *blk_cols,

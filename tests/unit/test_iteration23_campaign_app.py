@@ -159,6 +159,11 @@ def test_campaign_save_and_load_roundtrip():
         at2.selectbox(key="campaign_select").set_value(name).run()
         _click(at2, "load_campaign")
         assert not at2.exception
+        # регресс UI: имя кампании обновилось через pending-механизм (нельзя
+        # менять session_state ключа виджета после его создания), ошибок нет
+        assert at2.session_state["campaign_name"] == name
+        assert not [e for e in at2.error
+                    if "Не удалось загрузить" in str(e.value)]
         loaded = at2.session_state["campaign_ctrl"]
         assert set(loaded.runner.branches) == {"premium"}
         assert len(loaded.runner.points) == n_pts

@@ -56,6 +56,12 @@ def render_campaign_persistence(root: str) -> None:
     """
     st.sidebar.header("📁 Кампания")
     st.session_state.setdefault("campaign_name", "my_campaign")
+    # Отложенное имя (выставляется при загрузке кампании): применяем ДО
+    # инстанцирования виджета text_input — Streamlit запрещает менять
+    # session_state ключа виджета после его создания в том же прогоне.
+    pending = st.session_state.pop("campaign_name_pending", None)
+    if pending:
+        st.session_state["campaign_name"] = pending
     ctrl = get_campaign_controller()
 
     name = st.sidebar.text_input("Имя кампании", key="campaign_name")
@@ -77,14 +83,18 @@ def render_campaign_persistence(root: str) -> None:
             and sel != "— нет —":
         try:
             runner = cs.load_campaign(root, sel)
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.error(f"Не удалось загрузить '{sel}': {exc}")
+        else:
+            # Успех — st.rerun() ВНЕ try: RerunException наследует Exception,
+            # иначе управляющий сигнал перерисовки был бы проглочен except'ом
+            # и показан как «Не удалось загрузить».
             st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
-            st.session_state["campaign_name"] = sel
+            st.session_state["campaign_name_pending"] = sel
             st.session_state["camp_loaded_msg"] = (
                 f"Кампания '{sel}' загружена (общая база: "
                 f"{len(runner.points)} точек, веток: {len(runner.branches)}).")
             st.rerun()
-        except Exception as exc:  # noqa: BLE001
-            st.sidebar.error(f"Не удалось загрузить '{sel}': {exc}")
 
     if st.session_state.get("camp_loaded_msg"):
         st.sidebar.success(st.session_state.pop("camp_loaded_msg"))

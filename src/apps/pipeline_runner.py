@@ -27,6 +27,8 @@ from src.core.linalg import (scheffe_term_indices, scheffe_matrix,
                              scheffe_active_terms)
 from src.design.d_optimal import (build_candidate_pool, d_optimal_design,
                                   d_optimal_for_region)
+from src.design.blocking import (assign_blocks_start, augment_block_labels,
+                                 blocking_diagnostics)
 from src.design.i_optimal import (region_moment_matrix, i_optimal_design,
                                    i_optimal_augment,
                                    i_optimal_augment_sequential)
@@ -408,7 +410,20 @@ class PipelineRunner:
                   else np.full((n, P), np.nan))
         self.y = self.Y[:, 0]                       # первичное свойство
         self.origin = ["M2"] * n                    # origin-тег каждой точки
-        self.blocks = self._assign_blocks(n, max(1, int(self.cfg.n_blocks)))
+        # --- стартовый blocking: ОПТИМАЛЬНОЕ разбиение плана на блоки ---
+        # (партии/дни): interchange по log det блочной модели Шеффе+dummy,
+        # а не наивный round-robin (см. src/design/blocking.py)
+        nb = max(1, int(self.cfg.n_blocks))
+        blocking_diag: Optional[Dict[str, Any]] = None
+        if nb > 1:
+            blk = assign_blocks_start(self.design, nb, model=self.cfg.model,
+                                      n_restarts=self.cfg.n_restarts,
+                                      seed=self.cfg.seed)
+            self.blocks = blk.labels
+            blocking_diag = blocking_diagnostics(self.design, self.blocks,
+                                                 self.cfg.model)
+        else:
+            self.blocks = np.ones(n, dtype=int)
 
         self.state.set_stage("M2_screening_design")
         self.state.put("design", self.design)
@@ -422,7 +437,8 @@ class PipelineRunner:
                "y": self.y, "Y": self.Y,
                "property_names": list(self.property_names),
                "blocks": self.blocks,
-               "n_blocks": int(max(1, self.cfg.n_blocks)),
+               "n_blocks": int(nb),
+               "blocking": blocking_diag,
                "checkpoint": self._ckpt("after_M2")}
 
         self.results["M2"] = out
@@ -767,12 +783,20 @@ class PipelineRunner:
                                     acq_tol=1e-4, seed=self.cfg.seed + 1,
                                     model_kwargs={"n_restarts": self.cfg.n_restarts})
         self.moe = resB.model
+        self._ensure_blocks(n_ref=len(y0))          # блоки синхронны базе ДО M7
         self.design, self.y = resB.X, resB.y
+        # blocking добора: точки, добавленные активным обучением M7, — это
+        # НОВАЯ партия измерений → им назначается НОВЫЙ блок (sequential
+        # blocking, см. src/design/blocking.py)
+        n_added = len(resB.y) - len(y0)
+        if n_added > 0:
+            self.blocks = augment_block_labels(self.blocks, n_added)
         x_best, y_best = resB.best(maximize=True)
         self.state.set_stage("M7_active_learning")
         self.state.models["m7_final_moe"] = resB.model.to_state()
         self.state.put("design", self.design)
         self.state.put("responses", self.y)
+        self.state.put("blocks", self.blocks)
         out = {"n_start": int(len(y0)), "n_final": int(len(resB.y)),
                "y_best": float(y_best), "x_best": np.asarray(x_best),
                "stopped_early": bool(resB.stopped_early),
@@ -906,6 +930,23 @@ class PipelineRunner:
             self.origin = (list(self.origin) + ["M2"] * n)[:n] if self.origin \
                 else ["M2"] * n
 
+    def _ensure_blocks(self, n_ref: Optional[int] = None) -> None:
+        """Гарантировать, что метки блоков синхронны с числом точек базы.
+
+        ``n_ref`` — целевая длина (по умолчанию — текущий размер базы).
+        Отсутствующие метки (старые проекты) считаются блоком 1; недостающий
+        «хвост» дописывается НОВЫМ блоком (sequential blocking добора).
+        """
+        n = (int(n_ref) if n_ref is not None
+             else (0 if self.design is None else len(self.design)))
+        if self.blocks is None:
+            self.blocks = np.ones(n, dtype=int)
+            return
+        bl = np.asarray(self.blocks).astype(int).ravel()
+        if len(bl) < n:
+            bl = augment_block_labels(bl, n - len(bl))
+        self.blocks = bl[:n]
+
     def _refit_surrogates(self) -> None:
         """Переобучить общие суррогаты проекта на ТЕКУЩЕЙ общей базе (§12).
 
@@ -959,10 +1000,13 @@ class PipelineRunner:
 
         # ИЗМЕРЕНИЕ ВСЕХ P СВОЙСТВ (новая точка меряется целиком, §12)
         Ynew = self.truth_multi.evaluate(newX)
+        self._ensure_blocks()                       # блоки синхронны базе ДО добора
         self.design = np.vstack([self.design, newX])
         self.Y = np.vstack([self.Y, Ynew])
         self.y = self.Y[:, 0]
         self.origin += [f"branch:{branch_id}"] * len(newX)
+        # blocking добора: раунд ветки — НОВАЯ партия → НОВЫЙ блок (sequential)
+        self.blocks = augment_block_labels(self.blocks, len(newX))
         br.spent += len(newX)
 
         # лучший по ИЗМЕРЕННОЙ desirability цели ветки
@@ -986,6 +1030,7 @@ class PipelineRunner:
         self.state.put("responses", self.y)
         self.state.put("responses_multi", self.Y)
         self.state.put("origin", list(self.origin))
+        self.state.put("blocks", self.blocks)
         return {"branch": branch_id, "added": int(len(newX)),
                 "x_new": np.asarray(newX), "y_new": np.asarray(Ynew),
                 "status": br.status, "remaining": br.remaining(),
@@ -1131,6 +1176,13 @@ class PipelineRunner:
                 out["M2"]["block_sizes"] = {int(u): int(c)
                                             for u, c in zip(uniq, cnt)}
                 out["M2"]["blocks"] = bl.tolist()
+            # диагностика стартового blocking (цена блокировки, скаляры)
+            if m2.get("blocking"):
+                bd = m2["blocking"]
+                out["M2"]["blocking"] = {
+                    "d_eff_blocked": bd.get("d_eff_blocked"),
+                    "d_eff_model_adj": bd.get("d_eff_model_adj"),
+                    "d_loss_pct": bd.get("d_loss_pct")}
 
         if "M3_fit" in r:
             per = r["M3_fit"].get("per_property", {})
@@ -1174,16 +1226,20 @@ class PipelineRunner:
                 d5 = np.asarray(m5["design"], float)
                 out["M5"]["design"] = np.round(d5, 4).tolist()
                 out["M5"]["component_names"] = list(self.names)
-                # как этот план разложился бы по блокам проекта (round-robin):
-                # сам план пока «не применён» (точки не измерены), но разбиение
-                # показывает, как его поставить партиями при сборе откликов
-                nb = max(1, int(self.cfg.n_blocks))
-                if nb > 1:
-                    bl5 = self._assign_blocks(len(d5), nb)
-                    uniq, cnt = np.unique(bl5, return_counts=True)
-                    out["M5"]["block_sizes"] = {int(u): int(c)
-                                                for u, c in zip(uniq, cnt)}
-                    out["M5"]["blocks"] = bl5.tolist()
+                # blocking добора (sequential): предлагаемый план M5 — это
+                # НОВАЯ партия относительно уже измеренной базы, поэтому его
+                # точки получают СЛЕДУЮЩИЙ свободный номер блока (а не
+                # раскладываются round-robin по блокам базы)
+                base_bl = (np.asarray(self.blocks).astype(int).ravel()
+                           if self.blocks is not None
+                           else np.ones(int(m5.get("existing_n", 0)),
+                                        dtype=int))
+                full = augment_block_labels(base_bl, len(d5))
+                bl5 = full[len(base_bl):]
+                uniq, cnt = np.unique(bl5, return_counts=True)
+                out["M5"]["block_sizes"] = {int(u): int(c)
+                                            for u, c in zip(uniq, cnt)}
+                out["M5"]["blocks"] = bl5.tolist()
 
         if "M6" in r:
             per = r["M6"].get("per_property", {})

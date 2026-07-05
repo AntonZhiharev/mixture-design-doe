@@ -40,7 +40,8 @@ from src.apps import campaign as cv  # noqa: E402
 from src.apps import campaign_state as cs  # noqa: E402
 from src.apps.campaign_ui import (render_campaign,  # noqa: E402
                                    campaign_assistant_overview,
-                                   get_campaign_controller)
+                                   get_campaign_controller,
+                                   setup_prefill_from_runner)
 
 
 # Каталог сохранённых кампаний (в .gitignore — артефакт выполнения).
@@ -135,6 +136,12 @@ def render_campaign_persistence(root: str) -> None:
             # и показан как «Не удалось загрузить».
             st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
             has_draft = _restore_seed_draft(draft)
+            # C2: форма сетапа должна показать НАСТРОЙКИ загруженного проекта
+            # (компоненты, доли-границы, процесс-границы, отклики, seed), а не
+            # дефолты «A, B, C». Применяется отложенно в render_setup_form —
+            # ДО инстанцирования виджетов формы следующего прогона.
+            st.session_state["setup_prefill_pending"] = \
+                setup_prefill_from_runner(runner)
             st.session_state["campaign_name_pending"] = sel
             st.session_state["camp_loaded_msg"] = (
                 f"Проект '{sel}' загружен (общая база: "

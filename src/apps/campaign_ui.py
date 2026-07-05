@@ -842,6 +842,82 @@ def render_process_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
     return lower, upper
 
 
+def setup_prefill_from_runner(runner) -> Dict[str, Any]:
+    """C2 (§17.6.1): значения формы сетапа из ЗАГРУЖЕННОГО проекта.
+
+    Обратная проекция «раннер → ключи виджетов формы "🆕 Новый проект"»: имена
+    компонентов/процесс-параметров/откликов, границы долей (режим «Доли (0…1)» —
+    массовые части не сериализуются, честно показываем рассчитанные доли),
+    реальные границы процесс-осей и seed раннера. Без неё форма после загрузки
+    проекта показывала дефолты («A, B, C», 0…1, 150…200), и пользователь видел
+    «настройки не подтянулись» (A0.6). Чистая (без Streamlit) — тестируется
+    напрямую; применяется отложенно через ключ ``setup_prefill_pending``
+    (Streamlit запрещает менять ключ виджета, созданного в том же прогоне).
+    """
+    sch = runner.current_schema
+    mix = list(sch.mixture_names)
+    proc = list(sch.process_names)
+    q, d = len(mix), len(proc)
+    out: Dict[str, Any] = {
+        "setup_mix": ", ".join(mix),
+        "setup_resp": ", ".join(str(p) for p in runner.property_names),
+        "setup_proc": ", ".join(proc),
+        "setup_seed": int(getattr(runner, "seed", 0)),
+        "setup_comp_mode": "Доли (0…1)",
+    }
+    mb = sch.mixture_block()
+    if mb is not None:
+        for i in range(q):
+            out[f"setup_lo_{q}_{i}"] = float(mb.lower[i])
+            out[f"setup_hi_{q}_{i}"] = float(mb.upper[i])
+    pb = sch.process_block()
+    if pb is not None:
+        for i in range(d):
+            out[f"setup_plo_{d}_{i}"] = float(pb.lower[i])
+            out[f"setup_phi_{d}_{i}"] = float(pb.upper[i])
+    return out
+
+
+def project_settings_dataframe(runner) -> pd.DataFrame:
+    """Сводка настроек ТЕКУЩЕГО проекта: переменная / тип / границы L…U.
+
+    Показывается после сборки/загрузки проекта, чтобы пользователь видел, какие
+    доли компонентов и реальные границы процесс-параметров действуют в движке
+    (единый источник истины — ``runner.current_schema``, а не поля формы).
+    Чистая (без Streamlit) — тестируется напрямую."""
+    rows: List[Dict[str, Any]] = []
+    sch = runner.current_schema
+    mb = sch.mixture_block()
+    if mb is not None:
+        for nm, lo, hi in zip(mb.names, mb.lower, mb.upper):
+            rows.append({"переменная": str(nm), "тип": "компонент смеси (доля)",
+                         "нижняя": float(lo), "верхняя": float(hi)})
+    pb = sch.process_block()
+    if pb is not None:
+        for nm, lo, hi in zip(pb.names, pb.lower, pb.upper):
+            rows.append({"переменная": str(nm),
+                         "тип": "процесс-параметр (реальные единицы)",
+                         "нижняя": float(lo), "верхняя": float(hi)})
+    return pd.DataFrame(rows)
+
+
+def render_project_settings(runner) -> None:
+    """📋 Панель «настройки текущего проекта» (читает движок, не форму).
+
+    C2: после загрузки проекта именно здесь видно, что доли компонентов,
+    границы процесс-параметров и отклики ПОДТЯНУЛИСЬ (двойник формы сетапа,
+    но по фактическому состоянию раннера)."""
+    with st.expander("📋 Настройки текущего проекта (из движка)"):
+        st.caption(
+            f"Отклики: {', '.join(runner.property_names)} · схема v"
+            f"{int(runner.current_schema_version)} · seed раннера = "
+            f"{int(getattr(runner, 'seed', 0))} · общая база: "
+            f"{len(runner.points)} точек. Границы ниже — те, по которым "
+            "реально работает движок (сохраняются и загружаются с проектом).")
+        st.dataframe(project_settings_dataframe(runner),
+                     use_container_width=True, hide_index=True)
+
+
 def render_setup_form() -> None:
 
     """§17.4 (Ш3b): форма РЕАЛЬНОГО сетапа — mixture + процесс + отклики.
@@ -852,6 +928,13 @@ def render_setup_form() -> None:
     ключом, что и демо-кампания (главный поток §17 — один движок). Реального
     оракула нет: стартовые отклики вносит пользователь в ручном seed-цикле ниже.
     """
+    # C2: отложенный префилл формы из ЗАГРУЖЕННОГО проекта — применяем ДО
+    # инстанцирования виджетов формы (ключ кладёт загрузчик в сайдбаре;
+    # менять session_state виджета можно только до его создания в прогоне).
+    _pending = st.session_state.pop("setup_prefill_pending", None)
+    if _pending:
+        for _k, _v in dict(_pending).items():
+            st.session_state[_k] = _v
     with st.expander("🆕 Новый проект — реальный сетап (§17.4)",
                      expanded=get_campaign_controller() is None):
         st.caption(
@@ -1686,6 +1769,10 @@ def render_campaign() -> None:
                 "«Создать демо-проект» (синтетический оракул {A,B,C}×{T,P}).")
         return
     runner = ctrl.runner
+
+    # C2: read-only сводка настроек ДЕЙСТВУЮЩЕГО проекта (из движка) — видно,
+    # что доли компонентов/границы процесса/отклики подтянулись после загрузки.
+    render_project_settings(runner)
 
     # §17.4 (Ш3b): пока стартовый дизайн НЕ измерен (база пуста) — единственная
     # активная секция это ручной seed-цикл; ветко-UI ниже требует измеренных данных.

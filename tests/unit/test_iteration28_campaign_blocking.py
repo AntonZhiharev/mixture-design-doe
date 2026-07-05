@@ -182,3 +182,41 @@ def test_workbench_points_dataframe_has_block():
     wdf = ui.workbench_points_dataframe(r, res)
     assert "Блок" in wdf.columns
     assert set(wdf["Блок"].astype(int)) == {max(r.point_blocks())}
+
+
+# ----------------------------------------------------------------------
+# Видимость blocking в UI (подписи; фикс «не вижу блокинг» при nb=1)
+# ----------------------------------------------------------------------
+def test_seed_blocking_caption_off_explains_how_to_enable():
+    """nb=1 (дефолт): подпись явно говорит, что blocking выключен и как включить."""
+    from src.apps import campaign_ui as ui
+    r = _runner(n_blocks=1)
+    X = r.propose_seed(8)
+    txt = ui.seed_blocking_caption(r, X)
+    assert "выключена" in txt
+    assert "Партий (блоков)" in txt
+
+
+def test_seed_blocking_caption_on_shows_sizes_and_loss():
+    """nb>1: подпись несёт размеры партий и цену блокировки (d_loss %)."""
+    from src.apps import campaign_ui as ui
+    r = _runner(n_blocks=2)
+    X = r.propose_seed(10)
+    txt = ui.seed_blocking_caption(r, X)
+    assert "включена" in txt
+    assert "блок 1" in txt and "блок 2" in txt
+    assert "%" in txt
+
+
+def test_base_blocking_caption_after_commit_and_round():
+    """База с nb>1 и добором: подпись со сводкой партий; nb=1 → пустая строка."""
+    from src.apps import campaign_ui as ui
+    r = _runner_with_branch(n_blocks=2)
+    r.run_branch_round("b1", n_points=2, n_candidates=100)
+    txt = ui.base_blocking_caption(r)
+    assert "блок 1" in txt and "блок 3" in txt      # старт 1..2 + добор → 3
+    assert "НОВЫЙ блок" in txt
+
+    r1 = _runner(n_blocks=1)
+    r1.seed_initial(n=8)
+    assert ui.base_blocking_caption(r1) == ""       # 1 партия — не показываем

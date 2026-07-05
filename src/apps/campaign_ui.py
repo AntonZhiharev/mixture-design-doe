@@ -38,6 +38,7 @@ from ..apps import campaign_screening as csx
 from ..apps import campaign_state as cs
 
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
+from ..design.blocking import blocking_diagnostics
 
 
 
@@ -468,6 +469,66 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
         rows.append(row)
     return pd.DataFrame(rows)
 
+
+
+def seed_blocking_caption(runner, Xs) -> str:
+    """Iteration 28+: ВИДИМАЯ сводка блокировки стартового дизайна (подпись).
+
+    Blocking был «невидим»: при ``n_blocks_start == 1`` (дефолт) таблица
+    намеренно не несёт столбца «Блок», и в UI не оставалось НИ ОДНОГО
+    упоминания блокировки — пользователь не знал, что она есть и как её
+    включить. Возвращает строку-подпись под seed-таблицей:
+
+      * 1 партия  — подсказка, что blocking выключен и как включить;
+      * nb > 1    — размеры партий и цена блокировки (потеря D-информации
+        модельных термов, :func:`design.blocking.blocking_diagnostics`).
+
+    Чистая (без Streamlit) — тестируется напрямую.
+    """
+    nb = max(1, int(getattr(runner, "n_blocks_start", 1)))
+    Xs = np.atleast_2d(np.asarray(Xs, float))
+    if nb <= 1 or len(Xs) == 0:
+        return ("🧱 Блокировка выключена: весь стартовый план — ОДНА партия "
+                "(столбца «Блок» нет). Если опыты нельзя поставить одной "
+                "партией / за один день — увеличьте «Партий (блоков)» выше: "
+                "план оптимально разобьётся на партии и появится столбец "
+                "«Блок».")
+    try:
+        lab = np.asarray(runner.seed_block_labels(Xs), int)
+        q = len(runner.current_schema.mixture_names)
+        diag = blocking_diagnostics(
+            Xs[:, :q], lab, model=getattr(runner, "gp_mean_model", "quadratic"))
+        sizes = ", ".join(f"блок {b}: {c} оп."
+                          for b, c in sorted(diag["block_sizes"].items()))
+        return (f"🧱 Блокировка включена: {nb} партий ({sizes}); потеря "
+                f"D-информации модельных термов ≈ {diag['d_loss_pct']:.1f}% "
+                "(метки — в столбце «Блок»; показ = фиксация: при "
+                "commit_seed точки получат ЭТИ ЖЕ блоки).")
+    except Exception:  # noqa: BLE001 — подпись не должна ломать seed-цикл
+        return (f"🧱 Блокировка включена: {nb} партий — метки в столбце "
+                "«Блок».")
+
+
+def base_blocking_caption(runner) -> str:
+    """Iteration 28+: сводка блокировки ОБЩЕЙ базы кампании (подпись).
+
+    Показывается под таблицей общей базы: сколько партий (блоков), их размеры
+    и цена блокировки по :meth:`MixtureProcessRunner.blocking_summary`.
+    Одна партия / пустая база → пустая строка (подпись не показывается).
+    Чистая (без Streamlit) — тестируется напрямую."""
+    try:
+        bs = runner.blocking_summary()
+        if int(bs.get("n_blocks", 0)) <= 1:
+            return ""
+        sizes = ", ".join(f"блок {b}: {c} оп."
+                          for b, c in sorted(bs["block_sizes"].items()))
+        loss = bs.get("d_loss_pct")
+        loss_txt = (f"; потеря D-информации ≈ {float(loss):.1f}%"
+                    if loss is not None and np.isfinite(float(loss)) else "")
+        return (f"🧱 Партии (блоки) базы: {bs['n_blocks']} ({sizes}){loss_txt}. "
+                "Каждый добор ветки автоматически получает НОВЫЙ блок.")
+    except Exception:  # noqa: BLE001 — подпись не должна ломать показ базы
+        return ""
 
 
 def seed_design_excel_bytes(runner, Xs, Ys=None, *,
@@ -1149,6 +1210,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                                       *coord_names[:Xs.shape[1]],
                                       *mass_cols],
                             key="setup_seed_editor")
+    # Iteration 28+: blocking должен быть ВИДЕН всегда — и когда включён
+    # (размеры партий + цена блокировки), и когда выключен (как включить).
+    st.caption(seed_blocking_caption(runner, Xs))
     # C2: черновик Y из редактора живёт в session_state (setup_seed_Y), чтобы
     # частично внесённые отклики можно было сохранить в проект ДО фиксации
     # (commit_seed) и восстановить при загрузке. NaN допустимы (пустые ячейки).
@@ -1887,6 +1951,9 @@ def render_campaign() -> None:
         batch_kg = float(batch) if batch > 0 else None
         base_df = campaign_base_dataframe(runner, batch_kg=batch_kg)
         st.dataframe(base_df, use_container_width=True, hide_index=True)
+        _blk_txt = base_blocking_caption(runner)
+        if _blk_txt:
+            st.caption(_blk_txt)
         st.download_button(
             "⬇️ Скачать .xlsx",
             data=campaign_base_excel_bytes(runner, batch_kg=batch_kg),

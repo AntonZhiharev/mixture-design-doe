@@ -146,3 +146,45 @@ def test_load_prefills_setup_form_and_restores_seed_points():
             cst.delete_campaign(CAMPAIGN_ROOT, name)
         except Exception:  # noqa: BLE001
             pass
+
+
+def test_seed_batch_roundtrip_through_save_load():
+    """Регресс: «Размер пробы, кг/опыт» переживает save → load (замечание 7).
+
+    Раньше черновик seed нёс только X/Y, а ``setup_seed_batch`` терялся:
+    после загрузки проекта поле сбрасывалось в 0 и расход сырья пропадал."""
+    name = "regr_it25_batch"
+    try:
+        cst.delete_campaign(CAMPAIGN_ROOT, name)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # сессия 1: собрать проект (дефолты формы) → предложить seed →
+        # задать размер пробы → сохранить проект
+        at = AppTest.from_file(APP, default_timeout=300).run()
+        [w for w in at.button if w.key == "setup_build"][0].click().run()
+        assert not at.exception
+        at.session_state["setup_seed_n"] = 6
+        [w for w in at.button if w.key == "setup_propose_seed"][0].click().run()
+        assert not at.exception
+        at.number_input(key="setup_seed_batch").set_value(2.5).run()
+        at.text_input(key="campaign_name").set_value(name).run()
+        [w for w in at.button if w.key == "save_campaign"][0].click().run()
+        assert not at.exception
+
+        # черновик на диске несёт размер пробы
+        draft = cst.load_campaign_draft(CAMPAIGN_ROOT, name)
+        assert draft is not None
+        assert draft.get("seed_batch") == pytest.approx(2.5)
+
+        # сессия 2 (свежая): загрузка восстанавливает поле размера пробы
+        at2 = AppTest.from_file(APP, default_timeout=300).run()
+        at2.selectbox(key="campaign_select").set_value(name).run()
+        [w for w in at2.button if w.key == "load_campaign"][0].click().run()
+        assert not at2.exception
+        assert float(at2.session_state["setup_seed_batch"]) == pytest.approx(2.5)
+    finally:
+        try:
+            cst.delete_campaign(CAMPAIGN_ROOT, name)
+        except Exception:  # noqa: BLE001
+            pass

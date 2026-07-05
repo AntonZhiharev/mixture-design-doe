@@ -57,7 +57,9 @@ def _seed_draft_from_session() -> Optional[Dict[str, Any]]:
     Пока seed НЕ зафиксирован (``commit_seed``), предложенный план и частично
     внесённые Y живут только в ``setup_seed_X`` / ``setup_seed_Y`` — без этого
     черновика сохранение до фиксации давало «пустой» проект (0 точек), а
-    загрузка выглядела как потеря данных. NaN кодируется как null."""
+    загрузка выглядела как потеря данных. NaN кодируется как null. Размер
+    пробы (``setup_seed_batch``, замечание 7) — тоже часть черновика: без
+    него после загрузки поле сбрасывалось в 0 и расход сырья терялся."""
     X = st.session_state.get("setup_seed_X")
     if X is None:
         return None
@@ -69,6 +71,12 @@ def _seed_draft_from_session() -> Optional[Dict[str, Any]]:
         Y = np.atleast_2d(np.asarray(Y, float))
         draft["seed_Y"] = [
             [(float(v) if np.isfinite(v) else None) for v in row] for row in Y]
+    batch = st.session_state.get("setup_seed_batch")
+    try:
+        if batch is not None and float(batch) > 0:
+            draft["seed_batch"] = float(batch)
+    except (TypeError, ValueError):
+        pass
     return draft
 
 
@@ -77,8 +85,11 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
 
     Возвращает True, если черновик был и восстановлен. Ключ виджета-редактора
     Y сбрасывается, чтобы data_editor не наложил старые правки ячеек; сайдбар
-    рендерится ДО редактора, поэтому чистить ключ здесь безопасно."""
-    for k in ("setup_seed_X", "setup_seed_Y", "setup_seed_editor"):
+    рендерится ДО редактора, поэтому чистить ключ здесь безопасно. Размер
+    пробы (``seed_batch``) восстанавливается в ключ виджета — сайдбар идёт
+    раньше number_input, менять session_state ещё можно."""
+    for k in ("setup_seed_X", "setup_seed_Y", "setup_seed_editor",
+              "setup_seed_batch"):
         st.session_state.pop(k, None)
     if not draft or draft.get("seed_X") is None:
         return False
@@ -87,6 +98,8 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
         st.session_state["setup_seed_Y"] = np.asarray(
             [[(np.nan if v is None else float(v)) for v in row]
              for row in draft["seed_Y"]], float)
+    if draft.get("seed_batch") is not None:
+        st.session_state["setup_seed_batch"] = float(draft["seed_batch"])
     return True
 
 

@@ -993,7 +993,8 @@ def render_setup_form() -> None:
                     response_names=resp, mixture_lower=mlo, mixture_upper=mhi,
                     seed=int(seed_v))
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
-                for k in ("setup_seed_X", "setup_seed_Y"):
+                for k in ("setup_seed_X", "setup_seed_Y",
+                          "setup_seed_df", "setup_seed_df_sig"):
                     st.session_state.pop(k, None)
                 st.success(
                     f"Проект собран: смесь {mix} × процесс {proc}, отклики {resp}. "
@@ -1049,6 +1050,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         # СТАРЫЕ правки ячеек на новые строки); кнопка выше редактора, поэтому
         # виджет ещё не создан в этом прогоне и ключ можно чистить.
         st.session_state.pop("setup_seed_editor", None)
+        st.session_state.pop("setup_seed_df", None)
+        st.session_state.pop("setup_seed_df_sig", None)
 
     Xs = st.session_state.get("setup_seed_X")
     if Xs is None:
@@ -1059,6 +1062,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         st.session_state["setup_seed_Y"] = np.vstack(
             [runner._measure(np.asarray(x, float)) for x in Xs])
         st.session_state.pop("setup_seed_editor", None)
+        st.session_state.pop("setup_seed_df", None)
+        st.session_state.pop("setup_seed_df_sig", None)
 
     # Замечание 7: размер ПРОБЫ (партии) — добавляет столбцы расхода сырья
     # {компонент} (кг) = доля·batch, чтобы понимать, сколько взвесить на опыт.
@@ -1077,7 +1082,25 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     lab_cols = [f"{p} (lab)" for p in props]
     # Единый источник таблицы (показ = редактор = Excel): чистый хелпер строит
     # «№ опыта» + заблокированные координаты (+ расход сырья) + столбцы «(lab)».
-    df = seed_design_dataframe(runner, Xs, Ys, batch_kg=batch_kg)
+    #
+    # БАГФИКС (пропадающие значения): вход data_editor обязан быть СТАБИЛЬНЫМ
+    # между прогонами. Раньше df пересобирался КАЖДЫЙ rerun с уже внесённым
+    # черновиком Y — для Streamlit изменившиеся данные = НОВЫЙ виджет, и свежая
+    # (ещё не запечённая в df) правка сбрасывалась: первая введённая ячейка в
+    # каждой следующей колонке «исчезала», повторный ввод принимался. Теперь df
+    # кэшируется по сигнатуре (дизайн Xs + размер пробы) и пересобирается только
+    # при её смене / явном заполнении (демо-кнопка, новый дизайн, загрузка
+    # проекта) — черновик Y вливается в кэш в этот момент, правки не теряются.
+    sig = (Xs.tobytes(), Xs.shape, batch_kg)
+    if (st.session_state.get("setup_seed_df_sig") != sig
+            or "setup_seed_df" not in st.session_state):
+        st.session_state["setup_seed_df"] = seed_design_dataframe(
+            runner, Xs, Ys, batch_kg=batch_kg)
+        st.session_state["setup_seed_df_sig"] = sig
+        # Пересборка входа → чистим состояние виджета (мы выше редактора по
+        # коду, он ещё не создан в этом прогоне — ключ чистить безопасно).
+        st.session_state.pop("setup_seed_editor", None)
+    df = st.session_state["setup_seed_df"]
     st.caption("Составные координаты заблокированы; заполняются только столбцы "
                "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
     edited = st.data_editor(df, use_container_width=True, height=320,
@@ -1093,6 +1116,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
             [np.asarray(edited[c], float) for c in lab_cols])
     except (KeyError, TypeError, ValueError):
         pass
+    # Для Excel ниже берём СВЕЖИЙ черновик (включая правки текущего прогона).
+    Ys = st.session_state.get("setup_seed_Y", Ys)
 
     # C3: сохранить ПЛАН стартового эксперимента в Excel (ещё до фиксации) —
     # экспортируем внесённые в редакторе значения (пустые «(lab)» — под ручной
@@ -1115,7 +1140,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                     "тестовыми». Пустые ячейки (None) фиксировать нельзя.")
             out = ctrl.commit_seed(Xs, Y)
 
-            for k in ("setup_seed_X", "setup_seed_Y"):
+            for k in ("setup_seed_X", "setup_seed_Y",
+                      "setup_seed_df", "setup_seed_df_sig"):
                 st.session_state.pop(k, None)
             # P0: уведомление через _flash — st.success перед st.rerun не
             # доживал до глаз пользователя (rerun стирает вывод прогона).

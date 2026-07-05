@@ -89,7 +89,7 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
     пробы (``seed_batch``) восстанавливается в ключ виджета — сайдбар идёт
     раньше number_input, менять session_state ещё можно."""
     for k in ("setup_seed_X", "setup_seed_Y", "setup_seed_editor",
-              "setup_seed_batch"):
+              "setup_seed_batch", "setup_seed_df", "setup_seed_df_sig"):
         st.session_state.pop(k, None)
     if not draft or draft.get("seed_X") is None:
         return False

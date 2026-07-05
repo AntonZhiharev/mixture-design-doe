@@ -158,6 +158,7 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             "n_restarts": int(runner.n_restarts),
             "gp_mean_model": str(runner.gp_mean_model),
             "gp_kernel": str(runner.gp_kernel),
+            "n_blocks_start": int(getattr(runner, "n_blocks_start", 1)),
             "points": [p.to_dict() for p in runner.points],
             "branches": {bid: br.to_state()
                          for bid, br in runner.branches.items()},
@@ -209,6 +210,7 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
         n_restarts=int(r.get("n_restarts", 4)),
         gp_mean_model=str(r.get("gp_mean_model", "quadratic")),
         gp_kernel=str(r.get("gp_kernel", "matern52")),
+        n_blocks_start=int(r.get("n_blocks_start", 1)),
     )
 
     # История версий + текущая схема/версия — восстанавливаем ВЕРНО (move_region

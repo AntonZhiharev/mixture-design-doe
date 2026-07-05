@@ -67,6 +67,7 @@ from ..design.move_bounds import (move_bounds, handle_dropped_fixed,
                                   BORDER_HARD, BORDER_SOFT, boundary_hits,
                                   _var_bounds)
 from ..models.gp_expert import GPExpert
+from ..design.blocking import assign_blocks_start, blocking_diagnostics
 from ..design.block_model import build_model_terms, model_matrix
 from ..design.augmented import build_moments
 from ..design.branches import (Branch, branch_scores, propose_by_score,
@@ -107,7 +108,8 @@ class MixtureProcessRunner:
     def __init__(self, schema: ProjectSchema, oracle: Any, *,
                  baseline: Optional[Sequence[float]] = None,
                  seed: int = 0, n_restarts: int = 4,
-                 gp_mean_model: str = "quadratic", gp_kernel: str = "matern52"):
+                 gp_mean_model: str = "quadratic", gp_kernel: str = "matern52",
+                 n_blocks_start: int = 1):
         self.full_schema = schema
         self.oracle = oracle
         self.property_names: List[str] = list(oracle.property_names)
@@ -123,6 +125,8 @@ class MixtureProcessRunner:
         self.n_restarts = int(n_restarts)
         self.gp_mean_model = gp_mean_model
         self.gp_kernel = gp_kernel
+        # blocking: число партий (блоков) СТАРТОВОГО дизайна (1 = без блоков)
+        self.n_blocks_start = max(1, int(n_blocks_start))
 
         # baseline ПОЛНЫХ составных координат (mixture-доли + process-КОД [0,1]).
         if baseline is not None:
@@ -604,7 +608,7 @@ class MixtureProcessRunner:
         return np.atleast_2d(self.oracle.evaluate(full))
 
     def _make_point(self, coords_cur: np.ndarray, y_row: np.ndarray,
-                    origin: str) -> DataPoint:
+                    origin: str, block: Optional[int] = None) -> DataPoint:
         coords_cur = np.asarray(coords_cur, float).ravel()
         X: Dict[str, List[float]] = {}
         if self.q > 0:
@@ -613,8 +617,61 @@ class MixtureProcessRunner:
             X[PROCESS] = [float(v) for v in coords_cur[self.q:self.q + self.d]]
         Y = {name: float(y_row[i]) for i, name in enumerate(self.property_names)}
         tag = {"origin": origin, "schema_version": self.current_schema_version}
+        if block is not None:
+            tag["block"] = int(block)       # партия/день измерения (blocking)
         return DataPoint(schema_version=self.current_schema_version,
                          X=X, Y=Y, origin_tag=tag)
+
+    # ------------------------------------------------------------------
+    # Blocking (партии/дни): стартовый — ОПТИМАЛЬНЫЙ, добор — НОВЫЙ блок
+    # ------------------------------------------------------------------
+    def seed_block_labels(self, X: Any) -> np.ndarray:
+        """Метки блоков СТАРТОВОГО дизайна (оптимальный стартовый blocking).
+
+        Разбивает предложенные seed-точки на ``n_blocks_start`` партий
+        interchange-алгоритмом по log det блочной модели Шеффе на MIXTURE-долях
+        (:func:`design.blocking.assign_blocks_start`). Детерминированно по
+        ``self.seed`` ⇒ показ (``propose_seed``) и фиксация (``commit_seed``)
+        дают ОДНИ И ТЕ ЖЕ метки. ``n_blocks_start<=1`` → все точки в блоке 1.
+        """
+        X = np.atleast_2d(np.asarray(X, float))
+        n = len(X)
+        nb = max(1, int(getattr(self, "n_blocks_start", 1)))
+        if n == 0 or nb <= 1:
+            return np.ones(n, dtype=int)
+        blk = assign_blocks_start(X[:, :self.q], nb, model=self.gp_mean_model,
+                                  n_restarts=self.n_restarts, seed=self.seed)
+        return np.asarray(blk.labels, dtype=int)
+
+    def _next_block(self) -> int:
+        """Следующий свободный номер блока общей базы (добор = НОВЫЙ блок).
+
+        Sequential blocking: каждая партия добора (commit-раунд) измеряется в
+        другое время/из другого замеса, чем база, и получает следующий номер.
+        Точки без метки (старые проекты) считаются блоком 1.
+        """
+        blocks = [int(p.origin_tag.get("block", 1)) for p in self.points]
+        return (max(blocks) + 1) if blocks else 1
+
+    def point_blocks(self) -> List[int]:
+        """Метки блоков АКТИВНЫХ точек (в порядке ``self.X``; нет метки → 1)."""
+        return [int(p.origin_tag.get("block", 1))
+                for p in self._migrated_points()]
+
+    def blocking_summary(self) -> Dict[str, Any]:
+        """Диагностика блочной структуры активной базы (цена блокировки).
+
+        Считает :func:`design.blocking.blocking_diagnostics` по MIXTURE-долям
+        активных точек и их меткам блоков: D-эфф. с блоками/без, потерю
+        информации модельных термов (дополнение Шура). Пустая база →
+        ``{"n_blocks": 0, "block_sizes": {}}``.
+        """
+        mig = self._migrated_points()
+        if not mig:
+            return {"n_blocks": 0, "block_sizes": {}}
+        Xc = composite_matrix(self.current_schema, mig)
+        labels = [int(p.origin_tag.get("block", 1)) for p in mig]
+        return blocking_diagnostics(Xc[:, :self.q], labels, self.gp_mean_model)
 
     # ------------------------------------------------------------------
     # Ведущая база (DataPoint) ⇄ производные numpy-кэши на ТЕКУЩЕЙ схеме
@@ -686,7 +743,9 @@ class MixtureProcessRunner:
         s = self.seed if seed is None else int(seed)
         X0 = self._phase_candidates(n, s)
         Y0 = self._measure(X0)
-        self.points = [self._make_point(X0[i], Y0[i], "seed")
+        labels = self.seed_block_labels(X0)      # стартовый blocking (партии)
+        self.points = [self._make_point(X0[i], Y0[i], "seed",
+                                        block=int(labels[i]))
                        for i in range(len(X0))]
         self.fit_surrogates()
         return {"n": int(len(X0)), "P": int(self.Y.shape[1])}
@@ -736,8 +795,14 @@ class MixtureProcessRunner:
                 f"дано {Ynew.shape[1]}.")
         if newX.shape[0] == 0:
             return {"added": 0, "n_base": len(self.points), "P": P}
+        # стартовый blocking: оптимальные метки партий; если база уже непуста
+        # (повторный seed-коммит) — сдвигаем номера за существующие блоки
+        labels = self.seed_block_labels(newX)
+        offset = (max(int(p.origin_tag.get("block", 1)) for p in self.points)
+                  if self.points else 0)
         for i in range(len(newX)):
-            self.points.append(self._make_point(newX[i], Ynew[i], "seed"))
+            self.points.append(self._make_point(newX[i], Ynew[i], "seed",
+                                                block=int(labels[i]) + offset))
         self.fit_surrogates()
         return {"added": int(len(newX)), "n_base": len(self.points), "P": P}
 
@@ -1194,9 +1259,12 @@ class MixtureProcessRunner:
                     "d_best": br.d_best, "x_best": br.x_best,
                     "n_base": int(0 if self.X is None else len(self.X))}
 
+        # blocking добора: commit-раунд — НОВАЯ партия → ОДИН новый блок
+        blk = self._next_block()
         for i in range(len(newX)):
             self.points.append(
-                self._make_point(newX[i], Ynew[i], f"branch:{branch_id}"))
+                self._make_point(newX[i], Ynew[i], f"branch:{branch_id}",
+                                 block=blk))
         br.spent += len(newX)
 
         # измеренный d_best (§3): цена за изделие — по ИЗМЕРЕННОЙ ρ (в Ynew),

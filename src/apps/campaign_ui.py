@@ -343,6 +343,11 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
     Y = np.atleast_2d(np.asarray(getattr(runner, "Y", np.empty((len(X), 0))),
                                  float))
     origins = list(getattr(runner, "origin", []) or [])
+    # blocking: метки партий (блоков) активных точек — порядок совпадает с X
+    try:
+        blocks = list(runner.point_blocks())
+    except Exception:  # noqa: BLE001 — блоки не критичны для показа базы
+        blocks = []
     mix_names = list(runner.current_schema.mixture_names)
     n_mix = len(mix_names)
     # Показ процесса в АБСОЛЮТНЫХ единицах (замечание 2): mixture-доли не трогаем,
@@ -354,6 +359,7 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
         row: Dict[str, Any] = {"№ опыта": i + 1}
         og = origins[i] if i < len(origins) else ""
         row["источник"] = origin_label(runner, og)
+        row["Блок"] = int(blocks[i]) if i < len(blocks) else 1
         for j, cn in enumerate(coord_names[:X.shape[1]]):
             row[cn] = round(float(Xreal[i, j]), 4)
 
@@ -434,10 +440,21 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
     # ДОЛЯМ (mixture), поэтому берём их из исходного Xs (real == code для mixture).
     Xreal = process_code_to_real(runner, Xs)
 
+    # blocking: оптимальные метки партий стартового дизайна (детерминированы по
+    # seed раннера ⇒ при commit_seed точки получат ЭТИ ЖЕ метки)
+    seed_blocks = None
+    if int(getattr(runner, "n_blocks_start", 1)) > 1 and len(Xs):
+        try:
+            seed_blocks = np.asarray(runner.seed_block_labels(Xs), int)
+        except Exception:  # noqa: BLE001 — блоки не критичны для показа
+            seed_blocks = None
+
     nums = list(experiment_index(len(runner.points), len(Xs)))
     rows: List[Dict[str, Any]] = []
     for i in range(len(Xs)):
         row: Dict[str, Any] = {"№ опыта": nums[i]}
+        if seed_blocks is not None:
+            row["Блок"] = int(seed_blocks[i])
         for j, cn in enumerate(coord_names[:ncoord]):
             row[cn] = round(float(Xreal[i, j]), 4)
         if batch_kg is not None and float(batch_kg) > 0:
@@ -623,6 +640,14 @@ def workbench_points_dataframe(runner, result: Dict[str, Any]) -> pd.DataFrame:
     cols = list(runner.property_names)
     df = pd.DataFrame(y[:, [runner.prop_index[c] for c in cols]], columns=cols)
     df.insert(0, "origin", f"branch:{result.get('branch')}")
+    # blocking добора: только что залитые точки — последние в базе, их партия =
+    # последний (максимальный) блок общей базы
+    try:
+        bl = list(runner.point_blocks())
+        if len(bl) >= len(df):
+            df.insert(1, "Блок", [int(b) for b in bl[-len(df):]])
+    except Exception:  # noqa: BLE001 — блок не критичен для показа
+        pass
     return df
 
 
@@ -1025,7 +1050,7 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     q = len(runner.current_schema.mixture_names)
     d = len(runner.current_schema.process_names)
     rec_n = recommended_seed_size(q, d)
-    sc = st.columns([1, 1, 1])
+    sc = st.columns([1, 1, 1, 1])
     seed_n = sc[0].number_input(
         "N seed-точек", min_value=2, max_value=200, value=int(rec_n), step=1,
         key="setup_seed_n",
@@ -1042,7 +1067,19 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
              "(воспроизводимо); другое значение → другой случайный вариант. "
              "К числу «seed-точек» отношения не имеет — это разные «seed».")
 
-    if sc[2].button("📐 Предложить seed-дизайн", key="setup_propose_seed"):
+    nb_blocks = sc[2].number_input(
+        "Партий (блоков)", min_value=1, max_value=20,
+        value=int(getattr(runner, "n_blocks_start", 1)), step=1,
+        key="setup_seed_blocks",
+        help="Blocking стартового дизайна: если опыты нельзя поставить одной "
+             "партией / за один день, план ОПТИМАЛЬНО разбивается на блоки "
+             "(interchange по блочному D-критерию) — эффект партии ловится "
+             "блочной моделью и не искажает оценки состава. 1 — без "
+             "блокировки. Доборы веток автоматически получают НОВЫЙ блок "
+             "(каждая партия добора — отдельный блок).")
+    runner.n_blocks_start = max(1, int(nb_blocks))
+
+    if sc[3].button("📐 Предложить seed-дизайн", key="setup_propose_seed"):
         X = np.asarray(ctrl.propose_seed(int(seed_n), seed=int(seed_design)), float)
         st.session_state["setup_seed_X"] = X
         st.session_state.pop("setup_seed_Y", None)
@@ -1091,7 +1128,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # кэшируется по сигнатуре (дизайн Xs + размер пробы) и пересобирается только
     # при её смене / явном заполнении (демо-кнопка, новый дизайн, загрузка
     # проекта) — черновик Y вливается в кэш в этот момент, правки не теряются.
-    sig = (Xs.tobytes(), Xs.shape, batch_kg)
+    sig = (Xs.tobytes(), Xs.shape, batch_kg,
+           int(getattr(runner, "n_blocks_start", 1)))
     if (st.session_state.get("setup_seed_df_sig") != sig
             or "setup_seed_df" not in st.session_state):
         st.session_state["setup_seed_df"] = seed_design_dataframe(
@@ -1103,9 +1141,12 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     df = st.session_state["setup_seed_df"]
     st.caption("Составные координаты заблокированы; заполняются только столбцы "
                "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
+    blk_cols = (["Блок"] if int(getattr(runner, "n_blocks_start", 1)) > 1
+                else [])
     edited = st.data_editor(df, use_container_width=True, height=320,
                             hide_index=True,
-                            disabled=["№ опыта", *coord_names[:Xs.shape[1]],
+                            disabled=["№ опыта", *blk_cols,
+                                      *coord_names[:Xs.shape[1]],
                                       *mass_cols],
                             key="setup_seed_editor")
     # C2: черновик Y из редактора живёт в session_state (setup_seed_Y), чтобы

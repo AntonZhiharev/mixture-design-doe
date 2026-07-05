@@ -58,6 +58,49 @@ def test_helper_missing_mixture_raises():
         evaluate_point({"A": 0.5, "B": 0.5, "T": 0.5, "P": 0.5}, world_key="econ")
 
 
+def test_helper_proc_bounds_real_units():
+    """Процесс в РЕАЛЬНЫХ единицах (--proc-bounds) = той же точке в коде [0,1].
+
+    UI кампании показывает процесс-оси в реальных единицах (сетап §17.4,
+    например T=150…200, P=1…5); хелпер обязан нормировать их в код сам:
+    T=175 при T∈[150;200] — это код 0.5.
+    """
+    mix = {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
+    code = evaluate_point({**mix, "T": 0.5, "P": 0.5}, world_key="econ")
+    real = evaluate_point({**mix, "T": 175.0, "P": 3.0}, world_key="econ",
+                          proc_bounds={"T": (150.0, 200.0), "P": (1.0, 5.0)})
+    assert code == real
+
+
+def test_helper_proc_out_of_cube_raises():
+    """Процесс вне [0,1] без --proc-bounds — явная ошибка с подсказкой."""
+    import pytest
+    mix = {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
+    with pytest.raises(ValueError, match="proc-bounds"):
+        evaluate_point({**mix, "T": 175.0, "P": 3.0}, world_key="econ")
+
+
+def test_cli_tolerates_backslash_tokens(capsys):
+    """Копипаст многострочной bash-команды в cmd/PowerShell даёт токены '\\A=…'
+    — хелпер терпит это молча (артефакт '\\'-переносов, не ошибка ввода)."""
+    rc = main(["--world", "econ", "\\A=0.25", "B=0.25", "C=0.25", "D=0.25",
+               "\\", "T=0.5", "P=0.5"])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "strength" in captured
+
+
+def test_cli_proc_bounds_option(capsys):
+    """CLI --proc-bounds T=150:200,P=1:5 принимает реальные T,P из таблиц UI."""
+    rc = main(["--proc-bounds", "T=150:200,P=1:5",
+               "A=0.25", "B=0.25", "C=0.25", "D=0.25", "T=175", "P=3"])
+    assert rc == 0
+    out_cli = capsys.readouterr().out
+    ref = evaluate_point({"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25,
+                          "T": 0.5, "P": 0.5}, world_key="econ")
+    assert f"strength={ref['strength']:g}" in out_cli
+
+
 def test_helper_deterministic():
     """Истина без шума → повтор даёт идентичные значения (воспроизводимо)."""
     c = {"A": 0.4, "B": 0.2, "C": 0.2, "D": 0.2}

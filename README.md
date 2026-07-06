@@ -16,19 +16,34 @@ UI — единое Streamlit-приложение «кампания»; ядр�
 ## 🚀 Быстрый старт
 
 ```bash
-# 1. Виртуальное окружение
+# 1. Виртуальное окружение (один раз)
 python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # Linux / macOS
 
-# 2. Зависимости
-pip install -r requirements.txt
+# 2. Зависимости (один раз)
+.venv/Scripts/python.exe -m pip install -r requirements.txt   # Windows
+# .venv/bin/python -m pip install -r requirements.txt         # Linux / macOS
 
-# 3. Запуск главного приложения
-python run_streamlit_app.py
-# или напрямую:
+# 3. Запуск главного приложения — через python из venv,
+#    активация окружения НЕ обязательна:
+.venv/Scripts/python.exe run_streamlit_app.py                 # Windows (Git Bash / PowerShell / cmd)
+# .venv/bin/python run_streamlit_app.py                       # Linux / macOS
+```
+
+Если хочется короткую команду `streamlit run ...` — сначала активировать venv
+(в каждой новой сессии терминала):
+
+```bash
+source .venv/Scripts/activate    # Git Bash (Windows)
+# .venv\Scripts\Activate.ps1     # PowerShell
+# .venv\Scripts\activate.bat     # cmd
+# source .venv/bin/activate      # Linux / macOS
+
 streamlit run src/apps/streamlit_app.py
 ```
+
+> Голая команда `streamlit run ...` без активации venv даст
+> `bash: streamlit: command not found` — streamlit установлен внутри `.venv`,
+> а не глобально.
 
 Браузер: **http://localhost:8501**
 

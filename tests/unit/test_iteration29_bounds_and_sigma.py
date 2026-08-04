@@ -17,8 +17,9 @@
     точки выпуклыми комбинациями крайних вершин (с предупреждением), а не молча
     забивает пул копиями центроида;
   * ``GPExpert`` защищён от n < p: тренд Шеффе автоматически даунгрейдится
-    (quadratic → linear → constant), пока n ≥ p + mean_min_dof — иначе OLS
-    интерполирует, остатки ≈ 0 и GP выдаёт σ=0 («уверенно врёт»).
+    (quadratic → linear → constant), пока n < p + max(mean_min_dof, p)
+    (т.е. n < 2p, ужесточено в iter30) — иначе OLS интерполирует,
+    остатки ≈ 0 и GP выдаёт σ=0 («уверенно врёт»).
 """
 import warnings
 
@@ -130,7 +131,7 @@ def test_gpexpert_downgrades_quadratic_to_linear_at_n12_q6():
 
 
 def test_gpexpert_keeps_quadratic_with_enough_data():
-    X, y = _sim_data(30)                        # p_quad=21, 30 ≥ 21+3
+    X, y = _sim_data(45)                        # p_quad=21, 45 ≥ 2·21 (iter30)
     gp = GPExpert(mean_model="quadratic", seed=0, n_restarts=2).fit(X, y)
     assert gp.mean_model_effective_ == "quadratic"
 

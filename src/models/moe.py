@@ -78,7 +78,11 @@ class MixtureOfExperts:
             self._gating_classes = self.gating_.classes_
 
         # --- experts: one GP per regime ---
-        min_train = n_scheffe_params(q, self.mean_model) + 3
+        # порог согласован с гейтом тренда GPExpert (iter30): эксперт получает
+        # собственный кластер только при n_k ≥ p + max(3, p) ≈ 2p — иначе
+        # GPExpert внутри даунгрейдит тренд и σ раздувается на ровном месте
+        p_mean = n_scheffe_params(q, self.mean_model)
+        min_train = p_mean + max(3, p_mean)
         self.experts_ = []
         for k in range(K):
             idx = np.where(labels == k)[0]

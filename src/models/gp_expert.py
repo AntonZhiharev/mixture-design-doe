@@ -95,8 +95,11 @@ class GPExpert:
         self.seed = seed
         self.names = names
         # запас степеней свободы остатков тренда: тренд порядка m допускается
-        # только при n ≥ p(m) + mean_min_dof (иначе OLS интерполирует, остатки
-        # ≈ 0, ядру учиться нечему ⇒ σ=0 и GP «уверенно врёт»)
+        # только при n ≥ p(m) + max(mean_min_dof, p(m)) — т.е. фактически
+        # n ≥ 2·p(m). Фиксированный запас в 3 dof недостаточен: при q=6
+        # quadratic (p=21) пускался уже при n=24 → 3 dof остатков, OLS почти
+        # интерполирует, σ схлопывается (cov95≈0.24) и GP «уверенно врёт»
+        # вплоть до n≈45 (iter30).
         self.mean_min_dof = int(mean_min_dof)
         self.mean_model_effective_: Union[str, int, None] = None
         self.mean_: Optional[ScheffeModel] = None
@@ -105,17 +108,21 @@ class GPExpert:
 
     # ------------------------------------------------------------------
     def _resolve_mean_model(self, n: int, q: int) -> Union[str, int]:
-        """Эффективный порядок тренда: даунгрейд, пока n < p + mean_min_dof.
+        """Эффективный порядок тренда: даунгрейд, пока n < p + max(dof, p).
 
-        Возвращает имя/порядок допустимого тренда Шеффе либо ``"constant"``,
-        если даже линейный тренд не идентифицируем с запасом.
+        Требование ``n ≥ 2·p`` (при p ≥ mean_min_dof) гарантирует, что у OLS
+        остаётся не меньше p степеней свободы остатков — ядру GP есть на чём
+        учиться, σ не схлопывается. Возвращает имя/порядок допустимого тренда
+        Шеффе либо ``"constant"``, если даже линейный тренд не идентифицируем
+        с запасом.
         """
         req = self.mean_model
         req_order = (_NAME_ORDERS[req] if isinstance(req, str) and req in _NAME_ORDERS
                      else int(req))
         req_order = min(req_order, q)          # порядок Шеффе не выше q
         for m in range(req_order, 0, -1):
-            if n >= n_scheffe_params(q, m) + self.mean_min_dof:
+            p_m = n_scheffe_params(q, m)
+            if n >= p_m + max(self.mean_min_dof, p_m):
                 return _ORDER_NAMES.get(m, m)
         return "constant"
 
@@ -130,9 +137,10 @@ class GPExpert:
         self.mean_model_effective_ = eff
         if eff != self.mean_model:
             warnings.warn(
-                f"GPExpert: тренд '{self.mean_model}' не идентифицируем при "
-                f"n={n}, q={q} (нужно n ≥ p + {self.mean_min_dof}); "
-                f"использован тренд '{eff}'.", UserWarning, stacklevel=2)
+                f"GPExpert: тренд '{self.mean_model}' не идентифицируем с запасом "
+                f"при n={n}, q={q} (нужно n ≥ p + max({self.mean_min_dof}, p), "
+                f"т.е. ≥ 2p); использован тренд '{eff}'.", UserWarning,
+                stacklevel=2)
         if eff == "constant":
             self.mean_ = _ConstantMean(float(y.mean()) if n else 0.0)
         else:

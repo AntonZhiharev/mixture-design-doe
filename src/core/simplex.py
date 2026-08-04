@@ -48,6 +48,8 @@ class SimplexRegion:
             raise ValueError("lower and upper must have the same length.")
         self.names = (list(names) if names is not None
                       else [chr(ord("A") + i) for i in range(self.q)])
+        # iter35: метаданные последнего вызова random_points (n_fallback и др.)
+        self.last_sampling_info: dict | None = None
         self._validate()
 
     # ------------------------------------------------------------------
@@ -192,10 +194,18 @@ class SimplexRegion:
 
         Основной путь — rejection sampling в пространстве псевдокомпонентов.
         Если из-за узких границ приёмка мала и точек не хватает, остаток
-        добирается ВЫПУКЛЫМИ КОМБИНАЦИЯМИ крайних вершин (всегда допустимы,
-        область — их выпуклая оболочка) с предупреждением. Прежний тихий
-        fallback «забить центроидом» вырождал пул кандидатов (одинаковые
-        точки) и маскировал проблему узкой области.
+        добирается ПОСЛЕДОВАТЕЛЬНЫМ СУЖЕНИЕМ (iter35: singleton-группы,
+        :meth:`_random_points_grouped`) — всегда валидная точка за O(q),
+        без rejection и без перечисления вершин, с предупреждением о смене
+        меры (uniform-marginal по компонентам в порядке перечисления).
+        История fallback'ов: «забить центроидом» (до iter29) вырождал пул;
+        «выпуклые комбинации крайних вершин» (iter29..34) стягивали точки к
+        центроиду (замер iter34: q95(r/r_max)=0.28) и были вычислительно
+        патологичны при больших q (extreme_vertices = q·2^(q−1) комбинаций —
+        на q=17 это ~1.1 млн + O(V²) dedup, зависание на минуты).
+
+        Метаданные последнего вызова — ``self.last_sampling_info``
+        (``n``/``n_rejection``/``n_fallback``/``method``).
 
         ``groups`` (iter31) — НЕПЕРЕСЕКАЮЩИЕСЯ группы индексов компонентов
         («функциональные ниши», mixture-of-mixtures). Включает
@@ -214,7 +224,11 @@ class SimplexRegion:
         ``groups=None``/пусто → прежнее поведение бит-в-бит.
         """
         if groups:
-            return self._random_points_grouped(n, seed, groups)
+            X = self._random_points_grouped(n, seed, groups)
+            self.last_sampling_info = {
+                "n": int(n), "n_rejection": 0, "n_fallback": 0,
+                "method": "grouped"}
+            return X
         rng = np.random.default_rng(seed)
         out: List[np.ndarray] = []
         tries = 0
@@ -225,20 +239,26 @@ class SimplexRegion:
             x = self.from_pseudo(w)
             if self.is_feasible(x):
                 out.append(x)
-        if len(out) < n:
-            k = n - len(out)
+        n_rej = len(out)
+        if n_rej < n:
+            k = n - n_rej
             warnings.warn(
                 f"SimplexRegion.random_points: rejection sampling дал "
-                f"{len(out)}/{n} точек за {max_tries} попыток (узкие границы); "
-                f"{k} точек добрано выпуклыми комбинациями крайних вершин.",
+                f"{n_rej}/{n} точек за {max_tries} попыток (узкие границы); "
+                f"{k} точек добрано последовательным сужением "
+                f"(uniform-marginal, без rejection).",
                 UserWarning, stacklevel=2)
-            V = self.extreme_vertices()
-            if len(V) > 0:
-                W = rng.dirichlet(np.full(len(V), 0.5), size=k)
-                out.extend(W @ V)
-            else:  # региона-полтопа нет (числовая экзотика) — последний резерв
-                while len(out) < n:
-                    out.append(self.centroid())
+            # singleton-группы: каждый компонент — своя «часть»; допустимость
+            # гарантирована конструкцией (валидация ΣL≤1≤ΣU в конструкторе),
+            # O(q) на точку, без перечисления вершин и без rejection.
+            fb_seed = int(rng.integers(0, 2**31 - 1))
+            singles = [[i] for i in range(self.q)]
+            out.extend(self._random_points_grouped(k, fb_seed, singles))
+        self.last_sampling_info = {
+            "n": int(n), "n_rejection": int(n_rej),
+            "n_fallback": int(max(0, n - n_rej)),
+            "method": ("rejection" if n_rej >= n
+                       else "rejection+narrowing")}
         return np.array(out[:n])
 
     # ------------------------------------------------------------------

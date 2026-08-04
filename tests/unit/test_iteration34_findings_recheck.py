@@ -21,10 +21,13 @@
   инвариант (три равномерные маргинали при ΣA+ΣB+ΣC=1 несовместимы).
 
 Находка 2 (vertex-fallback стягивает к центроиду): подтверждена
-  (q95(r/r_max)=0.28 при пороге стянутости 0.75). Плюс новый факт:
-  фикстура «узкой области» из сессии (ΣU=0.99<1) НЕВАЛИДНА — конструктор
-  честно отвергает её; и fallback при q≥15 вычислительно патологичен
-  (extreme_vertices = q·2^(q−1) комбинаций — на q=17 процесс убит >5 мин).
+  (q95(r/r_max)=0.28 при пороге стянутости 0.75) и ЗАКРЫТА в iter35 —
+  fallback заменён последовательным сужением с singleton-группами
+  (всегда валидная точка за O(q), без rejection и без перечисления
+  вершин). Плюс факты: фикстура «узкой области» из сессии (ΣU=0.99<1)
+  НЕВАЛИДНА — конструктор честно отвергает её; старый vertex-fallback
+  при q≥15 был вычислительно патологичен (extreme_vertices = q·2^(q−1)
+  комбинаций — на q=17 процесс убит >5 мин).
 
 Находка 4 (phr-рецепт через внешний wf-бокс нежизнеспособен):
   подтверждена и усилена — acceptance 0/200000 (самая режущая ось
@@ -199,7 +202,7 @@ class TestGroupSumsInsideGolden:
 
 
 # ----------------------------------------------------------------------
-# C. Vertex-fallback: характеризация порчи плана (находка 2)
+# C. Fallback узкой области (находка 2): iter35 — narrowing вместо вершин
 # ----------------------------------------------------------------------
 class TestVertexFallback:
     # Валидная, но узкая область: ΣL=0.89 ≤ 1 ≤ ΣU=1.03 (замер acceptance 0.12%)
@@ -215,22 +218,29 @@ class TestVertexFallback:
 
     def test_narrow_bounds_warn(self):
         reg = SimplexRegion(lower=self.NARROW_LO, upper=self.NARROW_HI)
-        with pytest.warns(UserWarning, match="добрано выпуклыми комбинациями"):
+        with pytest.warns(UserWarning, match="добрано последовательным сужением"):
             reg.random_points(64, seed=1, max_tries=50)
 
-    def test_fallback_points_are_centroid_biased(self):
-        """Выпуклые комбинации вершин стягивают точки к центру (замер
-        q95(r/r_max)=0.28) — порча плана, а не просто предупреждение."""
+    def test_fallback_points_not_centroid_collapsed(self):
+        """iter35: narrowing-fallback НЕ стягивает точки к центроиду
+        (старый vertex-fallback давал q95(r/r_max)=0.28); все точки
+        допустимы, различны, края области достижимы."""
         reg = SimplexRegion(lower=self.NARROW_LO, upper=self.NARROW_HI)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             X = reg.random_points(512, seed=1, max_tries=50)
+        assert X.shape == (512, 6)
+        for x in X:
+            assert reg.is_feasible(x, tol=1e-6)
+        assert len(np.unique(np.round(X, 8), axis=0)) > 500
         c = np.asarray(reg.centroid(), dtype=float)
         V = np.asarray(reg.extreme_vertices(), dtype=float)
         r_max = np.max(np.linalg.norm(V - c, axis=1))
         r = np.linalg.norm(X - c, axis=1) / r_max
-        assert np.quantile(r, 0.95) < 0.5, \
-            f"ожидалась стянутость к центроиду, q95={np.quantile(r, 0.95):.3f}"
+        assert np.quantile(r, 0.95) > 0.5, \
+            f"narrowing-fallback стянут к центроиду: q95={np.quantile(r, 0.95):.3f}"
+        assert reg.last_sampling_info["n_fallback"] > 0
+        assert reg.last_sampling_info["method"] == "rejection+narrowing"
 
     def test_no_fallback_on_grouped_path(self):
         """Групповой путь (sequential narrowing) без rejection → без fallback."""
@@ -272,10 +282,11 @@ class TestRecipeViaSimplexIsInfeasible:
     phr→wf раздувает область ×(T_max/T_min)≈1.43 по каждой оси, узкие полосы
     (UV: [2.9e-4, 2.5e-3]) обваливают acceptance до нуля.
 
-    ВАЖНО: НЕ вызывать здесь reg.random_points — fallback потянет
-    extreme_vertices с q·2^(q−1) ≈ 1.1 млн комбинаций при q=17
-    (вычислительно патологично, зависание на минуты). Меряем rejection
-    векторно, без fallback-пути.
+    Историческая справка: до iter35 вызывать reg.random_points здесь было
+    нельзя — vertex-fallback тянул extreme_vertices с q·2^(q−1) ≈ 1.1 млн
+    комбинаций при q=17 (зависание на минуты). Теперь fallback — narrowing
+    (см. test_random_points_survives_q17). Acceptance по-прежнему меряем
+    векторно (характеризация меры, не механизма).
     """
 
     def test_rejection_acceptance_is_zero(self):
@@ -291,3 +302,18 @@ class TestRecipeViaSimplexIsInfeasible:
         assert ok.mean() < 1e-4, (
             f"acceptance неожиданно не обвалился ({ok.mean():.2e}) — "
             f"перепроверить оценку TOTAL_MIN/TOTAL_MAX")
+
+    def test_random_points_survives_q17(self):
+        """iter35: на реальном q=17 wf-боксе random_points больше НЕ виснет —
+        narrowing-fallback даёт валидные точки без перечисления вершин.
+        (Сама box-аппроксимация остаётся плохим входом — см. PhrSpec.)"""
+        names = tuple(RECIPE_PHR)
+        lo = np.array([v[0] / TOTAL_MAX for v in RECIPE_PHR.values()])
+        hi = np.array([min(v[1] / TOTAL_MIN, 1.0) for v in RECIPE_PHR.values()])
+        reg = SimplexRegion(lower=lo, upper=hi, names=names)
+        with pytest.warns(UserWarning, match="последовательным сужением"):
+            X = reg.random_points(32, seed=7, max_tries=200)
+        assert X.shape == (32, 17)
+        assert np.allclose(X.sum(axis=1), 1.0, atol=1e-9)
+        assert np.all(X >= lo - 1e-9) and np.all(X <= hi + 1e-9)
+        assert reg.last_sampling_info["n_fallback"] == 32

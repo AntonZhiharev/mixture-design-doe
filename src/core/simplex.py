@@ -185,7 +185,9 @@ class SimplexRegion:
     # Random feasible points (rejection sampling in pseudocomponent space)
     # ------------------------------------------------------------------
     def random_points(self, n: int, seed: int | None = None,
-                      max_tries: int = 10000) -> np.ndarray:
+                      max_tries: int = 10000,
+                      groups: Sequence[Sequence[int]] | None = None
+                      ) -> np.ndarray:
         """Generate ``n`` random feasible interior points.
 
         Основной путь — rejection sampling в пространстве псевдокомпонентов.
@@ -194,7 +196,25 @@ class SimplexRegion:
         область — их выпуклая оболочка) с предупреждением. Прежний тихий
         fallback «забить центроидом» вырождал пул кандидатов (одинаковые
         точки) и маскировал проблему узкой области.
+
+        ``groups`` (iter31) — НЕПЕРЕСЕКАЮЩИЕСЯ группы индексов компонентов
+        («функциональные ниши», mixture-of-mixtures). Включает
+        СТРАТИФИЦИРОВАННОЕ сэмплирование по сумме каждой группы: сумма Σ_g
+        тянется РАВНОМЕРНО на допустимом интервале, затем раскладывается
+        внутри группы conditional narrowing'ом (без rejection). Зачем: при
+        равномерной мере на политопе сумма группы из k компонентов
+        концентрируется (~Beta(k, q−k)) и края её диапазона недостижимы —
+        главная ось «доза ниши» не покрывается планом.
+
+        ОСОЗНАННЫЙ ВЫБОР МЕРЫ: со стратификацией распределение даёт
+        равномерную МАРГИНАЛЬ по суммам групп, но НЕравномерную совокупную
+        меру на области (узкие условные слои получают повышенный вес). Для
+        DoE/GP покрытие физически значимых осей важнее равномерности объёма.
+        НЕ «исправлять» обратно на равномерную меру — это регресс покрытия.
+        ``groups=None``/пусто → прежнее поведение бит-в-бит.
         """
+        if groups:
+            return self._random_points_grouped(n, seed, groups)
         rng = np.random.default_rng(seed)
         out: List[np.ndarray] = []
         tries = 0
@@ -222,10 +242,115 @@ class SimplexRegion:
         return np.array(out[:n])
 
     # ------------------------------------------------------------------
+    # Групповое (mixture-of-mixtures) сэмплирование — iter31
+    # ------------------------------------------------------------------
+    def _validate_groups(self, groups: Sequence[Sequence[int]]
+                         ) -> List[List[int]]:
+        """Нормализовать/проверить группы индексов: диапазон и непересечение."""
+        seen: set = set()
+        norm: List[List[int]] = []
+        for g in groups:
+            idx = [int(i) for i in g]
+            if not idx:
+                raise ValueError("Пустая группа в groups недопустима.")
+            for i in idx:
+                if not (0 <= i < self.q):
+                    raise ValueError(
+                        f"Индекс компонента {i} вне диапазона 0..{self.q - 1}.")
+                if i in seen:
+                    raise ValueError(
+                        f"Компонент {i} входит более чем в одну группу.")
+                seen.add(i)
+            norm.append(idx)
+        return norm
+
+    def _random_points_grouped(self, n: int, seed: int | None,
+                               groups: Sequence[Sequence[int]]) -> np.ndarray:
+        """n точек со СТРАТИФИКАЦИЕЙ сумм групп (см. docstring random_points).
+
+        Схема на точку: (1) суммы частей (группы + «остальные») тянутся
+        последовательно, каждая равномерно на интервале, суженном по уже
+        выбранным и по границам оставшихся (замыкание Σ=1 на последней части);
+        (2) сумма части раскладывается по её компонентам conditional
+        narrowing'ом (:func:`_narrowing_split`, без rejection). Допустимость
+        гарантирована конструкцией: валидация региона (ΣL≤1≤ΣU) делает все
+        сужённые интервалы непустыми.
+        """
+        idx_groups = self._validate_groups(groups)
+        grouped = {i for g in idx_groups for i in g}
+        rest = [i for i in range(self.q) if i not in grouped]
+        parts: List[List[int]] = list(idx_groups) + ([rest] if rest else [])
+        rng = np.random.default_rng(seed)
+        lo, hi = self.lower, self.upper
+        p_lo = [float(lo[p].sum()) for p in parts]
+        p_hi = [float(hi[p].sum()) for p in parts]
+        m = len(parts)
+        X = np.empty((int(n), self.q), dtype=float)
+        for t in range(int(n)):
+            left = 1.0
+            lo_after = float(sum(p_lo))
+            hi_after = float(sum(p_hi))
+            for j, p in enumerate(parts):
+                lo_after -= p_lo[j]
+                hi_after -= p_hi[j]
+                if j == m - 1:
+                    s = left                      # замыкание Σ=1
+                else:
+                    a = max(p_lo[j], left - hi_after)
+                    b = min(p_hi[j], left - lo_after)
+                    if b < a:                     # числовая страховка
+                        a = b = 0.5 * (a + b)
+                    s = float(rng.uniform(a, b)) if b > a else a
+                X[t, p] = _narrowing_split(lo[p], hi[p], s, rng)
+                left -= s
+        return X
+
+    # ------------------------------------------------------------------
     def __repr__(self) -> str:
         return (f"SimplexRegion(q={self.q}, "
                 f"L={np.round(self.lower, 3).tolist()}, "
                 f"U={np.round(self.upper, 3).tolist()})")
+
+
+# ----------------------------------------------------------------------
+# Conditional narrowing split (iter31) — раскладка суммы без rejection
+# ----------------------------------------------------------------------
+def _narrowing_split(lo: np.ndarray, hi: np.ndarray, total: float,
+                     rng: np.random.Generator) -> np.ndarray:
+    """Разложить сумму ``total`` по компонентам с границами ``[lo, hi]``.
+
+    Conditional narrowing: компоненты обходятся в СЛУЧАЙНОМ порядке (снимает
+    систематическое смещение первых координат); для очередного компонента
+    допустимый интервал сужается по остатку суммы и границам оставшихся:
+    ``[max(L_i, s − ΣU_ост), min(U_i, s − ΣL_ост)]``, значение — равномерно
+    в нём; последний компонент замыкает сумму. Без rejection: валидная точка
+    с первой попытки. Требует ``ΣL ≤ total ≤ ΣU`` (иначе ValueError).
+    """
+    lo = np.asarray(lo, dtype=float)
+    hi = np.asarray(hi, dtype=float)
+    k = len(lo)
+    s = float(total)
+    lo_rest = float(lo.sum())
+    hi_rest = float(hi.sum())
+    if s < lo_rest - 1e-9 or s > hi_rest + 1e-9:
+        raise ValueError(
+            f"_narrowing_split: сумма {s:.6f} вне [{lo_rest:.6f}, {hi_rest:.6f}].")
+    out = np.empty(k, dtype=float)
+    order = rng.permutation(k)
+    for pos, i in enumerate(order):
+        lo_rest -= float(lo[i])
+        hi_rest -= float(hi[i])
+        if pos == k - 1:
+            v = min(max(s, float(lo[i])), float(hi[i]))  # замыкание + страховка
+        else:
+            a = max(float(lo[i]), s - hi_rest)
+            b = min(float(hi[i]), s - lo_rest)
+            if b < a:                                    # числовая страховка
+                a = b = 0.5 * (a + b)
+            v = float(rng.uniform(a, b)) if b > a else a
+        out[i] = v
+        s -= v
+    return out
 
 
 # ----------------------------------------------------------------------

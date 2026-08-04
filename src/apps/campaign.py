@@ -808,7 +808,8 @@ class CampaignController:
                       cost_name: str = "price",
                       volume: Optional[float] = None,
                       cost_exp: Optional[float] = None,
-                      horizon: Optional[float] = None) -> Dict[str, Any]:
+                      horizon: Optional[float] = None,
+                      sampling_groups: Optional[Any] = None) -> Dict[str, Any]:
         """§17.5 (Ш4): ВРУЧНУЮ создать ветку на ОБЩЕМ пуле — цели + опц. ценовая нога.
 
         Замена авто-M7 (§17.0): пользователь сам объявляет намерение ветки —
@@ -840,9 +841,12 @@ class CampaignController:
                     f"ρ-свойство '{rho_property}' не среди свойств оракула "
                     f"{list(self.runner.property_names)}.")
 
+        # iter31: группы сэмплирования — часть намерения ветки (None →
+        # наследовать проектные); валидация имён — в add_branch (A0.6).
         br = self.runner.add_branch(name, dict(goals), budget=int(budget),
                                     satisfy_at=float(satisfy_at),
-                                    branch_id=branch_id)
+                                    branch_id=branch_id,
+                                    sampling_groups=sampling_groups)
         if has_price:
             self.runner.set_branch_cost(br.id, price_fn, cost_spec,
                                         rho_property=str(rho_property),

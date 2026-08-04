@@ -71,6 +71,11 @@ class Branch:
     volume: float = 0.0
     cost_exp: float = 0.0
     horizon: float = 0.0
+    # -- iter31: функциональные группы сэмплирования — часть НАМЕРЕНИЯ ветки.
+    # Эмпирическое знание из скрининга («эти компоненты — одна ниша для цели
+    # ветки»): пулы кандидатов ветки стратифицируются по сумме группы.
+    # None → наследовать проектные группы раннера; [] → явно без стратификации.
+    sampling_groups: Optional[List[List[str]]] = None
 
 
 
@@ -126,6 +131,9 @@ class Branch:
             "d_best": float(self.d_best), "history": list(self.history),
             "volume": float(self.volume), "cost_exp": float(self.cost_exp),
             "horizon": float(self.horizon),       # §15.6 §2: экономика ветки
+            # iter31: None (наследовать) сериализуется как None
+            "sampling_groups": ([list(g) for g in self.sampling_groups]
+                                if self.sampling_groups is not None else None),
         }
 
     @classmethod
@@ -143,6 +151,9 @@ class Branch:
             volume=float(d.get("volume", 0.0)),
             cost_exp=float(d.get("cost_exp", 0.0)),
             horizon=float(d.get("horizon", 0.0)),
+            sampling_groups=(
+                [list(g) for g in d["sampling_groups"]]
+                if d.get("sampling_groups") is not None else None),
         )
 
 

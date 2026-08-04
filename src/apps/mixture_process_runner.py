@@ -175,6 +175,13 @@ class MixtureProcessRunner:
         # двигать). hard (физика/закон/бюджет) двигать НЕЛЬЗЯ. Храним отдельно от
         # frozen-схемы (политика, не состояние модели): {var: "hard"|"soft"}.
         self._border_origin: Dict[str, str] = {}
+        # iter31: ПРОЕКТНЫЕ функциональные группы mixture-компонентов (априорное
+        # химическое знание «эти компоненты — одна ниша»). Политика раннера, НЕ
+        # frozen-схема (аналог _border_origin): включает стратифицированное
+        # сэмплирование по сумме группы в _phase_candidates (seed + все ветки).
+        # Ветка может переопределить своим намерением (Branch.sampling_groups).
+        self.sampling_groups: List[List[str]] = []
+
 
     # ------------------------------------------------------------------
     # размеры текущей фазы
@@ -877,7 +884,9 @@ class MixtureProcessRunner:
         schema = schema or self.current_schema
         return schema.mixture_block().as_simplex_region()
 
-    def _phase_candidates(self, n: int, seed: int) -> np.ndarray:
+    def _phase_candidates(self, n: int, seed: int,
+                          groups: Optional[Sequence[Sequence[str]]] = None
+                          ) -> np.ndarray:
         """n допустимых составных кандидатов ТЕКУЩЕЙ схемы (mixture-region ×
         process-куб [0,1]^d текущей размерности). Запертые mixture-bounds и
         членство process-блока полностью задают свободу фазы.
@@ -890,6 +899,12 @@ class MixtureProcessRunner:
         (раньше свободные брались чистым Дирихле × остаток и границы U_i
         массово нарушались). Несовместные границы (``ΣL/R>1`` или ``ΣU/R<1``)
         дают явный ``ValueError`` из валидации :class:`SimplexRegion` (A0.6).
+
+        ``groups`` (iter31) — функциональные группы имён mixture-компонентов
+        для СТРАТИФИКАЦИИ по сумме группы (см.
+        :meth:`SimplexRegion.random_points`). ``None`` → проектная политика
+        ``self.sampling_groups``; явный ``[]`` → без стратификации. Группы
+        масштаб-инвариантны нормировке под-региона (суммы линейны по R).
         """
         rng = np.random.default_rng(int(seed))
         n = int(n)
@@ -913,13 +928,103 @@ class MixtureProcessRunner:
                 sub = SimplexRegion(
                     lower=lo[free] / remainder,
                     upper=np.clip(hi[free] / remainder, 0.0, 1.0))
+                eff = self.sampling_groups if groups is None else groups
+                idx_groups = self._groups_free_indices(eff, free)
                 w = sub.random_points(
-                    n, seed=int(rng.integers(0, 2**31 - 1)))
+                    n, seed=int(rng.integers(0, 2**31 - 1)),
+                    groups=idx_groups or None)
                 mix[:, free] = w * remainder
         if self.d > 0:
             z = rng.uniform(0.0, 1.0, size=(n, self.d))
             return np.hstack([mix, z])
         return mix
+
+    # ------------------------------------------------------------------
+    # iter31: функциональные группы компонентов (стратификация суммы ниши)
+    # ------------------------------------------------------------------
+    def _validate_sampling_groups(self, groups: Sequence[Sequence[str]]
+                                  ) -> List[List[str]]:
+        """Проверить группы имён: известность компонентов и непересечение.
+
+        Имена валидируются против ПОЛНОГО состава симплекса (группу можно
+        задать до раскрытия компонента append'ом); при генерации кандидатов
+        имена, отсутствующие/запертые в ТЕКУЩЕЙ фазе, просто выпадают из
+        стратификации (см. :meth:`_groups_free_indices`).
+        """
+        known = (set(self._full_mix.names) if self._full_mix is not None
+                 else set())
+        if not known:
+            raise ValueError(
+                "Функциональные группы требуют mixture-блок в схеме.")
+        seen: set = set()
+        norm: List[List[str]] = []
+        for g in groups:
+            names = [str(nm) for nm in g]
+            if not names:
+                raise ValueError("Пустая функциональная группа недопустима.")
+            for nm in names:
+                if nm not in known:
+                    raise KeyError(
+                        f"Компонент '{nm}' не найден среди mixture-компонентов "
+                        f"{sorted(known)}.")
+                if nm in seen:
+                    raise ValueError(
+                        f"Компонент '{nm}' входит более чем в одну группу.")
+                seen.add(nm)
+            norm.append(names)
+        return norm
+
+    def set_mixture_sampling_groups(self, groups: Sequence[Sequence[str]]
+                                    ) -> None:
+        """iter31: задать ПРОЕКТНЫЕ функциональные группы компонентов.
+
+        Априорное химическое знание «эти компоненты — конкурирующая ниша»:
+        включает стратифицированное сэмплирование по сумме группы во ВСЕХ
+        пулах кандидатов (seed-дизайн и ветки без собственных групп). Ветка
+        может переопределить намерением (``Branch.sampling_groups``). Пустой
+        список — выключить. Валидация имён/непересечения — явные ошибки (A0.6).
+        """
+        self.sampling_groups = self._validate_sampling_groups(list(groups or []))
+
+    def set_branch_sampling_groups(self, branch_id: str,
+                                   groups: Optional[Sequence[Sequence[str]]]
+                                   ) -> None:
+        """iter31: задать группы КОНКРЕТНОЙ ветки (эмпирическое знание из
+        скрининга: компоненты показали общую природу к отклику цели).
+
+        ``None`` — наследовать проектные группы; ``[]`` — явно без
+        стратификации; список групп — использовать их в пулах этой ветки.
+        """
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if groups is None:
+            self.branches[branch_id].sampling_groups = None
+            return
+        self.branches[branch_id].sampling_groups = (
+            self._validate_sampling_groups(list(groups)))
+
+    def _groups_free_indices(self, groups: Sequence[Sequence[str]],
+                             free_mask: np.ndarray) -> List[List[int]]:
+        """Группы имён → группы ПОЗИЦИЙ в свободном под-регионе фазы.
+
+        Имена вне текущей схемы или запертые bounds'ами выпадают (их доза не
+        варьируется — стратифицировать нечего); опустевшие группы отбрасываются.
+        """
+        names = list(self.current_schema.mixture_names)
+        pos_of: Dict[int, int] = {}
+        fp = 0
+        for i, is_free in enumerate(free_mask):
+            if is_free:
+                pos_of[i] = fp
+                fp += 1
+        out: List[List[int]] = []
+        for g in groups:
+            idx = [pos_of[names.index(nm)] for nm in g
+                   if nm in names and free_mask[names.index(nm)]]
+            if idx:
+                out.append(idx)
+        return out
+
 
 
     # ------------------------------------------------------------------
@@ -927,7 +1032,9 @@ class MixtureProcessRunner:
     # ------------------------------------------------------------------
     def add_branch(self, name: str, goal: Mapping[str, DesirabilitySpec],
                    budget: int = 10, satisfy_at: float = 0.9,
-                   branch_id: Optional[str] = None) -> Branch:
+                   branch_id: Optional[str] = None,
+                   sampling_groups: Optional[Sequence[Sequence[str]]] = None
+                   ) -> Branch:
         unknown = set(goal) - set(self.property_names)
         if unknown:
             raise KeyError(f"Цель ветки ссылается на неизвестные свойства: "
@@ -935,8 +1042,12 @@ class MixtureProcessRunner:
         bid = branch_id or f"b{len(self.branches) + 1}"
         if bid in self.branches:
             raise ValueError(f"Ветка '{bid}' уже существует.")
+        # iter31: группы — часть намерения ветки; None → наследовать проектные
+        groups = (self._validate_sampling_groups(list(sampling_groups))
+                  if sampling_groups is not None else None)
         br = Branch(id=bid, name=name, goal=dict(goal),
-                    budget=int(budget), satisfy_at=float(satisfy_at))
+                    budget=int(budget), satisfy_at=float(satisfy_at),
+                    sampling_groups=groups)
         self.branches[bid] = br
         return br
 
@@ -1112,6 +1223,8 @@ class MixtureProcessRunner:
         cost_spec = cfg["cost_spec"]
         price_fn = cfg["price_fn"]
         s = (self.seed + 2000 + br.spent) if seed is None else int(seed)
+        # iter31: пул кандидатов ветки уважает её группы (None → проектные)
+        br_groups = br.sampling_groups
 
         # опорный рецепт (инкумбент) и его цена/качество (по ρ̂ суррогата)
         x_cur = (np.asarray(x_ref, float).ravel() if x_ref is not None
@@ -1137,7 +1250,7 @@ class MixtureProcessRunner:
         d_price_cur = float(np.asarray(desirability_value(price_cur, cost_spec),
                                        float).ravel()[0])
 
-        cand = self._phase_candidates(int(n_candidates), s)
+        cand = self._phase_candidates(int(n_candidates), s, groups=br_groups)
         pc_c = np.asarray(price_fn(cand), float).ravel()
         pred = self.surrogates[rho].predict(cand)
         rho_mean = np.asarray(pred.mean, float).ravel()
@@ -1230,7 +1343,9 @@ class MixtureProcessRunner:
         s = (self.seed + 1000 + br.spent) if seed is None else int(seed)
         newX_list: List[np.ndarray] = []
         if n_acq > 0:
-            cands = self._phase_candidates(n_candidates, s)
+            # iter31: пул кандидатов ветки уважает её группы (None → проектные)
+            cands = self._phase_candidates(n_candidates, s,
+                                           groups=br.sampling_groups)
             acq, d_pred, sigma = branch_scores(
                 self.surrogates, br.goal, cands, explore_frac=explore_frac,
                 cost_fn=cost_fn, cost_name=(cost_name or "cost"),

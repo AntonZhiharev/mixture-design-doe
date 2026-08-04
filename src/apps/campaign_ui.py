@@ -845,6 +845,27 @@ def _parse_floats(text: str) -> Optional[List[float]]:
         return None
 
 
+def parse_sampling_groups(text: str) -> List[List[str]]:
+    """iter31: разобрать функциональные группы компонентов из текста.
+
+    Формат: одна СТРОКА = одна группа, имена компонентов через запятую
+    (пустые строки игнорируются). Валидацию имён/непересечения делает движок
+    (``set_mixture_sampling_groups`` / ``add_branch``) — явные ошибки (A0.6).
+    Чистая (без Streamlit) — тестируется напрямую.
+    """
+    groups: List[List[str]] = []
+    for line in str(text).splitlines():
+        names = _parse_names(line)
+        if names:
+            groups.append(names)
+    return groups
+
+
+def sampling_groups_to_text(groups) -> str:
+    """iter31: группы → текст формы (обратное к :func:`parse_sampling_groups`)."""
+    return "\n".join(", ".join(g) for g in (groups or []))
+
+
 def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
     """§17.4 (замечание 1): ограничения состава — «Доли (0…1)» ИЛИ «Массовые части
     (база = 100)». Возвращает ``(lower, upper)`` в ДОЛЯХ или ``(None, None)``.
@@ -990,6 +1011,9 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
         for i in range(d):
             out[f"setup_plo_{d}_{i}"] = float(pb.lower[i])
             out[f"setup_phi_{d}_{i}"] = float(pb.upper[i])
+    # iter31: функциональные группы компонентов (проектная политика)
+    out["setup_groups"] = sampling_groups_to_text(
+        getattr(runner, "sampling_groups", []) or [])
     # blocking: число партий + фактор/имена блоков (виджеты seed-секции)
     out["setup_seed_blocks"] = int(getattr(runner, "n_blocks_start", 1))
     out["setup_block_factor"] = str(getattr(runner, "block_factor", "") or "")
@@ -1034,6 +1058,11 @@ def render_project_settings(runner) -> None:
             f"{int(getattr(runner, 'seed', 0))} · общая база: "
             f"{len(runner.points)} точек. Границы ниже — те, по которым "
             "реально работает движок (сохраняются и загружаются с проектом).")
+        groups = getattr(runner, "sampling_groups", []) or []
+        if groups:
+            st.caption("Функциональные группы (стратификация суммы ниши, "
+                       "iter31): "
+                       + " · ".join("{" + ", ".join(g) + "}" for g in groups))
         st.dataframe(project_settings_dataframe(runner),
                      use_container_width=True, hide_index=True)
 
@@ -1078,6 +1107,19 @@ def render_setup_form() -> None:
         mix_live = _parse_names(mix_txt)
         mlo, mhi = render_composition_bounds(mix_live, key_prefix="setup")
 
+        # iter31: функциональные группы — априорное химическое знание «эти
+        # компоненты — одна ниша». Включает стратифицированное сэмплирование по
+        # СУММЕ группы: без него равномерная выборка не достаёт края диапазона
+        # суммарной дозы ниши (Beta-концентрация), план не покрывает главную ось.
+        groups_txt = st.text_area(
+            "Функциональные группы компонентов (опц.)", value="",
+            key="setup_groups",
+            help="Одна строка = одна группа: имена компонентов через запятую "
+                 "(например, конкурирующие пластификаторы одной ниши). "
+                 "Стартовый дизайн будет равномерно покрывать СУММАРНУЮ дозу "
+                 "каждой группы, а не только середину диапазона. Группы не "
+                 "должны пересекаться. Пусто — без группировки.")
+
         proc_txt = st.text_input("Процесс-параметры (через запятую)",
                                  value="T, P", key="setup_proc")
         # Замечание 2: границы процесса — попарные поля L/U на каждый параметр в
@@ -1112,6 +1154,9 @@ def render_setup_form() -> None:
                     process_lower=plo, process_upper=phi,
                     response_names=resp, mixture_lower=mlo, mixture_upper=mhi,
                     seed=int(seed_v))
+                # iter31: проектные функциональные группы (валидация — движком)
+                runner.set_mixture_sampling_groups(
+                    parse_sampling_groups(groups_txt))
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
                 for k in ("setup_seed_X", "setup_seed_Y",
                           "setup_seed_df", "setup_seed_df_sig"):
@@ -1514,6 +1559,29 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
             help="Сколько периодов выпуска учитываем при оценке эффекта: денежная "
                  "польза накапливается за H периодов.")
 
+        # iter31: функциональные группы ветки — ЭМПИРИЧЕСКОЕ знание из
+        # скрининга («эти компоненты — одна ниша для цели ветки»). По умолчанию
+        # наследуются проектные группы; override — намерение конкретной ветки.
+        st.markdown("**🧩 Функциональные группы ветки (опц., iter31)**")
+        proj_groups = getattr(runner, "sampling_groups", []) or []
+        st.caption(
+            "Пулы кандидатов ветки будут равномерно покрывать СУММАРНУЮ дозу "
+            "каждой группы (стратификация суммы ниши). По умолчанию — "
+            + ("наследуются проектные группы: "
+               + " · ".join("{" + ", ".join(g) + "}" for g in proj_groups)
+               if proj_groups else "проектных групп нет, стратификация выключена")
+            + ". Задайте свои, если скрининг показал нишу для целей этой ветки.")
+        use_groups = st.checkbox(
+            "Задать группы для этой ветки (переопределить проектные)",
+            key="camp_nb_use_groups")
+        br_groups_txt = ""
+        if use_groups:
+            br_groups_txt = st.text_area(
+                f"Группы (одна строка = одна группа; компоненты: {mix_names})",
+                value="", key="camp_nb_groups",
+                help="Имена компонентов через запятую, одна группа на строку. "
+                     "Пусто при включённой галочке — явно БЕЗ стратификации "
+                     "(отключает и проектные группы для этой ветки).")
 
         if st.button("🌿 Создать ветку", key="camp_nb_create"):
             try:
@@ -1540,7 +1608,9 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                     cost_spec=cost_spec, rho_property=rho_prop,
                     volume=(float(vol) if vol > 0 else None),
                     cost_exp=(float(cexp) if cexp > 0 else None),
-                    horizon=(float(hor) if hor > 0 else None))
+                    horizon=(float(hor) if hor > 0 else None),
+                    sampling_groups=(parse_sampling_groups(br_groups_txt)
+                                     if use_groups else None))
                 st.session_state["camp_new_goals"] = []
                 _invalidate_branch_caches()
                 _flash(

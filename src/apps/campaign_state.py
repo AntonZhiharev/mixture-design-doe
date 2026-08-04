@@ -169,6 +169,9 @@ def runner_to_state(runner: MixtureProcessRunner, *,
                          for bid, br in runner.branches.items()},
             "branch_cost": branch_cost,
             "border_origin": dict(getattr(runner, "_border_origin", {}) or {}),
+            # iter31: проектные функциональные группы (политика сэмплирования)
+            "sampling_groups": [list(g) for g in
+                                (getattr(runner, "sampling_groups", []) or [])],
             "region_moves": [_region_move_to_dict(m)
                              for m in getattr(runner, "_region_moves", []) or []],
             "drop_policy": str(getattr(runner, "_drop_policy", "exclude")),
@@ -244,6 +247,9 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     runner.block_names = {int(k): str(v) for k, v in
                           (r.get("block_names", {}) or {}).items()}
     runner._border_origin = dict(r.get("border_origin", {}) or {})
+    # iter31: проектные группы (старые сейвы без ключа → пусто)
+    runner.sampling_groups = [list(g) for g in
+                              (r.get("sampling_groups", []) or [])]
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))
 

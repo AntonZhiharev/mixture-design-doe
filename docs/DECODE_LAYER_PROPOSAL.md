@@ -1,9 +1,10 @@
 # Стратегическая заметка: phr/DAG decode-слой (кандидат в REBUILD_SPEC)
 
-Статус: **шаг 1 (iter32, preflight) РЕАЛИЗОВАН** (04.08.2026); остальное —
-предложение, не в работе. Зафиксировано после iter31 (групповой
-стратифицированный сэмплер) по итогам внешнего архитектурного обсуждения
-(сессия 04.08.2026). Решение об этапах A/B — после эксплуатации preflight.
+Статус: **шаг 1 (iter32, preflight) и этап A (iter33, z-сэмплер-плагин)
+РЕАЛИЗОВАНЫ** (04.08.2026); этап B — предложение, не в работе. Зафиксировано
+после iter31 (групповой стратифицированный сэмплер) по итогам внешнего
+архитектурного обсуждения (сессия 04.08.2026). Решение об этапе B — после
+эксплуатации preflight и phr-сэмплера.
 
 
 ## Контекст и мотивация
@@ -80,8 +81,18 @@
    `MixtureProcessRunner.preflight()` (read-only, A0.6 — не блокирует) +
    показ в seed-цикле UI кампании (`seed_preflight_caption` / экспандер
    деталей). Тесты: `tests/unit/test_iteration32_preflight.py`.
-2. **Этап A:** z-сэмплер-плагин (parts/phr-spec → кандидаты-доли),
-   без изменения схемы/модели.
+2. **Этап A — СДЕЛАНО (iter33):** z-сэмплер-плагин (parts/phr-spec →
+   кандидаты-доли), без изменения схемы/модели:
+   `src/design/phr_sampler.py` — `PhrSpec` (DAG узлов 4 режимов
+   absolute/share_of/ratio_to/fixed, топосорт + детекция циклов,
+   статическая интервальная валидация до сэмплинга, `sample_z` без
+   rejection на `_narrowing_split` iter31, `decode`/`encode` с
+   roundtrip, `sample_candidates` → доли Σ=1, `fraction_bounds` —
+   консервативный бокс для mixture-блока схемы). Мост:
+   `MixtureProcessRunner.set_phr_spec()` + hook в `_phase_candidates`
+   (`phr_spec=None` → прежний путь бит-в-бит; несовпадение состава
+   фазы — warning + fallback). Тесты:
+   `tests/unit/test_iteration33_phr_sampler.py`.
 3. **Этап B:** groups/ratio_to в схеме + модель в z (RSM), encode
    исторических рецептов, anchors, quantize/премикс — полноценный
    раздел REBUILD_SPEC с миграционной политикой.

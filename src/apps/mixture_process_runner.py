@@ -50,6 +50,7 @@ Runner ORACLE-AGNOSTIC: оракул — любой объект с ``property_n
 """
 from __future__ import annotations
 
+import warnings
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -72,6 +73,7 @@ from ..design.block_model import build_model_terms, model_matrix
 from ..design.augmented import build_moments
 from ..design.preflight import (PreflightReport, PreflightThresholds,
                                 preflight_design)
+from ..design.phr_sampler import PhrSpec
 from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget,
                                ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
@@ -183,6 +185,13 @@ class MixtureProcessRunner:
         # сэмплирование по сумме группы в _phase_candidates (seed + все ветки).
         # Ветка может переопределить своим намерением (Branch.sampling_groups).
         self.sampling_groups: List[List[str]] = []
+        # iter33 (этап A decode-слоя, DECODE_LAYER_PROPOSAL): опциональный
+        # phr/DAG-сэмплер кандидатов. ПОЛИТИКА раннера (как sampling_groups):
+        # если задан и его компоненты совпадают с mixture-компонентами текущей
+        # фазы, mixture-часть пулов кандидатов сэмплится в z-пространстве
+        # спеки и декодируется в доли (Σ=1 конструкцией). None → прежний
+        # путь бит-в-бит.
+        self.phr_spec: Optional[PhrSpec] = None
 
 
     # ------------------------------------------------------------------
@@ -910,6 +919,24 @@ class MixtureProcessRunner:
         """
         rng = np.random.default_rng(int(seed))
         n = int(n)
+        # iter33: phr/DAG-сэмплер-плагин (этап A decode-слоя). Активен, когда
+        # компоненты спеки СОВПАДАЮТ с mixture-компонентами текущей фазы
+        # (иначе честное предупреждение и стандартный путь). Спека кодирует
+        # структуру области (группы/ratio) богаче sampling_groups — при
+        # заданной спеке стратификация groups не применяется.
+        if self.phr_spec is not None:
+            names = list(self.current_schema.mixture_names)
+            if list(self.phr_spec.component_names) == names:
+                mix = np.atleast_2d(self.phr_spec.sample_candidates(
+                    n, seed=int(rng.integers(0, 2**31 - 1))))
+                if self.d > 0:
+                    z = rng.uniform(0.0, 1.0, size=(n, self.d))
+                    return np.hstack([mix, z])
+                return mix
+            warnings.warn(
+                "phr_spec не совпадает с mixture-компонентами текущей фазы "
+                f"({list(self.phr_spec.component_names)} != {names}) — "
+                "используется стандартный сэмплер.", UserWarning, stacklevel=2)
         mb = self.current_schema.mixture_block()
         lo = np.asarray(mb.lower, float)
         hi = np.asarray(mb.upper, float)
@@ -987,6 +1014,28 @@ class MixtureProcessRunner:
         список — выключить. Валидация имён/непересечения — явные ошибки (A0.6).
         """
         self.sampling_groups = self._validate_sampling_groups(list(groups or []))
+
+    def set_phr_spec(self, spec: Optional[PhrSpec]) -> None:
+        """iter33: задать phr/DAG-спеку сэмплера кандидатов (этап A
+        decode-слоя, DECODE_LAYER_PROPOSAL).
+
+        Спека — вход в parts/phr (absolute/share_of/ratio_to/fixed);
+        кандидаты декодируются в доли Σ=1 и идут обычным путём (схема, GP,
+        миграция, UI не затрагиваются). Рекомендуемый порядок: строить
+        mixture-блок схемы из ``spec.fraction_bounds()`` — тогда все
+        декодированные кандидаты лежат в границах схемы. ``None`` —
+        выключить (прежний сэмплер бит-в-бит). Компоненты спеки должны
+        существовать среди mixture-компонентов полной схемы (A0.6).
+        """
+        if spec is not None:
+            known = (set(self._full_mix.names) if self._full_mix is not None
+                     else set())
+            unknown = [nm for nm in spec.component_names if nm not in known]
+            if unknown:
+                raise KeyError(
+                    f"Компоненты phr-спеки {unknown} не найдены среди "
+                    f"mixture-компонентов схемы {sorted(known)}.")
+        self.phr_spec = spec
 
     def set_branch_sampling_groups(self, branch_id: str,
                                    groups: Optional[Sequence[Sequence[str]]]

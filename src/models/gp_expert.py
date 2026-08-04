@@ -17,6 +17,7 @@ compare mu(x*) and sigma^2(x*) at fixed hyperparameters (atol 1e-6).
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple, Union
 
@@ -27,7 +28,34 @@ from sklearn.gaussian_process.kernels import (
     ConstantKernel, Matern, RBF, WhiteKernel,
 )
 
+from ..core.linalg import n_scheffe_params
 from .scheffe import ScheffeModel
+
+_ORDER_NAMES = {1: "linear", 2: "quadratic", 3: "cubic",
+                4: "quartic", 5: "quintic"}
+_NAME_ORDERS = {v: k for k, v in _ORDER_NAMES.items()}
+
+
+class _ConstantMean:
+    """Тренд-заглушка «среднее y» — последний уровень даунгрейда (n < q + запас).
+
+    Честнее интерполирующего полинома: остатки остаются информативными,
+    ядро GP учится на реальной вариации, σ не схлопывается в 0.
+    """
+
+    def __init__(self, value: float):
+        self.value = float(value)
+
+    def predict(self, X) -> np.ndarray:
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        return np.full(X.shape[0], self.value)
+
+    def to_state(self) -> dict:
+        return {"model": "constant", "value": self.value}
+
+    @classmethod
+    def from_state(cls, d: dict) -> "_ConstantMean":
+        return cls(d["value"])
 
 
 def _min_pairwise_distance(X: np.ndarray) -> float:
@@ -56,7 +84,8 @@ class GPExpert:
     def __init__(self, mean_model: Union[str, int] = "quadratic",
                  kernel: str = "matern52", noise_floor: float = 1e-6,
                  n_restarts: int = 15, seed: Optional[int] = None,
-                 names: Optional[Sequence[str]] = None):
+                 names: Optional[Sequence[str]] = None,
+                 mean_min_dof: int = 3):
         if kernel not in ("matern52", "rbf"):
             raise ValueError("kernel must be 'matern52' or 'rbf'.")
         self.mean_model = mean_model
@@ -65,9 +94,30 @@ class GPExpert:
         self.n_restarts = n_restarts
         self.seed = seed
         self.names = names
+        # запас степеней свободы остатков тренда: тренд порядка m допускается
+        # только при n ≥ p(m) + mean_min_dof (иначе OLS интерполирует, остатки
+        # ≈ 0, ядру учиться нечему ⇒ σ=0 и GP «уверенно врёт»)
+        self.mean_min_dof = int(mean_min_dof)
+        self.mean_model_effective_: Union[str, int, None] = None
         self.mean_: Optional[ScheffeModel] = None
         self.gp_: Optional[GaussianProcessRegressor] = None
         self._fitted = False
+
+    # ------------------------------------------------------------------
+    def _resolve_mean_model(self, n: int, q: int) -> Union[str, int]:
+        """Эффективный порядок тренда: даунгрейд, пока n < p + mean_min_dof.
+
+        Возвращает имя/порядок допустимого тренда Шеффе либо ``"constant"``,
+        если даже линейный тренд не идентифицируем с запасом.
+        """
+        req = self.mean_model
+        req_order = (_NAME_ORDERS[req] if isinstance(req, str) and req in _NAME_ORDERS
+                     else int(req))
+        req_order = min(req_order, q)          # порядок Шеффе не выше q
+        for m in range(req_order, 0, -1):
+            if n >= n_scheffe_params(q, m) + self.mean_min_dof:
+                return _ORDER_NAMES.get(m, m)
+        return "constant"
 
     # ------------------------------------------------------------------
     def fit(self, X, y) -> "GPExpert":
@@ -75,8 +125,18 @@ class GPExpert:
         y = np.asarray(y, dtype=float).ravel()
         n, q = X.shape
 
-        # --- mean = Scheffe OLS trend ---
-        self.mean_ = ScheffeModel(model=self.mean_model, names=self.names).fit(X, y)
+        # --- mean = Scheffe OLS trend (с защитой от n<p: даунгрейд порядка) ---
+        eff = self._resolve_mean_model(n, q)
+        self.mean_model_effective_ = eff
+        if eff != self.mean_model:
+            warnings.warn(
+                f"GPExpert: тренд '{self.mean_model}' не идентифицируем при "
+                f"n={n}, q={q} (нужно n ≥ p + {self.mean_min_dof}); "
+                f"использован тренд '{eff}'.", UserWarning, stacklevel=2)
+        if eff == "constant":
+            self.mean_ = _ConstantMean(float(y.mean()) if n else 0.0)
+        else:
+            self.mean_ = ScheffeModel(model=eff, names=self.names).fit(X, y)
         resid = y - self.mean_.predict(X)
 
         # --- kernel on residuals ---
@@ -137,6 +197,7 @@ class GPExpert:
         self._check_fitted()
         return {
             "mean_model": self.mean_model,
+            "mean_model_effective": self.mean_model_effective_,
             "kernel": self.kernel,
             "noise_floor": self.noise_floor,
             "names": self.names,
@@ -150,7 +211,11 @@ class GPExpert:
     def from_state(cls, d: dict) -> "GPExpert":
         obj = cls(mean_model=d["mean_model"], kernel=d["kernel"],
                   noise_floor=d.get("noise_floor", 1e-6), names=d.get("names"))
-        obj.mean_ = ScheffeModel.from_state(d["scheffe"])
+        obj.mean_model_effective_ = d.get("mean_model_effective", d["mean_model"])
+        if d["scheffe"].get("model") == "constant":
+            obj.mean_ = _ConstantMean.from_state(d["scheffe"])
+        else:
+            obj.mean_ = ScheffeModel.from_state(d["scheffe"])
         X = np.asarray(d["X_train"]); resid = np.asarray(d["resid_train"])
         q = X.shape[1]
         if d["kernel"] == "matern52":

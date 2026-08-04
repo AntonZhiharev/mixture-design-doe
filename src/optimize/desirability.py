@@ -389,9 +389,10 @@ def price_per_item(composition_price, rho) -> np.ndarray:
 
     ``price_изд = price_состав · ρ`` (physics-трактовка, см. блок выше). Обе части
     — поэлементные массивы одинаковой формы (или скаляры). ρ — полноценный отклик
-    GP+MoE (как strength/gloss), поэтому в acquisition/оптимизации сюда подаётся
-    его среднее ``surrogate.predict(X).mean``; неопределённость ``σ_ρ`` идёт в VoI
-    (§5), а не в саму точечную цену.
+    общего суррогата (GPExpert в кампании / MoE в pipeline, как strength/gloss),
+    поэтому в acquisition/оптимизации сюда подаётся его среднее
+    ``surrogate.predict(X).mean``; неопределённость ``σ_ρ`` идёт в VoI (§5),
+    а не в саму точечную цену.
     """
     pc = np.asarray(composition_price, float)
     r = np.asarray(rho, float)

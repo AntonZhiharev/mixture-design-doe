@@ -16,6 +16,7 @@ R reference for vertices: ``mixexp::Xvert``.
 """
 from __future__ import annotations
 
+import warnings
 from itertools import product
 from typing import List, Sequence, Tuple
 
@@ -185,7 +186,15 @@ class SimplexRegion:
     # ------------------------------------------------------------------
     def random_points(self, n: int, seed: int | None = None,
                       max_tries: int = 10000) -> np.ndarray:
-        """Generate ``n`` random feasible interior points."""
+        """Generate ``n`` random feasible interior points.
+
+        Основной путь — rejection sampling в пространстве псевдокомпонентов.
+        Если из-за узких границ приёмка мала и точек не хватает, остаток
+        добирается ВЫПУКЛЫМИ КОМБИНАЦИЯМИ крайних вершин (всегда допустимы,
+        область — их выпуклая оболочка) с предупреждением. Прежний тихий
+        fallback «забить центроидом» вырождал пул кандидатов (одинаковые
+        точки) и маскировал проблему узкой области.
+        """
         rng = np.random.default_rng(seed)
         out: List[np.ndarray] = []
         tries = 0
@@ -196,10 +205,21 @@ class SimplexRegion:
             x = self.from_pseudo(w)
             if self.is_feasible(x):
                 out.append(x)
-        if len(out) < n:  # fall back: clip whatever we have / fill with centroid
-            while len(out) < n:
-                out.append(self.centroid())
-        return np.array(out)
+        if len(out) < n:
+            k = n - len(out)
+            warnings.warn(
+                f"SimplexRegion.random_points: rejection sampling дал "
+                f"{len(out)}/{n} точек за {max_tries} попыток (узкие границы); "
+                f"{k} точек добрано выпуклыми комбинациями крайних вершин.",
+                UserWarning, stacklevel=2)
+            V = self.extreme_vertices()
+            if len(V) > 0:
+                W = rng.dirichlet(np.full(len(V), 0.5), size=k)
+                out.extend(W @ V)
+            else:  # региона-полтопа нет (числовая экзотика) — последний резерв
+                while len(out) < n:
+                    out.append(self.centroid())
+        return np.array(out[:n])
 
     # ------------------------------------------------------------------
     def __repr__(self) -> str:

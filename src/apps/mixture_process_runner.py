@@ -883,10 +883,13 @@ class MixtureProcessRunner:
         членство process-блока полностью задают свободу фазы.
 
         Запертые bounds'ами компоненты (``lower==upper``, напр. C на baseline в
-        фазе 1) держатся на своём значении; СВОБОДНЫЕ сэмплируются Дирихле и
-        масштабируются на остаток ``1−Σ_locked`` (Σx=1). Прямой
-        ``SimplexRegion.random_points`` тут непригоден: ``from_pseudo`` не уважает
-        верхнюю границу запертого компонента и сваливается в центроид.
+        фазе 1) держатся на своём значении. СВОБОДНЫЕ сэмплируются в ПОД-РЕГИОНЕ
+        симплекса с НОРМИРОВАННЫМИ границами ``L_i/R ≤ w_i ≤ U_i/R``
+        (``R = 1−Σ_locked``, Σw=1) и масштабируются обратно на ``R`` — так
+        каждый кандидат уважает индивидуальные L/U свободных компонентов
+        (раньше свободные брались чистым Дирихле × остаток и границы U_i
+        массово нарушались). Несовместные границы (``ΣL/R>1`` или ``ΣU/R<1``)
+        дают явный ``ValueError`` из валидации :class:`SimplexRegion` (A0.6).
         """
         rng = np.random.default_rng(int(seed))
         n = int(n)
@@ -897,10 +900,22 @@ class MixtureProcessRunner:
         free = ~locked
         held = lo.copy()
         held_sum = float(held[locked].sum())
+        remainder = 1.0 - held_sum
         mix = np.tile(held, (n, 1))
         if free.any():
-            w = rng.dirichlet(np.ones(int(free.sum())), size=n)
-            mix[:, free] = w * (1.0 - held_sum)
+            if remainder < 1e-12:
+                if np.any(lo[free] > 1e-12):
+                    raise ValueError(
+                        "Запертые компоненты съедают всю смесь (Σ_locked=1), "
+                        "но у свободных компонентов lower>0 — область пуста.")
+                mix[:, free] = 0.0
+            else:
+                sub = SimplexRegion(
+                    lower=lo[free] / remainder,
+                    upper=np.clip(hi[free] / remainder, 0.0, 1.0))
+                w = sub.random_points(
+                    n, seed=int(rng.integers(0, 2**31 - 1)))
+                mix[:, free] = w * remainder
         if self.d > 0:
             z = rng.uniform(0.0, 1.0, size=(n, self.d))
             return np.hstack([mix, z])

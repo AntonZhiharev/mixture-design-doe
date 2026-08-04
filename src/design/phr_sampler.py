@@ -34,6 +34,8 @@ quantize, премикс) и модель в z — этап B.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -358,6 +360,44 @@ class PhrSpec:
         сэмплер-плагин, схема/модель не затрагиваются)."""
         return self.to_fractions(self.decode(self.sample_z(n, seed=seed)))
 
+    # ------------------------------------------------------------------
+    # Версионирование спеки (iter35): порядок узлов — часть спеки
+    # ------------------------------------------------------------------
+    def to_dicts(self) -> List[Dict[str, Any]]:
+        """Каноническая сериализация спеки (round-trip c :meth:`from_dicts`).
+
+        ПОРЯДОК УЗЛОВ СОХРАНЯЕТСЯ: он определяет и порядок компонентов, и
+        порядок z-осей, и — через :func:`core.simplex._narrowing_split` /
+        последовательное сужение — какие оси получают точную равномерную
+        маргиналь (iter34, находка 1). Перестановка узлов — ДРУГАЯ спека.
+        """
+        out: List[Dict[str, Any]] = []
+        for nd in self.nodes:
+            d: Dict[str, Any] = {"name": nd.name, "mode": nd.mode}
+            if nd.mode == MODE_FIXED:
+                d["value"] = float(nd.value)
+            else:
+                d["lo"] = float(nd.lo)
+                d["hi"] = float(nd.hi)
+            if nd.mode == MODE_SHARE_OF:
+                d["of"] = nd.ref
+            elif nd.mode == MODE_RATIO_TO:
+                d["to"] = nd.ref
+            out.append(d)
+        return out
+
+    def spec_hash(self) -> str:
+        """SHA-256 отпечаток спеки (hex, 64 символа) для воспроизводимости.
+
+        Хеш чувствителен к ПОРЯДКУ узлов (см. :meth:`to_dicts`): порядок
+        влияет на меру сэмплера, поэтому обязан входить в отпечаток.
+        Записывайте хеш в документацию кампании — через полгода по нему
+        можно проверить, что геометрия не «уехала».
+        """
+        payload = json.dumps(self.to_dicts(), ensure_ascii=False,
+                             separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def fraction_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """Консервативный fraction-бокс ``L_i ≤ x_i ≤ U_i`` по интервалам
         phr листьев (математика экстремальных тоталей
@@ -372,3 +412,36 @@ class PhrSpec:
     def __repr__(self) -> str:
         return (f"PhrSpec(q={self.q}, dim_z={self.dim_z}, "
                 f"components={self.component_names})")
+
+
+# ----------------------------------------------------------------------
+# Правило премикса (iter35) — арифметика навески, слой m (этап B, вынесено
+# вперёд как чистая функция: от геометрии не зависит)
+# ----------------------------------------------------------------------
+def premix_required(delta_phr: float, lo: float, hi: float,
+                    threshold: float = 0.05) -> bool:
+    """Нужен ли премикс для компонента с диапазоном phr ``[lo, hi]``.
+
+    ``delta_phr`` — разрешение навески в phr (шаг весов, переведённый в phr
+    текущей загрузки: ``delta_phr = шаг_весов_г / (г на 1 phr)``). Правило
+    (DECODE_LAYER_PROPOSAL, слой m): если ошибка дозирования съедает больше
+    ``threshold`` (5%) РАБОЧЕГО ДИАПАЗОНА оси — компонент дозируется через
+    премикс (разбавленный концентрат), иначе план по этой оси нечитаем::
+
+        delta_phr / (hi - lo) > threshold  =>  премикс
+
+    Пример (замер 04.08.2026): весы 0.1 г при 5 г/phr → δ=0.02 phr;
+    SBM_55 [0.07, 0.45]: 0.02/0.38 ≈ 0.053 > 0.05 → премикс;
+    UV_CSFCP [0.05, 0.30]: 0.02/0.25 = 0.08 > 0.05 → премикс;
+    DINP [4, 14]: 0.02/10 = 0.002 → прямая навеска.
+    """
+    delta_phr = float(delta_phr)
+    lo = float(lo)
+    hi = float(hi)
+    if delta_phr < 0:
+        raise ValueError("premix_required: delta_phr должен быть ≥ 0.")
+    if hi <= lo + _TOL:
+        raise ValueError(
+            f"premix_required: вырожденный диапазон [{lo}, {hi}] — "
+            f"фиксированная дозировка, правило премикса неприменимо.")
+    return delta_phr / (hi - lo) > float(threshold)

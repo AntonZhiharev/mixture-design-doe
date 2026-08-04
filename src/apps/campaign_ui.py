@@ -556,6 +556,30 @@ def base_blocking_caption(runner) -> str:
         return ""
 
 
+def seed_preflight_caption(report) -> str:
+    """iter32: однострочная сводка preflight-диагностики seed-плана (подпись).
+
+    ``report`` — :class:`src.design.preflight.PreflightReport` (гейты
+    ОТНОСИТЕЛЬНЫЕ к reference-пулу той же области, см. модуль). Зелёная строка —
+    план информативен; жёлтая — перечисляет причины провала. Read-only и БЕЗ
+    блокировки (A0.6): решение фиксировать план остаётся за пользователем.
+    Чистая (без Streamlit) — тестируется напрямую."""
+    if report.passed:
+        return (f"🔎 Preflight: план информативен (rank {report.rank}/"
+                f"{report.rank_ref}, cond ×{report.cond / max(report.cond_ref, 1e-12):.1f} "
+                f"от reference-пула области).")
+    return "⚠️ Preflight: " + "; ".join(report.failures)
+
+
+def preflight_details_dataframe(report) -> pd.DataFrame:
+    """iter32: таблица проверок preflight для показа (чистая, без Streamlit).
+
+    Строки — :meth:`PreflightReport.rows` (проверка / значение плана / допуск /
+    ОК); допуски относительные к reference-пулу области (см. design/preflight).
+    """
+    return pd.DataFrame(report.rows())
+
+
 def seed_design_excel_bytes(runner, Xs, Ys=None, *,
                             batch_kg: Optional[float] = None) -> bytes:
     """§17.4 (C3): предложенный стартовый дизайн → xlsx-байты (кнопка скачивания).
@@ -1328,6 +1352,31 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # Iteration 28+: blocking должен быть ВИДЕН всегда — и когда включён
     # (размеры партий + цена блокировки), и когда выключен (как включить).
     st.caption(seed_blocking_caption(runner, Xs))
+    # iter32: preflight-диагностика предложенного плана (read-only, A0.6 —
+    # НЕ блокирует commit). Кэш по сигнатуре дизайна: reference-пул и SVD
+    # пересчитываются только при смене предложенных точек.
+    pf_sig = (Xs.tobytes(), Xs.shape)
+    if st.session_state.get("setup_seed_pf_sig") != pf_sig:
+        try:
+            st.session_state["setup_seed_pf"] = runner.preflight(Xs)
+        except Exception as exc:  # noqa: BLE001 — диагностика не ломает seed-цикл
+            st.session_state["setup_seed_pf"] = None
+            st.session_state["setup_seed_pf_err"] = str(exc)
+        st.session_state["setup_seed_pf_sig"] = pf_sig
+    pf = st.session_state.get("setup_seed_pf")
+    if pf is not None:
+        st.caption(seed_preflight_caption(pf))
+        with st.expander("🔎 Preflight: детали проверок плана"):
+            st.caption(
+                "Гейты ОТНОСИТЕЛЬНЫЕ: план сравнивается с равномерным "
+                "reference-пулом ЭТОЙ ЖЕ области (классические абсолютные "
+                "пороги cond<30 / VIF<5 в долях Шеффе неприменимы). Провал — "
+                "сигнал пересмотреть план ДО измерений; фиксация не блокируется.")
+            st.dataframe(preflight_details_dataframe(pf),
+                         use_container_width=True, hide_index=True)
+    elif st.session_state.get("setup_seed_pf_err"):
+        st.caption("🔎 Preflight недоступен: "
+                   + str(st.session_state["setup_seed_pf_err"]))
     # C2: черновик Y из редактора живёт в session_state (setup_seed_Y), чтобы
     # частично внесённые отклики можно было сохранить в проект ДО фиксации
     # (commit_seed) и восстановить при загрузке. NaN допустимы (пустые ячейки).

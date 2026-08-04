@@ -70,6 +70,8 @@ from ..models.gp_expert import GPExpert
 from ..design.blocking import assign_blocks_start, blocking_diagnostics
 from ..design.block_model import build_model_terms, model_matrix
 from ..design.augmented import build_moments
+from ..design.preflight import (PreflightReport, PreflightThresholds,
+                                preflight_design)
 from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget,
                                ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
@@ -1024,6 +1026,42 @@ class MixtureProcessRunner:
             if idx:
                 out.append(idx)
         return out
+
+    # ------------------------------------------------------------------
+    # iter32: preflight-диагностика плана ДО прогона (read-only, A0.6)
+    # ------------------------------------------------------------------
+    def preflight(self, X: Any, *,
+                  groups: Optional[Sequence[Sequence[str]]] = None,
+                  seed: Optional[int] = None, n_ref: int = 512,
+                  thresholds: Optional[PreflightThresholds] = None
+                  ) -> PreflightReport:
+        """iter32: preflight-диагностика дизайна ``X`` ТЕКУЩЕЙ фазы (read-only).
+
+        Гейты — ОТНОСИТЕЛЬНЫЕ к reference-пулу той же области (``n_ref``
+        кандидатов из :meth:`_phase_candidates`, детерминированно по ``seed``):
+        rank/cond/VIF модельной матрицы, слипшиеся пары координат, слепые
+        направления, покрытие оси суммы функциональных групп (iter31). Подробно
+        — :mod:`src.design.preflight`. НИЧЕГО не меняет и НЕ блокирует (A0.6):
+        ``report.passed``/``report.failures`` — сигнал пользователю/UI.
+
+        ``groups`` — группы имён mixture-компонентов; ``None`` → проектные
+        ``self.sampling_groups`` (той же политикой строится и reference).
+        """
+        s = self.seed if seed is None else int(seed)
+        X = np.atleast_2d(np.asarray(X, float))
+        if X.shape[1] != self.dim:
+            raise ValueError(f"X: ожидалось {self.dim} координат на точку, "
+                             f"дано {X.shape[1]}.")
+        eff = (self.sampling_groups if groups is None
+               else self._validate_sampling_groups(list(groups)))
+        X_ref = self._phase_candidates(int(n_ref), s + 20259, groups=eff)
+        names = list(self.current_schema.mixture_names)
+        idx_groups = [[names.index(nm) for nm in g if nm in names]
+                      for g in eff]
+        idx_groups = [g for g in idx_groups if g]
+        return preflight_design(self.current_schema, X, X_ref,
+                                groups=idx_groups or None,
+                                thresholds=thresholds)
 
 
 

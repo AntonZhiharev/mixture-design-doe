@@ -25,7 +25,12 @@
     метка, пары) даёт префилл формы с режимом «phr-спека (JSON)» и
     round-trip'ящимся JSON;
   * ``campaign_passport_dataframe`` — строки паспорта (hash-префикс 12,
-    метка, пары; «—» когда политика не задана).
+    метка, пары; «—» когда политика не задана);
+  * iter41.4 — ИЕРАРХИЧЕСКИЙ ручной ввод: ``phr_tree_from_spec`` /
+    ``phr_tree_to_dicts`` (round-trip референсной спеки бит-в-бит по
+    ``spec_hash``), ``validate_phr_tree`` (группа без детей, ratio_to без
+    ссылки, дубли имён, cap без ratio), ``phr_tree_move`` (порядок узлов
+    ВХОДИТ в hash) и таблица детей группы.
 """
 import json
 import warnings
@@ -260,3 +265,136 @@ class TestPassportDataframe:
     def test_empty_policy_shows_dashes(self):
         df = ui.campaign_passport_dataframe(_plain_runner())
         assert list(df["значение"]) == ["—", "—", "—"]
+
+
+# ======================================================================
+# 6. iter41.4 — иерархический ручной ввод (дерево «группа → компоненты»)
+# ======================================================================
+def _tree_hash(tree) -> str:
+    """Дерево ввода → spec_hash собранной из него спеки."""
+    return PhrSpec.from_dicts(ui.phr_tree_to_dicts(tree)).spec_hash()
+
+
+class TestPhrTreeRoundTrip:
+    """Ручной ввод обязан давать ТУ ЖЕ спеку, что JSON-канал."""
+
+    def test_reference_spec_round_trip_keeps_hash(self):
+        """spec → дерево → dicts → spec: hash бит-в-бит (порядок сохранён)."""
+        spec = PhrSpec.from_dicts(RECIPE_DICTS)
+        tree = ui.phr_tree_from_spec(spec)
+        assert _tree_hash(tree) == REFERENCE_HASH
+        assert ui.phr_tree_to_dicts(tree) == spec.to_dicts()
+
+    def test_reference_tree_has_resin_group_with_two_children(self):
+        """Узел со share_of-детьми становится ГРУППОЙ, дети — внутри неё."""
+        tree = ui.phr_tree_from_spec(PhrSpec.from_dicts(RECIPE_DICTS))
+        resin = next(b for b in tree if b["name"] == "resin")
+        assert resin["kind"] == "group"
+        assert resin["total_mode"] == "fixed"
+        assert resin["value"] == 100.0
+        assert [c["name"] for c in resin["children"]] == ["PVC_67", "PVC_71"]
+        # UV с динамическим потолком остаётся ОДИНОЧНЫМ узлом
+        uv = next(b for b in tree if b["name"] == "UV_CSFCP")
+        assert uv["kind"] == "single" and uv["mode"] == "absolute"
+        assert list(uv["cap_to"]) == ["DINP", "ESO"]
+
+    def test_group_expands_to_total_then_children(self):
+        """Группа разворачивается в узел-тотал + share_of-детей по порядку."""
+        tree = [ui.phr_group_block(
+            "FILLER.total", total_mode="absolute", lo=5.0, hi=25.0,
+            children=[{"name": "Chalk_95T", "lo": 0.3, "hi": 1.0},
+                      {"name": "Chalk_1T", "lo": 0.0, "hi": 0.7}])]
+        assert ui.phr_tree_to_dicts(tree) == [
+            {"name": "FILLER.total", "mode": "absolute", "lo": 5.0, "hi": 25.0},
+            {"name": "Chalk_95T", "mode": "share_of", "of": "FILLER.total",
+             "lo": 0.3, "hi": 1.0},
+            {"name": "Chalk_1T", "mode": "share_of", "of": "FILLER.total",
+             "lo": 0.0, "hi": 0.7},
+        ]
+
+    def test_cap_to_text_equals_cap_to_list(self):
+        """cap_to строкой «DINP, ESO» и списком — одна и та же спека."""
+        base = ui.phr_tree_from_spec(PhrSpec.from_dicts(RECIPE_DICTS))
+        as_text = [dict(b) for b in base]
+        uv = next(b for b in as_text if b["name"] == "UV_CSFCP")
+        uv["cap_to"] = "DINP, ESO"
+        assert _tree_hash(as_text) == _tree_hash(base) == REFERENCE_HASH
+
+
+class TestPhrTreeValidation:
+    """Ошибки ловятся ДО конструктора и указывают на блок (A0.6)."""
+
+    def test_group_without_children_is_rejected(self):
+        """Пустая группа молча стала бы компонентом смеси — это отказ."""
+        with pytest.raises(ValueError, match="без компонентов"):
+            ui.phr_tree_to_dicts([ui.phr_group_block("STAB.total", lo=3.5,
+                                                     hi=5.0)])
+
+    def test_ratio_to_without_reference_is_rejected(self):
+        with pytest.raises(ValueError, match="ratio_to"):
+            ui.phr_tree_to_dicts([ui.phr_single_block(
+                "SBM_55", mode="ratio_to", lo=0.02, hi=0.09)])
+
+    def test_duplicate_names_rejected_across_levels(self):
+        """Тотал группы и компонент делят ОДНО пространство имён."""
+        tree = [ui.phr_group_block("X", lo=1.0, hi=2.0,
+                                   children=[{"name": "c", "lo": 0.0, "hi": 1.0}]),
+                ui.phr_single_block("c", mode="fixed", value=1.0)]
+        with pytest.raises(ValueError, match="уже занято"):
+            ui.phr_tree_to_dicts(tree)
+
+    def test_cap_ratio_without_cap_to_rejected(self):
+        with pytest.raises(ValueError, match="cap_to"):
+            ui.phr_tree_to_dicts([ui.phr_single_block(
+                "UV", mode="absolute", lo=0.05, hi=0.3, cap_ratio=0.03)])
+
+    def test_empty_tree_rejected(self):
+        with pytest.raises(ValueError, match="пуста"):
+            ui.phr_tree_to_dicts([])
+
+    def test_inverted_bounds_rejected(self):
+        with pytest.raises(ValueError, match="больше верхней"):
+            ui.phr_tree_to_dicts([ui.phr_single_block(
+                "DINP", mode="absolute", lo=14.0, hi=4.0)])
+
+
+class TestPhrTreeOrder:
+    """Порядок узлов — часть спеки: кнопки ▲/▼ меняют spec_hash."""
+
+    def test_move_changes_hash(self):
+        tree = ui.phr_tree_from_spec(PhrSpec.from_dicts(RECIPE_DICTS))
+        moved = ui.phr_tree_move(tree, 1, +1)          # DINP ↔ ESO
+        assert [b["name"] for b in moved][:3] != [b["name"] for b in tree][:3]
+        assert _tree_hash(moved) != REFERENCE_HASH
+
+    def test_move_is_pure_and_reversible(self):
+        tree = ui.phr_tree_from_spec(PhrSpec.from_dicts(RECIPE_DICTS))
+        names = [b["name"] for b in tree]
+        back = ui.phr_tree_move(ui.phr_tree_move(tree, 2, +1), 3, -1)
+        assert [b["name"] for b in back] == names      # исходный не мутирован
+        assert _tree_hash(back) == REFERENCE_HASH
+
+    def test_move_out_of_range_is_noop(self):
+        tree = [ui.phr_single_block("a", mode="fixed", value=1.0),
+                ui.phr_single_block("b", mode="fixed", value=2.0)]
+        assert [b["name"] for b in ui.phr_tree_move(tree, 0, -1)] == ["a", "b"]
+        assert [b["name"] for b in ui.phr_tree_move(tree, 1, +1)] == ["a", "b"]
+
+
+class TestPhrChildrenTable:
+    """Таблица-редактор детей группы (порядок строк = порядок узлов)."""
+
+    def test_dataframe_round_trip(self):
+        kids = [{"name": "PF711", "lo": 0.6, "hi": 1.0},
+                {"name": "PF711LB", "lo": 0.0, "hi": 0.4}]
+        blk = ui.phr_group_block("STAB.total", lo=3.5, hi=5.0, children=kids)
+        df = ui.phr_children_dataframe(blk)
+        assert list(df.columns) == ["компонент", "доля L", "доля U"]
+        assert ui.phr_children_from_dataframe(df) == kids
+
+    def test_empty_rows_are_dropped(self):
+        """Пустой хвост динамического редактора — не ошибка ввода."""
+        df = ui.phr_children_dataframe({"children": []})
+        assert ui.phr_children_from_dataframe(df) == []
+
+

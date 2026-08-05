@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import math
 import zlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -963,6 +963,269 @@ def phr_spec_fraction_dataframe(spec: PhrSpec) -> pd.DataFrame:
         index=list(spec.component_names))
 
 
+# ----------------------------------------------------------------------
+# iter41.4 (расширение §41.1) — ИЕРАРХИЧЕСКИЙ ручной ввод спеки.
+#
+# Рецептура в лаборатории мыслится группами («стабилизатор 3.5…5 phr, внутри
+# PF711 60…100 %»), а не плоским списком узлов DAG. Дерево ввода — ПЛОСКИЙ
+# список блоков верхнего уровня, каждый из которых либо ГРУППА (узел-тотал +
+# доли-дети share_of), либо ОДИНОЧНЫЙ узел (absolute / fixed / ratio_to).
+# Порядок блоков и порядок детей задаёт пользователь: он входит в spec_hash
+# (перестановка узлов — другая мера сэмплера, iter35), поэтому кнопки ▲/▼ —
+# не косметика, а часть спецификации.
+#
+# Дерево JSON-native (списки/словари/числа/строки) — переживает session_state
+# и сериализацию. Все функции ниже ЧИСТЫЕ (без Streamlit).
+# ----------------------------------------------------------------------
+PHR_TOTAL_MODES = ("absolute", "fixed")
+PHR_SINGLE_MODES = ("absolute", "fixed", "ratio_to")
+
+
+def phr_group_block(name: str, *, total_mode: str = "absolute",
+                    lo: float = 0.0, hi: float = 0.0, value: float = 0.0,
+                    children: Optional[Sequence[Mapping[str, Any]]] = None
+                    ) -> Dict[str, Any]:
+    """iter41.4: блок-ГРУППА дерева ввода (узел-тотал + доли-дети).
+
+    ``total_mode='absolute'`` — тотал группы phr ∈ [lo, hi] (наполнитель
+    5…25 phr); ``'fixed'`` — тотал константа (смола = 100). Дети —
+    словари ``{"name", "lo", "hi"}`` с ДОЛЯМИ группы (0…1)."""
+    return {"kind": "group", "name": str(name), "total_mode": str(total_mode),
+            "lo": float(lo), "hi": float(hi), "value": float(value),
+            "children": [dict(c) for c in (children or [])]}
+
+
+def phr_single_block(name: str, *, mode: str = "absolute", lo: float = 0.0,
+                     hi: float = 0.0, value: float = 0.0, ref: str = "",
+                     cap_to: Any = "", cap_ratio: float = 0.0
+                     ) -> Dict[str, Any]:
+    """iter41.4: блок-ОДИНОЧНЫЙ узел дерева ввода (компонент вне групп).
+
+    ``absolute`` — phr ∈ [lo, hi] (опц. динамический потолок ``cap_to`` /
+    ``cap_ratio``); ``fixed`` — константа; ``ratio_to`` — коэффициент
+    [lo, hi] к узлу ``ref`` (SBM = 0.02…0.09 × Σ стабилизатора)."""
+    return {"kind": "single", "name": str(name), "mode": str(mode),
+            "lo": float(lo), "hi": float(hi), "value": float(value),
+            "ref": str(ref or ""), "cap_to": cap_to,
+            "cap_ratio": float(cap_ratio)}
+
+
+def _phr_cap_refs(raw: Any) -> List[str]:
+    """iter41.4: ``cap_to`` из формы → список имён.
+
+    Принимает список/кортеж ИЛИ строку через запятую (``"DINP, ESO"``) —
+    оба канала дают ОДИН И ТОТ ЖЕ набор ссылок, иначе ввод строкой давал
+    бы другой spec_hash, чем ввод списком."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(s).strip() for s in raw if str(s).strip()]
+    return _parse_names(str(raw))
+
+
+def validate_phr_tree(tree: Sequence[Mapping[str, Any]]) -> None:
+    """iter41.4: проверить дерево ввода ДО конструктора :class:`PhrSpec`.
+
+    Ловит то, что конструктор поймать не может или сообщит невнятно:
+
+    * пустое дерево, неизвестный ``kind``/режим, пустые имена;
+    * дубли имён (узел-тотал и компонент — одно пространство имён);
+    * **группа без детей** — конструктор молча сделает её ЛИСТОМ, то есть
+      компонентом смеси: тихая порча состава (A0.6 — не молчим);
+    * ``ratio_to`` без ссылки, ``cap_ratio`` без ``cap_to`` и наоборот,
+      ``lo > hi``.
+
+    Ошибки конструктора (циклы, Σдолей, неизвестные ссылки) остаются за
+    :meth:`PhrSpec.from_dicts` — здесь их не дублируем."""
+    if not tree:
+        raise ValueError("Спека пуста: добавьте хотя бы один узел "
+                         "(группу или компонент).")
+    seen: List[str] = []
+
+    def _claim(name: str, where: str) -> None:
+        nm = str(name or "").strip()
+        if not nm:
+            raise ValueError(f"{where}: пустое имя узла.")
+        if nm in seen:
+            raise ValueError(f"{where}: имя '{nm}' уже занято — имена узлов "
+                             "(групп и компонентов) должны быть уникальны.")
+        seen.append(nm)
+
+    for i, blk in enumerate(tree, start=1):
+        kind = str(blk.get("kind", ""))
+        name = str(blk.get("name", "") or "").strip()
+        where = f"Блок {i} ('{name}')" if name else f"Блок {i}"
+        if kind == "group":
+            _claim(name, where)
+            tm = str(blk.get("total_mode", ""))
+            if tm not in PHR_TOTAL_MODES:
+                raise ValueError(f"{where}: тотал группы — 'absolute' или "
+                                 f"'fixed', получено '{tm}'.")
+            if tm == "absolute" and float(blk.get("lo", 0.0)) > float(
+                    blk.get("hi", 0.0)):
+                raise ValueError(f"{where}: нижняя граница тотала больше "
+                                 "верхней.")
+            children = list(blk.get("children") or [])
+            if not children:
+                raise ValueError(
+                    f"{where}: группа без компонентов. Такой узел станет "
+                    "обычным компонентом смеси (лист DAG) — добавьте "
+                    "компоненты или сделайте его одиночным узлом.")
+            for j, ch in enumerate(children, start=1):
+                cw = f"{where}, компонент {j}"
+                _claim(ch.get("name", ""), cw)
+                if float(ch.get("lo", 0.0)) > float(ch.get("hi", 0.0)):
+                    raise ValueError(f"{cw}: доля L больше доли U.")
+        elif kind == "single":
+            _claim(name, where)
+            md = str(blk.get("mode", ""))
+            if md not in PHR_SINGLE_MODES:
+                raise ValueError(f"{where}: режим — один из "
+                                 f"{list(PHR_SINGLE_MODES)}, получено '{md}'.")
+            if md in ("absolute", "ratio_to") and float(
+                    blk.get("lo", 0.0)) > float(blk.get("hi", 0.0)):
+                raise ValueError(f"{where}: нижняя граница больше верхней.")
+            if md == "ratio_to" and not str(blk.get("ref", "") or "").strip():
+                raise ValueError(f"{where}: режим ratio_to требует ссылку на "
+                                 "узел (поле «к узлу»).")
+            caps = _phr_cap_refs(blk.get("cap_to", ""))
+            ratio = float(blk.get("cap_ratio", 0.0) or 0.0)
+            if caps and md != "absolute":
+                raise ValueError(f"{where}: динамический потолок (cap_to) "
+                                 "допустим только для absolute.")
+            if caps and ratio <= 0:
+                raise ValueError(f"{where}: задан cap_to, но cap_ratio ≤ 0.")
+            if ratio > 0 and not caps:
+                raise ValueError(f"{where}: задан cap_ratio, но не указан "
+                                 "cap_to (узел или список узлов).")
+        else:
+            raise ValueError(f"{where}: неизвестный тип блока '{kind}' "
+                             "(ожидается 'group' или 'single').")
+
+
+def phr_tree_to_dicts(tree: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """iter41.4: дерево ввода → список узлов формата
+    :meth:`PhrSpec.from_dicts`.
+
+    Порядок результата = порядок блоков; внутри группы сначала идёт
+    узел-тотал, затем его дети ``share_of`` в порядке таблицы. Именно этот
+    порядок попадёт в ``spec_hash``. Перед разворотом вызывается
+    :func:`validate_phr_tree`."""
+    validate_phr_tree(tree)
+    out: List[Dict[str, Any]] = []
+    for blk in tree:
+        name = str(blk["name"]).strip()
+        if str(blk.get("kind")) == "group":
+            if str(blk.get("total_mode")) == "fixed":
+                out.append({"name": name, "mode": "fixed",
+                            "value": float(blk.get("value", 0.0))})
+            else:
+                out.append({"name": name, "mode": "absolute",
+                            "lo": float(blk.get("lo", 0.0)),
+                            "hi": float(blk.get("hi", 0.0))})
+            for ch in blk.get("children") or []:
+                out.append({"name": str(ch["name"]).strip(),
+                            "mode": "share_of", "of": name,
+                            "lo": float(ch.get("lo", 0.0)),
+                            "hi": float(ch.get("hi", 0.0))})
+            continue
+        md = str(blk.get("mode"))
+        if md == "fixed":
+            out.append({"name": name, "mode": "fixed",
+                        "value": float(blk.get("value", 0.0))})
+        elif md == "ratio_to":
+            out.append({"name": name, "mode": "ratio_to",
+                        "to": str(blk.get("ref", "")).strip(),
+                        "lo": float(blk.get("lo", 0.0)),
+                        "hi": float(blk.get("hi", 0.0))})
+        else:
+            node: Dict[str, Any] = {"name": name, "mode": "absolute",
+                                    "lo": float(blk.get("lo", 0.0)),
+                                    "hi": float(blk.get("hi", 0.0))}
+            caps = _phr_cap_refs(blk.get("cap_to", ""))
+            if caps:
+                node["cap_to"] = caps[0] if len(caps) == 1 else caps
+                node["cap_ratio"] = float(blk.get("cap_ratio", 0.0))
+            out.append(node)
+    return out
+
+
+def phr_tree_from_spec(spec: PhrSpec) -> List[Dict[str, Any]]:
+    """iter41.4: спека → дерево ввода (обратное к
+    :func:`phr_tree_to_dicts`).
+
+    Нужно для префилла формы после загрузки проекта: узел, на который
+    ссылаются ``share_of``-дети, становится ГРУППОЙ; сами дети уходят
+    внутрь неё; остальные узлы — одиночные. Порядок сохраняется, поэтому
+    round-trip даёт ТОТ ЖЕ ``spec_hash``."""
+    kids: Dict[str, List[Dict[str, Any]]] = {}
+    for nd in spec.nodes:
+        if nd.mode == "share_of":
+            kids.setdefault(nd.ref, []).append(
+                {"name": nd.name, "lo": float(nd.lo), "hi": float(nd.hi)})
+    tree: List[Dict[str, Any]] = []
+    for nd in spec.nodes:
+        if nd.mode == "share_of":
+            continue
+        if nd.name in kids:
+            tree.append(phr_group_block(
+                nd.name,
+                total_mode="fixed" if nd.mode == "fixed" else "absolute",
+                lo=float(nd.lo), hi=float(nd.hi), value=float(nd.value),
+                children=kids[nd.name]))
+            continue
+        tree.append(phr_single_block(
+            nd.name, mode=nd.mode, lo=float(nd.lo), hi=float(nd.hi),
+            value=float(nd.value), ref=nd.ref or "",
+            cap_to=list(nd.cap_refs), cap_ratio=float(nd.cap_ratio)))
+    return tree
+
+
+def phr_tree_move(tree: Sequence[Mapping[str, Any]], index: int, delta: int
+                  ) -> List[Dict[str, Any]]:
+    """iter41.4: переместить блок верхнего уровня (кнопки ▲/▼).
+
+    Возвращает НОВЫЙ список (исходный не мутируется). Выход за границы —
+    список без изменений: край списка не ошибка пользователя."""
+    items = [dict(b) for b in tree]
+    j = int(index) + int(delta)
+    if not (0 <= int(index) < len(items)) or not (0 <= j < len(items)):
+        return items
+    items[int(index)], items[j] = items[j], items[int(index)]
+    return items
+
+
+def phr_children_dataframe(block: Mapping[str, Any]) -> pd.DataFrame:
+    """iter41.4: дети группы → таблица редактора (компонент / доля L / U)."""
+    rows = [{"компонент": str(c.get("name", "")),
+             "доля L": float(c.get("lo", 0.0)),
+             "доля U": float(c.get("hi", 1.0))}
+            for c in (block.get("children") or [])]
+    if not rows:
+        rows = [{"компонент": "", "доля L": 0.0, "доля U": 1.0}]
+    return pd.DataFrame(rows)
+
+
+def phr_children_from_dataframe(df) -> List[Dict[str, Any]]:
+    """iter41.4: таблица редактора → дети группы (порядок строк сохраняется).
+
+    Строки с пустым именем отбрасываются — это «пустой хвост» динамического
+    редактора, а не ошибка ввода."""
+    out: List[Dict[str, Any]] = []
+    for _, r in pd.DataFrame(df).iterrows():
+        nm = str(r.get("компонент", "") or "").strip()
+        if not nm:
+            continue
+        try:
+            lo = float(r.get("доля L", 0.0) or 0.0)
+            hi = float(r.get("доля U", 0.0) or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Компонент '{nm}': доли должны быть числами "
+                             "(0…1).") from exc
+        out.append({"name": nm, "lo": lo, "hi": hi})
+    return out
+
+
 def parse_preflight_pairs(text: str) -> List[Tuple[List[str], List[str]]]:
     """iter41.2: разобрать обязательные 2D-пары из текста формы.
 
@@ -1028,6 +1291,220 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
     ])
 
 
+# ----------------------------------------------------------------------
+# iter41.4 — Streamlit-часть иерархического ввода спеки
+# ----------------------------------------------------------------------
+_PHR_SRC_TREE = "Иерархия (ручной ввод)"
+_PHR_SRC_JSON = "JSON / файл"
+
+
+def _phr_uid(block: Dict[str, Any], fallback: int) -> str:
+    """Стабильный идентификатор блока для ключей виджетов.
+
+    Ключи виджетов НЕЛЬЗЯ привязывать к индексу: после ▲/▼ Streamlit
+    вернул бы в переставленные блоки старые значения (state живёт по
+    ключу). Поэтому каждому блоку выдаётся ``_uid``, переживающий
+    перестановку. Служебное поле игнорируется :func:`phr_tree_to_dicts`."""
+    uid = str(block.get("_uid", "") or "")
+    if not uid:
+        uid = f"{fallback}_{abs(zlib.crc32(str(block.get('name', '')).encode()))}"
+        block["_uid"] = uid
+    return uid
+
+
+def _render_phr_json_input(key_prefix: str) -> Optional[PhrSpec]:
+    """iter41.1: канал «JSON / файл» — uploader (приоритет) + textarea."""
+    st.caption(
+        "JSON-список узлов в формате PhrSpec.from_dicts "
+        "(absolute / share_of / ratio_to / fixed) — тот же формат, что "
+        "to_dicts (входит в spec_hash). Поле «Компоненты смеси» выше "
+        "ИГНОРИРУЕТСЯ: имена берутся из спеки (листья DAG).")
+    up = st.file_uploader("JSON-файл спеки (опц.)", type=["json"],
+                          key=f"{key_prefix}_phr_file")
+    txt = st.text_area("phr-спека (JSON)", value="", height=220,
+                       key=f"{key_prefix}_phr_json")
+    if up is not None:
+        st.caption("Используется загруженный файл "
+                   "(текстовое поле игнорируется).")
+        try:
+            src = up.getvalue().decode("utf-8")
+        except UnicodeDecodeError:
+            st.error("Файл спеки не в UTF-8 — сохраните JSON в UTF-8.")
+            return None
+    else:
+        src = txt
+    try:
+        return parse_phr_spec_json(src)
+    except ValueError as exc:
+        st.error(str(exc))
+        return None
+
+
+def _render_phr_group_block(blk: Dict[str, Any], uid: str,
+                            key_prefix: str) -> None:
+    """iter41.4: поля ГРУППЫ — имя, тотал (absolute/fixed) и таблица долей."""
+    gc = st.columns([3, 2, 2, 2])
+    blk["name"] = gc[0].text_input(
+        "Имя группы", value=str(blk.get("name", "")),
+        key=f"{key_prefix}_phr_gname_{uid}",
+        placeholder="например: FILLER.total")
+    blk["total_mode"] = gc[1].selectbox(
+        "Тотал группы", list(PHR_TOTAL_MODES),
+        index=list(PHR_TOTAL_MODES).index(
+            str(blk.get("total_mode", "absolute"))),
+        key=f"{key_prefix}_phr_gmode_{uid}",
+        help="absolute — суммарный phr группы в диапазоне [lo, hi]; "
+             "fixed — константа (смола = 100 phr).")
+    if str(blk["total_mode"]) == "fixed":
+        blk["value"] = gc[2].number_input(
+            "phr (константа)", value=float(blk.get("value", 0.0)), step=1.0,
+            format="%.4f", key=f"{key_prefix}_phr_gval_{uid}")
+    else:
+        blk["lo"] = gc[2].number_input(
+            "phr lo", value=float(blk.get("lo", 0.0)), step=0.5,
+            format="%.4f", key=f"{key_prefix}_phr_glo_{uid}")
+        blk["hi"] = gc[3].number_input(
+            "phr hi", value=float(blk.get("hi", 0.0)), step=0.5,
+            format="%.4f", key=f"{key_prefix}_phr_ghi_{uid}")
+
+    st.caption("Компоненты группы и их ДОЛИ группы (0…1). Сумма нижних ≤ 1 ≤ "
+               "сумма верхних — иначе конструктор спеки откажет. Порядок "
+               "строк = порядок узлов (входит в spec_hash).")
+    dkey = f"{key_prefix}_phr_kids_df_{uid}"
+    if dkey not in st.session_state:
+        st.session_state[dkey] = phr_children_dataframe(blk)
+    edited = st.data_editor(st.session_state[dkey], num_rows="dynamic",
+                            use_container_width=True, hide_index=True,
+                            key=f"{key_prefix}_phr_kids_{uid}")
+    try:
+        blk["children"] = phr_children_from_dataframe(edited)
+    except ValueError as exc:
+        st.error(str(exc))
+
+
+def _render_phr_single_block(blk: Dict[str, Any], uid: str,
+                             key_prefix: str) -> None:
+    """iter41.4: поля ОДИНОЧНОГО узла (absolute / fixed / ratio_to)."""
+    sc = st.columns([3, 2, 2, 2])
+    blk["name"] = sc[0].text_input(
+        "Имя компонента", value=str(blk.get("name", "")),
+        key=f"{key_prefix}_phr_sname_{uid}", placeholder="например: DINP")
+    blk["mode"] = sc[1].selectbox(
+        "Режим", list(PHR_SINGLE_MODES),
+        index=list(PHR_SINGLE_MODES).index(str(blk.get("mode", "absolute"))),
+        key=f"{key_prefix}_phr_smode_{uid}",
+        help="absolute — phr в [lo, hi]; fixed — константа; ratio_to — "
+             "коэффициент [lo, hi] к другому узлу (SBM = 0.02…0.09 × "
+             "Σ стабилизатора).")
+    md = str(blk["mode"])
+    if md == "fixed":
+        blk["value"] = sc[2].number_input(
+            "phr (константа)", value=float(blk.get("value", 0.0)), step=0.1,
+            format="%.4f", key=f"{key_prefix}_phr_sval_{uid}")
+        return
+    lo_label = "коэф. lo" if md == "ratio_to" else "phr lo"
+    hi_label = "коэф. hi" if md == "ratio_to" else "phr hi"
+    blk["lo"] = sc[2].number_input(
+        lo_label, value=float(blk.get("lo", 0.0)), step=0.05, format="%.4f",
+        key=f"{key_prefix}_phr_slo_{uid}")
+    blk["hi"] = sc[3].number_input(
+        hi_label, value=float(blk.get("hi", 0.0)), step=0.05, format="%.4f",
+        key=f"{key_prefix}_phr_shi_{uid}")
+    if md == "ratio_to":
+        blk["ref"] = st.text_input(
+            "К узлу (ratio_to)", value=str(blk.get("ref", "")),
+            key=f"{key_prefix}_phr_sref_{uid}",
+            placeholder="например: STAB.total")
+        return
+    cc = st.columns([3, 2])
+    caps_now = _phr_cap_refs(blk.get("cap_to", ""))
+    blk["cap_to"] = cc[0].text_input(
+        "Динамический потолок: узлы (через запятую, опц.)",
+        value=", ".join(caps_now), key=f"{key_prefix}_phr_scap_{uid}",
+        help="Потолок по СУММЕ указанных узлов (фазе): "
+             "hi_eff = min(hi, cap_ratio · Σ value). Пример: DINP, ESO.")
+    blk["cap_ratio"] = cc[1].number_input(
+        "cap_ratio", value=float(blk.get("cap_ratio", 0.0)), step=0.01,
+        format="%.4f", key=f"{key_prefix}_phr_scapr_{uid}")
+
+
+def _render_phr_tree_input(key_prefix: str) -> Optional[PhrSpec]:
+    """iter41.4: канал «Иерархия» — группы с компонентами + одиночные узлы.
+
+    Дерево живёт в ``session_state[f"{key_prefix}_phr_tree"]`` и правится
+    на месте; порядок блоков меняют кнопки ▲/▼ (он входит в ``spec_hash``).
+    Возвращает спеку или ``None``, если ввод пока невалиден (ошибка уже
+    показана пользователю)."""
+    tkey = f"{key_prefix}_phr_tree"
+    tree: List[Dict[str, Any]] = st.session_state.setdefault(tkey, [])
+    st.caption(
+        "Рецептура вводится как в лаборатории: ГРУППА (суммарный phr) → "
+        "компоненты группы в ДОЛЯХ, плюс одиночные компоненты вне групп. "
+        "Поле «Компоненты смеси» выше ИГНОРИРУЕТСЯ — имена берутся отсюда. "
+        "Порядок узлов входит в spec_hash: переставляйте кнопками ▲/▼.")
+
+    ac = st.columns([2, 2, 1])
+    if ac[0].button("➕ Группа", key=f"{key_prefix}_phr_add_group",
+                    use_container_width=True):
+        tree.append(phr_group_block(f"группа{len(tree) + 1}"))
+        st.session_state[tkey] = tree
+        st.rerun()
+    if ac[1].button("➕ Компонент вне групп",
+                    key=f"{key_prefix}_phr_add_single",
+                    use_container_width=True):
+        tree.append(phr_single_block(f"компонент{len(tree) + 1}"))
+        st.session_state[tkey] = tree
+        st.rerun()
+    if ac[2].button("🧹", key=f"{key_prefix}_phr_clear",
+                    help="Очистить спеку целиком"):
+        st.session_state[tkey] = []
+        for k in [k for k in st.session_state
+                  if str(k).startswith(f"{key_prefix}_phr_kids_df_")]:
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    if not tree:
+        st.info("Спека пуста: добавьте первую группу (например, "
+                "«RESIN.total» = 100 phr) или одиночный компонент.")
+        return None
+
+    for i, blk in enumerate(tree):
+        uid = _phr_uid(blk, i)
+        is_group = str(blk.get("kind")) == "group"
+        hc = st.columns([6, 1, 1, 1])
+        hc[0].markdown(f"**{i + 1}. {'📦 группа' if is_group else '🔹 узел'} "
+                       f"— {blk.get('name', '')}**")
+        if hc[1].button("▲", key=f"{key_prefix}_phr_up_{uid}",
+                        disabled=(i == 0)):
+            st.session_state[tkey] = phr_tree_move(tree, i, -1)
+            st.rerun()
+        if hc[2].button("▼", key=f"{key_prefix}_phr_dn_{uid}",
+                        disabled=(i == len(tree) - 1)):
+            st.session_state[tkey] = phr_tree_move(tree, i, +1)
+            st.rerun()
+        if hc[3].button("🗑", key=f"{key_prefix}_phr_del_{uid}"):
+            st.session_state[tkey] = [b for j, b in enumerate(tree) if j != i]
+            st.session_state.pop(f"{key_prefix}_phr_kids_df_{uid}", None)
+            st.rerun()
+        if is_group:
+            _render_phr_group_block(blk, uid, key_prefix)
+        else:
+            _render_phr_single_block(blk, uid, key_prefix)
+        st.divider()
+
+    st.session_state[tkey] = tree
+    try:
+        dicts = phr_tree_to_dicts(tree)
+    except ValueError as exc:      # ошибки дерева (пустая группа, дубли…)
+        st.error(str(exc))
+        return None
+    try:
+        return PhrSpec.from_dicts(dicts)
+    except ValueError as exc:      # ошибки конструктора (Σдолей, ссылки…)
+        st.error(str(exc))
+        return None
+
+
 def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
     """§17.4 (замечание 1): ограничения состава — «Доли (0…1)» ИЛИ «Массовые части
     (база = 100)». Возвращает ``(lower, upper)`` в ДОЛЯХ или ``(None, None)``.
@@ -1058,32 +1535,20 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
                  "возьмутся из спеки.")
         spec_key = f"{key_prefix}_phr_spec_obj"
         if mode == _MODE_PHR:
-            # iter41.1: третий режим — phr-спека (JSON). Uploader опционален и
-            # имеет приоритет над textarea (открытый вопрос 1: оба канала).
-            st.caption(
-                "JSON-список узлов в формате PhrSpec.from_dicts "
-                "(absolute / share_of / ratio_to / fixed) — тот же формат, что "
-                "to_dicts (входит в spec_hash). Поле «Компоненты смеси» выше "
-                "ИГНОРИРУЕТСЯ: имена берутся из спеки (листья DAG).")
-            up = st.file_uploader("JSON-файл спеки (опц.)", type=["json"],
-                                  key=f"{key_prefix}_phr_file")
-            txt = st.text_area("phr-спека (JSON)", value="", height=220,
-                               key=f"{key_prefix}_phr_json")
-            if up is not None:
-                st.caption("Используется загруженный файл "
-                           "(текстовое поле игнорируется).")
-                try:
-                    src = up.getvalue().decode("utf-8")
-                except UnicodeDecodeError:
-                    st.error("Файл спеки не в UTF-8 — сохраните JSON в UTF-8.")
-                    st.session_state[spec_key] = None
-                    return None, None
-            else:
-                src = txt
-            try:
-                spec = parse_phr_spec_json(src)
-            except ValueError as exc:
-                st.error(str(exc))
+            # iter41.1/41.4: два РАВНОПРАВНЫХ канала одной и той же спеки —
+            # иерархический ручной ввод (по умолчанию) и JSON/файл. Оба
+            # сходятся в PhrSpec, дальше показ и возврат общие.
+            src_mode = st.radio(
+                "Ввод спеки", [_PHR_SRC_TREE, _PHR_SRC_JSON],
+                key=f"{key_prefix}_phr_src", horizontal=True,
+                help="«Иерархия» — задать группы и компоненты руками (порядок "
+                     "узлов меняется кнопками ▲/▼). «JSON / файл» — вставить "
+                     "или загрузить готовую спеку в формате "
+                     "PhrSpec.from_dicts.")
+            spec = (_render_phr_tree_input(key_prefix)
+                    if src_mode == _PHR_SRC_TREE
+                    else _render_phr_json_input(key_prefix))
+            if spec is None:
                 st.session_state[spec_key] = None
                 return None, None
             st.session_state[spec_key] = spec
@@ -1244,6 +1709,9 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
         out["setup_comp_mode"] = _MODE_PHR
         out["setup_phr_json"] = json.dumps(spec.to_dicts(),
                                            ensure_ascii=False, indent=2)
+        # iter41.4: то же самое деревом — чтобы иерархический канал показывал
+        # загруженную спеку, а не пустую форму (round-trip сохраняет hash).
+        out["setup_phr_tree"] = phr_tree_from_spec(spec)
     return out
 
 

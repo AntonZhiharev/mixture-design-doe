@@ -10,9 +10,11 @@ z-сэмплер-плагин parts/phr-спеки.
 
   * ``absolute``  — phr равномерно в ``[lo, hi]`` (в т.ч. ТОТАЛ группы);
     опционально с ДИНАМИЧЕСКИМ ПОТОЛКОМ ``cap_to``/``cap_ratio``:
-    ``p ∈ [lo, min(hi, cap_ratio · value(cap_to))]`` — ТРАПЕЦИЯ, а не клин.
-    Кейс (сессия 05.08.2026, UV_CSFCP): растворимость ограничивает УФ
-    только СВЕРХУ (`UV ≤ 0.03·DINP`), нижняя граница 0.05 phr — требование
+    ``cap_to`` — имя узла ИЛИ СПИСОК имён (ФАЗА, значения складываются):
+    ``p ∈ [lo, min(hi, cap_ratio · Σ value(cap_to))]`` — ТРАПЕЦИЯ, не клин.
+    Кейс (сессии 05.08.2026, UV_CSFCP): растворимость ограничивает УФ
+    только СВЕРХУ и определяется ПЛАСТИФИКАТОРНОЙ ФАЗОЙ целиком
+    (`UV ≤ 0.03·(DINP + ESO)`), нижняя граница 0.05 phr — требование
     по защите и от пластификатора НЕ зависит. ``ratio_to`` здесь неверен:
     он масштабирует ОБА конца (клин), вшивая положительную корреляцию с
     доминирующей осью и монотонный prior, которого физика не требует;
@@ -62,16 +64,16 @@ _TOL = 1e-9
 @dataclass
 class PhrNode:
     """Узел phr-спеки. ``ref`` — имя референса (``of`` у share_of, ``to``
-    у ratio_to); у absolute/fixed референса нет. ``cap_ref``/``cap_ratio``
-    (только absolute) — динамический потолок
-    ``hi_eff = min(hi, cap_ratio · value(cap_ref))``."""
+    у ratio_to); у absolute/fixed референса нет. ``cap_refs``/``cap_ratio``
+    (только absolute) — динамический потолок по СУММЕ референсов (фазе):
+    ``hi_eff = min(hi, cap_ratio · Σ value(cap_refs))``."""
     name: str
     mode: str
     lo: float = 0.0
     hi: float = 0.0
     value: float = 0.0
     ref: str = ""
-    cap_ref: str = ""
+    cap_refs: Tuple[str, ...] = ()
     cap_ratio: float = 0.0
 
 
@@ -134,7 +136,9 @@ class PhrSpec:
     def from_dicts(cls, dicts: Sequence[Mapping[str, Any]]) -> "PhrSpec":
         """Спека из списка словарей: ключи ``name``, ``mode``, ``lo``, ``hi``,
         ``value`` (fixed), ``of`` (share_of) / ``to`` (ratio_to),
-        ``cap_to``/``cap_ratio`` (динамический потолок absolute-оси).
+        ``cap_to``/``cap_ratio`` (динамический потолок absolute-оси;
+        ``cap_to`` — имя узла или СПИСОК имён, значения референсов
+        складываются: потолок ссылается на фазу, а не на один компонент).
         Доли share_of без явных границ — ``[0, 1]``."""
         nodes: List[PhrNode] = []
         for d in dicts:
@@ -142,10 +146,15 @@ class PhrSpec:
             ref = str(d.get("of", d.get("to", "")) or "")
             lo = float(d.get("lo", 0.0))
             hi = float(d.get("hi", 1.0 if mode == MODE_SHARE_OF else 0.0))
+            raw_cap = d.get("cap_to", "") or ""
+            if isinstance(raw_cap, str):
+                cap_refs: Tuple[str, ...] = (raw_cap,) if raw_cap else ()
+            else:
+                cap_refs = tuple(str(x) for x in raw_cap)
             nodes.append(PhrNode(name=str(d.get("name", "")), mode=mode,
                                  lo=lo, hi=hi,
                                  value=float(d.get("value", 0.0)), ref=ref,
-                                 cap_ref=str(d.get("cap_to", "") or ""),
+                                 cap_refs=cap_refs,
                                  cap_ratio=float(d.get("cap_ratio", 0.0))))
         return cls(nodes)
 
@@ -170,18 +179,23 @@ class PhrSpec:
             elif nd.ref:
                 raise ValueError(
                     f"Узел '{nd.name}' ({nd.mode}): референс недопустим.")
-            if nd.cap_ref:
+            if nd.cap_refs:
                 if nd.mode != MODE_ABSOLUTE:
                     raise ValueError(
                         f"Узел '{nd.name}' ({nd.mode}): cap_to допустим "
                         f"только для absolute.")
-                if nd.cap_ref not in self._by_name:
+                if len(set(nd.cap_refs)) != len(nd.cap_refs):
                     raise ValueError(
-                        f"Узел '{nd.name}': cap-референс '{nd.cap_ref}' "
-                        f"не найден среди узлов спеки.")
-                if nd.cap_ref == nd.name:
-                    raise ValueError(
-                        f"Узел '{nd.name}': cap-ссылка на самого себя.")
+                        f"Узел '{nd.name}': дубли в cap_to "
+                        f"{list(nd.cap_refs)} недопустимы.")
+                for cr in nd.cap_refs:
+                    if cr not in self._by_name:
+                        raise ValueError(
+                            f"Узел '{nd.name}': cap-референс '{cr}' "
+                            f"не найден среди узлов спеки.")
+                    if cr == nd.name:
+                        raise ValueError(
+                            f"Узел '{nd.name}': cap-ссылка на самого себя.")
                 if nd.cap_ratio <= 0:
                     raise ValueError(
                         f"Узел '{nd.name}': cap_ratio должен быть > 0 "
@@ -191,7 +205,7 @@ class PhrSpec:
                     f"Узел '{nd.name}': cap_ratio без cap_to недопустим.")
 
     def _toposort(self) -> List[str]:
-        """Топосорт Кана по рёбрам ref→node и cap_ref→node;
+        """Топосорт Кана по рёбрам ref→node и cap_refs→node;
         цикл — явный ValueError."""
         indeg = {nd.name: 0 for nd in self.nodes}
         out_edges: Dict[str, List[str]] = {nd.name: [] for nd in self.nodes}
@@ -199,8 +213,8 @@ class PhrSpec:
             if nd.ref:
                 out_edges[nd.ref].append(nd.name)
                 indeg[nd.name] += 1
-            if nd.cap_ref:
-                out_edges[nd.cap_ref].append(nd.name)
+            for cr in nd.cap_refs:
+                out_edges[cr].append(nd.name)
                 indeg[nd.name] += 1
         queue = [nd.name for nd in self.nodes if indeg[nd.name] == 0]
         order: List[str] = []
@@ -249,14 +263,15 @@ class PhrSpec:
             if nd.mode == MODE_FIXED:
                 iv = (nd.value, nd.value)
             elif nd.mode == MODE_ABSOLUTE:
-                if nd.cap_ref:
-                    r_lo, r_hi = self._interval[nd.cap_ref]
+                if nd.cap_refs:
+                    r_lo = sum(self._interval[cr][0] for cr in nd.cap_refs)
+                    r_hi = sum(self._interval[cr][1] for cr in nd.cap_refs)
                     cap_min = nd.cap_ratio * r_lo
                     if cap_min < nd.lo - _TOL:
                         raise ValueError(
-                            f"Узел '{nd.name}': при минимальном "
-                            f"'{nd.cap_ref}'={r_lo:.6g} потолок "
-                            f"cap_ratio·ref={cap_min:.6g} < lo={nd.lo} — "
+                            f"Узел '{nd.name}': при минимальной фазе "
+                            f"Σ{list(nd.cap_refs)}={r_lo:.6g} потолок "
+                            f"cap_ratio·Σref={cap_min:.6g} < lo={nd.lo} — "
                             f"пустой диапазон (трапеция вырождается).")
                     iv = (nd.lo, min(nd.hi, nd.cap_ratio * r_hi))
                 else:
@@ -297,8 +312,9 @@ class PhrSpec:
     def sample_z(self, n: int, seed: Optional[int] = None) -> np.ndarray:
         """``n`` точек z-куба: absolute/ratio_to — равномерно по оси;
         absolute с cap — равномерно в ПЕР-ТОЧЕЧНОМ интервале
-        ``[lo, min(hi, cap_ratio · value(cap_ref))]`` (условная равномерность
-        на трапеции); доли share-группы — :func:`_narrowing_split`
+        ``[lo, min(hi, cap_ratio · Σ value(cap_refs))]`` (условная
+        равномерность на трапеции, референс — фаза);
+        доли share-группы — :func:`_narrowing_split`
         (Σ=1 без rejection). Обход — топологический (референсы cap вычислены
         раньше зависимых осей).
 
@@ -315,8 +331,9 @@ class PhrSpec:
             if nd.mode == MODE_FIXED:
                 vals[nm] = np.full(n, nd.value)
             elif nd.mode == MODE_ABSOLUTE:
-                if nd.cap_ref:
-                    hi_eff = np.minimum(nd.hi, nd.cap_ratio * vals[nd.cap_ref])
+                if nd.cap_refs:
+                    base = np.sum([vals[cr] for cr in nd.cap_refs], axis=0)
+                    hi_eff = np.minimum(nd.hi, nd.cap_ratio * base)
                     hi_eff = np.maximum(hi_eff, nd.lo)   # числовая страховка
                     z = nd.lo + (hi_eff - nd.lo) * rng.random(n)
                 else:
@@ -409,12 +426,13 @@ class PhrSpec:
                 raise ValueError(
                     f"encode: узел '{nm}' ({nd.mode}) вне границ "
                     f"[{nd.lo}, {nd.hi}]: значения {zj}.")
-            if nd.mode == MODE_ABSOLUTE and nd.cap_ref:
-                cap = nd.cap_ratio * vals[nd.cap_ref]
+            if nd.mode == MODE_ABSOLUTE and nd.cap_refs:
+                cap = nd.cap_ratio * np.sum(
+                    [vals[cr] for cr in nd.cap_refs], axis=0)
                 if np.any(zj > cap + tol):
                     raise ValueError(
                         f"encode: узел '{nm}' превышает потолок "
-                        f"{nd.cap_ratio:g}·'{nd.cap_ref}' (= {cap}): "
+                        f"{nd.cap_ratio:g}·Σ{list(nd.cap_refs)} (= {cap}): "
                         f"значения {zj} — рецепт вне спеки.")
             Z[:, self._z_col[nm]] = zj
         return Z[0] if single else Z
@@ -463,8 +481,12 @@ class PhrSpec:
                 d["of"] = nd.ref
             elif nd.mode == MODE_RATIO_TO:
                 d["to"] = nd.ref
-            if nd.cap_ref:                     # динамический потолок — часть
-                d["cap_to"] = nd.cap_ref       # геометрии, входит в отпечаток
+            if nd.cap_refs:                    # динамический потолок — часть
+                # геометрии, входит в отпечаток; каноническая форма:
+                # один референс — строка (обратная совместимость хеша),
+                # фаза — список имён
+                d["cap_to"] = (nd.cap_refs[0] if len(nd.cap_refs) == 1
+                               else list(nd.cap_refs))
                 d["cap_ratio"] = float(nd.cap_ratio)
             out.append(d)
         return out

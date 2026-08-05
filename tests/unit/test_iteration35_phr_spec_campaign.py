@@ -12,13 +12,16 @@
 Развёртка находок iter34 с геометрии (SimplexRegion) на РАБОЧИЙ путь
 кампании (PhrSpec, iter33) — см. docs/CAMPAIGN_SPEC_PVC.md. Канон:
 
-  * реальная 17-компонентная рецептура выражается спекой БЕЗ rejection:
+  * реальная 19-компонентная рецептура выражается спекой БЕЗ rejection:
     смола PVC_67+PVC_71 = 100 phr (share-группа), UV — absolute с
-    ДИНАМИЧЕСКИМ ПОТОЛКОМ (cap_to=DINP, cap_ratio=0.03): ТРАПЕЦИЯ
-    p_UV ∈ [0.05, min(0.30, 0.03·p_DINP)], а не клин ratio_to
-    (правка внешней сессии 05.08.2026: растворимость ограничивает УФ
+    ДИНАМИЧЕСКИМ ПОТОЛКОМ по ПЛАСТИФИКАТОРНОЙ ФАЗЕ
+    (cap_to=[DINP, ESO], cap_ratio=0.03): ТРАПЕЦИЯ
+    p_UV ∈ [0.05, min(0.30, 0.03·(p_DINP + p_ESO))], а не клин ratio_to
+    (правки внешних сессий 05.08.2026: растворимость ограничивает УФ
     только сверху; клин вшивал положительную корреляцию с доминирующей
-    осью DINP и монотонный prior, которого физика не требует);
+    осью DINP и монотонный prior, которого физика не требует; референс
+    потолка — ФАЗА пластификатора: UV-P растворяется в пластификаторе
+    как фазе, ЭСО — полноценный вторичный пластификатор);
   * golden-числа narrowing: немонотонность hi по потреблённой сумме
     (0.40 → 0.70 полка → 0.5333) — свойство формулы
     [max(L, s−ΣU_ост), min(U, s−ΣL_ост)], не снимка кода;
@@ -44,10 +47,16 @@ from src.apps.mixture_process_runner import MixtureProcessRunner
 
 # ----------------------------------------------------------------------
 # Реальная рецептура (phr): смола = 100 (share-группа PVC_67/PVC_71),
-# UV_CSFCP — absolute [0.05, 0.30] с потолком 0.03·DINP (трапеция).
-# Golden потолка: DINP=4 → hi=0.12; DINP=10 и 14 → hi=0.30 (полка).
+# fixed-узлы сетапа: ESO=2.50 (синергист триады Ca/Zn + β-дикетон),
+# SA_1860=0.10 (технологический минимум антиадгезива).
+# UV_CSFCP — absolute [0.05, 0.30] с потолком 0.03·(DINP+ESO): референс —
+# пластификаторная фаза, а не один DINP (правка внешней сессии 05.08.2026:
+# UV-P растворяется в фазе; ЭСО — вторичный пластификатор). Golden потолка:
+# DINP=4 → hi=0.195; DINP=7.5 → hi=0.30 (излом, DINP+ESO=10);
+# DINP=14 → hi=0.30 (полка).
 # ----------------------------------------------------------------------
 UV_LO, UV_HI, UV_CAP = 0.05, 0.30, 0.03
+ESO_PHR, SA_PHR = 2.50, 0.10
 
 RECIPE_DICTS = [
     {"name": "resin", "mode": "fixed", "value": 100.0},
@@ -56,6 +65,7 @@ RECIPE_DICTS = [
     {"name": "PVC_71", "mode": "share_of", "of": "resin",
      "lo": 0.00, "hi": 0.70},
     {"name": "DINP", "mode": "absolute", "lo": 4.0, "hi": 14.0},
+    {"name": "ESO", "mode": "fixed", "value": ESO_PHR},
     {"name": "Chalk_1T", "mode": "absolute", "lo": 0.0, "hi": 17.5},
     {"name": "Chalk_95T", "mode": "absolute", "lo": 1.5, "hi": 25.0},
     {"name": "CPE_135A", "mode": "absolute", "lo": 3.0, "hi": 15.0},
@@ -67,24 +77,26 @@ RECIPE_DICTS = [
     {"name": "DL_60", "mode": "absolute", "lo": 0.12, "hi": 0.84},
     {"name": "AKLUB_K_435", "mode": "absolute", "lo": 0.04, "hi": 0.72},
     {"name": "OPE", "mode": "absolute", "lo": 0.04, "hi": 0.72},
+    {"name": "SA_1860", "mode": "fixed", "value": SA_PHR},
     {"name": "TiO2_BLR895", "mode": "absolute", "lo": 0.3, "hi": 8.0},
     {"name": "SBM_55", "mode": "absolute", "lo": 0.07, "hi": 0.45},
     {"name": "UV_CSFCP", "mode": "absolute", "lo": UV_LO, "hi": UV_HI,
-     "cap_to": "DINP", "cap_ratio": UV_CAP},
+     "cap_to": ["DINP", "ESO"], "cap_ratio": UV_CAP},
 ]
 
-COMPONENTS = ["PVC_67", "PVC_71", "DINP", "Chalk_1T", "Chalk_95T",
+COMPONENTS = ["PVC_67", "PVC_71", "DINP", "ESO", "Chalk_1T", "Chalk_95T",
               "CPE_135A", "PBNK_3355", "PMPlus_8", "DL_531", "PF711",
-              "PF711LB", "DL_60", "AKLUB_K_435", "OPE", "TiO2_BLR895",
-              "SBM_55", "UV_CSFCP"]
+              "PF711LB", "DL_60", "AKLUB_K_435", "OPE", "SA_1860",
+              "TiO2_BLR895", "SBM_55", "UV_CSFCP"]
 
-# Anchor: производственный рецепт в phr (внутри спеки; UV=0.2 ≤ 0.03·DINP=0.3)
+# Anchor: производственный рецепт в phr (внутри спеки;
+# UV=0.2 ≤ 0.03·(DINP+ESO)=0.375)
 ANCHOR_PHR = {
-    "PVC_67": 70.0, "PVC_71": 30.0, "DINP": 10.0, "Chalk_1T": 10.0,
-    "Chalk_95T": 10.0, "CPE_135A": 8.0, "PBNK_3355": 4.0, "PMPlus_8": 0.5,
-    "DL_531": 0.3, "PF711": 3.0, "PF711LB": 1.0, "DL_60": 0.5,
-    "AKLUB_K_435": 0.3, "OPE": 0.3, "TiO2_BLR895": 3.0,
-    "SBM_55": 0.2, "UV_CSFCP": 0.2,
+    "PVC_67": 70.0, "PVC_71": 30.0, "DINP": 10.0, "ESO": ESO_PHR,
+    "Chalk_1T": 10.0, "Chalk_95T": 10.0, "CPE_135A": 8.0, "PBNK_3355": 4.0,
+    "PMPlus_8": 0.5, "DL_531": 0.3, "PF711": 3.0, "PF711LB": 1.0,
+    "DL_60": 0.5, "AKLUB_K_435": 0.3, "OPE": 0.3, "SA_1860": SA_PHR,
+    "TiO2_BLR895": 3.0, "SBM_55": 0.2, "UV_CSFCP": 0.2,
 }
 
 
@@ -104,12 +116,15 @@ class TestRecipeSpec:
     def test_structure_and_intervals(self):
         spec = _spec()
         assert spec.component_names == COMPONENTS
-        assert spec.q == 17
+        assert spec.q == 19
         iv = spec.phr_intervals()
         # share-группа смолы восстанавливает исходные phr-диапазоны точно
         assert iv["PVC_67"] == pytest.approx((30.0, 100.0))
         assert iv["PVC_71"] == pytest.approx((0.0, 70.0))
-        # absolute+cap: [0.05, min(0.30, 0.03·14=0.42)] = [0.05, 0.30]
+        # fixed-узлы сетапа — вырожденные интервалы
+        assert iv["ESO"] == pytest.approx((ESO_PHR, ESO_PHR))
+        assert iv["SA_1860"] == pytest.approx((SA_PHR, SA_PHR))
+        # absolute+cap(фаза): [0.05, min(0.30, 0.03·16.5=0.495)] = [0.05, 0.30]
         assert iv["UV_CSFCP"] == pytest.approx((0.05, 0.30))
 
     def test_candidates_sum1_bounds_and_resin_100(self):
@@ -130,14 +145,16 @@ class TestRecipeSpec:
 
     def test_uv_trapezoid_by_construction(self):
         """Ось, обвалившая wf-бокс (iter34: acceptance 0/200000), в PhrSpec
-        держится конструкцией — теперь ТРАПЕЦИЕЙ: UV ≤ 0.03·DINP (сверху,
-        растворимость) при свободном низе UV ≥ 0.05 phr; инвариант
-        переживает нормировку p → x (доли пропорциональны phr)."""
+        держится конструкцией — теперь ТРАПЕЦИЕЙ по ФАЗЕ:
+        UV ≤ 0.03·(DINP+ESO) (сверху, растворимость) при свободном низе
+        UV ≥ 0.05 phr; инвариант переживает нормировку p → x
+        (доли пропорциональны phr)."""
         spec = _spec()
         X = spec.sample_candidates(2048, seed=2)
         uv = spec.component_names.index("UV_CSFCP")
         dinp = spec.component_names.index("DINP")
-        ratio = X[:, uv] / X[:, dinp]
+        eso = spec.component_names.index("ESO")
+        ratio = X[:, uv] / (X[:, dinp] + X[:, eso])
         assert np.all(ratio <= UV_CAP + 1e-9)          # потолок конструкцией
         P = spec.decode(spec.sample_z(2048, seed=2))
         p_uv = P[:, uv]
@@ -152,7 +169,12 @@ class TestUvTrapezoidGeometry:
     """Клин ratio_to имел три следствия: (1) нельзя поставить низкий УФ при
     высоком ДИНФ; (2) corr(p_UV, p_DINP) ≈ 0.9 по построению — эффект УФ
     загрязнялся самой сильной осью; (3) вшит монотонный prior «больше
-    пластификатора → больше абсорбера». Трапеция снимает все три."""
+    пластификатора → больше абсорбера». Трапеция снимает все три.
+
+    Референс потолка — ПЛАСТИФИКАТОРНАЯ ФАЗА (DINP + ESO), не один DINP:
+    излом трапеции сдвигается с D=10 на D=7.5 (DINP+ESO=10), наклонный
+    участок сжимается с 60% до 35% диапазона, и corr(p_UV, p_DINP)
+    аналитически падает до ≈0.18 БЕЗ искажения маргинали DINP."""
 
     def _phr(self, n=4096, seed=20260805):
         spec = _spec()
@@ -160,23 +182,26 @@ class TestUvTrapezoidGeometry:
         col = {nm: j for j, nm in enumerate(spec.component_names)}
         return P, col
 
-    def test_golden_cap_dinp4_012(self):
-        """DINP=4 → hi_eff = min(0.30, 0.03·4) = 0.12: рецепт UV=0.12
-        принимается, UV=0.13 отвергается по потолку."""
+    def test_golden_cap_dinp4_0195(self):
+        """DINP=4 → hi_eff = min(0.30, 0.03·(4+2.5)) = 0.195: рецепт
+        UV=0.195 принимается, UV=0.20 отвергается по потолку. Референс-фаза
+        открывает угол «мало пластификатора + средний УФ», который при
+        cap_to=DINP был отрезан ошибочно (0.12 → 0.195)."""
         spec = _spec()
         p = _anchor_vec(spec).copy()
         col = {nm: j for j, nm in enumerate(spec.component_names)}
         p[col["DINP"]] = 4.0
-        p[col["UV_CSFCP"]] = 0.12
+        p[col["UV_CSFCP"]] = 0.195
         spec.encode(p)                                 # ровно на потолке — ок
-        p[col["UV_CSFCP"]] = 0.13
+        p[col["UV_CSFCP"]] = 0.20
         with pytest.raises(ValueError, match="UV_CSFCP.*потолок"):
             spec.encode(p)
 
-    @pytest.mark.parametrize("dinp", [10.0, 14.0])
+    @pytest.mark.parametrize("dinp", [7.5, 10.0, 14.0])
     def test_golden_cap_plateau_030(self, dinp):
-        """DINP=10 и 14 → hi_eff = 0.30 (полка собственного hi): UV=0.30
-        принимается, UV=0.31 отвергается уже СОБСТВЕННОЙ границей."""
+        """DINP=7.5 (излом: DINP+ESO=10), 10 и 14 → hi_eff = 0.30 (полка
+        собственного hi): UV=0.30 принимается, UV=0.31 отвергается уже
+        СОБСТВЕННОЙ границей."""
         spec = _spec()
         p = _anchor_vec(spec).copy()
         col = {nm: j for j, nm in enumerate(spec.component_names)}
@@ -202,18 +227,19 @@ class TestUvTrapezoidGeometry:
 
     def test_uv_dinp_correlation_dropped(self):
         """Следствие 2 клина снято: corr(p_UV, p_DINP) упала с ≈0.9 (клин,
-        по построению) до геометрического пола трапеции.
+        по построению) до ≈0.18 у трапеции по фазе.
 
-        ЧЕСТНАЯ ОГОВОРКА к порогу «< 0.4» внешней сессии: при равномерной
-        маргинали DINP (канон кампании — доминирующая ось) и условно-
-        равномерном UV в [0.05, min(0.30, 0.03·D)] corr = 0.4235
-        аналитически (замер 05.08.2026: 0.422 при n=4096) — это свойство
-        ФОРМЫ трапеции, а не сэмплера. Опустить ниже 0.4 можно только
-        исказив маргиналь DINP (сэмплинг UV-первым даёт ≈0.38) — осознанно
-        НЕ делаем. Порог 0.45 = геометрический пол + запас на шум."""
+        История порога: при cap_to=DINP (неверный референс) геометрический
+        пол формы был 0.4235 аналитически — опустить его ниже можно было
+        только исказив маргиналь DINP. Правка референса на ФАЗУ (DINP+ESO,
+        излом 7.5, наклонный участок 35% диапазона) даёт аналитически
+        Cov=0.0353, σ_UV=0.0692 ⇒ ρ≈0.18 БЕЗ искажения маргинали —
+        спор о пороге снят исправлением физики, а не компромиссом.
+        Порог 0.25 = аналитический уровень + запас на шум; тест снова
+        осмысленный сторож, а не документация геометрии."""
         P, c = self._phr()
         r = np.corrcoef(P[:, c["UV_CSFCP"]], P[:, c["DINP"]])[0, 1]
-        assert abs(r) < 0.45, f"corr(p_UV, p_DINP) = {r:.3f}"
+        assert abs(r) < 0.25, f"corr(p_UV, p_DINP) = {r:.3f}"
 
     def test_uv_free_at_low_tio2(self):
         """Гипотеза кампании «мало титана + средний УФ» требует свободы по
@@ -311,7 +337,7 @@ class TestAnchors:
     def test_anchor_above_solubility_cap_rejected(self):
         spec = _spec()
         bad = _anchor_vec(spec)
-        bad[spec.component_names.index("DINP")] = 4.0        # потолок = 0.12
+        bad[spec.component_names.index("DINP")] = 4.0        # потолок = 0.195
         assert bad[spec.component_names.index("UV_CSFCP")] == 0.2
         with pytest.raises(ValueError, match="UV_CSFCP.*потолок"):
             spec.encode(bad)
@@ -358,6 +384,31 @@ class TestSpecHash:
         d = [dict(x) for x in RECIPE_DICTS]
         next(x for x in d if x["name"] == "UV_CSFCP")["cap_ratio"] = 0.04
         assert PhrSpec.from_dicts(d).spec_hash() != _spec().spec_hash()
+
+    def test_cap_phase_composition_changes_hash(self):
+        """Состав cap-фазы — часть геометрии: cap_to=DINP (без ЭСО) —
+        другая спека. Иначе смена fixed-ЭСО не меняла бы отпечаток
+        (замечание внешней сессии: смещение потолка обязано входить в хеш)."""
+        d = [dict(x) for x in RECIPE_DICTS]
+        next(x for x in d if x["name"] == "UV_CSFCP")["cap_to"] = "DINP"
+        assert PhrSpec.from_dicts(d).spec_hash() != _spec().spec_hash()
+
+    def test_fixed_eso_value_changes_hash(self):
+        """ЭСО входит в cap-фазу ⇒ его fixed-значение — часть геометрии
+        потолка и обязано менять отпечаток."""
+        d = [dict(x) for x in RECIPE_DICTS]
+        next(x for x in d if x["name"] == "ESO")["value"] = 3.0
+        assert PhrSpec.from_dicts(d).spec_hash() != _spec().spec_hash()
+
+    def test_single_cap_ref_canonical_form(self):
+        """Канонизация: cap_to=["DINP"] и cap_to="DINP" — одна геометрия,
+        один отпечаток (список из одного имени сериализуется строкой)."""
+        d1 = [dict(x) for x in RECIPE_DICTS]
+        next(x for x in d1 if x["name"] == "UV_CSFCP")["cap_to"] = "DINP"
+        d2 = [dict(x) for x in RECIPE_DICTS]
+        next(x for x in d2 if x["name"] == "UV_CSFCP")["cap_to"] = ["DINP"]
+        assert (PhrSpec.from_dicts(d1).spec_hash()
+                == PhrSpec.from_dicts(d2).spec_hash())
 
 
 # ----------------------------------------------------------------------
@@ -416,11 +467,12 @@ class TestCampaignPath:
             X = runner._phase_candidates(256, seed=7)
         assert not [x for x in w if issubclass(x.category, UserWarning)], \
             [str(x.message) for x in w]
-        assert X.shape == (256, 17)
+        assert X.shape == (256, 19)
         np.testing.assert_allclose(X.sum(axis=1), 1.0, atol=1e-9)
         uv = spec.component_names.index("UV_CSFCP")
         dinp = spec.component_names.index("DINP")
-        ratio = X[:, uv] / X[:, dinp]
+        eso = spec.component_names.index("ESO")
+        ratio = X[:, uv] / (X[:, dinp] + X[:, eso])
         assert np.all(ratio <= UV_CAP + 1e-9)          # трапеция: потолок
 
     def test_preflight_reference_in_phr_space(self):

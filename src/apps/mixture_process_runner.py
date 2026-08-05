@@ -1704,14 +1704,24 @@ class MixtureProcessRunner:
     # M8-argmax по суррогату над составной областью текущей фазы (§15.1.4)
     # ------------------------------------------------------------------
     def optimize_xbest(self, branch_id: str, *, n_candidates: int = 2000,
-                       refine_iters: int = 200, n_starts: int = 5
+                       refine_iters: int = 200, n_starts: int = 5,
+                       chance_constraints=None
                        ) -> DesirabilityResult:
         """M8-argmax: мультистарт-максимум desirability ветки по ОБЩИМ суррогатам
         над составной областью ТЕКУЩЕЙ фазы (mixture-region × process-куб
         [0,1]^d). Возвращает :class:`DesirabilityResult` с рецептом ``x`` длиной
         ``q+d`` (current). Свобода фазы целиком в схеме: запертые mixture
         компоненты сидят в своих ``[v,v]``-bounds региона, отсутствующие process
-        просто вне области (достроятся baseline'ом при измерении)."""
+        просто вне области (достроятся baseline'ом при измерении).
+
+        chance_constraints (iter39, блокер 2 DECODE_LAYER_PROPOSAL):
+        ``property -> optimize.desirability.ChanceConstraint`` — вероятностные
+        ограничения ``Pr(y∈[lo,hi]) ≥ 1−α`` (постановка для ΔE по
+        колор-группам). σ-канал строится автоматически из ОБЩИХ суррогатов:
+        ``surrogate.predict(X).std`` — ПОЛНАЯ предиктивная σ (у MoE включает
+        межэкспертное рассогласование — неопределённость гейта). Свойство
+        ограничения может не входить в goal ветки — mean-предиктор
+        достраивается из того же суррогата."""
         if branch_id not in self.branches:
             raise KeyError(f"Нет ветки '{branch_id}'.")
         if not self.surrogates:
@@ -1723,6 +1733,20 @@ class MixtureProcessRunner:
         kw: Dict[str, Any] = dict(
             n_candidates=int(n_candidates), refine_iters=int(refine_iters),
             n_starts=int(n_starts), seed=self.seed + 5000 + br.spent)
+        # iter39: σ до оптимизатора — chance-constraints поверх desirability
+        if chance_constraints:
+            for name in chance_constraints:
+                if name not in self.surrogates:
+                    raise KeyError(
+                        f"Нет суррогата для chance-constraint '{name}' "
+                        f"(есть: {sorted(self.surrogates)}).")
+                if name not in predictors:
+                    predictors[name] = (
+                        lambda X, gp=self.surrogates[name]: gp.predict(X).mean)
+            kw["chance_constraints"] = dict(chance_constraints)
+            kw["sigma_predictors"] = {
+                name: (lambda X, gp=self.surrogates[name]: gp.predict(X).std)
+                for name in chance_constraints}
         # iter38 (B1): активная phr-спека → argmax уважает phr-геометрию
         # (cap-потолки/трапеции, share, ratio) по построению — и в глобальном
         # пуле, и в refine. Та же политика совпадения состава, что в

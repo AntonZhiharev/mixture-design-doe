@@ -16,6 +16,29 @@ Derringer–Suich desirability (REBUILD_SPEC M8, §3):
 Cost is handled as just another property with a "min" spec (grab: cost is a
 real objective, not a hack) — see `optimize_desirability(cost_fn=..., cost_spec=...)`.
 
+Iter39 (блокер 2 DECODE_LAYER_PROPOSAL, «до сетапа»): σ-канал до оптимизатора.
+
+  * :class:`ChanceConstraint` — вероятностное ограничение
+    ``Pr(y_min ≤ y ≤ y_max) ≥ 1−α`` (постановка для ΔE по колористическим
+    группам: недодоз УФ = рекламации в поле, потери асимметричны).
+    d-фактор = ``clip(p / (1−α), 0, 1)`` — гладкий по μ и σ (градиент даёт
+    Φ), плоского нуля нет: направление возврата в допустимую область
+    сохраняется всюду, в отличие от жёсткого veto по среднему.
+  * ``sigma_predictors`` — параллельный канал ``name -> callable(X)->σ(X)``.
+    ⚠️ Для MoE подавать ПОЛНУЮ предиктивную σ (``MoEPrediction.std``):
+    она уже включает и внутриэкспертную дисперсию Σ π_k σ_k², и
+    межэкспертное рассогласование Σ π_k (μ_k − μ̄)² — неопределённость
+    гейта. Только «внутри» переоценивает Pr на границах зон экспертов —
+    ровно там, где идёт оптимизация.
+  * :func:`hard_threshold_spec` — порог на ПРЕДСКАЗАННОЕ СРЕДНЕЕ
+    (Adhesion/Opacity) с ramp ШИРИНОЙ ШУМА ИЗМЕРЕНИЯ отклика: veto
+    практически жёсткое, но наклон сохранён — оптимизатор может выйти из
+    недопустимой области (узкий/нулевой ramp даёт плоский нуль без
+    направления возврата).
+  * binding-отчёт (`DesirabilityResult.binding_report`) — какое ограничение
+    бинднулось и на скольких точках глобального пула: «оптимум не найден»
+    отличим от «оптимум запрещён».
+
 Optimisation is performed OVER THE CONSTRAINED SIMPLEX (grab #10: no free-R^q
 gradient).  We score a feasible candidate set, then locally refine the best
 point with feasibility-preserving random perturbations.
@@ -28,6 +51,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
+
+from scipy.special import ndtr
 
 from ..core.simplex import SimplexRegion
 
@@ -107,6 +132,113 @@ def desirability_value(y, spec: DesirabilitySpec) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------
+# iter39 (блокер 2 DECODE_LAYER_PROPOSAL): σ-канал до оптимизатора
+# ----------------------------------------------------------------------
+_SIGMA_FLOOR = 1e-12          # σ→0 ⇒ prob вырождается в индикатор среднего
+
+
+@dataclass
+class ChanceConstraint:
+    """Вероятностное ограничение ``Pr(y_min ≤ y ≤ y_max) ≥ 1−α``.
+
+    Постановка для ΔE по колористическим группам (блокер 2): потери
+    асимметричны (недодоз УФ = рекламации в поле), поэтому ограничение —
+    на ХВОСТ предиктивного распределения, а не на среднее (veto по
+    среднему для ΔE недостаточно — см. шапку модуля).
+
+    d-фактор = ``clip(p / (1−α), 0, 1)`` — МНОЖИТЕЛЬ к d_overall:
+
+      * ``p ≥ 1−α``  → фактор 1 (ограничение выполнено — не влияет);
+      * ``p < 1−α``  → фактор ``p/(1−α)`` ∈ (0,1) — гладкий по μ и σ
+        (градиент даёт Φ); плоского нуля нет: направление возврата в
+        допустимую область сохраняется всюду.
+
+    ⚠️ σ должна быть ПОЛНОЙ предиктивной. Для MoE это
+    ``MoEPrediction.std``: Var[y] = Σ π_k σ_k² (внутри экспертов)
+    + Σ π_k (μ_k − μ̄)² (межэкспертное рассогласование — неопределённость
+    гейта). Только «внутри» переоценивает p на границах зон
+    ответственности экспертов — ровно там, где идёт оптимизация.
+
+    ``y_min=-inf`` / ``y_max=+inf`` — односторонние варианты
+    (для ΔE: ``ChanceConstraint(y_max=dE_max, alpha=…)``).
+    """
+
+    y_min: float = -np.inf
+    y_max: float = np.inf
+    alpha: float = 0.05
+
+    def __post_init__(self) -> None:
+        if not (0.0 < self.alpha < 1.0):
+            raise ValueError("alpha must be in (0, 1).")
+        if not (self.y_min < self.y_max):
+            raise ValueError("Require y_min < y_max.")
+        if not (np.isfinite(self.y_min) or np.isfinite(self.y_max)):
+            raise ValueError("At least one of y_min / y_max must be finite.")
+
+    def prob(self, mu, sigma) -> np.ndarray:
+        """``Pr(y_min ≤ y ≤ y_max)`` при ``y ~ N(μ, σ²)`` (поэлементно).
+
+        σ прижимается к ``_SIGMA_FLOOR`` снизу: при σ→0 вероятность
+        вырождается в индикатор «среднее внутри интервала».
+        """
+        mu = np.atleast_1d(np.asarray(mu, dtype=float))
+        sigma = np.maximum(np.atleast_1d(np.asarray(sigma, dtype=float)),
+                           _SIGMA_FLOOR)
+        upper = (ndtr((self.y_max - mu) / sigma)
+                 if np.isfinite(self.y_max) else np.ones_like(mu))
+        lower = (ndtr((self.y_min - mu) / sigma)
+                 if np.isfinite(self.y_min) else np.zeros_like(mu))
+        return np.clip(upper - lower, 0.0, 1.0)
+
+    def dfactor(self, mu, sigma) -> np.ndarray:
+        """Множитель к d_overall: ``clip(prob / (1−α), 0, 1)``."""
+        return np.clip(self.prob(mu, sigma) / (1.0 - self.alpha), 0.0, 1.0)
+
+
+def hard_threshold_spec(threshold: float, noise_sd: float,
+                        direction: str = "ge", *,
+                        width_in_sd: float = 1.0,
+                        s: float = 1.0,
+                        weight: float = 1.0) -> DesirabilitySpec:
+    """Порог на ПРЕДСКАЗАННОЕ СРЕДНЕЕ с ramp шириной ~ шума измерения.
+
+    Для пороговых откликов (Adhesion ≥ T, Opacity ≥ T): d = 1 в допустимой
+    области (ограничение «молчит» в геометрическом среднем), d = 0 глубже
+    ``width_in_sd·noise_sd`` за порогом (veto), между ними — НАКЛОН.
+
+    Почему ramp не «узкий», а шириной порядка шума измерения отклика:
+    узкий/нулевой ramp даёт плоский нуль на всей недопустимой области —
+    у оптимизатора нет направления возврата (refine встаёт, глобальный
+    пул может вернуть вырожденный выбор среди d=0). Ramp ~ шуму сохраняет
+    градиент к допустимой области, оставляя veto практически жёстким:
+    различить «чуть ниже порога» и «на пороге» точнее шума всё равно
+    нельзя.
+
+    Это ограничение НА СРЕДНЕЕ, не вероятностное: для Adhesion/Opacity
+    достаточно, для ΔE — нет (там :class:`ChanceConstraint`).
+
+    Parameters
+    ----------
+    threshold   : порог допустимости.
+    noise_sd    : СКО шума измерения отклика (>0).
+    direction   : "ge" — допустимо ``y ≥ threshold``; "le" — ``y ≤ threshold``.
+    width_in_sd : ширина ramp в единицах noise_sd (дефолт 1).
+    s, weight   : параметры формы/веса :class:`DesirabilitySpec`.
+    """
+    ramp = float(width_in_sd) * float(noise_sd)
+    if ramp <= 0.0:
+        raise ValueError("Require noise_sd > 0 and width_in_sd > 0 "
+                         "(нулевой ramp = плоский нуль без градиента).")
+    if direction in ("ge", ">="):
+        return DesirabilitySpec("max", low=threshold - ramp, high=threshold,
+                                s=s, weight=weight)
+    if direction in ("le", "<="):
+        return DesirabilitySpec("min", low=threshold, high=threshold + ramp,
+                                s=s, weight=weight)
+    raise ValueError(f"Unknown direction '{direction}' (use 'ge' | 'le').")
+
+
+# ----------------------------------------------------------------------
 # Weighted geometric-mean aggregation
 # ----------------------------------------------------------------------
 def overall_desirability(d_individual: Mapping[str, np.ndarray],
@@ -176,6 +308,9 @@ class DesirabilityResult:
     refined: bool = False               # whether local refinement improved x
     n_starts: int = 1                   # number of multi-start refinements run
     history: list = field(default_factory=list)
+    # iter39: {"n_pool", "specs": {name: …}, "chance": {name: …}} — какое
+    # ограничение бинднулось и на скольких точках глобального пула
+    binding_report: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         props = ", ".join(f"{k}={v:.4g}" for k, v in self.properties.items())
@@ -203,7 +338,9 @@ def optimize_desirability(region: SimplexRegion,
                           process_lower: Optional[Sequence[float]] = None,
                           process_upper: Optional[Sequence[float]] = None,
                           process_fixed: Optional[Mapping[int, float]] = None,
-                          phr_spec=None
+                          phr_spec=None,
+                          chance_constraints: Optional[Mapping[str, ChanceConstraint]] = None,
+                          sigma_predictors: Optional[Mapping[str, Predictor]] = None
                           ) -> DesirabilityResult:
     """Maximise the overall desirability over the constrained mixture simplex,
     optionally PRODUCT-ed with a process box (mixture×process, §15.1.4).
@@ -235,9 +372,22 @@ def optimize_desirability(region: SimplexRegion,
                   где лежит оптимум, rejection обваливается — урок iter34).
                   Требование: ``phr_spec.component_names`` соответствует
                   mixture-столбцам региона (``phr_spec.q == region.q``).
+    chance_constraints : iter39 (блокер 2) — ``name -> ChanceConstraint``:
+                  вероятностные ограничения ``Pr(y∈[y_min,y_max]) ≥ 1−α``.
+                  Каждый d-фактор ``clip(p/(1−α),0,1)`` УМНОЖАЕТСЯ на
+                  d_overall (и в глобальном пуле, и в refine). Для каждого
+                  имени требуется mean-предиктор в ``predictors`` И
+                  σ-предиктор в ``sigma_predictors``. ``None`` — прежнее
+                  поведение бит-в-бит (RNG-поток не тронут).
+    sigma_predictors : ``name -> callable(X)->σ(X)`` — предиктивная σ для
+                  chance-constraints. Для MoE подавать ПОЛНУЮ σ
+                  (``lambda X: moe.predict(X).std`` — включает
+                  неопределённость гейта, см. :class:`ChanceConstraint`).
 
     Returns a :class:`DesirabilityResult`; при наличии process-бокса ``x`` —
     составной рецепт ``[x..., z_code...]`` (длиной ``q+d``).
+    ``binding_report`` — статистика veto/биндинга по глобальному пулу
+    и значения ограничений в x*.
     """
     # ---- assemble the full set of named objectives -------------------
     specs = dict(specs)
@@ -249,6 +399,35 @@ def optimize_desirability(region: SimplexRegion,
     missing = required - set(predictors)
     if missing:
         raise KeyError(f"Specs without a predictor: {sorted(missing)}")
+
+    # ---- iter39: σ-канал (chance-constraints поверх desirability) -----
+    cc: Dict[str, ChanceConstraint] = dict(chance_constraints or {})
+    sig_preds: Dict[str, Predictor] = dict(sigma_predictors or {})
+    if cc:
+        no_mean = set(cc) - set(predictors)
+        if no_mean:
+            raise KeyError(
+                f"Chance-constraints без mean-предиктора: {sorted(no_mean)}")
+        no_sigma = set(cc) - set(sig_preds)
+        if no_sigma:
+            raise KeyError(
+                f"Chance-constraints без sigma-предиктора: {sorted(no_sigma)}")
+
+    def chance_probs(X: np.ndarray,
+                     props: Mapping[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """``Pr(y∈[y_min,y_max])`` по каждому ограничению (σ считается тут)."""
+        X = np.atleast_2d(X)
+        return {n: cc[n].prob(props[n],
+                              np.asarray(sig_preds[n](X), float).ravel())
+                for n in cc}
+
+    def chance_factor(probs: Mapping[str, np.ndarray]) -> np.ndarray:
+        """``Π clip(p/(1−α), 0, 1)`` — множитель к d_overall."""
+        f: Optional[np.ndarray] = None
+        for n, p in probs.items():
+            fn = np.clip(p / (1.0 - cc[n].alpha), 0.0, 1.0)
+            f = fn if f is None else f * fn
+        return f
 
     def evaluate_props(X: np.ndarray) -> Dict[str, np.ndarray]:
         props = {n: np.asarray(f(X), float).ravel() for n, f in predictors.items()}
@@ -316,6 +495,9 @@ def optimize_desirability(region: SimplexRegion,
 
     desir = Desirability(specs)
     d_all = desir.overall(props)
+    probs_pool = chance_probs(candidates, props) if cc else {}
+    if cc:
+        d_all = d_all * chance_factor(probs_pool)
     n_eval = len(candidates)
 
     # MULTI-START: refine from the top `n_starts` distinct global candidates
@@ -374,6 +556,9 @@ def optimize_desirability(region: SimplexRegion,
                 x_try = x_mix_try
             p_try = evaluate_props(x_try.reshape(1, -1))
             d_try = float(desir.overall(p_try)[0])
+            if cc:
+                d_try *= float(chance_factor(
+                    chance_probs(x_try.reshape(1, -1), p_try))[0])
             n_eval += 1
             if d_try > d_cur:
                 d_cur, x_cur = d_try, x_try.copy()
@@ -395,10 +580,36 @@ def optimize_desirability(region: SimplexRegion,
     d_ind = {n: float(v[0]) for n, v in desir.individual(props_best).items()}
     props_scalar = {n: float(v[0]) for n, v in props_best.items()}
 
+    # binding-отчёт (iter39): «оптимум не найден» отличим от «оптимум
+    # запрещён». Статистика — по ГЛОБАЛЬНОМУ пулу (refine-пробы не входят),
+    # значения ограничений — в возвращаемом x*.
+    d_ind_pool = desir.individual(props)
+    report: Dict[str, dict] = {
+        "n_pool": int(len(candidates)),
+        "specs": {n: {"n_veto": int(np.sum(v <= 0.0)),
+                      "frac_veto": float(np.mean(v <= 0.0)),
+                      "d_at_optimum": d_ind[n]}
+                  for n, v in d_ind_pool.items()},
+        "chance": {},
+    }
+    if cc:
+        probs_best = chance_probs(x_best.reshape(1, -1), props_best)
+        for n, con in cc.items():
+            thr = 1.0 - con.alpha
+            p_star = float(probs_best[n][0])
+            report["chance"][n] = {
+                "alpha": float(con.alpha),
+                "n_below": int(np.sum(probs_pool[n] < thr)),
+                "frac_below": float(np.mean(probs_pool[n] < thr)),
+                "prob_at_optimum": p_star,
+                "satisfied_at_optimum": bool(p_star >= thr - 1e-12),
+            }
+
     return DesirabilityResult(
         x=x_best, d_overall=d_best, d_individual=d_ind,
         properties=props_scalar, n_evaluated=n_eval,
         refined=refined, n_starts=len(start_indices), history=history,
+        binding_report=report,
     )
 
 

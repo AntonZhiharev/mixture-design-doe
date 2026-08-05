@@ -224,7 +224,25 @@ nominal.**
 резе: сильно отрицательная корреляция — количественный сигнал разделять
 функции по слоям (решение внешней сессии 05.08.2026).
 
-## 7. Связанные документы и тесты
+## 7. Постановка откликов кампании (iter39, блокер 2 закрыт)
+
+Desirability-свёртка — НЕ для всех откликов; постановка зафиксирована
+до сетапа (`src/optimize/desirability.py`,
+`tests/unit/test_iteration39_sigma_channel.py`):
+
+| Отклик | Постановка | Инструмент |
+|---|---|---|
+| **Желатинизация** | двусторонний ТАРГЕТ **60–70 %** (НЕ larger-is-better: пере-желатинизация разрушает сеть CPE, белесость растёт) | `DesirabilitySpec("target", low=60, high=70+δ, target=65)` — калибровать low/high/target по факту при сетапе |
+| **Adhesion** | жёсткий порог на предсказанное СРЕДНЕЕ, ramp = шум измерения отклика (не «узкий»: нулевой ramp — плоский нуль без направления возврата) | `hard_threshold_spec(threshold, noise_sd, "ge")` |
+| **Opacity** | то же; при TiO2 < 1 phr ожидаем биндинг — смотреть `binding_report` | `hard_threshold_spec(...)` + `DesirabilityResult.binding_report` |
+| **ΔE (УФ)** | вероятностное: `Pr(ΔE ≤ ΔE_max) ≥ 1−α` ОТДЕЛЬНО по колористическим группам (потери асимметричны: недодоз = рекламации в поле) | `ChanceConstraint(y_max=ΔE_max, alpha=α)` через `optimize_xbest(chance_constraints=…)` — σ берётся из общих суррогатов автоматически |
+
+`binding_report` каждой оптимизации — обязателен к просмотру: он
+отличает «оптимум не найден» от «оптимум запрещён» (сколько точек пула
+под veto/ниже 1−α и активность ограничений в x*). Ответ на вопрос
+«забиндилась ли Opacity при TiO2 < 1» придёт именно отсюда.
+
+## 8. Связанные документы и тесты
 
 * `docs/DECODE_LAYER_PROPOSAL.md` — decode-слой (iter32/33, этап B).
 * `tests/unit/test_iteration34_findings_recheck.py` — свойства меры
@@ -237,3 +255,6 @@ nominal.**
 * `tests/unit/test_iteration37_campaign_gaps.py` — закрытие скрин-аудита:
   maximin-аугментация от existing, метаданные кампании в `origin_tag`,
   `quantize_recipe`, pair-coverage гейт, Sobol для process-осей.
+* `tests/unit/test_iteration39_sigma_channel.py` — σ-канал до оптимизатора
+  (блокер 2): `ChanceConstraint`, `hard_threshold_spec`, `binding_report`,
+  полная предиктивная σ MoE (гейт), свойства проекции `clip_z`.

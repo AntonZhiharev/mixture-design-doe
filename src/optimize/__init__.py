@@ -2,6 +2,8 @@
 from .desirability import (
     DesirabilitySpec,
     DesirabilityResult,
+    ChanceConstraint,
+    hard_threshold_spec,
     desirability_value,
     overall_desirability,
     Desirability,
@@ -11,6 +13,8 @@ from .desirability import (
 __all__ = [
     "DesirabilitySpec",
     "DesirabilityResult",
+    "ChanceConstraint",
+    "hard_threshold_spec",
     "desirability_value",
     "overall_desirability",
     "Desirability",

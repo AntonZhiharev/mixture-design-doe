@@ -20,9 +20,10 @@ A0.6: всё, что меняет состояние (смена роли, spawn
 """
 from __future__ import annotations
 
+import json
 import math
 import zlib
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,7 @@ from ..apps import campaign_state as cs
 
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 from ..design.blocking import blocking_diagnostics
+from ..design.phr_sampler import PhrSpec
 
 
 
@@ -890,6 +892,142 @@ def sampling_groups_to_text(groups) -> str:
     return "\n".join(", ".join(g) for g in (groups or []))
 
 
+# ----------------------------------------------------------------------
+# iter41 (UI_REVISION_SPEC §41) — чистые хелперы phr-спеки и паспорта
+# кампании (без Streamlit, тестируются напрямую)
+# ----------------------------------------------------------------------
+_MODE_PHR = "phr-спека (JSON)"
+
+
+def parse_phr_spec_json(text: str) -> PhrSpec:
+    """iter41.1: разобрать phr-спеку из JSON-текста формы/файла.
+
+    Формат — список узлов :meth:`PhrSpec.from_dicts` (тот же, что
+    :meth:`PhrSpec.to_dicts` → входит в ``spec_hash``). Ошибки формата
+    JSON заворачиваются в человекочитаемый ``ValueError``; ошибки
+    КОНСТРУКТОРА спеки (циклы, ссылки, пустые пересечения) — наружу как
+    есть: они уже человекочитаемы и указывают на узел (A0.6).
+    """
+    s = str(text or "").strip()
+    if not s:
+        raise ValueError("Пустой ввод: вставьте JSON-список узлов phr-спеки "
+                         "(формат PhrSpec.from_dicts).")
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Некорректный JSON (строка {exc.lineno}, позиция {exc.colno}): "
+            f"{exc.msg}.") from exc
+    if not isinstance(data, list):
+        raise ValueError("Ожидался JSON-СПИСОК узлов ([{...}, ...]), получен "
+                         f"{type(data).__name__}.")
+    if not all(isinstance(d, dict) for d in data):
+        raise ValueError("Каждый узел спеки должен быть JSON-объектом "
+                         "{\"name\": ..., \"mode\": ...}.")
+    return PhrSpec.from_dicts(data)
+
+
+def phr_spec_summary_dataframe(spec: PhrSpec) -> pd.DataFrame:
+    """iter41.1: сводка узлов спеки — узел / режим / lo / hi / ref /
+    cap_to / cap_ratio / «компонент смеси?» (лист DAG).
+
+    Для ``fixed``-узлов lo=hi=value (честный вырожденный интервал).
+    Чистая (без Streamlit) — тестируется напрямую."""
+    leaves = set(spec.component_names)
+    rows: List[Dict[str, Any]] = []
+    for nd in spec.nodes:
+        if nd.mode == "fixed":
+            lo, hi = float(nd.value), float(nd.value)
+        else:
+            lo, hi = float(nd.lo), float(nd.hi)
+        rows.append({
+            "узел": nd.name, "режим": nd.mode, "lo": lo, "hi": hi,
+            "ref": nd.ref or "",
+            "cap_to": ", ".join(nd.cap_refs),
+            "cap_ratio": float(nd.cap_ratio) if nd.cap_refs else np.nan,
+            "компонент смеси": nd.name in leaves,
+        })
+    return pd.DataFrame(rows)
+
+
+def phr_spec_fraction_dataframe(spec: PhrSpec) -> pd.DataFrame:
+    """iter41.1: интервалы phr компонентов (:meth:`PhrSpec.phr_intervals`)
+    и рассчитанные ДОЛИ для mixture-блока (:meth:`PhrSpec.fraction_bounds`)
+    — аналог таблицы режима «Массовые части». Индекс = компоненты смеси."""
+    iv = spec.phr_intervals()
+    lo, hi = spec.fraction_bounds()
+    return pd.DataFrame(
+        {"phr lo": [iv[nm][0] for nm in spec.component_names],
+         "phr hi": [iv[nm][1] for nm in spec.component_names],
+         "доля L": np.round(lo, 6), "доля U": np.round(hi, 6)},
+        index=list(spec.component_names))
+
+
+def parse_preflight_pairs(text: str) -> List[Tuple[List[str], List[str]]]:
+    """iter41.2: разобрать обязательные 2D-пары из текста формы.
+
+    Формат: одна СТРОКА = одна пара, стороны через ``|``, ось-сумма —
+    имена через запятую (``T | PMPlus_8, DL_531``). Пустые строки
+    игнорируются. Ошибки формата — явный ``ValueError`` с номером строки;
+    валидацию ИМЁН против схемы делает :meth:`set_preflight_pairs` (A0.6).
+    Чистая (без Streamlit) — round-trip c :func:`preflight_pairs_to_text`.
+    """
+    pairs: List[Tuple[List[str], List[str]]] = []
+    for ln, line in enumerate(str(text or "").splitlines(), start=1):
+        if not line.strip():
+            continue
+        sides = line.split("|")
+        if len(sides) != 2:
+            raise ValueError(
+                f"Строка {ln}: ожидается «осьA | осьB» (ровно один "
+                f"разделитель «|»): {line.strip()!r}.")
+        a, b = _parse_names(sides[0]), _parse_names(sides[1])
+        if not a or not b:
+            raise ValueError(
+                f"Строка {ln}: пустая сторона пары: {line.strip()!r}.")
+        pairs.append((a, b))
+    return pairs
+
+
+def preflight_pairs_to_text(pairs) -> str:
+    """iter41.2: пары → текст формы (обратное к :func:`parse_preflight_pairs`)."""
+    return "\n".join(f"{', '.join(a)} | {', '.join(b)}"
+                     for a, b in (pairs or []))
+
+
+def setup_mixture_names(field_names: Sequence[str],
+                        spec: Optional[PhrSpec]) -> List[str]:
+    """iter41.1: имена компонентов при сборке проекта.
+
+    При АКТИВНОЙ phr-спеке имена берутся из ``spec.component_names``
+    (поле «Компоненты смеси» игнорируется) — иначе рассинхрон имён, и
+    раннер молча (warning) откатится на бокс-сэмплер. Без спеки — имена
+    из поля формы. Чистая (без Streamlit) — тестируется напрямую."""
+    if spec is not None:
+        return list(spec.component_names)
+    return [str(s) for s in field_names]
+
+
+def campaign_passport_dataframe(runner) -> pd.DataFrame:
+    """iter41.3: паспорт кампании — phr-спека (q, dim_z, hash-префикс
+    12 симв.), метка, обязательные 2D-пары. «—» = политика не задана
+    (видимость по A0.6, ничего не скрываем). Чистая (без Streamlit)."""
+    spec = getattr(runner, "phr_spec", None)
+    if spec is not None:
+        spec_val = (f"q={spec.q}, dim_z={spec.dim_z}, "
+                    f"hash {spec.spec_hash()[:12]}…")
+    else:
+        spec_val = "—"
+    label = str(getattr(runner, "campaign_label", "") or "")
+    pairs = getattr(runner, "preflight_pairs", []) or []
+    pairs_val = preflight_pairs_to_text(pairs).replace("\n", " ; ")
+    return pd.DataFrame([
+        {"параметр": "phr-спека (decode-слой)", "значение": spec_val},
+        {"параметр": "метка кампании", "значение": label or "—"},
+        {"параметр": "обязательные 2D-пары", "значение": pairs_val or "—"},
+    ])
+
+
 def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
     """§17.4 (замечание 1): ограничения состава — «Доли (0…1)» ИЛИ «Массовые части
     (база = 100)». Возвращает ``(lower, upper)`` в ДОЛЯХ или ``(None, None)``.
@@ -909,12 +1047,62 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
     st.markdown("**📐 Ограничения состава (опц.)**")
     with st.container():
         mode = st.radio(
-            "Способ ввода", ["Доли (0…1)", "Массовые части (база = 100)"],
+            "Способ ввода",
+            ["Доли (0…1)", "Массовые части (база = 100)", _MODE_PHR],
             key=f"{key_prefix}_comp_mode",
             help="«Массовые части»: базовый компонент = 100 частей, остальные "
                  "задаются диапазоном частей, а доли (и плавающий диапазон доли "
                  "базы) считаются автоматически. «Доли»: границы доли каждого "
-                 "компонента 0…1.")
+                 "компонента 0…1. «phr-спека (JSON)»: DAG-спека parts/phr "
+                 "(decode-слой iter33) — имена компонентов и границы долей "
+                 "возьмутся из спеки.")
+        spec_key = f"{key_prefix}_phr_spec_obj"
+        if mode == _MODE_PHR:
+            # iter41.1: третий режим — phr-спека (JSON). Uploader опционален и
+            # имеет приоритет над textarea (открытый вопрос 1: оба канала).
+            st.caption(
+                "JSON-список узлов в формате PhrSpec.from_dicts "
+                "(absolute / share_of / ratio_to / fixed) — тот же формат, что "
+                "to_dicts (входит в spec_hash). Поле «Компоненты смеси» выше "
+                "ИГНОРИРУЕТСЯ: имена берутся из спеки (листья DAG).")
+            up = st.file_uploader("JSON-файл спеки (опц.)", type=["json"],
+                                  key=f"{key_prefix}_phr_file")
+            txt = st.text_area("phr-спека (JSON)", value="", height=220,
+                               key=f"{key_prefix}_phr_json")
+            if up is not None:
+                st.caption("Используется загруженный файл "
+                           "(текстовое поле игнорируется).")
+                try:
+                    src = up.getvalue().decode("utf-8")
+                except UnicodeDecodeError:
+                    st.error("Файл спеки не в UTF-8 — сохраните JSON в UTF-8.")
+                    st.session_state[spec_key] = None
+                    return None, None
+            else:
+                src = txt
+            try:
+                spec = parse_phr_spec_json(src)
+            except ValueError as exc:
+                st.error(str(exc))
+                st.session_state[spec_key] = None
+                return None, None
+            st.session_state[spec_key] = spec
+            st.caption(f"Компоненты смеси из спеки ({spec.q}): "
+                       f"{', '.join(spec.component_names)} · z-осей: "
+                       f"{spec.dim_z}.")
+            st.dataframe(phr_spec_summary_dataframe(spec),
+                         use_container_width=True, hide_index=True)
+            st.caption("Интервалы phr компонентов и рассчитанные ДОЛИ для "
+                       "mixture-блока схемы (fraction_bounds):")
+            st.dataframe(phr_spec_fraction_dataframe(spec),
+                         use_container_width=True)
+            st.code(spec.spec_hash(), language=None)
+            st.caption("spec_hash активной спеки: зафиксируйте хеш и лоты "
+                       "сырья ДО первого замера (CAMPAIGN_SPEC_PVC §3) — "
+                       "задним числом не восстанавливается.")
+            lo_arr, hi_arr = spec.fraction_bounds()
+            return lo_arr.tolist(), hi_arr.tolist()
+        st.session_state[spec_key] = None
         if mode.startswith("Доли"):
             st.caption("Доли каждого компонента (0…1). Сумма нижних ≤ 1 ≤ сумма "
                        "верхних. Оставьте 0…1, если ограничений нет.")
@@ -1043,6 +1231,19 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
     out["setup_block_factor"] = str(getattr(runner, "block_factor", "") or "")
     for b, nm in (getattr(runner, "block_names", {}) or {}).items():
         out[f"setup_block_name_{int(b)}"] = str(nm)
+    # iter41.3: паспорт кампании (метка + обязательные 2D-пары) — политика
+    # записывается ДО первого замера и обязана отражаться после загрузки.
+    out["setup_campaign_label"] = str(
+        getattr(runner, "campaign_label", "") or "")
+    out["setup_preflight_pairs"] = preflight_pairs_to_text(
+        getattr(runner, "preflight_pairs", []) or [])
+    # iter41.3: активная phr-спека → режим «phr-спека (JSON)» с каноническим
+    # JSON to_dicts (round-trip: parse_phr_spec_json(json).spec_hash() == hash).
+    spec = getattr(runner, "phr_spec", None)
+    if spec is not None:
+        out["setup_comp_mode"] = _MODE_PHR
+        out["setup_phr_json"] = json.dumps(spec.to_dicts(),
+                                           ensure_ascii=False, indent=2)
     return out
 
 
@@ -1089,6 +1290,15 @@ def render_project_settings(runner) -> None:
                        + " · ".join("{" + ", ".join(g) + "}" for g in groups))
         st.dataframe(project_settings_dataframe(runner),
                      use_container_width=True, hide_index=True)
+        # iter41.3: паспорт кампании — phr-спека / метка / пары (read-only).
+        st.caption("🪪 Паспорт кампании (CAMPAIGN_SPEC_PVC §3):")
+        st.dataframe(campaign_passport_dataframe(runner),
+                     use_container_width=True, hide_index=True)
+        spec = getattr(runner, "phr_spec", None)
+        if spec is not None:
+            st.code(spec.spec_hash(), language=None)
+            st.caption("spec_hash активной phr-спеки (полный hex) — сверяйте "
+                       "с зафиксированным в документации кампании.")
 
 
 def render_setup_form() -> None:
@@ -1130,19 +1340,33 @@ def render_setup_form() -> None:
         # pipeline). Части → доли каноничной parts_ranges_to_fraction_bounds.
         mix_live = _parse_names(mix_txt)
         mlo, mhi = render_composition_bounds(mix_live, key_prefix="setup")
+        # iter41.1: активная phr-спека (разобрана формой выше) и признак режима.
+        phr_mode = str(st.session_state.get("setup_comp_mode", "")) == _MODE_PHR
+        phr_spec_live: Optional[PhrSpec] = (
+            st.session_state.get("setup_phr_spec_obj") if phr_mode else None)
 
         # iter31: функциональные группы — априорное химическое знание «эти
         # компоненты — одна ниша». Включает стратифицированное сэмплирование по
         # СУММЕ группы: без него равномерная выборка не достаёт края диапазона
         # суммарной дозы ниши (Beta-концентрация), план не покрывает главную ось.
-        groups_txt = st.text_area(
-            "Функциональные группы компонентов (опц.)", value="",
-            key="setup_groups",
-            help="Одна строка = одна группа: имена компонентов через запятую "
-                 "(например, конкурирующие пластификаторы одной ниши). "
-                 "Стартовый дизайн будет равномерно покрывать СУММАРНУЮ дозу "
-                 "каждой группы, а не только середину диапазона. Группы не "
-                 "должны пересекаться. Пусто — без группировки.")
+        # iter41.1: при активной phr-спеке группы к сэмплингу НЕ применяются
+        # (_phase_candidates идёт phr-путём) — поле скрыто с подписью.
+        if phr_mode:
+            groups_txt = ""
+            st.caption("Функциональные группы (iter31) в режиме phr-спеки не "
+                       "применяются: сэмплинг кандидатов идёт decode-путём "
+                       "спеки (iter33), стратификация групп — только для "
+                       "box-режимов.")
+        else:
+            groups_txt = st.text_area(
+                "Функциональные группы компонентов (опц.)", value="",
+                key="setup_groups",
+                help="Одна строка = одна группа: имена компонентов через "
+                     "запятую (например, конкурирующие пластификаторы одной "
+                     "ниши). Стартовый дизайн будет равномерно покрывать "
+                     "СУММАРНУЮ дозу каждой группы, а не только середину "
+                     "диапазона. Группы не должны пересекаться. Пусто — без "
+                     "группировки.")
 
         proc_txt = st.text_input("Процесс-параметры (через запятую)",
                                  value="T, P", key="setup_proc")
@@ -1152,6 +1376,24 @@ def render_setup_form() -> None:
         # делает сам.
         proc_live = _parse_names(proc_txt)
         plo, phi = render_process_bounds(proc_live, key_prefix="setup")
+
+        # iter41.2: паспорт кампании — записать ДО первого замера
+        # (CAMPAIGN_SPEC_PVC §3: задним числом не восстанавливается).
+        st.markdown("**🪪 Паспорт кампании (опц., CAMPAIGN_SPEC_PVC §3)**")
+        st.caption("Заполните ДО первого замера: метаданные точек задним "
+                   "числом не восстанавливаются.")
+        label_txt = st.text_input(
+            "Метка кампании", value="", key="setup_campaign_label",
+            help="Пишется в origin_tag каждой новой точки (вместе со "
+                 "spec_hash активной phr-спеки и номером партии) — без неё "
+                 "блочный дрейф при staged-расширении не отделить.")
+        pairs_txt = st.text_area(
+            "Обязательные 2D-пары", value="", key="setup_preflight_pairs",
+            help="Гейт pair-coverage в preflight. Одна строка = пара, стороны "
+                 "через «|», ось-сумма — имена через запятую. Например:\n"
+                 "UV_CSFCP | TiO2_BLR895\n"
+                 "T | PMPlus_8, DL_531")
+
         seed_v = st.number_input(
 
             "Seed раннера (зерно ГСЧ проекта)", value=1, step=1, key="setup_seed",
@@ -1171,23 +1413,46 @@ def render_setup_form() -> None:
                     raise ValueError("Добавьте хотя бы один процесс-параметр "
                                      "и задайте его границы (§17.4).")
                 # mlo/mhi уже посчитаны формой render_composition_bounds выше
-                # (доли; None — полный симплекс).
+                # (доли; None — полный симплекс; в режиме phr-спеки —
+                # fraction_bounds спеки).
+                if phr_mode and phr_spec_live is None:
+                    raise ValueError(
+                        "Режим «phr-спека (JSON)»: спека не разобрана — "
+                        "исправьте JSON (ошибка показана в форме выше).")
+                # iter41.1: имена компонентов — из спеки (поле игнорируется),
+                # иначе рассинхрон имён и молчаливый откат на бокс-сэмплер.
+                mix = setup_mixture_names(mix, phr_spec_live)
 
                 runner = build_setup_runner(
                     mixture_names=mix, process_names=proc,
                     process_lower=plo, process_upper=phi,
                     response_names=resp, mixture_lower=mlo, mixture_upper=mhi,
                     seed=int(seed_v))
-                # iter31: проектные функциональные группы (валидация — движком)
-                runner.set_mixture_sampling_groups(
-                    parse_sampling_groups(groups_txt))
+                if phr_spec_live is not None:
+                    # iter41.1: decode-слой активен — кандидаты пойдут
+                    # phr-путём; группы iter31 в этом режиме не применяются.
+                    runner.set_phr_spec(phr_spec_live)
+                else:
+                    # iter31: проектные функциональные группы (валидация —
+                    # движком)
+                    runner.set_mixture_sampling_groups(
+                        parse_sampling_groups(groups_txt))
+                # iter41.2: паспорт кампании — ДО первого замера (валидация
+                # имён пар — штатным set_preflight_pairs, A0.6).
+                if str(label_txt).strip():
+                    runner.set_campaign_label(str(label_txt).strip())
+                runner.set_preflight_pairs(parse_preflight_pairs(pairs_txt))
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
                 for k in ("setup_seed_X", "setup_seed_Y",
                           "setup_seed_df", "setup_seed_df_sig"):
                     st.session_state.pop(k, None)
                 st.success(
-                    f"Проект собран: смесь {mix} × процесс {proc}, отклики {resp}. "
-                    "База пуста — предложите и измерьте стартовый дизайн ниже.")
+                    f"Проект собран: смесь {mix} × процесс {proc}, отклики {resp}."
+                    + (f" phr-спека активна (hash "
+                       f"{phr_spec_live.spec_hash()[:12]}…)."
+                       if phr_spec_live is not None else "")
+                    + " База пуста — предложите и измерьте стартовый дизайн "
+                      "ниже.")
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
 

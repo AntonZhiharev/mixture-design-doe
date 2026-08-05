@@ -360,6 +360,92 @@ class PhrSpec:
         return Z
 
     # ------------------------------------------------------------------
+    # Границы и проекция z (iter38, B1: refine оптимизатора в z)
+    # ------------------------------------------------------------------
+    def z_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """СТАТИЧЕСКИЕ границы z-осей ``(lo, hi)`` в порядке ``z_names``.
+
+        У cap-узлов ``hi`` — статический потолок узла; динамический
+        (``cap_ratio · Σ value(cap_refs)``) учитывается :meth:`clip_z`
+        пер-точечно. Ширины ``hi − lo`` — естественный масштаб возмущений
+        по осям z (у осей разные единицы: phr / доли / коэффициенты).
+        """
+        lo = np.array([self._by_name[nm].lo for nm in self.z_names])
+        hi = np.array([self._by_name[nm].hi for nm in self.z_names])
+        return lo, hi
+
+    def clip_z(self, z: Sequence[float] | np.ndarray) -> np.ndarray:
+        """Проекция произвольного z в допустимую область спеки —
+        допустимость ПО ПОСТРОЕНИЮ, без rejection (iter38, B1).
+
+        Бокс в z НЕ статический, поэтому обход топологический:
+
+          * absolute — clip в ``[lo, hi]``; с cap — в УСЛОВНЫЙ интервал
+            ``[lo, max(lo, min(hi, cap_ratio · Σ value(cap_refs)))]``
+            (референсы к этому моменту уже спроецированы);
+          * ratio_to — clip коэффициента в ``[lo, hi]``;
+          * share-группа — clip долей в ``[lo, hi]`` + детерминированное
+            перераспределение невязки Σ=1 пропорционально запасу до границы
+            (дефицит — по headroom ``hi − s``, избыток — по slack
+            ``s − lo``); выполнимость гарантирована статической валидацией
+            (Σlo ≤ 1 ≤ Σhi).
+
+        Идемпотентна на валидных z (``clip_z(sample_z(...)) == sample_z``).
+        Используется refine-циклом оптимизатора: возмущение в z → clip_z →
+        decode — каждая проба допустима, в отличие от rejection, который
+        у границы (где и лежит оптимум) обваливается (урок iter34).
+        """
+        z = np.asarray(z, dtype=float)
+        single = z.ndim == 1
+        Z = np.atleast_2d(z).astype(float).copy()
+        if Z.shape[1] != self.dim_z:
+            raise ValueError(
+                f"clip_z: ожидалось {self.dim_z} z-координат "
+                f"({self.z_names}), получено {Z.shape[1]}.")
+        vals: Dict[str, np.ndarray] = {}
+        done_groups: set = set()
+        for nm in self._topo:
+            nd = self._by_name[nm]
+            if nd.mode == MODE_FIXED:
+                vals[nm] = np.full(len(Z), nd.value)
+            elif nd.mode == MODE_ABSOLUTE:
+                j = self._z_col[nm]
+                if nd.cap_refs:
+                    base = np.sum([vals[cr] for cr in nd.cap_refs], axis=0)
+                    hi_eff = np.maximum(
+                        np.minimum(nd.hi, nd.cap_ratio * base), nd.lo)
+                else:
+                    hi_eff = nd.hi
+                Z[:, j] = np.clip(Z[:, j], nd.lo, hi_eff)
+                vals[nm] = Z[:, j]
+            elif nd.mode == MODE_RATIO_TO:
+                j = self._z_col[nm]
+                Z[:, j] = np.clip(Z[:, j], nd.lo, nd.hi)
+                vals[nm] = Z[:, j] * vals[nd.ref]
+            else:                              # share_of: группа целиком
+                if nd.ref in done_groups:
+                    continue
+                members = self._share_groups[nd.ref]
+                cols = [self._z_col[m] for m in members]
+                lo = np.array([self._by_name[m].lo for m in members])
+                hi = np.array([self._by_name[m].hi for m in members])
+                S = np.clip(Z[:, cols], lo, hi)
+                resid = 1.0 - S.sum(axis=1)
+                idx = np.where(resid > _TOL)[0]
+                if idx.size:                   # дефицит → добрать по headroom
+                    head = hi[None, :] - S[idx]
+                    S[idx] += head * (resid[idx] / head.sum(axis=1))[:, None]
+                idx = np.where(resid < -_TOL)[0]
+                if idx.size:                   # избыток → снять по slack
+                    slack = S[idx] - lo[None, :]
+                    S[idx] += slack * (resid[idx] / slack.sum(axis=1))[:, None]
+                Z[:, cols] = S
+                for m in members:
+                    vals[m] = Z[:, self._z_col[m]] * vals[nd.ref]
+                done_groups.add(nd.ref)
+        return Z[0] if single else Z
+
+    # ------------------------------------------------------------------
     # decode / encode
     # ------------------------------------------------------------------
     def decode(self, z: Sequence[float] | np.ndarray) -> np.ndarray:

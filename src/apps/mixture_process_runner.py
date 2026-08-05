@@ -1723,6 +1723,20 @@ class MixtureProcessRunner:
         kw: Dict[str, Any] = dict(
             n_candidates=int(n_candidates), refine_iters=int(refine_iters),
             n_starts=int(n_starts), seed=self.seed + 5000 + br.spent)
+        # iter38 (B1): активная phr-спека → argmax уважает phr-геометрию
+        # (cap-потолки/трапеции, share, ratio) по построению — и в глобальном
+        # пуле, и в refine. Та же политика совпадения состава, что в
+        # _phase_candidates: несовпадение — warning + прежний путь.
+        if self.phr_spec is not None:
+            names = list(self.current_schema.mixture_names)
+            if list(self.phr_spec.component_names) == names:
+                kw["phr_spec"] = self.phr_spec
+            else:
+                warnings.warn(
+                    "phr_spec не совпадает с mixture-компонентами текущей "
+                    f"фазы ({list(self.phr_spec.component_names)} != {names})"
+                    " — optimize_xbest использует стандартный путь (бокс).",
+                    UserWarning, stacklevel=2)
         if self.d > 0:
             kw.update(process_lower=[0.0] * self.d,
                       process_upper=[1.0] * self.d)

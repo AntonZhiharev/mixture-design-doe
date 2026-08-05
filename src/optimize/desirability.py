@@ -202,7 +202,8 @@ def optimize_desirability(region: SimplexRegion,
                           seed: Optional[int] = None,
                           process_lower: Optional[Sequence[float]] = None,
                           process_upper: Optional[Sequence[float]] = None,
-                          process_fixed: Optional[Mapping[int, float]] = None
+                          process_fixed: Optional[Mapping[int, float]] = None,
+                          phr_spec=None
                           ) -> DesirabilityResult:
     """Maximise the overall desirability over the constrained mixture simplex,
     optionally PRODUCT-ed with a process box (mixture×process, §15.1.4).
@@ -225,6 +226,15 @@ def optimize_desirability(region: SimplexRegion,
                   поток ГСЧ ИДЕНТИЧНЫ прежним (обратная совместимость, §15.1.4).
     process_fixed : ``{idx: value}`` для ЗАКРЫТЫХ фазой process-координат (маска
                   свободы): эти координаты держатся на ``value`` и не варьируются.
+    phr_spec    : опциональная phr/DAG-спека (``design.phr_sampler.PhrSpec``,
+                  duck-typed; iter38, B1). ``None`` (дефолт) — прежний путь
+                  бит-в-бит. Задана ⇒ оптимизация уважает phr-геометрию
+                  (cap-потолки/трапеции, share-группы, ratio_to) ПО ПОСТРОЕНИЮ:
+                  глобальный пул — ``sample_z → decode → to_fractions``, refine —
+                  возмущение в z + ``clip_z`` + decode (НЕ rejection: у границы,
+                  где лежит оптимум, rejection обваливается — урок iter34).
+                  Требование: ``phr_spec.component_names`` соответствует
+                  mixture-столбцам региона (``phr_spec.q == region.q``).
 
     Returns a :class:`DesirabilityResult`; при наличии process-бокса ``x`` —
     составной рецепт ``[x..., z_code...]`` (длиной ``q+d``).
@@ -269,12 +279,27 @@ def optimize_desirability(region: SimplexRegion,
         return np.hstack([Xmix, Z])
 
     # ---- global stage: score a feasible candidate set ----------------
+    if phr_spec is not None and int(phr_spec.q) != int(q):
+        raise ValueError(
+            f"optimize_desirability: phr_spec даёт {phr_spec.q} компонентов, "
+            f"а mixture-регион — {q}.")
     rng = np.random.default_rng(seed)
-    cand = region.random_points(n_candidates, seed=seed)
-    verts = region.extreme_vertices()
-    cent = region.centroid().reshape(1, -1)
-    mix_candidates = (np.vstack([cand, verts, cent]) if len(verts)
-                      else np.vstack([cand, cent]))
+    if phr_spec is None:
+        cand = region.random_points(n_candidates, seed=seed)
+        verts = region.extreme_vertices()
+        cent = region.centroid().reshape(1, -1)
+        mix_candidates = (np.vstack([cand, verts, cent]) if len(verts)
+                          else np.vstack([cand, cent]))
+        Zmix = None
+        z_width = None
+    else:
+        # phr-путь (iter38, B1): кандидаты допустимы по построению; вершины/
+        # центроид БОКСА не добавляются — это артефакты бокса, в углах
+        # которого phr-геометрия и нарушается.
+        Zmix = phr_spec.sample_z(n_candidates, seed=seed)
+        mix_candidates = phr_spec.to_fractions(phr_spec.decode(Zmix))
+        z_lo, z_hi = phr_spec.z_bounds()
+        z_width = z_hi - z_lo          # масштаб осей z (единицы разные)
     rng_proc = (np.random.default_rng((0 if seed is None else seed) + 12345)
                 if d else None)
     candidates = _augment(mix_candidates, rng_proc)
@@ -307,31 +332,43 @@ def optimize_desirability(region: SimplexRegion,
                 "n_starts": len(start_indices)}]
 
     # ---- local stage: feasibility-preserving random refinement -------
-    # Рабочий вектор: [mixture pseudocomponents (q), СВОБОДНЫЕ process-коды].
-    # При d==0 размер шага == q ⇒ поток ГСЧ совпадает с прежним (golden цел).
-    step_dim = q + len(free_proc)
+    # Рабочий вектор (дефолт): [mixture pseudocomponents (q), СВОБОДНЫЕ
+    # process-коды]. При d==0 размер шага == q ⇒ поток ГСЧ совпадает с
+    # прежним (golden цел). phr-путь: mixture-часть возмущается в z
+    # (dim_z осей) с clip_z + decode — допустимость по построению.
+    mix_dim = q if phr_spec is None else int(phr_spec.dim_z)
+    step_dim = mix_dim + len(free_proc)
     for s_no, gi in enumerate(start_indices):
         x_cur = candidates[gi].copy()
         d_cur = float(d_all[gi])
-        w_cur = region.to_pseudo(x_cur[:q])      # work in pseudocomponents
+        if phr_spec is None:
+            w_cur = region.to_pseudo(x_cur[:q])  # work in pseudocomponents
+        else:
+            zmix_cur = Zmix[gi].copy()           # work in z (phr-геометрия)
         z_cur = x_cur[q:].copy() if d else np.empty(0)
         improved = False
         for it in range(int(refine_iters)):
             step = rng.normal(0.0, refine_scale, size=step_dim)
-            w_try = np.clip(w_cur + step[:q], 0.0, None)
-            s = w_try.sum()
-            if s <= 0:
-                continue
-            w_try = w_try / s
-            x_mix_try = region.from_pseudo(w_try)
-            if not region.is_feasible(x_mix_try):
-                x_mix_try = region.clip(x_mix_try)
-                if not region.is_feasible(x_mix_try):
+            if phr_spec is None:
+                w_try = np.clip(w_cur + step[:q], 0.0, None)
+                s = w_try.sum()
+                if s <= 0:
                     continue
+                w_try = w_try / s
+                x_mix_try = region.from_pseudo(w_try)
+                if not region.is_feasible(x_mix_try):
+                    x_mix_try = region.clip(x_mix_try)
+                    if not region.is_feasible(x_mix_try):
+                        continue
+            else:
+                # step ~ N(0, refine_scale) в НОРМИРОВАННЫХ осях → в единицы z
+                zmix_try = phr_spec.clip_z(zmix_cur + step[:mix_dim] * z_width)
+                x_mix_try = phr_spec.to_fractions(phr_spec.decode(zmix_try))
             if d:
                 z_try = z_cur.copy()
                 for k, j in enumerate(free_proc):
-                    z_try[j] = float(np.clip(z_cur[j] + step[q + k], plo[j], phi[j]))
+                    z_try[j] = float(np.clip(z_cur[j] + step[mix_dim + k],
+                                             plo[j], phi[j]))
                 x_try = np.concatenate([x_mix_try, z_try])
             else:
                 x_try = x_mix_try
@@ -340,7 +377,10 @@ def optimize_desirability(region: SimplexRegion,
             n_eval += 1
             if d_try > d_cur:
                 d_cur, x_cur = d_try, x_try.copy()
-                w_cur = region.to_pseudo(x_cur[:q])
+                if phr_spec is None:
+                    w_cur = region.to_pseudo(x_cur[:q])
+                else:
+                    zmix_cur = zmix_try.copy()
                 z_cur = x_cur[q:].copy() if d else np.empty(0)
                 improved = True
         history.append({"stage": "start", "start": s_no, "from_global": gi,

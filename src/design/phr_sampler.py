@@ -21,7 +21,13 @@ z-сэмплер-плагин parts/phr-спеки.
   * ``share_of``  — доля родительского узла ``of`` в ``[lo, hi] ⊆ [0,1]``;
     доли одной группы связаны Σ=1 (раскладка без rejection —
     :func:`core.simplex._narrowing_split`, канон iter31: uniform-MARGINAL
-    по физически значимым осям);
+    по физически значимым осям); опционально ``min_phr``/``max_phr`` —
+    ТЕХНОЛОГИЧЕСКИЕ лимиты в phr (складской лимит, техминимум), которые
+    НЕ являются боксом по доле: они превращаются в CONDITIONAL NARROWING
+    после розыгрыша тотала группы ``T`` (iter45/B1):
+    ``φ ∈ [max(φᴸ, min_phr/T), min(φᵁ, max_phr/T)]`` — эффективный
+    диапазон доли зависит от точки и НЕМОНОТОНЕН по ``T``
+    (см. :meth:`PhrSpec.share_bounds_at_total`);
   * ``ratio_to``  — коэффициент к ПРОИЗВОЛЬНОМУ узлу ``to`` (не обязательно
     родителю — поэтому DAG, а не дерево): ``p = r · value(to)``,
     ``r ∈ [lo, hi]`` (пример: «SBM = 0.02…0.09 × Σ стабилизатора»);
@@ -67,7 +73,10 @@ class PhrNode:
     """Узел phr-спеки. ``ref`` — имя референса (``of`` у share_of, ``to``
     у ratio_to); у absolute/fixed референса нет. ``cap_refs``/``cap_ratio``
     (только absolute) — динамический потолок по СУММЕ референсов (фазе):
-    ``hi_eff = min(hi, cap_ratio · Σ value(cap_refs))``."""
+    ``hi_eff = min(hi, cap_ratio · Σ value(cap_refs))``.
+    ``min_phr``/``max_phr`` (только share_of, iter45/B1) — технологические
+    лимиты узла В PHR: conditional narrowing доли после розыгрыша тотала,
+    а НЕ бокс по доле (``None`` — лимита нет)."""
     name: str
     mode: str
     lo: float = 0.0
@@ -76,6 +85,8 @@ class PhrNode:
     ref: str = ""
     cap_refs: Tuple[str, ...] = ()
     cap_ratio: float = 0.0
+    min_phr: Optional[float] = None
+    max_phr: Optional[float] = None
 
 
 class PhrSpec:
@@ -128,6 +139,9 @@ class PhrSpec:
                                        in enumerate(self.z_names)}
         # статическая интервальная валидация (ДО любого сэмплинга)
         self._interval: Dict[str, Tuple[float, float]] = {}
+        # окно тотала группы, суженное phr-лимитами её членов (iter45/B1):
+        # родитель share-группы → эффективные границы его absolute-оси
+        self._total_window: Dict[str, Tuple[float, float]] = {}
         self._validate_intervals()
 
     # ------------------------------------------------------------------
@@ -139,7 +153,8 @@ class PhrSpec:
         ``value`` (fixed), ``of`` (share_of) / ``to`` (ratio_to),
         ``cap_to``/``cap_ratio`` (динамический потолок absolute-оси;
         ``cap_to`` — имя узла или СПИСОК имён, значения референсов
-        складываются: потолок ссылается на фазу, а не на один компонент).
+        складываются: потолок ссылается на фазу, а не на один компонент),
+        ``min_phr``/``max_phr`` (технологические лимиты share_of-узла в phr).
         Доли share_of без явных границ — ``[0, 1]``."""
         nodes: List[PhrNode] = []
         for d in dicts:
@@ -152,11 +167,17 @@ class PhrSpec:
                 cap_refs: Tuple[str, ...] = (raw_cap,) if raw_cap else ()
             else:
                 cap_refs = tuple(str(x) for x in raw_cap)
+            raw_min = d.get("min_phr", None)
+            raw_max = d.get("max_phr", None)
             nodes.append(PhrNode(name=str(d.get("name", "")), mode=mode,
                                  lo=lo, hi=hi,
                                  value=float(d.get("value", 0.0)), ref=ref,
                                  cap_refs=cap_refs,
-                                 cap_ratio=float(d.get("cap_ratio", 0.0))))
+                                 cap_ratio=float(d.get("cap_ratio", 0.0)),
+                                 min_phr=(None if raw_min is None
+                                          else float(raw_min)),
+                                 max_phr=(None if raw_max is None
+                                          else float(raw_max))))
         return cls(nodes)
 
     # ------------------------------------------------------------------
@@ -204,6 +225,23 @@ class PhrSpec:
             elif nd.cap_ratio:
                 raise ValueError(
                     f"Узел '{nd.name}': cap_ratio без cap_to недопустим.")
+            if nd.min_phr is not None or nd.max_phr is not None:
+                if nd.mode != MODE_SHARE_OF:
+                    raise ValueError(
+                        f"Узел '{nd.name}' ({nd.mode}): min_phr/max_phr "
+                        f"допустимы только для share_of — у absolute/ratio_to "
+                        f"границы уже заданы в своих координатах.")
+                if nd.min_phr is not None and nd.min_phr < 0:
+                    raise ValueError(
+                        f"Узел '{nd.name}': min_phr={nd.min_phr} < 0.")
+                if (nd.min_phr is not None and nd.max_phr is not None
+                        and nd.min_phr > nd.max_phr + _TOL):
+                    raise ValueError(
+                        f"Узел '{nd.name}': min_phr={nd.min_phr} > "
+                        f"max_phr={nd.max_phr}.")
+                if nd.max_phr is not None and nd.max_phr <= _TOL:
+                    raise ValueError(
+                        f"Узел '{nd.name}': max_phr={nd.max_phr} ≤ 0.")
 
     def _toposort(self) -> List[str]:
         """Топосорт Кана по рёбрам ref→node и cap_refs→node;
@@ -285,10 +323,220 @@ class PhrSpec:
                         f"'{nd.ref}' с нижней границей {r_lo:.6g} ≤ 0 — "
                         f"референс должен быть строго положительным.")
                 iv = (nd.lo * r_lo, nd.hi * r_hi)
+                if nd.mode == MODE_SHARE_OF and (nd.min_phr is not None
+                                                 or nd.max_phr is not None):
+                    lo_p, hi_p = iv
+                    if nd.min_phr is not None:
+                        lo_p = max(lo_p, nd.min_phr)
+                    if nd.max_phr is not None:
+                        hi_p = min(hi_p, nd.max_phr)
+                    if lo_p > hi_p + _TOL:
+                        raise ValueError(
+                            f"Узел '{nd.name}': phr-лимиты "
+                            f"[{nd.min_phr}, {nd.max_phr}] не пересекаются "
+                            f"с достижимым диапазоном доли "
+                            f"[{iv[0]:.6g}, {iv[1]:.6g}] "
+                            f"(φ∈[{nd.lo:g}, {nd.hi:g}] при тотале "
+                            f"'{nd.ref}'∈[{r_lo:.6g}, {r_hi:.6g}]).")
+                    iv = (lo_p, hi_p)
             self._interval[nm] = iv
+            if nm in self._share_groups:
+                self._interval[nm] = self._narrow_total_window(nm, iv)
         if sum(self._interval[nm][1] for nm in self.component_names) <= _TOL:
             raise ValueError("Суммарный phr компонентов не может быть > 0 — "
                              "пустая рецептура.")
+
+    # ------------------------------------------------------------------
+    # phr-лимиты share-узлов (iter45/B1): окно тотала и per-point narrowing
+    # ------------------------------------------------------------------
+    def _narrow_total_window(self, parent: str,
+                             iv: Tuple[float, float]) -> Tuple[float, float]:
+        """Сузить интервал ТОТАЛА группы до значений ``T``, при которых
+        доли её членов с ``min_phr``/``max_phr`` вообще выполнимы.
+
+        Три источника ограничений на ``T`` (все — следствие того, что лимит
+        задан в phr, а координата узла — доля):
+
+        1. пер-узловая непустота ``max(φᴸ, min/T) ≤ min(φᵁ, max/T)``:
+           ``T ≥ min_i/φᵁ_i`` и ``T ≤ max_i/φᴸ_i``;
+        2. ``Σ max(φᴸ_i, min_i/T) ≤ 1`` — иначе минимумы не помещаются
+           в тотал (функция невозрастает по ``T`` ⇒ даёт нижнюю границу);
+        3. ``Σ min(φᵁ_i, max_i/T) ≥ 1`` — иначе тотал нечем набрать
+           (тоже невозрастает ⇒ даёт верхнюю границу).
+
+        Итог — интервал ``[a, b] ⊆ iv``. Пустой — ошибка КОНФИГА (спека
+        не задаёт ни одного реализуемого рецепта). Если окно у́же
+        заявленного интервала, тотал обязан быть сужаемой осью
+        (``absolute`` без cap) или ``fixed``, уже попадающим в окно; иначе
+        сужение пришлось бы делать пер-точечно вверх по DAG — это НЕ
+        реализовано и отвергается явной ошибкой, а не тихим приближением.
+
+        Диагностика идёт от частного к общему (сначала точное указание на
+        узел, потом групповое утверждение) — иначе пользователь получает
+        сообщение про «окно тотала» там, где виноват один лимит. Для
+        ``fixed``-тотала (``t_lo == t_hi``) пер-узловая проверка (0) и окно
+        (1) ЭКВИВАЛЕНТНЫ, поэтому недостижимый лимит всегда диагностируется
+        как «узел X: лимиты не пересекаются с достижимым диапазоном»
+        (отдельной fixed-ветки нет — она была бы мёртвым кодом).
+        """
+        members = self._share_groups[parent]
+        limited = [m for m in members
+                   if self._by_name[m].min_phr is not None
+                   or self._by_name[m].max_phr is not None]
+        if not limited:
+            return iv
+        t_lo, t_hi = iv
+        if t_lo <= _TOL:
+            raise ValueError(
+                f"Группа '{parent}': phr-лимиты членов требуют строго "
+                f"положительного тотала, а его нижняя граница {t_lo:.6g}.")
+        for m in limited:            # (0) достижимость лимита самим узлом
+            nd = self._by_name[m]
+            reach_lo, reach_hi = nd.lo * t_lo, nd.hi * t_hi
+            lim_lo = nd.min_phr if nd.min_phr is not None else 0.0
+            lim_hi = nd.max_phr if nd.max_phr is not None else float("inf")
+            if max(reach_lo, lim_lo) > min(reach_hi, lim_hi) + _TOL:
+                raise ValueError(
+                    f"Узел '{m}': phr-лимиты [{lim_lo:g}, {lim_hi:g}] "
+                    f"не пересекаются с достижимым диапазоном "
+                    f"[{reach_lo:.6g}, {reach_hi:.6g}] "
+                    f"(φ∈[{nd.lo:g}, {nd.hi:g}] при тотале "
+                    f"'{parent}'∈[{t_lo:.6g}, {t_hi:.6g}]).")
+        a0, b0 = 0.0, float("inf")   # (1) окно из пер-узловой непустоты
+        for m in limited:
+            nd = self._by_name[m]
+            if nd.min_phr is not None and nd.hi > _TOL:
+                a0 = max(a0, nd.min_phr / nd.hi)
+            if nd.max_phr is not None and nd.lo > _TOL:
+                b0 = min(b0, nd.max_phr / nd.lo)
+        if a0 > b0 + _TOL:
+            raise ValueError(
+                f"Группа '{parent}': phr-лимиты членов {limited} несовместимы "
+                f"между собой — тотал должен быть одновременно ≥ {a0:.6g} "
+                f"и ≤ {b0:.6g}.")
+        a, b = max(float(t_lo), a0), min(float(t_hi), b0)
+        if a > b + _TOL:
+            raise ValueError(
+                f"Группа '{parent}': окно тотала по phr-лимитам "
+                f"[{a0:.6g}, {b0:.6g}] не пересекается с интервалом тотала "
+                f"[{t_lo:.6g}, {t_hi:.6g}].")
+
+        def f_min(T: float) -> float:           # Σ нижних долей при тотале T
+            return sum(self._share_lo_at(m, T) for m in members)
+
+        def f_max(T: float) -> float:           # Σ верхних долей при тотале T
+            return sum(self._share_hi_at(m, T) for m in members)
+
+        if f_min(a) > 1.0 + _TOL:               # (2) минимумы не помещаются
+            if f_min(b) > 1.0 + _TOL:
+                raise ValueError(
+                    f"Группа '{parent}': при любом тотале из "
+                    f"[{t_lo:.6g}, {t_hi:.6g}] сумма минимальных долей "
+                    f"(с учётом min_phr) > 1 — рецепт нереализуем.")
+            a = _bisect_decreasing(f_min, a, b, 1.0)
+        if f_max(b) < 1.0 - _TOL:               # (3) тотал нечем набрать
+            if f_max(a) < 1.0 - _TOL:
+                raise ValueError(
+                    f"Группа '{parent}': при любом тотале из "
+                    f"[{t_lo:.6g}, {t_hi:.6g}] сумма максимальных долей "
+                    f"(с учётом max_phr) < 1 — рецепт нереализуем.")
+            b = _bisect_decreasing(f_max, a, b, 1.0)
+        if a > b + _TOL:
+            raise ValueError(
+                f"Группа '{parent}': окно тотала пусто после учёта phr-"
+                f"лимитов ([{a:.6g}, {b:.6g}]).")
+        if a <= t_lo + _TOL and b >= t_hi - _TOL:
+            return iv                            # ничего не сузилось
+        nd_p = self._by_name[parent]
+        if nd_p.mode != MODE_ABSOLUTE or nd_p.cap_refs:
+            raise ValueError(
+                f"Группа '{parent}': phr-лимиты членов сужают тотал до "
+                f"[{a:.6g}, {b:.6g}], но тотал задан режимом "
+                f"'{nd_p.mode}'{' с cap' if nd_p.cap_refs else ''} — "
+                f"сужение такой оси не поддерживается; задайте тотал "
+                f"absolute-узлом или ослабьте лимиты.")
+        self._total_window[parent] = (a, b)
+        return (a, b)
+
+    def _share_lo_at(self, name: str, total: float) -> float:
+        nd = self._by_name[name]
+        lo = nd.lo
+        if nd.min_phr is not None:
+            lo = max(lo, nd.min_phr / total)
+        return min(lo, self._share_hi_at_raw(nd, total))
+
+    def _share_hi_at(self, name: str, total: float) -> float:
+        return self._share_hi_at_raw(self._by_name[name], total)
+
+    @staticmethod
+    def _share_hi_at_raw(nd: PhrNode, total: float) -> float:
+        hi = nd.hi
+        if nd.max_phr is not None:
+            hi = min(hi, nd.max_phr / total)
+        return hi
+
+    def _axis_bounds(self, name: str) -> Tuple[float, float]:
+        """Эффективные границы z-оси узла: у absolute-родителя группы с
+        phr-лимитами это ОКНО ТОТАЛА, иначе заявленные ``[lo, hi]``."""
+        nd = self._by_name[name]
+        return self._total_window.get(name, (nd.lo, nd.hi))
+
+    def _share_box_at_total(self, members: Sequence[str],
+                            total: np.ndarray
+                            ) -> Tuple[np.ndarray, np.ndarray]:
+        """Пер-точечный бокс долей группы при тоталах ``total`` (n,):
+        ``lo₀ᵢ = max(φᴸ, min_phr/T)``, ``hi₀ᵢ = min(φᵁ, max_phr/T)``.
+        Возвращает две матрицы (n × k). Связь Σ=1 здесь НЕ применяется —
+        её делает :func:`_narrowing_split` (сэмплинг) / renorm (clip_z);
+        учёт партнёров по группе — :meth:`share_bounds_at_total`."""
+        T = np.asarray(total, dtype=float).ravel()
+        k = len(members)
+        LO = np.empty((T.size, k), dtype=float)
+        HI = np.empty((T.size, k), dtype=float)
+        safe_T = np.where(T > _TOL, T, _TOL)
+        for i, m in enumerate(members):
+            nd = self._by_name[m]
+            lo_i = np.full(T.size, float(nd.lo))
+            hi_i = np.full(T.size, float(nd.hi))
+            if nd.min_phr is not None:
+                lo_i = np.maximum(lo_i, nd.min_phr / safe_T)
+            if nd.max_phr is not None:
+                hi_i = np.minimum(hi_i, nd.max_phr / safe_T)
+            lo_i = np.minimum(lo_i, hi_i)       # числовая страховка
+            LO[:, i] = lo_i
+            HI[:, i] = hi_i
+        return LO, HI
+
+    def share_bounds_at_total(self, parent: str, total: float
+                              ) -> Tuple[np.ndarray, np.ndarray]:
+        """ЭФФЕКТИВНЫЕ границы долей членов группы ``parent`` при тотале
+        ``total`` — с учётом phr-лимитов узла И партнёров по группе (Σφ=1):
+
+            ``loᵢ = max(lo₀ᵢ, 1 − Σ_{j≠i} hi₀ⱼ)``,
+            ``hiᵢ = min(hi₀ᵢ, 1 − Σ_{j≠i} lo₀ⱼ)``.
+
+        ⚠️ Функция ``hi(T)`` НЕМОНОТОННА: рост тотала ослабляет собственный
+        потолок ``max_phr/T``, но одновременно ужесточает вклад партнёров
+        через их ``min_phr/T``. Пример (PVC, iter45): φᵁ=0.70, ``max_phr``
+        узла 8.0, у партнёра ``min_phr``=3.0 →
+        ``hi(T) = min(0.70, 8/T, 1 − 3/T)``: 0.40 при T=5, полка 0.70 на
+        T∈[10, 11.4286], 0.5333 при T=15. Тест «hi растёт с T» дал бы
+        ложный отказ.
+        """
+        if parent not in self._share_groups:
+            raise ValueError(
+                f"share_bounds_at_total: '{parent}' не является родителем "
+                f"share-группы (группы: {sorted(self._share_groups)}).")
+        T = float(total)
+        if T <= _TOL:
+            raise ValueError(
+                f"share_bounds_at_total: тотал должен быть > 0 (получено {T}).")
+        members = self._share_groups[parent]
+        LO, HI = self._share_box_at_total(members, np.array([T]))
+        lo0, hi0 = LO[0], HI[0]
+        lo = np.maximum(lo0, 1.0 - (hi0.sum() - hi0))
+        hi = np.minimum(hi0, 1.0 - (lo0.sum() - lo0))
+        return lo, hi
 
     # ------------------------------------------------------------------
     # Свойства
@@ -332,13 +580,14 @@ class PhrSpec:
             if nd.mode == MODE_FIXED:
                 vals[nm] = np.full(n, nd.value)
             elif nd.mode == MODE_ABSOLUTE:
+                a_lo, a_hi = self._axis_bounds(nm)
                 if nd.cap_refs:
                     base = np.sum([vals[cr] for cr in nd.cap_refs], axis=0)
-                    hi_eff = np.minimum(nd.hi, nd.cap_ratio * base)
-                    hi_eff = np.maximum(hi_eff, nd.lo)   # числовая страховка
-                    z = nd.lo + (hi_eff - nd.lo) * rng.random(n)
+                    hi_eff = np.minimum(a_hi, nd.cap_ratio * base)
+                    hi_eff = np.maximum(hi_eff, a_lo)    # числовая страховка
+                    z = a_lo + (hi_eff - a_lo) * rng.random(n)
                 else:
-                    z = rng.uniform(nd.lo, nd.hi, size=n)
+                    z = rng.uniform(a_lo, a_hi, size=n)
                 Z[:, self._z_col[nm]] = z
                 vals[nm] = z
             elif nd.mode == MODE_RATIO_TO:
@@ -350,10 +599,9 @@ class PhrSpec:
                     continue
                 members = self._share_groups[nd.ref]
                 cols = [self._z_col[m] for m in members]
-                lo = np.array([self._by_name[m].lo for m in members])
-                hi = np.array([self._by_name[m].hi for m in members])
+                LO, HI = self._share_box_at_total(members, vals[nd.ref])
                 for t in range(n):
-                    Z[t, cols] = _narrowing_split(lo, hi, 1.0, rng)
+                    Z[t, cols] = _narrowing_split(LO[t], HI[t], 1.0, rng)
                 for m in members:
                     vals[m] = Z[:, self._z_col[m]] * vals[nd.ref]
                 done_groups.add(nd.ref)
@@ -367,11 +615,16 @@ class PhrSpec:
 
         У cap-узлов ``hi`` — статический потолок узла; динамический
         (``cap_ratio · Σ value(cap_refs)``) учитывается :meth:`clip_z`
-        пер-точечно. Ширины ``hi − lo`` — естественный масштаб возмущений
+        пер-точечно. У absolute-тотала группы с phr-лимитами возвращается
+        ОКНО ТОТАЛА (iter45/B1) — вне окна доли членов нереализуемы.
+        Ширины ``hi − lo`` — естественный масштаб возмущений
         по осям z (у осей разные единицы: phr / доли / коэффициенты).
         """
-        lo = np.array([self._by_name[nm].lo for nm in self.z_names])
-        hi = np.array([self._by_name[nm].hi for nm in self.z_names])
+        bounds = [self._axis_bounds(nm) if self._by_name[nm].mode == MODE_ABSOLUTE
+                  else (self._by_name[nm].lo, self._by_name[nm].hi)
+                  for nm in self.z_names]
+        lo = np.array([b[0] for b in bounds])
+        hi = np.array([b[1] for b in bounds])
         return lo, hi
 
     def clip_z(self, z: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -425,13 +678,14 @@ class PhrSpec:
                 vals[nm] = np.full(len(Z), nd.value)
             elif nd.mode == MODE_ABSOLUTE:
                 j = self._z_col[nm]
+                a_lo, a_hi = self._axis_bounds(nm)
                 if nd.cap_refs:
                     base = np.sum([vals[cr] for cr in nd.cap_refs], axis=0)
                     hi_eff = np.maximum(
-                        np.minimum(nd.hi, nd.cap_ratio * base), nd.lo)
+                        np.minimum(a_hi, nd.cap_ratio * base), a_lo)
                 else:
-                    hi_eff = nd.hi
-                Z[:, j] = np.clip(Z[:, j], nd.lo, hi_eff)
+                    hi_eff = a_hi
+                Z[:, j] = np.clip(Z[:, j], a_lo, hi_eff)
                 vals[nm] = Z[:, j]
             elif nd.mode == MODE_RATIO_TO:
                 j = self._z_col[nm]
@@ -442,17 +696,16 @@ class PhrSpec:
                     continue
                 members = self._share_groups[nd.ref]
                 cols = [self._z_col[m] for m in members]
-                lo = np.array([self._by_name[m].lo for m in members])
-                hi = np.array([self._by_name[m].hi for m in members])
-                S = np.clip(Z[:, cols], lo, hi)
+                LO, HI = self._share_box_at_total(members, vals[nd.ref])
+                S = np.clip(Z[:, cols], LO, HI)
                 resid = 1.0 - S.sum(axis=1)
                 idx = np.where(resid > _TOL)[0]
                 if idx.size:                   # дефицит → добрать по headroom
-                    head = hi[None, :] - S[idx]
+                    head = HI[idx] - S[idx]
                     S[idx] += head * (resid[idx] / head.sum(axis=1))[:, None]
                 idx = np.where(resid < -_TOL)[0]
                 if idx.size:                   # избыток → снять по slack
-                    slack = S[idx] - lo[None, :]
+                    slack = S[idx] - LO[idx]
                     S[idx] += slack * (resid[idx] / slack.sum(axis=1))[:, None]
                 Z[:, cols] = S
                 for m in members:
@@ -524,10 +777,23 @@ class PhrSpec:
                         f"encode: референс '{nd.ref}' узла '{nm}' равен 0 — "
                         f"коэффициент не определён.")
                 zj = vals[nm] / denom
-            if np.any(zj < nd.lo - tol) or np.any(zj > nd.hi + tol):
+            b_lo, b_hi = (self._axis_bounds(nm)
+                          if nd.mode == MODE_ABSOLUTE else (nd.lo, nd.hi))
+            if np.any(zj < b_lo - tol) or np.any(zj > b_hi + tol):
                 raise ValueError(
                     f"encode: узел '{nm}' ({nd.mode}) вне границ "
-                    f"[{nd.lo}, {nd.hi}]: значения {zj}.")
+                    f"[{b_lo}, {b_hi}]: значения {zj}.")
+            if nd.mode == MODE_SHARE_OF and (nd.min_phr is not None
+                                             or nd.max_phr is not None):
+                v = vals[nm]                   # phr узла (доля × тотал)
+                if nd.min_phr is not None and np.any(v < nd.min_phr - tol):
+                    raise ValueError(
+                        f"encode: узел '{nm}' ниже технологического минимума "
+                        f"min_phr={nd.min_phr:g}: значения {v} phr.")
+                if nd.max_phr is not None and np.any(v > nd.max_phr + tol):
+                    raise ValueError(
+                        f"encode: узел '{nm}' выше лимита "
+                        f"max_phr={nd.max_phr:g}: значения {v} phr.")
             if nd.mode == MODE_ABSOLUTE and nd.cap_refs:
                 cap = nd.cap_ratio * np.sum(
                     [vals[cr] for cr in nd.cap_refs], axis=0)
@@ -581,6 +847,13 @@ class PhrSpec:
                 d["hi"] = float(nd.hi)
             if nd.mode == MODE_SHARE_OF:
                 d["of"] = nd.ref
+                # phr-лимиты — часть геометрии (сужают область), поэтому
+                # входят в отпечаток; отсутствие ключей = спека без лимитов,
+                # хеш таких спек не меняется (совместимость с iter35)
+                if nd.min_phr is not None:
+                    d["min_phr"] = float(nd.min_phr)
+                if nd.max_phr is not None:
+                    d["max_phr"] = float(nd.max_phr)
             elif nd.mode == MODE_RATIO_TO:
                 d["to"] = nd.ref
             if nd.cap_refs:                    # динамический потолок — часть
@@ -716,6 +989,14 @@ class PhrSpec:
                     violations.append(
                         f"{nm}: коэффициент {r:g} вне границ "
                         f"[{nd.lo:g}, {nd.hi:g}] с допуском {tol_r:g}.")
+                if nd.min_phr is not None and v < nd.min_phr - tol_v:
+                    violations.append(
+                        f"{nm}: факт {v:g} phr ниже технологического минимума "
+                        f"{nd.min_phr:g} с допуском {tol_v:g}.")
+                if nd.max_phr is not None and v > nd.max_phr + tol_v:
+                    violations.append(
+                        f"{nm}: факт {v:g} phr выше лимита {nd.max_phr:g} "
+                        f"с допуском {tol_v:g}.")
 
         moved = np.abs(actual - p)
         return QuantizeReport(
@@ -758,6 +1039,28 @@ class QuantizeReport:
     @property
     def ok(self) -> bool:
         return not self.violations
+
+
+# ----------------------------------------------------------------------
+# Бисекция по НЕВОЗРАСТАЮЩЕЙ функции (iter45/B1): окно тотала группы
+# ----------------------------------------------------------------------
+def _bisect_decreasing(f, lo: float, hi: float, target: float,
+                       iters: int = 200) -> float:
+    """Наименьший ``T ∈ [lo, hi]`` с ``f(T) ≤ target`` для НЕВОЗРАСТАЮЩЕЙ
+    ``f``. Предполагается ``f(hi) ≤ target`` (проверено вызывающим кодом);
+    возвращается правый конец вилки — точка, где условие уже выполнено
+    (консервативно: окно тотала не расширяется за счёт ошибки бисекции).
+    """
+    a, b = float(lo), float(hi)
+    for _ in range(int(iters)):
+        mid = 0.5 * (a + b)
+        if f(mid) <= target:
+            b = mid
+        else:
+            a = mid
+        if b - a <= 1e-12 * max(1.0, abs(b)):
+            break
+    return b
 
 
 # ----------------------------------------------------------------------

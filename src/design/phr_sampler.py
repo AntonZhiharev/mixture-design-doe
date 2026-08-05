@@ -45,7 +45,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -503,6 +504,124 @@ class PhrSpec:
                              separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    # ------------------------------------------------------------------
+    # Квантование навески (iter37, скрин-аудит п.3): nominal vs actual
+    # ------------------------------------------------------------------
+    def quantize_recipe(self, p: Sequence[float] | np.ndarray,
+                        delta_phr: float) -> "QuantizeReport":
+        """Номинальный рецепт → ФАКТИЧЕСКАЯ навеска на сетке весов + проверка
+        «после округления до разрешения весов точка всё ещё в границах».
+
+        Реальный лабораторный риск (скрин-аудит 05.08.2026, п.3): весы имеют
+        шаг ``delta_phr`` (в phr текущей загрузки), лаборант навешивает НЕ
+        номинал, а ближайшее кратное шага — и округлённая точка может выйти
+        из геометрии спеки (границы узла, cap-потолок, fixed-значение).
+
+        Алгоритм:
+
+        1. Каждый ЛИСТ снапится к ближайшему узлу δ-сетки ВНУТРИ своего
+           статического интервала phr; если ближайший узел вылетает за
+           ``[lo, hi]`` — берётся ближайший узел внутри интервала; если в
+           интервале НЕТ ни одного узла сетки (диапазон уже шага весов) —
+           violation: ось нечитаема прямой навеской (см.
+           :func:`premix_required`).
+        2. По фактическим (actual) значениям листьев пересчитываются
+           внутренние узлы (сумма детей) и проверяются ДИНАМИЧЕСКИЕ
+           ограничения спеки: fixed-значения, границы share_of/ratio_to,
+           cap-потолки. Допуск проверки каждого узла — накопленная ошибка
+           округления его листьев (δ × число листьев под узлом): честный
+           сдвиг от квантования не флагается, структурные выходы — флагаются.
+
+        Ничего не подгоняется молча (A0.6): каждый выход за геометрию —
+        строка в ``violations`` (``ok=False``), решение (премикс, пересчёт
+        рецепта, другая навеска) — за пользователем.
+        """
+        delta = float(delta_phr)
+        if delta <= 0:
+            raise ValueError("quantize_recipe: delta_phr должен быть > 0.")
+        p = np.asarray(p, dtype=float).ravel()
+        if p.size != self.q:
+            raise ValueError(
+                f"quantize_recipe: ожидалось {self.q} компонентов "
+                f"({self.component_names}), получено {p.size}.")
+        leaf_col = {nm: j for j, nm in enumerate(self.component_names)}
+        violations: List[str] = []
+
+        # --- 1: снап листьев к δ-сетке внутри статического интервала -----
+        actual = np.empty_like(p)
+        for nm, j in leaf_col.items():
+            lo, hi = self._interval[nm]
+            x = round(p[j] / delta) * delta
+            if x < lo - _TOL:
+                x = math.ceil((lo - _TOL) / delta) * delta
+            elif x > hi + _TOL:
+                x = math.floor((hi + _TOL) / delta) * delta
+            if x < lo - _TOL or x > hi + _TOL:
+                violations.append(
+                    f"{nm}: в интервале phr [{lo:g}, {hi:g}] нет узла сетки "
+                    f"δ={delta:g} — прямой навеской ось нечитаема (премикс).")
+                x = min(max(round(p[j] / delta) * delta, lo), hi)
+            actual[j] = x
+
+        # --- 2: фактические значения всех узлов (дети → родители) --------
+        vals: Dict[str, float] = {}
+        n_leaves: Dict[str, int] = {}
+        for nm in reversed(self._topo):
+            if nm in self._share_groups:
+                members = self._share_groups[nm]
+                vals[nm] = float(sum(vals[m] for m in members))
+                n_leaves[nm] = int(sum(n_leaves[m] for m in members))
+            else:
+                vals[nm] = float(actual[leaf_col[nm]])
+                n_leaves[nm] = 1
+
+        # --- 3: динамические ограничения с допуском на округление --------
+        for nm in self._topo:
+            nd = self._by_name[nm]
+            v = vals[nm]
+            tol_v = delta * n_leaves[nm] + _TOL
+            if nd.mode == MODE_FIXED:
+                if abs(v - nd.value) > tol_v:
+                    violations.append(
+                        f"{nm}: fixed={nd.value:g}, факт {v:g} — отклонение "
+                        f"больше допуска квантования {tol_v:g}.")
+            elif nd.mode == MODE_ABSOLUTE:
+                if v < nd.lo - tol_v or v > nd.hi + tol_v:
+                    violations.append(
+                        f"{nm}: факт {v:g} вне границ [{nd.lo:g}, {nd.hi:g}] "
+                        f"с допуском {tol_v:g}.")
+                if nd.cap_refs:
+                    cap_sum = float(sum(vals[cr] for cr in nd.cap_refs))
+                    tol_cap = (tol_v + nd.cap_ratio
+                               * sum(delta * n_leaves[cr] + _TOL
+                                     for cr in nd.cap_refs))
+                    if v > nd.cap_ratio * cap_sum + tol_cap:
+                        violations.append(
+                            f"{nm}: факт {v:g} превышает потолок "
+                            f"{nd.cap_ratio:g}·Σ{list(nd.cap_refs)} "
+                            f"(= {nd.cap_ratio * cap_sum:g}) с допуском "
+                            f"{tol_cap:g} — точка вне трапеции.")
+            else:                                   # share_of / ratio_to
+                ref_v = vals[nd.ref]
+                if ref_v <= _TOL:
+                    violations.append(
+                        f"{nm}: референс '{nd.ref}' после округления равен 0 "
+                        f"— коэффициент не определён.")
+                    continue
+                r = v / ref_v
+                tol_r = (tol_v + nd.hi * (delta * n_leaves[nd.ref] + _TOL)
+                         ) / ref_v
+                if r < nd.lo - tol_r or r > nd.hi + tol_r:
+                    violations.append(
+                        f"{nm}: коэффициент {r:g} вне границ "
+                        f"[{nd.lo:g}, {nd.hi:g}] с допуском {tol_r:g}.")
+
+        moved = np.abs(actual - p)
+        return QuantizeReport(
+            p_nominal=p.copy(), p_actual=actual, delta_phr=delta,
+            moved_max=float(moved.max()) if moved.size else 0.0,
+            violations=violations)
+
     def fraction_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """Консервативный fraction-бокс ``L_i ≤ x_i ≤ U_i`` по интервалам
         phr листьев (математика экстремальных тоталей
@@ -517,6 +636,27 @@ class PhrSpec:
     def __repr__(self) -> str:
         return (f"PhrSpec(q={self.q}, dim_z={self.dim_z}, "
                 f"components={self.component_names})")
+
+
+@dataclass
+class QuantizeReport:
+    """Итог квантования рецепта к разрешению весов (iter37, слой m, п.3).
+
+    ``p_nominal``/``p_actual`` — phr листьев ДО/ПОСЛЕ снапа к δ-сетке
+    (порядок = ``PhrSpec.component_names``); ``moved_max`` — максимальный
+    сдвиг листа; ``violations`` — человекочитаемые нарушения геометрии
+    после округления (пусто ⇒ ``ok``). Дозируйте ФАКТИЧЕСКИЕ значения и
+    храните их рядом с номиналом: модель должна видеть actual, а не nominal.
+    """
+    p_nominal: np.ndarray
+    p_actual: np.ndarray
+    delta_phr: float
+    moved_max: float
+    violations: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.violations
 
 
 # ----------------------------------------------------------------------

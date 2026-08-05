@@ -51,7 +51,7 @@ Runner ORACLE-AGNOSTIC: оракул — любой объект с ``property_n
 from __future__ import annotations
 
 import warnings
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -192,6 +192,16 @@ class MixtureProcessRunner:
         # спеки и декодируется в доли (Σ=1 конструкцией). None → прежний
         # путь бит-в-бит.
         self.phr_spec: Optional[PhrSpec] = None
+        # iter37 (скрин-аудит 05.08.2026, п.2): метка кампании. Пишется в
+        # origin_tag каждой точки вместе с хешом активной phr-спеки —
+        # постфактум фазу/кампанию к точке не привязать, а без индикатора
+        # блочный дрейф β припишется новому компоненту. Пусто — без метки.
+        self.campaign_label: str = ""
+        # iter37 (п.4): ОБЯЗАТЕЛЬНЫЕ 2D-пары осей кампании (политика раннера,
+        # как sampling_groups): preflight проверяет покрытие каждой пары
+        # относительно reference-пула. Элемент: (оси_A, оси_B), где ось —
+        # список имён координат (сумма списка, напр. Σ_ACR = [PMPlus_8, DL_531]).
+        self.preflight_pairs: List[Tuple[List[str], List[str]]] = []
 
 
     # ------------------------------------------------------------------
@@ -640,6 +650,14 @@ class MixtureProcessRunner:
             X[PROCESS] = [float(v) for v in coords_cur[self.q:self.q + self.d]]
         Y = {name: float(y_row[i]) for i, name in enumerate(self.property_names)}
         tag = {"origin": origin, "schema_version": self.current_schema_version}
+        # iter37 (п.2): индикатор кампании/геометрии — метаданные, которые
+        # постфактум не восстанавливаются. Фаза = schema_version (уже в теге),
+        # партия = block; сюда добавляются метка кампании и отпечаток активной
+        # phr-спеки (какая геометрия породила точку).
+        if self.campaign_label:
+            tag["campaign"] = str(self.campaign_label)
+        if self.phr_spec is not None:
+            tag["spec_hash"] = self.phr_spec.spec_hash()
         if block is not None:
             tag["block"] = int(block)       # партия/день измерения (blocking)
         return DataPoint(schema_version=self.current_schema_version,
@@ -780,17 +798,65 @@ class MixtureProcessRunner:
     # ними для синт.оракула (мерит сам). Ветки на старте ещё нет, поэтому это
     # отдельная от branch-цикла пара; origin точек = "seed".
     # ------------------------------------------------------------------
-    def propose_seed(self, n: int = 12, *, seed: Optional[int] = None
-                     ) -> np.ndarray:
+    def propose_seed(self, n: int = 12, *, seed: Optional[int] = None,
+                     reuse_existing: bool = True) -> np.ndarray:
         """§17.4: ПРЕДЛОЖИТЬ стартовый seed-дизайн БЕЗ измерения (read-only).
 
         Возвращает ``n`` составных кандидатов ТЕКУЩЕЙ схемы (mixture-region ×
         process-куб) как первую половину ручного стартового цикла: пользователь
         измеряет их сам и фиксирует через :meth:`commit_seed`. НИЧЕГО не измеряет
         и НЕ пишет в общую базу (A0.6). Детерминированно по ``seed``. Аналог
-        :meth:`propose_points`, но для стартового дизайна (ветки ещё нет)."""
+        :meth:`propose_points`, но для стартового дизайна (ветки ещё нет).
+
+        iter37 (скрин-аудит п.1): если общая база НЕ пуста (staged-кампания:
+        seed новой фазы после ``augment_phase_*``), план по умолчанию
+        ПРИСТЁГИВАЕТСЯ к существующим точкам — :meth:`propose_augment`
+        (greedy maximin от existing), а не генерируется с нуля.
+        ``reuse_existing=False`` — прежнее поведение принудительно."""
         s = self.seed if seed is None else int(seed)
+        if reuse_existing and self.points:
+            return self.propose_augment(int(n), seed=s)
         return self._phase_candidates(int(n), s)
+
+    def propose_augment(self, n: int, *, seed: Optional[int] = None,
+                        n_candidates: int = 600,
+                        groups: Optional[Sequence[Sequence[str]]] = None
+                        ) -> np.ndarray:
+        """iter37 (скрин-аудит п.1): ДОБОР ``n`` точек текущей фазы,
+        ДОПОЛНЯЮЩИЙ существующую базу (greedy maximin от existing).
+
+        Staged-стратегия «добавили компонент → набрали точек → алгоритм
+        поджал слабое» требует, чтобы план расширенной фазы пристёгивался к
+        уже измеренным точкам: existing = активные точки, мигрированные к
+        ТЕКУЩЕЙ схеме (старые точки после ``augment_phase_mixture`` лежат на
+        грани C=0), пул кандидатов — та же политика фазы
+        (:meth:`_phase_candidates`: phr_spec / sampling_groups /
+        Sobol-process). Жадный maximin: каждая следующая точка максимизирует
+        минимальную дистанцию до existing ∪ уже выбранных — новые точки
+        заполняют дыры области ОТНОСИТЕЛЬНО фазы-1, а не дублируют её.
+        Пустая база → первые ``n`` кандидатов пула (обычный план фазы).
+        Read-only (A0.6), детерминированно по ``seed``.
+        """
+        s = self.seed if seed is None else int(seed)
+        n = int(n)
+        if n <= 0:
+            return np.empty((0, self.dim), float)
+        pool = self._phase_candidates(max(int(n_candidates), 4 * n), s,
+                                      groups=groups)
+        mig = self._migrated_points()
+        if not mig:
+            return pool[:n]
+        base = np.asarray(composite_matrix(self.current_schema, mig), float)
+        # min-дистанция² каждого кандидата до существующих точек
+        d2 = np.min(((pool[:, None, :] - base[None, :, :]) ** 2).sum(-1),
+                    axis=1)
+        chosen: List[np.ndarray] = []
+        for _ in range(min(n, len(pool))):
+            j = int(np.argmax(d2))
+            chosen.append(pool[j])
+            d2 = np.minimum(d2, ((pool - pool[j]) ** 2).sum(axis=1))
+            d2[j] = -1.0                      # не выбирать повторно
+        return np.vstack(chosen)
 
     def commit_seed(self, X: Any, Y: Any) -> Dict[str, Any]:
         """§17.4: ЗАФИКСИРОВАТЬ измеренные ``Y`` стартового seed-дизайна.
@@ -930,8 +996,7 @@ class MixtureProcessRunner:
                 mix = np.atleast_2d(self.phr_spec.sample_candidates(
                     n, seed=int(rng.integers(0, 2**31 - 1))))
                 if self.d > 0:
-                    z = rng.uniform(0.0, 1.0, size=(n, self.d))
-                    return np.hstack([mix, z])
+                    return np.hstack([mix, self._process_cube(n, rng)])
                 return mix
             warnings.warn(
                 "phr_spec не совпадает с mixture-компонентами текущей фазы "
@@ -964,9 +1029,27 @@ class MixtureProcessRunner:
                     groups=idx_groups or None)
                 mix[:, free] = w * remainder
         if self.d > 0:
-            z = rng.uniform(0.0, 1.0, size=(n, self.d))
-            return np.hstack([mix, z])
+            return np.hstack([mix, self._process_cube(n, rng)])
         return mix
+
+    def _process_cube(self, n: int, rng: np.random.Generator) -> np.ndarray:
+        """iter37 (скрин-аудит п.5): точки process-куба ``[0,1]^d`` —
+        scrambled Sobol' (QMC), а не iid uniform.
+
+        iid uniform даёт заметно худшее покрытие 2D-пар process-осей, чем
+        Sobol/LHS: при d≈4 и ожидаемых взаимодействиях (T×UV и т.п.) пары
+        осей должны покрываться равномерно, а не случайными сгустками.
+        Служебное предупреждение scipy о n≠2^k подавляется осознанно:
+        балансовые свойства Соболя не требуются, важна low-discrepancy
+        равномерность. Детерминированно: seed вытягивается из общего
+        rng-потока фазы (тот же контракт, что у mixture-части).
+        """
+        from scipy.stats import qmc
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            sampler = qmc.Sobol(d=self.d, scramble=True,
+                                seed=int(rng.integers(0, 2**31 - 1)))
+            return sampler.random(int(n))
 
     # ------------------------------------------------------------------
     # iter31: функциональные группы компонентов (стратификация суммы ниши)
@@ -1037,6 +1120,46 @@ class MixtureProcessRunner:
                     f"mixture-компонентов схемы {sorted(known)}.")
         self.phr_spec = spec
 
+    def set_campaign_label(self, label: str) -> None:
+        """iter37 (п.2): задать метку кампании — пишется в ``origin_tag``
+        каждой новой точки (вместе с ``schema_version`` = фаза, ``block`` =
+        партия и ``spec_hash`` активной phr-спеки). Метаданные точки задним
+        числом не восстанавливаются; без индикатора кампании блочный дрейф β
+        при staged-расширении припишется новому компоненту. Пустая строка —
+        выключить."""
+        self.campaign_label = str(label or "")
+
+    def set_preflight_pairs(self, pairs: Optional[Sequence[Any]]) -> None:
+        """iter37 (п.4): задать ОБЯЗАТЕЛЬНЫЕ 2D-пары осей кампании.
+
+        Каждый элемент — пара ``(A, B)``, где ``A``/``B`` — имя координаты
+        (mixture или process) или СПИСОК имён (ось = сумма, напр.
+        Σ_ACR = ``["PMPlus_8", "DL_531"]``). Пары проверяются гейтом
+        pair-coverage в :meth:`preflight` (покрытие 2D-сетки пары
+        относительно reference-пула). Имена валидируются против ПОЛНОЙ
+        схемы (пару можно задать до раскрытия оси append'ом); в preflight
+        пары с осями вне ТЕКУЩЕЙ фазы просто выпадают из проверки (как
+        группы в стратификации). Пустой список / None — выключить."""
+        known = set(self._full_mix.names if self._full_mix is not None else [])
+        if self._full_proc is not None:
+            known |= set(self._full_proc.names)
+        norm: List[Tuple[List[str], List[str]]] = []
+        for pair in (pairs or []):
+            if len(pair) != 2:
+                raise ValueError(f"Пара осей должна иметь 2 элемента: {pair!r}.")
+            a, b = pair
+            ax = [a] if isinstance(a, str) else [str(x) for x in a]
+            bx = [b] if isinstance(b, str) else [str(x) for x in b]
+            if not ax or not bx:
+                raise ValueError(f"Пустая ось в паре {pair!r} недопустима.")
+            for nm in ax + bx:
+                if nm not in known:
+                    raise KeyError(
+                        f"Ось пары '{nm}' не найдена среди координат полной "
+                        f"схемы {sorted(known)}.")
+            norm.append((ax, bx))
+        self.preflight_pairs = norm
+
     def set_branch_sampling_groups(self, branch_id: str,
                                    groups: Optional[Sequence[Sequence[str]]]
                                    ) -> None:
@@ -1081,6 +1204,7 @@ class MixtureProcessRunner:
     # ------------------------------------------------------------------
     def preflight(self, X: Any, *,
                   groups: Optional[Sequence[Sequence[str]]] = None,
+                  pairs: Optional[Sequence[Any]] = None,
                   seed: Optional[int] = None, n_ref: int = 512,
                   thresholds: Optional[PreflightThresholds] = None
                   ) -> PreflightReport:
@@ -1095,6 +1219,9 @@ class MixtureProcessRunner:
 
         ``groups`` — группы имён mixture-компонентов; ``None`` → проектные
         ``self.sampling_groups`` (той же политикой строится и reference).
+        ``pairs`` (iter37, п.4) — обязательные 2D-пары осей (см.
+        :meth:`set_preflight_pairs`); ``None`` → проектные
+        ``self.preflight_pairs``; пары с осями вне текущей фазы выпадают.
         """
         s = self.seed if seed is None else int(seed)
         X = np.atleast_2d(np.asarray(X, float))
@@ -1108,8 +1235,21 @@ class MixtureProcessRunner:
         idx_groups = [[names.index(nm) for nm in g if nm in names]
                       for g in eff]
         idx_groups = [g for g in idx_groups if g]
+        # iter37 (п.4): пары осей → индексы координат текущей фазы; пара с
+        # осью вне фазы выпадает из проверки (как имена в группах)
+        coord_names = names + list(self.current_schema.process_names)
+        eff_pairs = (self.preflight_pairs if pairs is None else [
+            ([a] if isinstance(a, str) else [str(x) for x in a],
+             [b] if isinstance(b, str) else [str(x) for x in b])
+            for a, b in pairs])
+        idx_pairs = []
+        for ax, bx in eff_pairs:
+            if all(nm in coord_names for nm in list(ax) + list(bx)):
+                idx_pairs.append(([coord_names.index(nm) for nm in ax],
+                                  [coord_names.index(nm) for nm in bx]))
         return preflight_design(self.current_schema, X, X_ref,
                                 groups=idx_groups or None,
+                                pairs=idx_pairs or None,
                                 thresholds=thresholds)
 
 

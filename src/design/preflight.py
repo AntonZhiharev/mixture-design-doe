@@ -24,7 +24,13 @@
      подпространстве допустимых вариаций (ортогонально Σx=1 и запертым осям)
      не меньше ``blind_ratio`` × reference; направление провала именуется;
   6. **coverage** — покрытие оси суммы каждой функциональной группы (iter31)
-     не уже ``coverage_min`` × reference-диапазона.
+     не уже ``coverage_min`` × reference-диапазона;
+  7. **pair-coverage** (iter37, скрин-аудит п.4) — покрытие 2D-сетки
+     ОБЯЗАТЕЛЬНЫХ пар осей кампании (УФ×TiO₂, T×УФ, ΔT×Σ_ACR и т.п.):
+     доля занятых дизайном ячеек ``pair_grid × pair_grid`` относительно
+     занятых reference-пулом не меньше ``pair_coverage_min``. Ось пары —
+     сумма координат (одиночная координата = список из одного индекса),
+     поэтому проверяются и пары с групповой осью (ΔT×Σ_ACR).
 
 ПОЧЕМУ ГЕЙТЫ ОТНОСИТЕЛЬНЫЕ (сверка с классикой). Абсолютные пороги
 регрессионной диагностики из внешнего обсуждения (cond<30, VIF<5,
@@ -61,12 +67,17 @@ class PreflightThresholds:
     тесный бокс даёт ~200×/~1e4×/~0.02 — зазор на порядок в обе стороны).
     ``corr_max`` — абсолютный порог слипшейся пары осей.
     ``coverage_min`` — минимальная доля reference-диапазона суммы группы.
+    ``pair_coverage_min``/``pair_grid`` (iter37) — гейт покрытия обязательных
+    2D-пар: доля ячеек ``pair_grid²``-сетки пары, занятых дизайном, от занятых
+    reference-пулом.
     """
     cond_factor: float = 20.0
     vif_factor: float = 100.0
     corr_max: float = 0.98
     blind_ratio: float = 0.10
     coverage_min: float = 0.80
+    pair_coverage_min: float = 0.60
+    pair_grid: int = 3
 
 
 @dataclass
@@ -77,6 +88,22 @@ class GroupCoverage:
     hi: float
     ref_lo: float
     ref_hi: float
+    coverage: float
+    ok: bool
+
+
+@dataclass
+class PairCoverage:
+    """Покрытие 2D-сетки одной обязательной пары осей (iter37, п.4).
+
+    Ось = сумма координат ``names_*``; ``occupied``/``occupied_ref`` — число
+    занятых ячеек сетки дизайном/reference; ``coverage`` — доля занятых
+    дизайном среди занятых reference (учитываются только reference-ячейки:
+    вне них область пары пуста и «непокрытость» не вменяется плану)."""
+    names_a: List[str]
+    names_b: List[str]
+    occupied: int
+    occupied_ref: int
     coverage: float
     ok: bool
 
@@ -105,12 +132,15 @@ class PreflightReport:
     blind_direction: Optional[Dict[str, float]]
     group_coverage: List[GroupCoverage] = field(default_factory=list)
     coverage_ok: bool = True
+    pair_coverage: List[PairCoverage] = field(default_factory=list)
+    pair_ok: bool = True
     thresholds: PreflightThresholds = field(default_factory=PreflightThresholds)
 
     @property
     def passed(self) -> bool:
         return (self.rank_ok and self.cond_ok and self.vif_ok
-                and self.corr_ok and self.blind_ok and self.coverage_ok)
+                and self.corr_ok and self.blind_ok and self.coverage_ok
+                and self.pair_ok)
 
     @property
     def failures(self) -> List[str]:
@@ -143,6 +173,13 @@ class PreflightReport:
                            f"{g.coverage:.0%} < {t.coverage_min:.0%}: план "
                            f"видит [{g.lo:.3f}, {g.hi:.3f}] из "
                            f"[{g.ref_lo:.3f}, {g.ref_hi:.3f}]")
+        for pc in self.pair_coverage:
+            if not pc.ok:
+                out.append(f"покрытие пары Σ({', '.join(pc.names_a)}) × "
+                           f"Σ({', '.join(pc.names_b)}) = {pc.coverage:.0%} "
+                           f"< {t.pair_coverage_min:.0%}: занято "
+                           f"{pc.occupied} из {pc.occupied_ref} ячеек "
+                           f"{t.pair_grid}×{t.pair_grid}")
         return out
 
     def rows(self) -> List[Dict[str, Any]]:
@@ -174,6 +211,11 @@ class PreflightReport:
             rows.append({"Проверка": f"покрытие Σ({', '.join(g.names)})",
                          "План": f"{g.coverage:.0%}",
                          "Допуск": f"≥ {t.coverage_min:.0%}", "ОК": g.ok})
+        for pc in self.pair_coverage:
+            rows.append({"Проверка": (f"пара Σ({', '.join(pc.names_a)}) × "
+                                      f"Σ({', '.join(pc.names_b)})"),
+                         "План": f"{pc.coverage:.0%}",
+                         "Допуск": f"≥ {t.pair_coverage_min:.0%}", "ОК": pc.ok})
         return rows
 
     def summary(self) -> Dict[str, Any]:
@@ -186,6 +228,7 @@ class PreflightReport:
             "corr_max_abs": self.corr_max_abs,
             "eig_min": self.eig_min, "eig_min_ref": self.eig_min_ref,
             "group_coverage": [g.coverage for g in self.group_coverage],
+            "pair_coverage": [pc.coverage for pc in self.pair_coverage],
             "failures": self.failures,
         }
 
@@ -278,6 +321,8 @@ def _min_variance_direction(X: np.ndarray, B: np.ndarray
 # ----------------------------------------------------------------------
 def preflight_design(schema: ProjectSchema, X: np.ndarray, X_ref: np.ndarray, *,
                      groups: Optional[Sequence[Sequence[int]]] = None,
+                     pairs: Optional[Sequence[Tuple[Sequence[int],
+                                                    Sequence[int]]]] = None,
                      terms: Optional[ModelTerms] = None,
                      thresholds: Optional[PreflightThresholds] = None
                      ) -> PreflightReport:
@@ -288,6 +333,9 @@ def preflight_design(schema: ProjectSchema, X: np.ndarray, X_ref: np.ndarray, *,
     в runner его строит та же политика кандидатов, что для seed/веток.
     ``groups`` — функциональные группы ИНДЕКСОВ mixture-координат текущей
     схемы (iter31) для проверки покрытия оси суммы; ``None`` — без проверки.
+    ``pairs`` (iter37, п.4) — обязательные 2D-пары осей: элемент —
+    ``(indices_a, indices_b)``, ось = сумма координат по индексам; ``None`` —
+    без проверки пар.
     Чистая и read-only; исключения — только на несогласованные размерности.
     """
     thr = thresholds or PreflightThresholds()
@@ -362,6 +410,18 @@ def preflight_design(schema: ProjectSchema, X: np.ndarray, X_ref: np.ndarray, *,
             ok=bool(coverage >= thr.coverage_min)))
     coverage_ok = all(g.ok for g in gcov)
 
+    # --- 7: покрытие 2D-сетки обязательных пар осей (iter37, п.4) ----------
+    pcov: List[PairCoverage] = []
+    for ia, ib in (pairs or []):
+        ia = [int(i) for i in ia]
+        ib = [int(i) for i in ib]
+        pcov.append(_pair_coverage(
+            X, X_ref, ia, ib,
+            names_a=[coord_names[i] for i in ia],
+            names_b=[coord_names[i] for i in ib],
+            grid=int(thr.pair_grid), min_cov=float(thr.pair_coverage_min)))
+    pair_ok = all(pc.ok for pc in pcov)
+
     return PreflightReport(
         n=int(X.shape[0]), p=int(mt.p),
         rank=rank, rank_ref=rank_ref, rank_ok=bool(rank_ok),
@@ -371,4 +431,42 @@ def preflight_design(schema: ProjectSchema, X: np.ndarray, X_ref: np.ndarray, *,
         corr_max_abs=corr_max_abs, corr_pair=corr_pair, corr_ok=corr_ok,
         eig_min=float(eig_min), eig_min_ref=float(eig_min_ref),
         blind_ok=blind_ok, blind_direction=blind_direction,
-        group_coverage=gcov, coverage_ok=coverage_ok, thresholds=thr)
+        group_coverage=gcov, coverage_ok=coverage_ok,
+        pair_coverage=pcov, pair_ok=pair_ok, thresholds=thr)
+
+
+def _pair_coverage(X: np.ndarray, X_ref: np.ndarray,
+                   ia: Sequence[int], ib: Sequence[int], *,
+                   names_a: List[str], names_b: List[str],
+                   grid: int, min_cov: float) -> PairCoverage:
+    """Покрытие 2D-сетки пары осей (iter37, п.4) — чистый примитив.
+
+    Границы сетки — по reference-пулу (он определяет достижимую область
+    пары, включая непрямоугольные формы вроде UV-трапеции); ячейка «занята»,
+    если в неё попала хоть одна точка. Coverage = |ячейки(X) ∩ ячейки(ref)| /
+    |ячейки(ref)|: план не штрафуется за ячейки, пустые и у reference
+    (вне области пары). Вырожденная ось reference (нулевой размах) → пара
+    не проверяема, coverage = 1.0 (не слепота плана — область не варьирует).
+    """
+    def _axis(M: np.ndarray, idx: Sequence[int]) -> np.ndarray:
+        return M[:, list(idx)].sum(axis=1)
+
+    u, v = _axis(X, ia), _axis(X, ib)
+    ur, vr = _axis(X_ref, ia), _axis(X_ref, ib)
+    span_u = float(ur.max() - ur.min())
+    span_v = float(vr.max() - vr.min())
+    if span_u <= _EPS or span_v <= _EPS:
+        return PairCoverage(names_a=list(names_a), names_b=list(names_b),
+                            occupied=0, occupied_ref=0, coverage=1.0, ok=True)
+
+    def _cells(a: np.ndarray, b: np.ndarray) -> set:
+        ka = np.clip(((a - ur.min()) / span_u * grid).astype(int), 0, grid - 1)
+        kb = np.clip(((b - vr.min()) / span_v * grid).astype(int), 0, grid - 1)
+        return set(zip(ka.tolist(), kb.tolist()))
+
+    ref_cells = _cells(ur, vr)
+    des_cells = _cells(u, v) & ref_cells
+    cov = len(des_cells) / max(len(ref_cells), 1)
+    return PairCoverage(names_a=list(names_a), names_b=list(names_b),
+                        occupied=len(des_cells), occupied_ref=len(ref_cells),
+                        coverage=float(cov), ok=bool(cov >= min_cov))

@@ -6,6 +6,10 @@
 архитектурного обсуждения (сессия 04.08.2026). Решение об этапе B — после
 эксплуатации preflight и phr-сэмплера.
 
+**Дополнение 05.08.2026 (iter37, скрин-аудит «что реально не закрыто»):
+5 пунктов аудита ЗАКРЫТЫ** — см. §«Скрин-аудит» ниже и
+`tests/unit/test_iteration37_campaign_gaps.py`.
+
 
 ## Контекст и мотивация
 
@@ -52,10 +56,24 @@
    ОТНОСИТЕЛЬНЫМИ к reference-пулу той же области; абсолютные пороги
    осмысленны только в z-пространстве (этап A/B).
 
-6. Augmentation (maximin от existing), версионирование spec (хеш —
+6. Augmentation (maximin от existing — **СДЕЛАНО в iter37**:
+   `MixtureProcessRunner.propose_augment()`, `propose_seed` при непустой
+   базе пристёгивает план к existing), версионирование spec (хеш —
    **СДЕЛАНО в iter35**: `PhrSpec.spec_hash()`/`to_dicts()`, порядок узлов
    входит в отпечаток; правило премикса — `premix_required()`; см.
-   `docs/CAMPAIGN_SPEC_PVC.md`), индикатор кампании в модели.
+   `docs/CAMPAIGN_SPEC_PVC.md`), индикатор кампании (**СДЕЛАНО в iter37**:
+   `set_campaign_label()` + `spec_hash`/`schema_version`/`block` в
+   `origin_tag` каждой точки).
+
+## Скрин-аудит 05.08.2026 — 5 пунктов, ЗАКРЫТЫ в iter37
+
+| # | Проверка | Реализация |
+|---|----------|------------|
+| 1 | Аугментация переиспользует точки фазы 1 | `propose_augment` (greedy maximin от existing, пул — та же политика фазы: phr_spec / groups / Sobol); `propose_seed(reuse_existing=True)` — дефолт при непустой базе |
+| 2 | Индикатор кампании/фазы в метаданных точки | `origin_tag`: `campaign` (метка, `set_campaign_label`), `spec_hash` (геометрия), `schema_version` (фаза), `block` (партия) |
+| 3 | Квантование nominal vs actual, границы после округления | `PhrSpec.quantize_recipe(p, delta_phr)` → `QuantizeReport` (снап к δ-сетке внутри границ; violations на осях уже шага, fixed вне сетки, cap/share/ratio после округления) |
+| 4 | Покрытие обязательных 2D-пар | pair-coverage гейт preflight (`set_preflight_pairs` / `preflight(pairs=…)`, ось = сумма имён, порог `pair_coverage_min=0.60` на сетке 3×3 относительно reference) |
+| 5 | PROCESS сэмплится iid uniform | `_process_cube`: scrambled Sobol' (QMC) для process-куба во всех пулах `_phase_candidates` (оба пути: phr и стандартный) |
 
 ## Сверка с кодовой базой (что внешняя сессия не видела)
 
@@ -95,6 +113,12 @@
    (`phr_spec=None` → прежний путь бит-в-бит; несовпадение состава
    фазы — warning + fallback). Тесты:
    `tests/unit/test_iteration33_phr_sampler.py`.
-3. **Этап B:** groups/ratio_to в схеме + модель в z (RSM), encode
-   исторических рецептов, anchors, quantize/премикс — полноценный
-   раздел REBUILD_SPEC с миграционной политикой.
+3. **iter37 — СДЕЛАНО (05.08.2026):** закрытие скрин-аудита (см. таблицу
+   выше): maximin-аугментация от existing, метаданные кампании в точках,
+   `quantize_recipe` (слой m: nominal→actual + проверка границ),
+   pair-coverage гейт preflight, Sobol для process-осей. Тесты:
+   `tests/unit/test_iteration37_campaign_gaps.py`.
+4. **Этап B:** groups/ratio_to в схеме + модель в z (RSM), encode
+   исторических рецептов, anchors — полноценный раздел REBUILD_SPEC
+   с миграционной политикой (quantize/премикс вынесены вперёд:
+   `premix_required` iter35, `quantize_recipe` iter37).

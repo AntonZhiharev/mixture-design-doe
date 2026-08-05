@@ -18,6 +18,12 @@ z-сэмплер-плагин parts/phr-спеки.
     по защите и от пластификатора НЕ зависит. ``ratio_to`` здесь неверен:
     он масштабирует ОБА конца (клин), вшивая положительную корреляцию с
     доминирующей осью и монотонный prior, которого физика не требует;
+    опционально ``scale='log'`` (iter47/B5): z-координата оси — ``ln phr``,
+    сэмплинг равномерен в ``[ln lo, ln hi]`` (лог-равномерная маргиналь по
+    phr: плотность в нижней декаде, где живёт сатурирующий отклик);
+    cap-потолок задан В PHR и применяется ПОСЛЕ экспоненцирования —
+    пер-точечно логарифмируется уже суженная граница
+    ``min(hi, cap_ratio·Σref)``, а не сами референсы;
   * ``share_of``  — доля родительского узла ``of`` в ``[lo, hi] ⊆ [0,1]``;
     доли одной группы связаны Σ=1 (раскладка без rejection —
     :func:`core.simplex._narrowing_split`, канон iter31: uniform-MARGINAL
@@ -145,8 +151,9 @@ class PhrNode:
     ``min_phr``/``max_phr`` (share-режимы, iter45/B1) — технологические
     лимиты узла В PHR: conditional narrowing доли после розыгрыша тотала,
     а НЕ бокс по доле (``None`` — лимита нет). ``scale`` (только absolute,
-    iter46/B6) — шкала сэмплинга оси: ``linear`` | ``log`` (сам лог-сэмплинг
-    — iter47/B5; до него геометрические операции отвергают log явно).
+    iter46/B6) — шкала сэмплинга оси: ``linear`` | ``log``; при ``log``
+    (iter47/B5) z-координата оси — ``ln phr``: сэмплинг/границы/clip идут
+    в лог-шкале, cap-потолок — в phr (применяется после экспоненцирования).
     У ``share_closure`` границы НЕ задаются (``lo=hi=0`` — сентинель):
     диапазон производный от свободного партнёра (iter46/B8)."""
     name: str
@@ -243,8 +250,7 @@ class PhrSpec:
                                    and nd.name not in derived]
         self._z_col: Dict[str, int] = {nm: j for j, nm
                                        in enumerate(self.z_names)}
-        # iter46/B6: оси с scale='log' — схема/хеш принимают, сэмплинг до
-        # iter47 (B5) отвергается явно (_require_linear)
+        # оси с scale='log' (iter47/B5): их z-координата — ln phr
         self._log_axes: List[str] = [nd.name for nd in self.nodes
                                      if nd.scale == "log"]
         # статическая интервальная валидация (ДО любого сэмплинга)
@@ -853,16 +859,6 @@ class PhrSpec:
         nd = self._by_name[name]
         return self._total_window.get(name, (nd.lo, nd.hi))
 
-    def _require_linear(self, op: str) -> None:
-        """iter46/B6: схема v2 ПРИНИМАЕТ ``scale='log'`` (сериализация и
-        хеш работают), но сам лог-сэмплинг — iter47 (B5); до него
-        геометрические операции отвергают такие спеки явно, а не искажают
-        меру молча (A0.6)."""
-        if self._log_axes:
-            raise ValueError(
-                f"{op}: оси {self._log_axes} имеют scale='log' — "
-                f"лог-сэмплинг будет реализован в iter47 (B5).")
-
     def share_base_bounds(self, name: str) -> Tuple[float, float]:
         """Статические границы ДОЛИ share-узла: у ``share_closure`` —
         ПРОИЗВОДНЫЙ диапазон ``[1−φᵁ_free, 1−φᴸ_free]`` (iter46/B2),
@@ -966,8 +962,12 @@ class PhrSpec:
         iter46/B2: доли группы разыгрываются ЦЕЛИКОМ (все k членов), но в z
         пишутся только члены с собственной координатой — производный член
         (closure / последний simplex) в z не входит.
+
+        iter47/B5: оси ``scale='log'`` — z-координата ``ln phr``, равномерно
+        в ``[ln lo, ln hi]``; у cap-осей потолок вычисляется В PHR
+        (``min(hi, cap_ratio·Σ value(cap_refs))``), логарифмируется уже
+        суженная граница — условная ЛОГ-равномерность на трапеции.
         """
-        self._require_linear("sample_z")
         rng = np.random.default_rng(seed)
         n = int(n)
         Z = np.empty((n, self.dim_z), dtype=float)
@@ -979,15 +979,30 @@ class PhrSpec:
                 vals[nm] = np.full(n, nd.value)
             elif nd.mode == MODE_ABSOLUTE:
                 a_lo, a_hi = self._axis_bounds(nm)
-                if nd.cap_refs:
-                    base = np.sum([vals[cr] for cr in nd.cap_refs], axis=0)
-                    hi_eff = np.minimum(a_hi, nd.cap_ratio * base)
-                    hi_eff = np.maximum(hi_eff, a_lo)    # числовая страховка
-                    z = a_lo + (hi_eff - a_lo) * rng.random(n)
+                if nd.scale == "log":                    # iter47/B5
+                    if nd.cap_refs:
+                        base = np.sum([vals[cr] for cr in nd.cap_refs],
+                                      axis=0)
+                        hi_eff = np.minimum(a_hi, nd.cap_ratio * base)
+                        hi_eff = np.maximum(hi_eff, a_lo)  # числ. страховка
+                        ln_hi = np.log(hi_eff)           # потолок В PHR
+                    else:
+                        ln_hi = math.log(a_hi)
+                    ln_lo = math.log(a_lo)
+                    z = ln_lo + (ln_hi - ln_lo) * rng.random(n)
+                    Z[:, self._z_col[nm]] = z
+                    vals[nm] = np.exp(z)
                 else:
-                    z = rng.uniform(a_lo, a_hi, size=n)
-                Z[:, self._z_col[nm]] = z
-                vals[nm] = z
+                    if nd.cap_refs:
+                        base = np.sum([vals[cr] for cr in nd.cap_refs],
+                                      axis=0)
+                        hi_eff = np.minimum(a_hi, nd.cap_ratio * base)
+                        hi_eff = np.maximum(hi_eff, a_lo)  # числ. страховка
+                        z = a_lo + (hi_eff - a_lo) * rng.random(n)
+                    else:
+                        z = rng.uniform(a_lo, a_hi, size=n)
+                    Z[:, self._z_col[nm]] = z
+                    vals[nm] = z
             elif nd.mode == MODE_RATIO_TO:
                 z = rng.uniform(nd.lo, nd.hi, size=n)
                 Z[:, self._z_col[nm]] = z
@@ -1017,15 +1032,20 @@ class PhrSpec:
         (``cap_ratio · Σ value(cap_refs)``) учитывается :meth:`clip_z`
         пер-точечно. У absolute-тотала группы с phr-лимитами возвращается
         ОКНО ТОТАЛА (iter45/B1) — вне окна доли членов нереализуемы.
+        У log-осей (iter47/B5) границы ЛОГАРИФМИРУЮТСЯ (z — ``ln phr``):
+        ширина ``ln hi − ln lo`` даёт МУЛЬТИПЛИКАТИВНЫЙ масштаб возмущений.
         Ширины ``hi − lo`` — естественный масштаб возмущений
-        по осям z (у осей разные единицы: phr / доли / коэффициенты).
+        по осям z (у осей разные единицы: phr / ln phr / доли / коэфф.).
         """
-        self._require_linear("z_bounds")
         bounds = []
         for nm in self.z_names:
             nd = self._by_name[nm]
             if nd.mode == MODE_ABSOLUTE:
-                bounds.append(self._axis_bounds(nm))
+                a_lo, a_hi = self._axis_bounds(nm)
+                if nd.scale == "log":                    # iter47/B5: ln phr
+                    bounds.append((math.log(a_lo), math.log(a_hi)))
+                else:
+                    bounds.append((a_lo, a_hi))
             elif nd.mode in _SHARE_MODES:
                 bounds.append(self._share_base[nm])
             else:
@@ -1069,8 +1089,11 @@ class PhrSpec:
         Используется refine-циклом оптимизатора: возмущение в z → clip_z →
         decode — каждая проба допустима, в отличие от rejection, который
         у границы (где и лежит оптимум) обваливается (урок iter34).
+
+        iter47/B5: log-оси проецируются В ЛОГ-ШКАЛЕ — z клипится в
+        ``[ln lo, ln hi_eff]``, где потолок ``hi_eff`` вычислен В PHR
+        (cap применяется после экспоненцирования).
         """
-        self._require_linear("clip_z")
         z = np.asarray(z, dtype=float)
         single = z.ndim == 1
         Z = np.atleast_2d(z).astype(float).copy()
@@ -1093,8 +1116,13 @@ class PhrSpec:
                         np.minimum(a_hi, nd.cap_ratio * base), a_lo)
                 else:
                     hi_eff = a_hi
-                Z[:, j] = np.clip(Z[:, j], a_lo, hi_eff)
-                vals[nm] = Z[:, j]
+                if nd.scale == "log":                    # iter47/B5: ln phr
+                    Z[:, j] = np.clip(Z[:, j],
+                                      math.log(a_lo), np.log(hi_eff))
+                    vals[nm] = np.exp(Z[:, j])
+                else:
+                    Z[:, j] = np.clip(Z[:, j], a_lo, hi_eff)
+                    vals[nm] = Z[:, j]
             elif nd.mode == MODE_RATIO_TO:
                 j = self._z_col[nm]
                 Z[:, j] = np.clip(Z[:, j], nd.lo, nd.hi)
@@ -1135,7 +1163,8 @@ class PhrSpec:
     # decode / encode
     # ------------------------------------------------------------------
     def decode(self, z: Sequence[float] | np.ndarray) -> np.ndarray:
-        """z → p: phr компонентов (столбцы = ``component_names``)."""
+        """z → p: phr компонентов (столбцы = ``component_names``).
+        Log-оси (iter47/B5) экспоненцируются: ``p = exp(z)``."""
         z = np.asarray(z, dtype=float)
         single = z.ndim == 1
         Z = np.atleast_2d(z)
@@ -1149,7 +1178,8 @@ class PhrSpec:
             if nd.mode == MODE_FIXED:
                 vals[nm] = np.full(len(Z), nd.value)
             elif nd.mode == MODE_ABSOLUTE:
-                vals[nm] = Z[:, self._z_col[nm]].copy()
+                col = Z[:, self._z_col[nm]]
+                vals[nm] = np.exp(col) if nd.scale == "log" else col.copy()
             else:  # ratio_to / share-режимы
                 if nm in self._z_col:
                     vals[nm] = Z[:, self._z_col[nm]] * vals[nd.ref]
@@ -1167,7 +1197,9 @@ class PhrSpec:
         """p → z (обратное к :meth:`decode`): для anchors/исторических
         рецептов, заданных в phr. Внутренние узлы восстанавливаются суммой
         детей; несоответствие fixed-значению или выход за границы осей —
-        явный ValueError (anchor вне области — ошибка данных)."""
+        явный ValueError (anchor вне области — ошибка данных). Проверки
+        границ/cap у absolute-осей идут В PHR; z-координата log-оси
+        (iter47/B5) — ``ln phr``."""
         p = np.asarray(p, dtype=float)
         single = p.ndim == 1
         P = np.atleast_2d(p)
@@ -1229,6 +1261,10 @@ class PhrSpec:
                         f"encode: узел '{nm}' превышает потолок "
                         f"{nd.cap_ratio:g}·Σ{list(nd.cap_refs)} (= {cap}): "
                         f"значения {zj} — рецепт вне спеки.")
+            if nd.mode == MODE_ABSOLUTE and nd.scale == "log":
+                # iter47/B5: z log-оси — ln phr; все проверки выше выполнены
+                # в phr (lo > 0 из валидации гарантирует ln определён)
+                zj = np.log(np.maximum(zj, np.finfo(float).tiny))
             if nm in self._z_col:              # производные члены — без z-оси
                 Z[:, self._z_col[nm]] = zj
         return Z[0] if single else Z

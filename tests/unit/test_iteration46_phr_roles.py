@@ -24,8 +24,8 @@ ARD-длины пар не идентифицируются, preflight-гейт 
     игнорирование; ``members`` обязаны ТОЧНО совпадать с детьми группы;
   * C5: share-бокс группы ``φᵢᵁ ≤ 1 − Σ_{j≠i} φⱼᴸ`` НЕСТРОГО (LUB впритык
     0.60 = 1 − 0.40 — не ошибка);
-  * ``scale='log'`` принимается схемой/хешем, сэмплинг до iter47 (B5)
-    отвергается явно.
+  * ``scale='log'`` принимается схемой/хешем; лог-сэмплинг реализован
+    в iter47/B5 (см. test_iteration47_log_sampling.py).
 
 Golden-хеш v2-спеки в тесты НЕ закладывается (решение C4) — проверяются
 только round-trip-инварианты.
@@ -501,7 +501,7 @@ class TestPhrLimitsOnNewRoles:
 
 
 # ======================================================================
-# 6. scale (B6): схема/хеш принимают, сэмплинг до iter47 отвергает явно
+# 6. scale (B6): схема/хеш принимают; лог-сэмплинг — iter47/B5
 # ======================================================================
 class TestScale:
 
@@ -523,14 +523,16 @@ class TestScale:
         ])
         assert linear.spec_hash() != spec.spec_hash()  # scale — часть геометрии
 
-    def test_geometry_ops_reject_log_until_iter47(self):
+    def test_geometry_ops_accept_log_since_iter47(self):
+        # iter47/B5: гейт снят — геометрия log-осей работает
+        # (подробные инварианты — test_iteration47_log_sampling.py)
         spec = self._log_spec()
-        with pytest.raises(ValueError, match="iter47"):
-            spec.sample_z(10, seed=0)
-        with pytest.raises(ValueError, match="iter47"):
-            spec.z_bounds()
-        with pytest.raises(ValueError, match="iter47"):
-            spec.clip_z(np.zeros(spec.dim_z))
+        Z = spec.sample_z(10, seed=0)
+        assert Z.shape == (10, spec.dim_z)
+        lo, hi = spec.z_bounds()
+        assert np.all(lo <= hi)
+        Zc = spec.clip_z(Z)
+        assert np.allclose(Zc, Z)              # валидные точки не двигаются
 
     def test_scale_validation(self):
         with pytest.raises(ValueError, match="неизвестная шкала"):

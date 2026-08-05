@@ -34,6 +34,7 @@ import numpy as np
 from ..core.schema import DataPoint, ProjectSchema
 from ..core.schema_evolution import SchemaHistory
 from ..design.branches import Branch
+from ..design.phr_sampler import PhrSpec
 from ..optimize.desirability import DesirabilitySpec
 from .mixture_process_runner import MixtureProcessRunner
 
@@ -172,6 +173,17 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             # iter31: проектные функциональные группы (политика сэмплирования)
             "sampling_groups": [list(g) for g in
                                 (getattr(runner, "sampling_groups", []) or [])],
+            # iter40 (UI_REVISION_SPEC): политика кампании — phr-спека
+            # (decode-слой iter33/38), метка кампании и обязательные 2D-пары
+            # preflight (iter37 п.2/п.4). Без сериализации save/load молча
+            # откатывал сэмплер/оптимизатор на бокс и терял метаданные
+            # origin_tag новых точек (A0.6 — тихая потеря недопустима).
+            "phr_spec": (runner.phr_spec.to_dicts()
+                         if getattr(runner, "phr_spec", None) is not None
+                         else None),
+            "campaign_label": str(getattr(runner, "campaign_label", "") or ""),
+            "preflight_pairs": [[list(a), list(b)] for a, b in
+                                (getattr(runner, "preflight_pairs", []) or [])],
             "region_moves": [_region_move_to_dict(m)
                              for m in getattr(runner, "_region_moves", []) or []],
             "drop_policy": str(getattr(runner, "_drop_policy", "exclude")),
@@ -250,6 +262,17 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     # iter31: проектные группы (старые сейвы без ключа → пусто)
     runner.sampling_groups = [list(g) for g in
                               (r.get("sampling_groups", []) or [])]
+    # iter40: политика кампании — восстанавливаем ШТАТНЫМИ сеттерами
+    # (валидация против полной схемы); старые сейвы без ключей → выключено.
+    spec_dicts = r.get("phr_spec")
+    if spec_dicts:
+        runner.set_phr_spec(PhrSpec.from_dicts(spec_dicts))
+    label = str(r.get("campaign_label", "") or "")
+    if label:
+        runner.set_campaign_label(label)
+    pairs = r.get("preflight_pairs", []) or []
+    if pairs:
+        runner.set_preflight_pairs(pairs)
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))
 

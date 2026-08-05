@@ -9,6 +9,13 @@ z-сэмплер-плагин parts/phr-спеки.
 Спека — список узлов, каждый в одном из 4 режимов координат:
 
   * ``absolute``  — phr равномерно в ``[lo, hi]`` (в т.ч. ТОТАЛ группы);
+    опционально с ДИНАМИЧЕСКИМ ПОТОЛКОМ ``cap_to``/``cap_ratio``:
+    ``p ∈ [lo, min(hi, cap_ratio · value(cap_to))]`` — ТРАПЕЦИЯ, а не клин.
+    Кейс (сессия 05.08.2026, UV_CSFCP): растворимость ограничивает УФ
+    только СВЕРХУ (`UV ≤ 0.03·DINP`), нижняя граница 0.05 phr — требование
+    по защите и от пластификатора НЕ зависит. ``ratio_to`` здесь неверен:
+    он масштабирует ОБА конца (клин), вшивая положительную корреляцию с
+    доминирующей осью и монотонный prior, которого физика не требует;
   * ``share_of``  — доля родительского узла ``of`` в ``[lo, hi] ⊆ [0,1]``;
     доли одной группы связаны Σ=1 (раскладка без rejection —
     :func:`core.simplex._narrowing_split`, канон iter31: uniform-MARGINAL
@@ -55,13 +62,17 @@ _TOL = 1e-9
 @dataclass
 class PhrNode:
     """Узел phr-спеки. ``ref`` — имя референса (``of`` у share_of, ``to``
-    у ratio_to); у absolute/fixed референса нет."""
+    у ratio_to); у absolute/fixed референса нет. ``cap_ref``/``cap_ratio``
+    (только absolute) — динамический потолок
+    ``hi_eff = min(hi, cap_ratio · value(cap_ref))``."""
     name: str
     mode: str
     lo: float = 0.0
     hi: float = 0.0
     value: float = 0.0
     ref: str = ""
+    cap_ref: str = ""
+    cap_ratio: float = 0.0
 
 
 class PhrSpec:
@@ -122,7 +133,8 @@ class PhrSpec:
     @classmethod
     def from_dicts(cls, dicts: Sequence[Mapping[str, Any]]) -> "PhrSpec":
         """Спека из списка словарей: ключи ``name``, ``mode``, ``lo``, ``hi``,
-        ``value`` (fixed), ``of`` (share_of) / ``to`` (ratio_to).
+        ``value`` (fixed), ``of`` (share_of) / ``to`` (ratio_to),
+        ``cap_to``/``cap_ratio`` (динамический потолок absolute-оси).
         Доли share_of без явных границ — ``[0, 1]``."""
         nodes: List[PhrNode] = []
         for d in dicts:
@@ -132,7 +144,9 @@ class PhrSpec:
             hi = float(d.get("hi", 1.0 if mode == MODE_SHARE_OF else 0.0))
             nodes.append(PhrNode(name=str(d.get("name", "")), mode=mode,
                                  lo=lo, hi=hi,
-                                 value=float(d.get("value", 0.0)), ref=ref))
+                                 value=float(d.get("value", 0.0)), ref=ref,
+                                 cap_ref=str(d.get("cap_to", "") or ""),
+                                 cap_ratio=float(d.get("cap_ratio", 0.0))))
         return cls(nodes)
 
     # ------------------------------------------------------------------
@@ -156,14 +170,37 @@ class PhrSpec:
             elif nd.ref:
                 raise ValueError(
                     f"Узел '{nd.name}' ({nd.mode}): референс недопустим.")
+            if nd.cap_ref:
+                if nd.mode != MODE_ABSOLUTE:
+                    raise ValueError(
+                        f"Узел '{nd.name}' ({nd.mode}): cap_to допустим "
+                        f"только для absolute.")
+                if nd.cap_ref not in self._by_name:
+                    raise ValueError(
+                        f"Узел '{nd.name}': cap-референс '{nd.cap_ref}' "
+                        f"не найден среди узлов спеки.")
+                if nd.cap_ref == nd.name:
+                    raise ValueError(
+                        f"Узел '{nd.name}': cap-ссылка на самого себя.")
+                if nd.cap_ratio <= 0:
+                    raise ValueError(
+                        f"Узел '{nd.name}': cap_ratio должен быть > 0 "
+                        f"(получено {nd.cap_ratio}).")
+            elif nd.cap_ratio:
+                raise ValueError(
+                    f"Узел '{nd.name}': cap_ratio без cap_to недопустим.")
 
     def _toposort(self) -> List[str]:
-        """Топосорт Кана по рёбрам ref→node; цикл — явный ValueError."""
+        """Топосорт Кана по рёбрам ref→node и cap_ref→node;
+        цикл — явный ValueError."""
         indeg = {nd.name: 0 for nd in self.nodes}
         out_edges: Dict[str, List[str]] = {nd.name: [] for nd in self.nodes}
         for nd in self.nodes:
             if nd.ref:
                 out_edges[nd.ref].append(nd.name)
+                indeg[nd.name] += 1
+            if nd.cap_ref:
+                out_edges[nd.cap_ref].append(nd.name)
                 indeg[nd.name] += 1
         queue = [nd.name for nd in self.nodes if indeg[nd.name] == 0]
         order: List[str] = []
@@ -212,7 +249,18 @@ class PhrSpec:
             if nd.mode == MODE_FIXED:
                 iv = (nd.value, nd.value)
             elif nd.mode == MODE_ABSOLUTE:
-                iv = (nd.lo, nd.hi)
+                if nd.cap_ref:
+                    r_lo, r_hi = self._interval[nd.cap_ref]
+                    cap_min = nd.cap_ratio * r_lo
+                    if cap_min < nd.lo - _TOL:
+                        raise ValueError(
+                            f"Узел '{nd.name}': при минимальном "
+                            f"'{nd.cap_ref}'={r_lo:.6g} потолок "
+                            f"cap_ratio·ref={cap_min:.6g} < lo={nd.lo} — "
+                            f"пустой диапазон (трапеция вырождается).")
+                    iv = (nd.lo, min(nd.hi, nd.cap_ratio * r_hi))
+                else:
+                    iv = (nd.lo, nd.hi)
             else:  # ratio_to / share_of: произведение неотрицательных интервалов
                 r_lo, r_hi = self._interval[nd.ref]
                 if r_lo <= _TOL:
@@ -248,7 +296,11 @@ class PhrSpec:
     # ------------------------------------------------------------------
     def sample_z(self, n: int, seed: Optional[int] = None) -> np.ndarray:
         """``n`` точек z-куба: absolute/ratio_to — равномерно по оси;
-        доли share-группы — :func:`_narrowing_split` (Σ=1 без rejection).
+        absolute с cap — равномерно в ПЕР-ТОЧЕЧНОМ интервале
+        ``[lo, min(hi, cap_ratio · value(cap_ref))]`` (условная равномерность
+        на трапеции); доли share-группы — :func:`_narrowing_split`
+        (Σ=1 без rejection). Обход — топологический (референсы cap вычислены
+        раньше зависимых осей).
 
         Мера: uniform-MARGINAL по физически значимым осям (тот же осознанный
         выбор, что iter31 ``SimplexRegion.random_points(groups=…)``).
@@ -256,16 +308,37 @@ class PhrSpec:
         rng = np.random.default_rng(seed)
         n = int(n)
         Z = np.empty((n, self.dim_z), dtype=float)
-        for nm in self.z_names:
+        vals: Dict[str, np.ndarray] = {}
+        done_groups: set = set()
+        for nm in self._topo:
             nd = self._by_name[nm]
-            if nd.mode in (MODE_ABSOLUTE, MODE_RATIO_TO):
-                Z[:, self._z_col[nm]] = rng.uniform(nd.lo, nd.hi, size=n)
-        for parent, members in self._share_groups.items():
-            cols = [self._z_col[m] for m in members]
-            lo = np.array([self._by_name[m].lo for m in members])
-            hi = np.array([self._by_name[m].hi for m in members])
-            for t in range(n):
-                Z[t, cols] = _narrowing_split(lo, hi, 1.0, rng)
+            if nd.mode == MODE_FIXED:
+                vals[nm] = np.full(n, nd.value)
+            elif nd.mode == MODE_ABSOLUTE:
+                if nd.cap_ref:
+                    hi_eff = np.minimum(nd.hi, nd.cap_ratio * vals[nd.cap_ref])
+                    hi_eff = np.maximum(hi_eff, nd.lo)   # числовая страховка
+                    z = nd.lo + (hi_eff - nd.lo) * rng.random(n)
+                else:
+                    z = rng.uniform(nd.lo, nd.hi, size=n)
+                Z[:, self._z_col[nm]] = z
+                vals[nm] = z
+            elif nd.mode == MODE_RATIO_TO:
+                z = rng.uniform(nd.lo, nd.hi, size=n)
+                Z[:, self._z_col[nm]] = z
+                vals[nm] = z * vals[nd.ref]
+            else:                              # share_of: группа целиком
+                if nd.ref in done_groups:
+                    continue
+                members = self._share_groups[nd.ref]
+                cols = [self._z_col[m] for m in members]
+                lo = np.array([self._by_name[m].lo for m in members])
+                hi = np.array([self._by_name[m].hi for m in members])
+                for t in range(n):
+                    Z[t, cols] = _narrowing_split(lo, hi, 1.0, rng)
+                for m in members:
+                    vals[m] = Z[:, self._z_col[m]] * vals[nd.ref]
+                done_groups.add(nd.ref)
         return Z
 
     # ------------------------------------------------------------------
@@ -336,6 +409,13 @@ class PhrSpec:
                 raise ValueError(
                     f"encode: узел '{nm}' ({nd.mode}) вне границ "
                     f"[{nd.lo}, {nd.hi}]: значения {zj}.")
+            if nd.mode == MODE_ABSOLUTE and nd.cap_ref:
+                cap = nd.cap_ratio * vals[nd.cap_ref]
+                if np.any(zj > cap + tol):
+                    raise ValueError(
+                        f"encode: узел '{nm}' превышает потолок "
+                        f"{nd.cap_ratio:g}·'{nd.cap_ref}' (= {cap}): "
+                        f"значения {zj} — рецепт вне спеки.")
             Z[:, self._z_col[nm]] = zj
         return Z[0] if single else Z
 
@@ -383,6 +463,9 @@ class PhrSpec:
                 d["of"] = nd.ref
             elif nd.mode == MODE_RATIO_TO:
                 d["to"] = nd.ref
+            if nd.cap_ref:                     # динамический потолок — часть
+                d["cap_to"] = nd.cap_ref       # геометрии, входит в отпечаток
+                d["cap_ratio"] = float(nd.cap_ratio)
             out.append(d)
         return out
 

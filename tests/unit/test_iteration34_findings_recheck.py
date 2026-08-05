@@ -218,13 +218,16 @@ class TestVertexFallback:
 
     def test_narrow_bounds_warn(self):
         reg = SimplexRegion(lower=self.NARROW_LO, upper=self.NARROW_HI)
-        with pytest.warns(UserWarning, match="добрано последовательным сужением"):
+        with pytest.warns(UserWarning,
+                          match="перегенерирован последовательным сужением"):
             reg.random_points(64, seed=1, max_tries=50)
 
     def test_fallback_points_not_centroid_collapsed(self):
-        """iter35: narrowing-fallback НЕ стягивает точки к центроиду
+        """iter35/36: narrowing-fallback НЕ стягивает точки к центроиду
         (старый vertex-fallback давал q95(r/r_max)=0.28); все точки
-        допустимы, различны, края области достижимы."""
+        допустимы, различны, края области достижимы. iter36 —
+        всё-или-ничего: при недоборе rejection ВЕСЬ план перегенерируется
+        narrowing'ом (однородная мера, без смеси распределений)."""
         reg = SimplexRegion(lower=self.NARROW_LO, upper=self.NARROW_HI)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -239,8 +242,23 @@ class TestVertexFallback:
         r = np.linalg.norm(X - c, axis=1) / r_max
         assert np.quantile(r, 0.95) > 0.5, \
             f"narrowing-fallback стянут к центроиду: q95={np.quantile(r, 0.95):.3f}"
-        assert reg.last_sampling_info["n_fallback"] > 0
-        assert reg.last_sampling_info["method"] == "rejection+narrowing"
+        assert reg.last_sampling_info["n_fallback"] == 512
+        assert reg.last_sampling_info["n_rejection"] == 0
+        assert reg.last_sampling_info["method"] == "narrowing"
+
+    def test_method_is_always_homogeneous(self):
+        """iter36 (внешняя сессия 05.08.2026): смешение мер в одном плане
+        запрещено — narrowing-точки концентрировались в труднодостижимых
+        углах, где информация дороже всего. ``method`` обязан быть одним из
+        однородных значений; ``rejection+narrowing`` не существует."""
+        reg = SimplexRegion(lower=self.NARROW_LO, upper=self.NARROW_HI)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            reg.random_points(64, seed=1, max_tries=50)
+        assert reg.last_sampling_info["method"] in (
+            "rejection", "narrowing", "grouped")
+        assert reg.last_sampling_info["n_rejection_discarded"] >= 0
+        _g3().random_points(16, seed=1)
 
     def test_no_fallback_on_grouped_path(self):
         """Групповой путь (sequential narrowing) без rejection → без fallback."""

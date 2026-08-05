@@ -193,11 +193,16 @@ class SimplexRegion:
         """Generate ``n`` random feasible interior points.
 
         Основной путь — rejection sampling в пространстве псевдокомпонентов.
-        Если из-за узких границ приёмка мала и точек не хватает, остаток
-        добирается ПОСЛЕДОВАТЕЛЬНЫМ СУЖЕНИЕМ (iter35: singleton-группы,
-        :meth:`_random_points_grouped`) — всегда валидная точка за O(q),
-        без rejection и без перечисления вершин, с предупреждением о смене
-        меры (uniform-marginal по компонентам в порядке перечисления).
+        Если из-за узких границ приёмка мала и точек не хватает — правило
+        ВСЁ-ИЛИ-НИЧЕГО (iter36): частично набранные rejection-точки
+        ОТБРАСЫВАЮТСЯ и ВЕСЬ план перегенерируется последовательным
+        сужением (singleton-группы, :meth:`_random_points_grouped`) —
+        всегда валидная точка за O(q), без rejection и без перечисления
+        вершин, с предупреждением о смене меры (uniform-marginal по
+        компонентам в порядке перечисления). Почему не «добор остатка»:
+        смесь двух распределений в одном плане (iter35) концентрировала
+        narrowing-точки в труднодостижимых углах — там, где информация
+        дороже всего; однородная мера плана важнее экономии сэмплов.
         История fallback'ов: «забить центроидом» (до iter29) вырождал пул;
         «выпуклые комбинации крайних вершин» (iter29..34) стягивали точки к
         центроиду (замер iter34: q95(r/r_max)=0.28) и были вычислительно
@@ -205,7 +210,10 @@ class SimplexRegion:
         на q=17 это ~1.1 млн + O(V²) dedup, зависание на минуты).
 
         Метаданные последнего вызова — ``self.last_sampling_info``
-        (``n``/``n_rejection``/``n_fallback``/``method``).
+        (``n``/``n_rejection``/``n_fallback``/``method``); ``method`` всегда
+        ОДНОРОДЕН: ``"rejection"`` | ``"narrowing"`` | ``"grouped"``
+        (смешанного ``"rejection+narrowing"`` больше не существует —
+        preflight/аудит могут на это опираться).
 
         ``groups`` (iter31) — НЕПЕРЕСЕКАЮЩИЕСЯ группы индексов компонентов
         («функциональные ниши», mixture-of-mixtures). Включает
@@ -241,24 +249,27 @@ class SimplexRegion:
                 out.append(x)
         n_rej = len(out)
         if n_rej < n:
-            k = n - n_rej
             warnings.warn(
                 f"SimplexRegion.random_points: rejection sampling дал "
                 f"{n_rej}/{n} точек за {max_tries} попыток (узкие границы); "
-                f"{k} точек добрано последовательным сужением "
-                f"(uniform-marginal, без rejection).",
+                f"ВЕСЬ план перегенерирован последовательным сужением "
+                f"(uniform-marginal, без rejection) — всё-или-ничего, "
+                f"без смешения мер в одном плане.",
                 UserWarning, stacklevel=2)
             # singleton-группы: каждый компонент — своя «часть»; допустимость
             # гарантирована конструкцией (валидация ΣL≤1≤ΣU в конструкторе),
             # O(q) на точку, без перечисления вершин и без rejection.
             fb_seed = int(rng.integers(0, 2**31 - 1))
             singles = [[i] for i in range(self.q)]
-            out.extend(self._random_points_grouped(k, fb_seed, singles))
+            X = self._random_points_grouped(n, fb_seed, singles)
+            self.last_sampling_info = {
+                "n": int(n), "n_rejection": 0, "n_fallback": int(n),
+                "n_rejection_discarded": int(n_rej),
+                "method": "narrowing"}
+            return X
         self.last_sampling_info = {
-            "n": int(n), "n_rejection": int(n_rej),
-            "n_fallback": int(max(0, n - n_rej)),
-            "method": ("rejection" if n_rej >= n
-                       else "rejection+narrowing")}
+            "n": int(n), "n_rejection": int(n), "n_fallback": 0,
+            "method": "rejection"}
         return np.array(out[:n])
 
     # ------------------------------------------------------------------

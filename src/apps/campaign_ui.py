@@ -918,12 +918,23 @@ def parse_phr_spec_json(text: str) -> PhrSpec:
         raise ValueError(
             f"Некорректный JSON (строка {exc.lineno}, позиция {exc.colno}): "
             f"{exc.msg}.") from exc
+    if isinstance(data, dict):
+        # iter46/B6: обёртка схемы v2 {"spec_version": 2, "nodes": [...]};
+        # объект БЕЗ 'nodes' — это не обёртка, а ошибка формата (например,
+        # один узел объектом вместо списка) — прежнее понятное сообщение.
+        if "nodes" not in data:
+            raise ValueError(
+                "Ожидался JSON-СПИСОК узлов ([{...}, ...]) или обёртка "
+                "{\"spec_version\": 2, \"nodes\": [...]}, получен объект "
+                f"с ключами {sorted(data)}.")
+        return PhrSpec.from_dicts(data)
     if not isinstance(data, list):
-        raise ValueError("Ожидался JSON-СПИСОК узлов ([{...}, ...]), получен "
-                         f"{type(data).__name__}.")
+        raise ValueError("Ожидался JSON-СПИСОК узлов ([{...}, ...]) или "
+                         "обёртка {\"spec_version\": 2, \"nodes\": [...]}, "
+                         f"получен {type(data).__name__}.")
     if not all(isinstance(d, dict) for d in data):
         raise ValueError("Каждый узел спеки должен быть JSON-объектом "
-                         "{\"name\": ..., \"mode\": ...}.")
+                         "{\"name\": ..., \"mode\"/\"role\": ...}.")
     return PhrSpec.from_dicts(data)
 
 
@@ -938,6 +949,10 @@ def phr_spec_summary_dataframe(spec: PhrSpec) -> pd.DataFrame:
     for nd in spec.nodes:
         if nd.mode == "fixed":
             lo, hi = float(nd.value), float(nd.value)
+        elif nd.mode == "share_closure":
+            # iter46/B2: у closure диапазон ПРОИЗВОДНЫЙ [1−φᵁ, 1−φᴸ] —
+            # показываем его, а не сентинель (0, 0)
+            lo, hi = map(float, spec.share_base_bounds(nd.name))
         else:
             lo, hi = float(nd.lo), float(nd.hi)
         rows.append({
@@ -1157,7 +1172,16 @@ def phr_tree_from_spec(spec: PhrSpec) -> List[Dict[str, Any]]:
     Нужно для префилла формы после загрузки проекта: узел, на который
     ссылаются ``share_of``-дети, становится ГРУППОЙ; сами дети уходят
     внутрь неё; остальные узлы — одиночные. Порядок сохраняется, поэтому
-    round-trip даёт ТОТ ЖЕ ``spec_hash``."""
+    round-trip даёт ТОТ ЖЕ ``spec_hash``.
+
+    iter46: дерево — редактор legacy-схемы v1 (``share_of``); спека схемы
+    v2 (роли SHARE_FREE/SHARE_CLOSURE/SHARE_SIMPLEX) в дерево не
+    проецируется — явная ошибка, а не искажённое дерево (A0.6)."""
+    if getattr(spec, "schema_version", 1) == 2:
+        raise ValueError(
+            "Иерархический редактор поддерживает legacy-схему v1 (share_of); "
+            "спека схемы v2 (роли SHARE_FREE/SHARE_CLOSURE/SHARE_SIMPLEX) "
+            "редактируется через канал «JSON / файл».")
     kids: Dict[str, List[Dict[str, Any]]] = {}
     for nd in spec.nodes:
         if nd.mode == "share_of":
@@ -1711,7 +1735,10 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
                                            ensure_ascii=False, indent=2)
         # iter41.4: то же самое деревом — чтобы иерархический канал показывал
         # загруженную спеку, а не пустую форму (round-trip сохраняет hash).
-        out["setup_phr_tree"] = phr_tree_from_spec(spec)
+        # iter46: дерево — legacy-канал (v1); спека схемы v2 префиллится
+        # только JSON'ом (phr_tree_from_spec для v2 — явная ошибка).
+        if getattr(spec, "schema_version", 1) == 1:
+            out["setup_phr_tree"] = phr_tree_from_spec(spec)
     return out
 
 

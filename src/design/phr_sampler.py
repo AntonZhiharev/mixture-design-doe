@@ -33,6 +33,27 @@ z-сэмплер-плагин parts/phr-спеки.
     ``r ∈ [lo, hi]`` (пример: «SBM = 0.02…0.09 × Σ стабилизатора»);
   * ``fixed``     — константа phr (базовый компонент: смола = 100).
 
+Новый контракт долей (iter46/B2, ревизия «pvc_edge_v1»): legacy ``share_of``
+даёт КАЖДОМУ члену группы свою z-ось, поэтому пары (φ, 1−φ) точно
+коллинеарны — rank(Z) < dim_z, cond → ∞, ARD-длины пар не идентифицируются.
+Вместо этого — роли с явным замыканием:
+
+  * ``share_free``    — свободная доля k=2-группы (z-ось, ``share_range``);
+  * ``share_closure`` — замыкание k=2-группы: z-оси НЕТ, диапазон
+    ПРОИЗВОДНЫЙ ``[1−φᵁ_free, 1−φᴸ_free]``; задавать range запрещено —
+    ошибка валидации, не тихое игнорирование (B8);
+  * ``share_simplex`` — совместные доли k≥3-группы (все члены): z-осей
+    k−1, ПОСЛЕДНИЙ член группы — зависимая координата ``1 − Σ остальных``
+    (замыкание — внутреннее свойство сэмплера, не роль узла, C1).
+
+Схема сериализации v2 (iter46/B6): роли ``FIXED`` / ``ABSOLUTE`` /
+``ABSOLUTE_CAPPED`` / ``GROUP_TOTAL`` / ``GROUP_TOTAL_FIXED`` /
+``SHARE_FREE`` / ``SHARE_CLOSURE`` / ``SHARE_SIMPLEX`` / ``RATIO_TO``;
+ключи ``role`` / ``range`` / ``share_range`` / ``group`` / ``members`` /
+``reference`` / ``scale`` / ``spec_version`` — см. :meth:`PhrSpec.from_dicts`.
+Legacy-схема v1 (``mode``) продолжает работать без изменений: старые сейвы
+и хеши валидны, обе схемы различимы по ключам.
+
 Узел, на который ссылаются share_of-дети, — ВНУТРЕННИЙ (его phr раздаётся
 детям, компонентом смеси он не является). Компоненты = листья DAG.
 
@@ -63,9 +84,56 @@ MODE_ABSOLUTE = "absolute"
 MODE_SHARE_OF = "share_of"
 MODE_RATIO_TO = "ratio_to"
 MODE_FIXED = "fixed"
-_MODES = (MODE_ABSOLUTE, MODE_SHARE_OF, MODE_RATIO_TO, MODE_FIXED)
+# Новый контракт долей (iter46/B2): closure/зависимый член — без z-оси.
+MODE_SHARE_FREE = "share_free"
+MODE_SHARE_CLOSURE = "share_closure"
+MODE_SHARE_SIMPLEX = "share_simplex"
+_NEW_SHARE_MODES = (MODE_SHARE_FREE, MODE_SHARE_CLOSURE, MODE_SHARE_SIMPLEX)
+_SHARE_MODES = (MODE_SHARE_OF,) + _NEW_SHARE_MODES
+_MODES = (MODE_ABSOLUTE, MODE_SHARE_OF, MODE_RATIO_TO,
+          MODE_FIXED) + _NEW_SHARE_MODES
+_SCALES = ("linear", "log")
 
 _TOL = 1e-9
+
+# ----------------------------------------------------------------------
+# Схема сериализации v2 (iter46/B6): role → (mode, обязательные ключи,
+# допустимые ключи). Всё вне allowed — ошибка (в т.ч. legacy-ключи
+# lo/hi/of/to/mode и range у closure/fixed — B8: не тихое игнорирование).
+# ----------------------------------------------------------------------
+_ROLE_TABLE: Dict[str, Tuple[str, frozenset, frozenset]] = {
+    "FIXED": ("fixed",
+              frozenset({"value"}),
+              frozenset({"name", "role", "value"})),
+    "ABSOLUTE": ("absolute",
+                 frozenset({"range"}),
+                 frozenset({"name", "role", "range", "scale"})),
+    "ABSOLUTE_CAPPED": ("absolute",
+                        frozenset({"range", "cap_to", "cap_ratio"}),
+                        frozenset({"name", "role", "range", "scale",
+                                   "cap_to", "cap_ratio"})),
+    "GROUP_TOTAL": ("absolute",
+                    frozenset({"range", "members"}),
+                    frozenset({"name", "role", "range", "members"})),
+    "GROUP_TOTAL_FIXED": ("fixed",
+                          frozenset({"value", "members"}),
+                          frozenset({"name", "role", "value", "members"})),
+    "SHARE_FREE": ("share_free",
+                   frozenset({"group", "share_range"}),
+                   frozenset({"name", "role", "group", "share_range",
+                              "min_phr", "max_phr"})),
+    "SHARE_CLOSURE": ("share_closure",
+                      frozenset({"group"}),
+                      frozenset({"name", "role", "group",
+                                 "min_phr", "max_phr"})),
+    "SHARE_SIMPLEX": ("share_simplex",
+                      frozenset({"group", "share_range"}),
+                      frozenset({"name", "role", "group", "share_range",
+                                 "min_phr", "max_phr"})),
+    "RATIO_TO": ("ratio_to",
+                 frozenset({"reference", "range"}),
+                 frozenset({"name", "role", "reference", "range"})),
+}
 
 
 @dataclass
@@ -74,9 +142,13 @@ class PhrNode:
     у ratio_to); у absolute/fixed референса нет. ``cap_refs``/``cap_ratio``
     (только absolute) — динамический потолок по СУММЕ референсов (фазе):
     ``hi_eff = min(hi, cap_ratio · Σ value(cap_refs))``.
-    ``min_phr``/``max_phr`` (только share_of, iter45/B1) — технологические
+    ``min_phr``/``max_phr`` (share-режимы, iter45/B1) — технологические
     лимиты узла В PHR: conditional narrowing доли после розыгрыша тотала,
-    а НЕ бокс по доле (``None`` — лимита нет)."""
+    а НЕ бокс по доле (``None`` — лимита нет). ``scale`` (только absolute,
+    iter46/B6) — шкала сэмплинга оси: ``linear`` | ``log`` (сам лог-сэмплинг
+    — iter47/B5; до него геометрические операции отвергают log явно).
+    У ``share_closure`` границы НЕ задаются (``lo=hi=0`` — сентинель):
+    диапазон производный от свободного партнёра (iter46/B8)."""
     name: str
     mode: str
     lo: float = 0.0
@@ -87,6 +159,7 @@ class PhrNode:
     cap_ratio: float = 0.0
     min_phr: Optional[float] = None
     max_phr: Optional[float] = None
+    scale: str = "linear"
 
 
 class PhrSpec:
@@ -104,7 +177,8 @@ class PhrSpec:
         X = spec.sample_candidates(200, seed=0)   # (n, q) доли, Σ=1
     """
 
-    def __init__(self, nodes: Sequence[PhrNode]):
+    def __init__(self, nodes: Sequence[PhrNode],
+                 schema_version: Optional[int] = None):
         self.nodes: List[PhrNode] = list(nodes)
         if not self.nodes:
             raise ValueError("Пустая phr-спека недопустима.")
@@ -123,8 +197,35 @@ class PhrSpec:
         # share-группы: родитель → упорядоченный список имён детей
         self._share_groups: Dict[str, List[str]] = {}
         for nd in self.nodes:
-            if nd.mode == MODE_SHARE_OF:
+            if nd.mode in _SHARE_MODES:
                 self._share_groups.setdefault(nd.ref, []).append(nd.name)
+        # iter46/B2: статические границы ДОЛИ каждого share-узла (у closure
+        # — производные от свободного партнёра) и производные члены групп
+        # (closure / последний член simplex-группы) — БЕЗ собственной z-оси
+        self._share_base: Dict[str, Tuple[float, float]] = {}
+        self._derived_of: Dict[str, str] = {}
+        self._validate_share_groups()
+        # версия схемы сериализации: 1 — legacy (mode), 2 — роли (iter46/B6)
+        has_new = any(nd.mode in _NEW_SHARE_MODES or nd.scale != "linear"
+                      for nd in self.nodes)
+        if schema_version is None:
+            schema_version = 2 if has_new else 1
+        if schema_version not in (1, 2):
+            raise ValueError(
+                f"Неизвестная версия схемы phr-спеки: {schema_version!r} "
+                f"(поддерживаются 1 и 2).")
+        if schema_version == 1 and has_new:
+            raise ValueError(
+                "Схема v1 (legacy) не поддерживает роли share_free/"
+                "share_closure/share_simplex и scale — используйте "
+                "схему v2 (role-ключи).")
+        if schema_version == 2 and any(nd.mode == MODE_SHARE_OF
+                                       for nd in self.nodes):
+            raise ValueError(
+                "Схема v2 не поддерживает legacy-режим 'share_of' — "
+                "используйте SHARE_FREE/SHARE_CLOSURE (k=2) или "
+                "SHARE_SIMPLEX (k≥3).")
+        self.schema_version: int = int(schema_version)
         self._topo: List[str] = self._toposort()
         # компоненты смеси = листья (НЕ родители share-групп), порядок спеки
         self.component_names: List[str] = [
@@ -132,11 +233,20 @@ class PhrSpec:
         if len(self.component_names) < 2:
             raise ValueError(
                 "phr-спека должна давать ≥2 компонента смеси (листа DAG).")
-        # z-оси: все НЕ-fixed узлы в порядке спеки (share-узел = его доля)
+        # z-оси: НЕ-fixed узлы в порядке спеки МИНУС производные члены
+        # групп нового контракта (iter46/B2: closure и последний член
+        # simplex-группы восстанавливаются как 1 − Σ партнёров — точной
+        # линейной зависимости в design-пространстве больше нет)
+        derived = set(self._derived_of.values())
         self.z_names: List[str] = [nd.name for nd in self.nodes
-                                   if nd.mode != MODE_FIXED]
+                                   if nd.mode != MODE_FIXED
+                                   and nd.name not in derived]
         self._z_col: Dict[str, int] = {nm: j for j, nm
                                        in enumerate(self.z_names)}
+        # iter46/B6: оси с scale='log' — схема/хеш принимают, сэмплинг до
+        # iter47 (B5) отвергается явно (_require_linear)
+        self._log_axes: List[str] = [nd.name for nd in self.nodes
+                                     if nd.scale == "log"]
         # статическая интервальная валидация (ДО любого сэмплинга)
         self._interval: Dict[str, Tuple[float, float]] = {}
         # окно тотала группы, суженное phr-лимитами её членов (iter45/B1):
@@ -148,16 +258,51 @@ class PhrSpec:
     # Конструкторы
     # ------------------------------------------------------------------
     @classmethod
-    def from_dicts(cls, dicts: Sequence[Mapping[str, Any]]) -> "PhrSpec":
-        """Спека из списка словарей: ключи ``name``, ``mode``, ``lo``, ``hi``,
-        ``value`` (fixed), ``of`` (share_of) / ``to`` (ratio_to),
-        ``cap_to``/``cap_ratio`` (динамический потолок absolute-оси;
-        ``cap_to`` — имя узла или СПИСОК имён, значения референсов
-        складываются: потолок ссылается на фазу, а не на один компонент),
-        ``min_phr``/``max_phr`` (технологические лимиты share_of-узла в phr).
-        Доли share_of без явных границ — ``[0, 1]``."""
+    def from_dicts(cls, dicts) -> "PhrSpec":
+        """Спека из JSON-представления. Понимает ДВЕ схемы:
+
+        * **v1 (legacy, ``mode``)** — список узлов с ключами ``name``,
+          ``mode``, ``lo``/``hi``, ``value`` (fixed), ``of`` (share_of) /
+          ``to`` (ratio_to), ``cap_to``/``cap_ratio`` (потолок absolute-оси;
+          ``cap_to`` — имя или СПИСОК имён, значения складываются),
+          ``min_phr``/``max_phr``. Доли share_of без явных границ —
+          ``[0, 1]``. Поведение и хеши прежние (старые сейвы валидны);
+        * **v2 (роли, iter46/B6)** — список узлов с ключом ``role``
+          (см. ``_ROLE_TABLE``) и ключами ``range``/``share_range``
+          (пары ``[lo, hi]``), ``group``/``members``/``reference``/``scale``;
+          допускается обёртка ``{"spec_version": 2, "nodes": [...]}``.
+          Ключи вне схемы роли (в т.ч. legacy lo/hi/of/to и range у
+          closure/fixed) — ошибка валидации, не тихое игнорирование (B8).
+
+        Смешивать ``mode`` и ``role`` в одном списке нельзя.
+        """
+        if isinstance(dicts, Mapping):               # v2-обёртка
+            extra = set(dicts) - {"spec_version", "nodes"}
+            if extra:
+                raise ValueError(
+                    f"Неизвестные ключи обёртки спеки: {sorted(extra)} "
+                    f"(допустимы 'spec_version' и 'nodes').")
+            ver = dicts.get("spec_version")
+            if ver not in (2, "2"):
+                raise ValueError(
+                    f"spec_version={ver!r} не поддерживается (ожидается 2; "
+                    f"legacy-схема v1 — плоский список узлов с 'mode').")
+            raw = dicts.get("nodes")
+            if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+                raise ValueError(
+                    "Обёртка спеки: 'nodes' должен быть списком узлов.")
+            return cls(cls._nodes_from_roles(list(raw)), schema_version=2)
+        items = list(dicts)
+        has_role = any("role" in d for d in items)
+        has_mode = any("mode" in d for d in items)
+        if has_role and has_mode:
+            raise ValueError(
+                "Смешаны схемы: часть узлов с 'mode' (v1), часть с 'role' "
+                "(v2) — спека должна быть в одной схеме.")
+        if has_role:
+            return cls(cls._nodes_from_roles(items), schema_version=2)
         nodes: List[PhrNode] = []
-        for d in dicts:
+        for d in items:
             mode = str(d.get("mode", ""))
             ref = str(d.get("of", d.get("to", "")) or "")
             lo = float(d.get("lo", 0.0))
@@ -178,19 +323,127 @@ class PhrSpec:
                                           else float(raw_min)),
                                  max_phr=(None if raw_max is None
                                           else float(raw_max))))
-        return cls(nodes)
+        return cls(nodes, schema_version=1)
+
+    @classmethod
+    def _nodes_from_roles(cls, items: Sequence[Mapping[str, Any]]
+                          ) -> List[PhrNode]:
+        """iter46/B6: разбор узлов схемы v2 (роли) в :class:`PhrNode`.
+
+        Строгая валидация ключей per-role (``_ROLE_TABLE``): недостающие
+        обязательные и лишние ключи — ошибка (ловит и legacy lo/hi/of/to,
+        и range у closure/fixed — B8). Кросс-проверка ``members`` групп:
+        список обязан ТОЧНО совпадать (состав И порядок) с узлами,
+        объявившими ``group`` на этот тотал (C2-строгость: несовпадение —
+        ошибка, а не «лишние игнорируются»).
+        """
+        def _pair(d: Mapping[str, Any], key: str, name: str,
+                  role: str) -> Tuple[float, float]:
+            v = d[key]
+            if not isinstance(v, (list, tuple)) or len(v) != 2:
+                raise ValueError(
+                    f"Узел '{name}' ({role}): '{key}' должен быть парой "
+                    f"[lo, hi], получено {v!r}.")
+            return float(v[0]), float(v[1])
+
+        nodes: List[PhrNode] = []
+        declared: Dict[str, List[str]] = {}      # тотал → members из схемы
+        children: Dict[str, List[str]] = {}      # тотал → узлы с group=…
+        names: List[str] = []
+        for d in items:
+            if not isinstance(d, Mapping):
+                raise ValueError(f"Узел спеки должен быть объектом, "
+                                 f"получено {type(d).__name__}.")
+            name = str(d.get("name", ""))
+            role = str(d.get("role", ""))
+            if role not in _ROLE_TABLE:
+                raise ValueError(
+                    f"Узел '{name}': неизвестная роль '{role}' "
+                    f"(допустимо: {sorted(_ROLE_TABLE)}).")
+            mode, required, allowed = _ROLE_TABLE[role]
+            if role in ("SHARE_CLOSURE", "FIXED", "GROUP_TOTAL_FIXED"):
+                bad = [k for k in ("range", "share_range") if k in d]
+                if bad:
+                    reason = ("диапазон closure ПРОИЗВОДНЫЙ: "
+                              "[1−φᵁ_free, 1−φᴸ_free]"
+                              if role == "SHARE_CLOSURE"
+                              else "fixed-узел задаётся ключом 'value'")
+                    raise ValueError(
+                        f"Узел '{name}' ({role}): ключи {bad} недопустимы — "
+                        f"{reason} (B8: ошибка, не тихое игнорирование).")
+            missing = sorted(required - set(d))
+            if missing:
+                raise ValueError(
+                    f"Узел '{name}' ({role}): нет обязательных ключей "
+                    f"{missing}.")
+            extra = sorted(set(d) - allowed)
+            if extra:
+                raise ValueError(
+                    f"Узел '{name}' ({role}): ключи {extra} не входят в "
+                    f"схему v2 (допустимо: {sorted(allowed)}).")
+            lo = hi = 0.0
+            if "range" in d:
+                lo, hi = _pair(d, "range", name, role)
+            elif "share_range" in d:
+                lo, hi = _pair(d, "share_range", name, role)
+            cap_refs: Tuple[str, ...] = ()
+            if role == "ABSOLUTE_CAPPED":
+                raw_cap = d["cap_to"]
+                if (isinstance(raw_cap, str)
+                        or not isinstance(raw_cap, (list, tuple))
+                        or not raw_cap):
+                    raise ValueError(
+                        f"Узел '{name}' (ABSOLUTE_CAPPED): 'cap_to' — "
+                        f"непустой СПИСОК имён узлов (фаза), получено "
+                        f"{raw_cap!r}.")
+                cap_refs = tuple(str(x) for x in raw_cap)
+            ref = str(d.get("group", d.get("reference", "")) or "")
+            raw_min = d.get("min_phr", None)
+            raw_max = d.get("max_phr", None)
+            nodes.append(PhrNode(
+                name=name, mode=mode, lo=lo, hi=hi,
+                value=float(d.get("value", 0.0)), ref=ref,
+                cap_refs=cap_refs,
+                cap_ratio=float(d.get("cap_ratio", 0.0)),
+                min_phr=(None if raw_min is None else float(raw_min)),
+                max_phr=(None if raw_max is None else float(raw_max)),
+                scale=str(d.get("scale", "linear"))))
+            names.append(name)
+            if "members" in d:
+                mv = d["members"]
+                if (isinstance(mv, str)
+                        or not isinstance(mv, (list, tuple)) or not mv):
+                    raise ValueError(
+                        f"Узел '{name}' ({role}): 'members' — непустой "
+                        f"СПИСОК имён узлов группы.")
+                declared[name] = [str(x) for x in mv]
+            if mode in _NEW_SHARE_MODES and ref:
+                children.setdefault(ref, []).append(name)
+        for parent, members in declared.items():
+            actual = children.get(parent, [])
+            if actual != members:
+                raise ValueError(
+                    f"Группа '{parent}': 'members' {members} не совпадают "
+                    f"со списком узлов group='{parent}' в порядке спеки "
+                    f"{actual} — состав и порядок обязаны совпадать точно.")
+        for parent in children:
+            if parent in set(names) and parent not in declared:
+                raise ValueError(
+                    f"Узел '{parent}': на него ссылаются share-узлы, но "
+                    f"роль не GROUP_TOTAL/GROUP_TOTAL_FIXED (нет 'members').")
+        return nodes
 
     # ------------------------------------------------------------------
     # Валидация структуры
     # ------------------------------------------------------------------
     def _validate_refs(self) -> None:
         for nd in self.nodes:
-            needs_ref = nd.mode in (MODE_SHARE_OF, MODE_RATIO_TO)
+            needs_ref = nd.mode in _SHARE_MODES or nd.mode == MODE_RATIO_TO
             if needs_ref:
                 if not nd.ref:
                     raise ValueError(
                         f"Узел '{nd.name}' ({nd.mode}): не указан референс "
-                        f"('of'/'to').")
+                        f"('of'/'to'/'group').")
                 if nd.ref not in self._by_name:
                     raise ValueError(
                         f"Узел '{nd.name}': референс '{nd.ref}' не найден "
@@ -226,11 +479,11 @@ class PhrSpec:
                 raise ValueError(
                     f"Узел '{nd.name}': cap_ratio без cap_to недопустим.")
             if nd.min_phr is not None or nd.max_phr is not None:
-                if nd.mode != MODE_SHARE_OF:
+                if nd.mode not in _SHARE_MODES:
                     raise ValueError(
                         f"Узел '{nd.name}' ({nd.mode}): min_phr/max_phr "
-                        f"допустимы только для share_of — у absolute/ratio_to "
-                        f"границы уже заданы в своих координатах.")
+                        f"допустимы только для share-режимов — у absolute/"
+                        f"ratio_to границы уже заданы в своих координатах.")
                 if nd.min_phr is not None and nd.min_phr < 0:
                     raise ValueError(
                         f"Узел '{nd.name}': min_phr={nd.min_phr} < 0.")
@@ -242,6 +495,124 @@ class PhrSpec:
                 if nd.max_phr is not None and nd.max_phr <= _TOL:
                     raise ValueError(
                         f"Узел '{nd.name}': max_phr={nd.max_phr} ≤ 0.")
+            if nd.mode == MODE_SHARE_CLOSURE and (nd.lo or nd.hi):
+                raise ValueError(
+                    f"Узел '{nd.name}' (share_closure): диапазон доли не "
+                    f"задаётся — он ПРОИЗВОДНЫЙ от свободного партнёра "
+                    f"[1−φᵁ_free, 1−φᴸ_free] (iter46/B8).")
+            if nd.scale not in _SCALES:
+                raise ValueError(
+                    f"Узел '{nd.name}': неизвестная шкала scale="
+                    f"'{nd.scale}' (допустимо: {list(_SCALES)}).")
+            if nd.scale == "log":
+                if nd.mode != MODE_ABSOLUTE:
+                    raise ValueError(
+                        f"Узел '{nd.name}' ({nd.mode}): scale='log' допустим "
+                        f"только для absolute-осей.")
+                if nd.lo <= 0:
+                    raise ValueError(
+                        f"Узел '{nd.name}': scale='log' требует lo > 0 "
+                        f"(получено {nd.lo}).")
+
+    def _validate_share_groups(self) -> None:
+        """iter46/B2: состав share-групп нового контракта и производные
+        границы closure.
+
+        Инварианты (ревизия контракта «pvc_edge_v1», C1/C5):
+
+          * смешивать legacy ``share_of`` и новые роли в одной группе нельзя;
+          * k=2 → РОВНО один ``share_closure`` + один ``share_free``
+            (``share_simplex`` при k=2 запрещён);
+          * k≥3 → ВСЕ члены ``share_simplex`` (closure запрещён: замыкание —
+            внутреннее свойство сэмплера, не роль узла, C1); зависимая
+            координата — ПОСЛЕДНИЙ член группы (порядок узлов — часть спеки);
+          * share-бокс группы (C5): ``φᵢᵁ ≤ 1 − Σ_{j≠i} φⱼᴸ`` НЕСТРОГО
+            (LUB впритык: 0.60 = 1 − 0.40 — не ошибка; строгое ``<`` дало
+            бы ложный отказ);
+          * родитель группы нового контракта — absolute без cap
+            (GROUP_TOTAL) или fixed (GROUP_TOTAL_FIXED), scale='linear'.
+
+        Заполняет ``_share_base`` (статические границы долей; у closure —
+        производные ``[1−φᵁ_free, 1−φᴸ_free]``) и ``_derived_of``
+        (родитель → член группы без z-оси).
+        """
+        for parent, members in self._share_groups.items():
+            new_m = [m for m in members
+                     if self._by_name[m].mode in _NEW_SHARE_MODES]
+            if not new_m:                          # legacy-группа share_of
+                for m in members:
+                    nd = self._by_name[m]
+                    self._share_base[m] = (nd.lo, nd.hi)
+                continue
+            if len(new_m) != len(members):
+                raise ValueError(
+                    f"Группа '{parent}': смешаны legacy 'share_of' и роли "
+                    f"нового контракта — недопустимо.")
+            for m in members:                      # доли ⊆ [0,1] до производных
+                nd = self._by_name[m]
+                if nd.mode == MODE_SHARE_CLOSURE:
+                    continue
+                if nd.lo < -_TOL or nd.lo > nd.hi + _TOL or nd.hi > 1 + _TOL:
+                    raise ValueError(
+                        f"Узел '{m}': некорректный share_range "
+                        f"[{nd.lo}, {nd.hi}] (нужно 0 ≤ lo ≤ hi ≤ 1).")
+            k = len(members)
+            closures = [m for m in members
+                        if self._by_name[m].mode == MODE_SHARE_CLOSURE]
+            frees = [m for m in members
+                     if self._by_name[m].mode == MODE_SHARE_FREE]
+            simplex = [m for m in members
+                       if self._by_name[m].mode == MODE_SHARE_SIMPLEX]
+            if k < 2:
+                raise ValueError(
+                    f"Группа '{parent}': группа нового контракта из одного "
+                    f"узла не имеет смысла (нужно k ≥ 2).")
+            if k == 2:
+                if simplex:
+                    raise ValueError(
+                        f"Группа '{parent}': SHARE_SIMPLEX допустим только "
+                        f"при k ≥ 3; для k=2 — SHARE_FREE + SHARE_CLOSURE.")
+                if len(closures) != 1 or len(frees) != 1:
+                    raise ValueError(
+                        f"Группа '{parent}' (k=2): требуется РОВНО один "
+                        f"SHARE_CLOSURE и один SHARE_FREE (получено "
+                        f"closure={len(closures)}, free={len(frees)}).")
+                fr = self._by_name[frees[0]]
+                self._share_base[frees[0]] = (fr.lo, fr.hi)
+                self._share_base[closures[0]] = (1.0 - fr.hi, 1.0 - fr.lo)
+                self._derived_of[parent] = closures[0]
+            else:
+                if len(simplex) != k:
+                    raise ValueError(
+                        f"Группа '{parent}' (k={k} ≥ 3): все члены должны "
+                        f"быть SHARE_SIMPLEX (SHARE_CLOSURE/SHARE_FREE при "
+                        f"k≥3 запрещены — замыкание делает сэмплер, C1).")
+                lo_sum = sum(self._by_name[m].lo for m in members)
+                for m in members:
+                    nd = self._by_name[m]
+                    self._share_base[m] = (nd.lo, nd.hi)
+                    lub = 1.0 - (lo_sum - nd.lo)
+                    if nd.hi > lub + _TOL:         # C5, сравнение НЕСТРОГОЕ
+                        raise ValueError(
+                            f"Группа '{parent}': share-бокс несовместен — "
+                            f"φᵁ('{m}')={nd.hi:g} > 1 − Σφᴸ(партнёров)="
+                            f"{lub:g} (C5).")
+                self._derived_of[parent] = members[-1]
+            p = self._by_name[parent]
+            if p.mode == MODE_ABSOLUTE and p.cap_refs:
+                raise ValueError(
+                    f"Группа '{parent}': тотал группы нового контракта не "
+                    f"может иметь cap_to (роль GROUP_TOTAL — absolute "
+                    f"без cap).")
+            if p.mode not in (MODE_ABSOLUTE, MODE_FIXED):
+                raise ValueError(
+                    f"Группа '{parent}': тотал группы нового контракта "
+                    f"должен быть GROUP_TOTAL (absolute) или "
+                    f"GROUP_TOTAL_FIXED (fixed), а не '{p.mode}'.")
+            if p.scale != "linear":
+                raise ValueError(
+                    f"Группа '{parent}': тотал группы задаётся в линейной "
+                    f"шкале (scale='{p.scale}' недопустим).")
 
     def _toposort(self) -> List[str]:
         """Топосорт Кана по рёбрам ref→node и cap_refs→node;
@@ -282,17 +653,18 @@ class PhrSpec:
                 if nd.value < 0:
                     raise ValueError(f"Узел '{nd.name}': fixed value < 0.")
                 continue
-            if nd.lo < -_TOL or nd.lo > nd.hi + _TOL:
+            b_lo, b_hi = self._share_base.get(nd.name, (nd.lo, nd.hi))
+            if b_lo < -_TOL or b_lo > b_hi + _TOL:
                 raise ValueError(
                     f"Узел '{nd.name}': некорректные границы "
-                    f"[{nd.lo}, {nd.hi}] (нужно 0 ≤ lo ≤ hi).")
-            if nd.mode == MODE_SHARE_OF and nd.hi > 1 + _TOL:
+                    f"[{b_lo}, {b_hi}] (нужно 0 ≤ lo ≤ hi).")
+            if nd.mode in _SHARE_MODES and b_hi > 1 + _TOL:
                 raise ValueError(
-                    f"Узел '{nd.name}': доля share_of должна быть ≤ 1 "
-                    f"(hi={nd.hi}).")
+                    f"Узел '{nd.name}': доля share-узла должна быть ≤ 1 "
+                    f"(hi={b_hi}).")
         for parent, members in self._share_groups.items():
-            s_lo = sum(self._by_name[m].lo for m in members)
-            s_hi = sum(self._by_name[m].hi for m in members)
+            s_lo = sum(self._share_base[m][0] for m in members)
+            s_hi = sum(self._share_base[m][1] for m in members)
             if s_lo > 1 + _TOL or s_hi < 1 - _TOL:
                 raise ValueError(
                     f"Группа share_of узла '{parent}': пустое пересечение — "
@@ -315,16 +687,17 @@ class PhrSpec:
                     iv = (nd.lo, min(nd.hi, nd.cap_ratio * r_hi))
                 else:
                     iv = (nd.lo, nd.hi)
-            else:  # ratio_to / share_of: произведение неотрицательных интервалов
+            else:  # ratio_to / share-режимы: произведение интервалов ≥ 0
                 r_lo, r_hi = self._interval[nd.ref]
                 if r_lo <= _TOL:
                     raise ValueError(
                         f"Узел '{nd.name}' ({nd.mode}) ссылается на "
                         f"'{nd.ref}' с нижней границей {r_lo:.6g} ≤ 0 — "
                         f"референс должен быть строго положительным.")
-                iv = (nd.lo * r_lo, nd.hi * r_hi)
-                if nd.mode == MODE_SHARE_OF and (nd.min_phr is not None
-                                                 or nd.max_phr is not None):
+                s_lo, s_hi = self._share_base.get(nm, (nd.lo, nd.hi))
+                iv = (s_lo * r_lo, s_hi * r_hi)
+                if nd.mode in _SHARE_MODES and (nd.min_phr is not None
+                                                or nd.max_phr is not None):
                     lo_p, hi_p = iv
                     if nd.min_phr is not None:
                         lo_p = max(lo_p, nd.min_phr)
@@ -336,7 +709,7 @@ class PhrSpec:
                             f"[{nd.min_phr}, {nd.max_phr}] не пересекаются "
                             f"с достижимым диапазоном доли "
                             f"[{iv[0]:.6g}, {iv[1]:.6g}] "
-                            f"(φ∈[{nd.lo:g}, {nd.hi:g}] при тотале "
+                            f"(φ∈[{s_lo:g}, {s_hi:g}] при тотале "
                             f"'{nd.ref}'∈[{r_lo:.6g}, {r_hi:.6g}]).")
                     iv = (lo_p, hi_p)
             self._interval[nm] = iv
@@ -392,7 +765,8 @@ class PhrSpec:
                 f"положительного тотала, а его нижняя граница {t_lo:.6g}.")
         for m in limited:            # (0) достижимость лимита самим узлом
             nd = self._by_name[m]
-            reach_lo, reach_hi = nd.lo * t_lo, nd.hi * t_hi
+            s_lo, s_hi = self._share_base[m]
+            reach_lo, reach_hi = s_lo * t_lo, s_hi * t_hi
             lim_lo = nd.min_phr if nd.min_phr is not None else 0.0
             lim_hi = nd.max_phr if nd.max_phr is not None else float("inf")
             if max(reach_lo, lim_lo) > min(reach_hi, lim_hi) + _TOL:
@@ -400,15 +774,16 @@ class PhrSpec:
                     f"Узел '{m}': phr-лимиты [{lim_lo:g}, {lim_hi:g}] "
                     f"не пересекаются с достижимым диапазоном "
                     f"[{reach_lo:.6g}, {reach_hi:.6g}] "
-                    f"(φ∈[{nd.lo:g}, {nd.hi:g}] при тотале "
+                    f"(φ∈[{s_lo:g}, {s_hi:g}] при тотале "
                     f"'{parent}'∈[{t_lo:.6g}, {t_hi:.6g}]).")
         a0, b0 = 0.0, float("inf")   # (1) окно из пер-узловой непустоты
         for m in limited:
             nd = self._by_name[m]
-            if nd.min_phr is not None and nd.hi > _TOL:
-                a0 = max(a0, nd.min_phr / nd.hi)
-            if nd.max_phr is not None and nd.lo > _TOL:
-                b0 = min(b0, nd.max_phr / nd.lo)
+            s_lo, s_hi = self._share_base[m]
+            if nd.min_phr is not None and s_hi > _TOL:
+                a0 = max(a0, nd.min_phr / s_hi)
+            if nd.max_phr is not None and s_lo > _TOL:
+                b0 = min(b0, nd.max_phr / s_lo)
         if a0 > b0 + _TOL:
             raise ValueError(
                 f"Группа '{parent}': phr-лимиты членов {limited} несовместимы "
@@ -460,17 +835,14 @@ class PhrSpec:
 
     def _share_lo_at(self, name: str, total: float) -> float:
         nd = self._by_name[name]
-        lo = nd.lo
+        lo = self._share_base[name][0]
         if nd.min_phr is not None:
             lo = max(lo, nd.min_phr / total)
-        return min(lo, self._share_hi_at_raw(nd, total))
+        return min(lo, self._share_hi_at(name, total))
 
     def _share_hi_at(self, name: str, total: float) -> float:
-        return self._share_hi_at_raw(self._by_name[name], total)
-
-    @staticmethod
-    def _share_hi_at_raw(nd: PhrNode, total: float) -> float:
-        hi = nd.hi
+        nd = self._by_name[name]
+        hi = self._share_base[name][1]
         if nd.max_phr is not None:
             hi = min(hi, nd.max_phr / total)
         return hi
@@ -480,6 +852,26 @@ class PhrSpec:
         phr-лимитами это ОКНО ТОТАЛА, иначе заявленные ``[lo, hi]``."""
         nd = self._by_name[name]
         return self._total_window.get(name, (nd.lo, nd.hi))
+
+    def _require_linear(self, op: str) -> None:
+        """iter46/B6: схема v2 ПРИНИМАЕТ ``scale='log'`` (сериализация и
+        хеш работают), но сам лог-сэмплинг — iter47 (B5); до него
+        геометрические операции отвергают такие спеки явно, а не искажают
+        меру молча (A0.6)."""
+        if self._log_axes:
+            raise ValueError(
+                f"{op}: оси {self._log_axes} имеют scale='log' — "
+                f"лог-сэмплинг будет реализован в iter47 (B5).")
+
+    def share_base_bounds(self, name: str) -> Tuple[float, float]:
+        """Статические границы ДОЛИ share-узла: у ``share_closure`` —
+        ПРОИЗВОДНЫЙ диапазон ``[1−φᵁ_free, 1−φᴸ_free]`` (iter46/B2),
+        у остальных — заявленный ``share_range`` / ``[lo, hi]``."""
+        if name not in self._share_base:
+            raise ValueError(
+                f"share_base_bounds: '{name}' не является share-узлом "
+                f"(share-узлы: {sorted(self._share_base)}).")
+        return self._share_base[name]
 
     def _share_box_at_total(self, members: Sequence[str],
                             total: np.ndarray
@@ -496,8 +888,9 @@ class PhrSpec:
         safe_T = np.where(T > _TOL, T, _TOL)
         for i, m in enumerate(members):
             nd = self._by_name[m]
-            lo_i = np.full(T.size, float(nd.lo))
-            hi_i = np.full(T.size, float(nd.hi))
+            b_lo, b_hi = self._share_base[m]
+            lo_i = np.full(T.size, float(b_lo))
+            hi_i = np.full(T.size, float(b_hi))
             if nd.min_phr is not None:
                 lo_i = np.maximum(lo_i, nd.min_phr / safe_T)
             if nd.max_phr is not None:
@@ -569,7 +962,12 @@ class PhrSpec:
 
         Мера: uniform-MARGINAL по физически значимым осям (тот же осознанный
         выбор, что iter31 ``SimplexRegion.random_points(groups=…)``).
+
+        iter46/B2: доли группы разыгрываются ЦЕЛИКОМ (все k членов), но в z
+        пишутся только члены с собственной координатой — производный член
+        (closure / последний simplex) в z не входит.
         """
+        self._require_linear("sample_z")
         rng = np.random.default_rng(seed)
         n = int(n)
         Z = np.empty((n, self.dim_z), dtype=float)
@@ -594,16 +992,18 @@ class PhrSpec:
                 z = rng.uniform(nd.lo, nd.hi, size=n)
                 Z[:, self._z_col[nm]] = z
                 vals[nm] = z * vals[nd.ref]
-            else:                              # share_of: группа целиком
+            else:                              # share-режимы: группа целиком
                 if nd.ref in done_groups:
                     continue
                 members = self._share_groups[nd.ref]
-                cols = [self._z_col[m] for m in members]
                 LO, HI = self._share_box_at_total(members, vals[nd.ref])
+                S = np.empty((n, len(members)), dtype=float)
                 for t in range(n):
-                    Z[t, cols] = _narrowing_split(LO[t], HI[t], 1.0, rng)
-                for m in members:
-                    vals[m] = Z[:, self._z_col[m]] * vals[nd.ref]
+                    S[t] = _narrowing_split(LO[t], HI[t], 1.0, rng)
+                for i, m in enumerate(members):
+                    if m in self._z_col:       # производный член — без z-оси
+                        Z[:, self._z_col[m]] = S[:, i]
+                    vals[m] = S[:, i] * vals[nd.ref]
                 done_groups.add(nd.ref)
         return Z
 
@@ -620,9 +1020,16 @@ class PhrSpec:
         Ширины ``hi − lo`` — естественный масштаб возмущений
         по осям z (у осей разные единицы: phr / доли / коэффициенты).
         """
-        bounds = [self._axis_bounds(nm) if self._by_name[nm].mode == MODE_ABSOLUTE
-                  else (self._by_name[nm].lo, self._by_name[nm].hi)
-                  for nm in self.z_names]
+        self._require_linear("z_bounds")
+        bounds = []
+        for nm in self.z_names:
+            nd = self._by_name[nm]
+            if nd.mode == MODE_ABSOLUTE:
+                bounds.append(self._axis_bounds(nm))
+            elif nd.mode in _SHARE_MODES:
+                bounds.append(self._share_base[nm])
+            else:
+                bounds.append((nd.lo, nd.hi))
         lo = np.array([b[0] for b in bounds])
         hi = np.array([b[1] for b in bounds])
         return lo, hi
@@ -663,6 +1070,7 @@ class PhrSpec:
         decode — каждая проба допустима, в отличие от rejection, который
         у границы (где и лежит оптимум) обваливается (урок iter34).
         """
+        self._require_linear("clip_z")
         z = np.asarray(z, dtype=float)
         single = z.ndim == 1
         Z = np.atleast_2d(z).astype(float).copy()
@@ -691,13 +1099,22 @@ class PhrSpec:
                 j = self._z_col[nm]
                 Z[:, j] = np.clip(Z[:, j], nd.lo, nd.hi)
                 vals[nm] = Z[:, j] * vals[nd.ref]
-            else:                              # share_of: группа целиком
+            else:                              # share-режимы: группа целиком
                 if nd.ref in done_groups:
                     continue
                 members = self._share_groups[nd.ref]
-                cols = [self._z_col[m] for m in members]
                 LO, HI = self._share_box_at_total(members, vals[nd.ref])
-                S = np.clip(Z[:, cols], LO, HI)
+                S = np.empty((len(Z), len(members)), dtype=float)
+                der_i = -1
+                for i, m in enumerate(members):
+                    if m in self._z_col:
+                        S[:, i] = Z[:, self._z_col[m]]
+                    else:                      # производный член: остаток
+                        der_i = i
+                if der_i >= 0:
+                    others = [i for i in range(len(members)) if i != der_i]
+                    S[:, der_i] = 1.0 - S[:, others].sum(axis=1)
+                S = np.clip(S, LO, HI)
                 resid = 1.0 - S.sum(axis=1)
                 idx = np.where(resid > _TOL)[0]
                 if idx.size:                   # дефицит → добрать по headroom
@@ -707,9 +1124,10 @@ class PhrSpec:
                 if idx.size:                   # избыток → снять по slack
                     slack = S[idx] - LO[idx]
                     S[idx] += slack * (resid[idx] / slack.sum(axis=1))[:, None]
-                Z[:, cols] = S
-                for m in members:
-                    vals[m] = Z[:, self._z_col[m]] * vals[nd.ref]
+                for i, m in enumerate(members):
+                    if m in self._z_col:
+                        Z[:, self._z_col[m]] = S[:, i]
+                    vals[m] = S[:, i] * vals[nd.ref]
                 done_groups.add(nd.ref)
         return Z[0] if single else Z
 
@@ -732,8 +1150,15 @@ class PhrSpec:
                 vals[nm] = np.full(len(Z), nd.value)
             elif nd.mode == MODE_ABSOLUTE:
                 vals[nm] = Z[:, self._z_col[nm]].copy()
-            else:  # ratio_to / share_of
-                vals[nm] = Z[:, self._z_col[nm]] * vals[nd.ref]
+            else:  # ratio_to / share-режимы
+                if nm in self._z_col:
+                    vals[nm] = Z[:, self._z_col[nm]] * vals[nd.ref]
+                else:      # производный член группы: 1 − Σ долей партнёров
+                    others = [m for m in self._share_groups[nd.ref]
+                              if m != nm]
+                    share = 1.0 - np.sum(
+                        [Z[:, self._z_col[m]] for m in others], axis=0)
+                    vals[nm] = share * vals[nd.ref]
         P = np.column_stack([vals[nm] for nm in self.component_names])
         return P[0] if single else P
 
@@ -770,21 +1195,23 @@ class PhrSpec:
                 continue
             if nd.mode == MODE_ABSOLUTE:
                 zj = vals[nm]
-            else:                              # ratio_to / share_of
+            else:                              # ratio_to / share-режимы
                 denom = vals[nd.ref]
                 if np.any(denom <= _TOL):
                     raise ValueError(
                         f"encode: референс '{nd.ref}' узла '{nm}' равен 0 — "
                         f"коэффициент не определён.")
                 zj = vals[nm] / denom
-            b_lo, b_hi = (self._axis_bounds(nm)
-                          if nd.mode == MODE_ABSOLUTE else (nd.lo, nd.hi))
+            if nd.mode == MODE_ABSOLUTE:
+                b_lo, b_hi = self._axis_bounds(nm)
+            else:
+                b_lo, b_hi = self._share_base.get(nm, (nd.lo, nd.hi))
             if np.any(zj < b_lo - tol) or np.any(zj > b_hi + tol):
                 raise ValueError(
                     f"encode: узел '{nm}' ({nd.mode}) вне границ "
                     f"[{b_lo}, {b_hi}]: значения {zj}.")
-            if nd.mode == MODE_SHARE_OF and (nd.min_phr is not None
-                                             or nd.max_phr is not None):
+            if nd.mode in _SHARE_MODES and (nd.min_phr is not None
+                                            or nd.max_phr is not None):
                 v = vals[nm]                   # phr узла (доля × тотал)
                 if nd.min_phr is not None and np.any(v < nd.min_phr - tol):
                     raise ValueError(
@@ -802,7 +1229,8 @@ class PhrSpec:
                         f"encode: узел '{nm}' превышает потолок "
                         f"{nd.cap_ratio:g}·Σ{list(nd.cap_refs)} (= {cap}): "
                         f"значения {zj} — рецепт вне спеки.")
-            Z[:, self._z_col[nm]] = zj
+            if nm in self._z_col:              # производные члены — без z-оси
+                Z[:, self._z_col[nm]] = zj
         return Z[0] if single else Z
 
     # ------------------------------------------------------------------
@@ -836,7 +1264,14 @@ class PhrSpec:
         порядок z-осей, и — через :func:`core.simplex._narrowing_split` /
         последовательное сужение — какие оси получают точную равномерную
         маргиналь (iter34, находка 1). Перестановка узлов — ДРУГАЯ спека.
+
+        Формат определяется ``schema_version``: v1 — legacy-ключи
+        ``mode``/``lo``/``hi``/``of``/``to`` (байт-в-байт как до iter46,
+        хеши старых спек не меняются); v2 — role-ключи (iter46/B6,
+        :meth:`_to_role_dicts`).
         """
+        if self.schema_version == 2:
+            return self._to_role_dicts()
         out: List[Dict[str, Any]] = []
         for nd in self.nodes:
             d: Dict[str, Any] = {"name": nd.name, "mode": nd.mode}
@@ -863,6 +1298,53 @@ class PhrSpec:
                 d["cap_to"] = (nd.cap_refs[0] if len(nd.cap_refs) == 1
                                else list(nd.cap_refs))
                 d["cap_ratio"] = float(nd.cap_ratio)
+            out.append(d)
+        return out
+
+    def _to_role_dicts(self) -> List[Dict[str, Any]]:
+        """iter46/B6: сериализация в схему v2 (роли) — обратное к
+        :meth:`_nodes_from_roles`; round-trip сохраняет ``spec_hash``.
+        Роли восстанавливаются из структуры: fixed/absolute-родитель
+        share-группы → GROUP_TOTAL_FIXED/GROUP_TOTAL, absolute с cap →
+        ABSOLUTE_CAPPED; ``members`` — из фактических детей группы."""
+        out: List[Dict[str, Any]] = []
+        for nd in self.nodes:
+            is_group = nd.name in self._share_groups
+            d: Dict[str, Any] = {"name": nd.name}
+            if nd.mode == MODE_FIXED:
+                d["role"] = "GROUP_TOTAL_FIXED" if is_group else "FIXED"
+                d["value"] = float(nd.value)
+                if is_group:
+                    d["members"] = list(self._share_groups[nd.name])
+            elif nd.mode == MODE_ABSOLUTE:
+                if is_group:
+                    d["role"] = "GROUP_TOTAL"
+                    d["range"] = [float(nd.lo), float(nd.hi)]
+                    d["members"] = list(self._share_groups[nd.name])
+                else:
+                    d["role"] = ("ABSOLUTE_CAPPED" if nd.cap_refs
+                                 else "ABSOLUTE")
+                    d["range"] = [float(nd.lo), float(nd.hi)]
+                    if nd.scale != "linear":
+                        d["scale"] = nd.scale
+                    if nd.cap_refs:
+                        d["cap_to"] = list(nd.cap_refs)
+                        d["cap_ratio"] = float(nd.cap_ratio)
+            elif nd.mode == MODE_RATIO_TO:
+                d["role"] = "RATIO_TO"
+                d["reference"] = nd.ref
+                d["range"] = [float(nd.lo), float(nd.hi)]
+            else:                              # share-роли нового контракта
+                d["role"] = {MODE_SHARE_FREE: "SHARE_FREE",
+                             MODE_SHARE_CLOSURE: "SHARE_CLOSURE",
+                             MODE_SHARE_SIMPLEX: "SHARE_SIMPLEX"}[nd.mode]
+                d["group"] = nd.ref
+                if nd.mode != MODE_SHARE_CLOSURE:
+                    d["share_range"] = [float(nd.lo), float(nd.hi)]
+                if nd.min_phr is not None:
+                    d["min_phr"] = float(nd.min_phr)
+                if nd.max_phr is not None:
+                    d["max_phr"] = float(nd.max_phr)
             out.append(d)
         return out
 
@@ -975,7 +1457,7 @@ class PhrSpec:
                             f"{nd.cap_ratio:g}·Σ{list(nd.cap_refs)} "
                             f"(= {nd.cap_ratio * cap_sum:g}) с допуском "
                             f"{tol_cap:g} — точка вне трапеции.")
-            else:                                   # share_of / ratio_to
+            else:                                   # share-режимы / ratio_to
                 ref_v = vals[nd.ref]
                 if ref_v <= _TOL:
                     violations.append(
@@ -983,12 +1465,13 @@ class PhrSpec:
                         f"— коэффициент не определён.")
                     continue
                 r = v / ref_v
-                tol_r = (tol_v + nd.hi * (delta * n_leaves[nd.ref] + _TOL)
+                s_lo, s_hi = self._share_base.get(nm, (nd.lo, nd.hi))
+                tol_r = (tol_v + s_hi * (delta * n_leaves[nd.ref] + _TOL)
                          ) / ref_v
-                if r < nd.lo - tol_r or r > nd.hi + tol_r:
+                if r < s_lo - tol_r or r > s_hi + tol_r:
                     violations.append(
                         f"{nm}: коэффициент {r:g} вне границ "
-                        f"[{nd.lo:g}, {nd.hi:g}] с допуском {tol_r:g}.")
+                        f"[{s_lo:g}, {s_hi:g}] с допуском {tol_r:g}.")
                 if nd.min_phr is not None and v < nd.min_phr - tol_v:
                     violations.append(
                         f"{nm}: факт {v:g} phr ниже технологического минимума "

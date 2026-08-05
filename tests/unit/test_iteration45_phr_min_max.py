@@ -192,7 +192,9 @@ def test_empty_limit_intersection_is_config_error():
 
 
 def test_limits_only_on_share_nodes():
-    with pytest.raises(ValueError, match="только для share_of"):
+    # iter46/B2: сообщение обобщено — лимиты допустимы на ВСЕХ share-режимах
+    # (share_of / share_free / share_closure / share_simplex), суть та же.
+    with pytest.raises(ValueError, match="только для share-режимов"):
         _spec(STAB_total={"max_phr": 10.0})
 
 

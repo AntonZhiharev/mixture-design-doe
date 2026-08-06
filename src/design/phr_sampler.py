@@ -56,9 +56,23 @@ z-сэмплер-плагин parts/phr-спеки.
 ``ABSOLUTE_CAPPED`` / ``GROUP_TOTAL`` / ``GROUP_TOTAL_FIXED`` /
 ``SHARE_FREE`` / ``SHARE_CLOSURE`` / ``SHARE_SIMPLEX`` / ``RATIO_TO``;
 ключи ``role`` / ``range`` / ``share_range`` / ``group`` / ``members`` /
-``reference`` / ``scale`` / ``spec_version`` — см. :meth:`PhrSpec.from_dicts`.
+``reference`` / ``scale`` / ``spec_version`` / ``group_order`` —
+см. :meth:`PhrSpec.from_dicts`.
 Legacy-схема v1 (``mode``) продолжает работать без изменений: старые сейвы
 и хеши валидны, обе схемы различимы по ключам.
+
+``group_order`` (iter48/B4, C2) — приоритет GROUP_TOTAL-групп кампании:
+ТОЧНАЯ перестановка множества групп с ролью ``GROUP_TOTAL``
+(``GROUP_TOTAL_FIXED`` исключается: тотал детерминирован, стратифицировать
+нечего). Входит в ``to_dicts()``/``spec_hash()``. ВАЖНО (честная граница):
+в phr-пути тоталы групп — НЕЗАВИСИМЫЕ absolute-оси, каждая получает ТОЧНУЮ
+равномерную маргиналь независимо от порядка — меру ЭТОГО сэмплера
+``group_order`` не меняет (в отличие от fraction-space группового сэмплера
+iter31, где точную маргиналь получает только первая группа: KS≈0.019
+против ≈0.38 у последующих, замер iter34). Порядок фиксируется как
+контракт кампании (приоритет осей, CAMPAIGN_SPEC_PVC §1) и обязан входить
+в отпечаток: при любом использовании fraction-space groups или будущей
+стратификации без него план не воспроизводится.
 
 Узел, на который ссылаются share_of-дети, — ВНУТРЕННИЙ (его phr раздаётся
 детям, компонентом смеси он не является). Компоненты = листья DAG.
@@ -185,7 +199,8 @@ class PhrSpec:
     """
 
     def __init__(self, nodes: Sequence[PhrNode],
-                 schema_version: Optional[int] = None):
+                 schema_version: Optional[int] = None,
+                 group_order: Optional[Sequence[str]] = None):
         self.nodes: List[PhrNode] = list(nodes)
         if not self.nodes:
             raise ValueError("Пустая phr-спека недопустима.")
@@ -233,6 +248,47 @@ class PhrSpec:
                 "используйте SHARE_FREE/SHARE_CLOSURE (k=2) или "
                 "SHARE_SIMPLEX (k≥3).")
         self.schema_version: int = int(schema_version)
+        # iter48/B4 (C2): приоритет GROUP_TOTAL-групп кампании. Если задан —
+        # это ТОЧНАЯ перестановка множества групп с ролью GROUP_TOTAL
+        # (absolute-тотал share-группы); GROUP_TOTAL_FIXED исключается
+        # (тотал детерминирован, стратифицировать нечего). Пропуски, лишние
+        # имена, дубли и fixed-тоталы — ошибка, не тихое игнорирование.
+        # Пустой список эквивалентен «не задан» (ключ опциональный).
+        self.group_order: List[str] = [str(g) for g in (group_order or [])]
+        if self.group_order:
+            if self.schema_version != 2:
+                raise ValueError(
+                    "group_order поддерживается только схемой v2 (роли): "
+                    "в legacy-схеме v1 роли GROUP_TOTAL нет (iter48/B4).")
+            dups = sorted({g for g in self.group_order
+                           if self.group_order.count(g) > 1})
+            if dups:
+                raise ValueError(
+                    f"group_order: дубли {dups} недопустимы — требуется "
+                    f"ТОЧНАЯ перестановка множества GROUP_TOTAL (C2).")
+            strat = [nd.name for nd in self.nodes
+                     if nd.name in self._share_groups
+                     and nd.mode == MODE_ABSOLUTE]
+            for g in self.group_order:
+                if g not in self._by_name:
+                    raise ValueError(
+                        f"group_order: узел '{g}' не найден среди узлов "
+                        f"спеки (GROUP_TOTAL-группы: {strat}).")
+                if g not in self._share_groups:
+                    raise ValueError(
+                        f"group_order: узел '{g}' не является тоталом "
+                        f"share-группы (GROUP_TOTAL-группы: {strat}).")
+                if self._by_name[g].mode == MODE_FIXED:
+                    raise ValueError(
+                        f"group_order: '{g}' — GROUP_TOTAL_FIXED, его тотал "
+                        f"детерминирован, стратифицировать нечего (C2) — "
+                        f"исключите его из списка.")
+            missing = [g for g in strat if g not in self.group_order]
+            if missing:
+                raise ValueError(
+                    f"group_order: не перечислены группы {missing} — "
+                    f"требуется ТОЧНАЯ перестановка множества GROUP_TOTAL "
+                    f"(C2), частичный список недопустим.")
         self._topo: List[str] = self._toposort()
         # компоненты смеси = листья (НЕ родители share-групп), порядок спеки
         self.component_names: List[str] = [
@@ -276,18 +332,21 @@ class PhrSpec:
         * **v2 (роли, iter46/B6)** — список узлов с ключом ``role``
           (см. ``_ROLE_TABLE``) и ключами ``range``/``share_range``
           (пары ``[lo, hi]``), ``group``/``members``/``reference``/``scale``;
-          допускается обёртка ``{"spec_version": 2, "nodes": [...]}``.
+          допускается обёртка ``{"spec_version": 2, "nodes": [...]}``
+          с опциональным ключом ``group_order`` (iter48/B4) — ТОЧНАЯ
+          перестановка множества GROUP_TOTAL-групп (приоритет осей
+          кампании, входит в ``spec_hash``).
           Ключи вне схемы роли (в т.ч. legacy lo/hi/of/to и range у
           closure/fixed) — ошибка валидации, не тихое игнорирование (B8).
 
         Смешивать ``mode`` и ``role`` в одном списке нельзя.
         """
         if isinstance(dicts, Mapping):               # v2-обёртка
-            extra = set(dicts) - {"spec_version", "nodes"}
+            extra = set(dicts) - {"spec_version", "nodes", "group_order"}
             if extra:
                 raise ValueError(
                     f"Неизвестные ключи обёртки спеки: {sorted(extra)} "
-                    f"(допустимы 'spec_version' и 'nodes').")
+                    f"(допустимы 'spec_version', 'nodes' и 'group_order').")
             ver = dicts.get("spec_version")
             if ver not in (2, "2"):
                 raise ValueError(
@@ -297,7 +356,15 @@ class PhrSpec:
             if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
                 raise ValueError(
                     "Обёртка спеки: 'nodes' должен быть списком узлов.")
-            return cls(cls._nodes_from_roles(list(raw)), schema_version=2)
+            go = dicts.get("group_order")
+            if go is not None:
+                if isinstance(go, str) or not isinstance(go, Sequence):
+                    raise ValueError(
+                        "Обёртка спеки: 'group_order' должен быть СПИСКОМ "
+                        "имён GROUP_TOTAL-узлов (iter48/B4).")
+                go = [str(x) for x in go]
+            return cls(cls._nodes_from_roles(list(raw)), schema_version=2,
+                       group_order=go)
         items = list(dicts)
         has_role = any("role" in d for d in items)
         has_mode = any("mode" in d for d in items)
@@ -1293,7 +1360,7 @@ class PhrSpec:
     # ------------------------------------------------------------------
     # Версионирование спеки (iter35): порядок узлов — часть спеки
     # ------------------------------------------------------------------
-    def to_dicts(self) -> List[Dict[str, Any]]:
+    def to_dicts(self) -> List[Dict[str, Any]] | Dict[str, Any]:
         """Каноническая сериализация спеки (round-trip c :meth:`from_dicts`).
 
         ПОРЯДОК УЗЛОВ СОХРАНЯЕТСЯ: он определяет и порядок компонентов, и
@@ -1305,9 +1372,20 @@ class PhrSpec:
         ``mode``/``lo``/``hi``/``of``/``to`` (байт-в-байт как до iter46,
         хеши старых спек не меняются); v2 — role-ключи (iter46/B6,
         :meth:`_to_role_dicts`).
+
+        iter48/B4: при заданном ``group_order`` v2-спека сериализуется
+        ОБЁРТКОЙ ``{"spec_version": 2, "group_order": [...], "nodes":
+        [...]}`` — порядок групп входит в ``spec_hash``. Спеки БЕЗ
+        ``group_order`` сериализуются плоским списком байт-в-байт как до
+        iter48 (хеши прежних спек не меняются).
         """
         if self.schema_version == 2:
-            return self._to_role_dicts()
+            nodes = self._to_role_dicts()
+            if self.group_order:
+                return {"spec_version": 2,
+                        "group_order": list(self.group_order),
+                        "nodes": nodes}
+            return nodes
         out: List[Dict[str, Any]] = []
         for nd in self.nodes:
             d: Dict[str, Any] = {"name": nd.name, "mode": nd.mode}
@@ -1389,6 +1467,8 @@ class PhrSpec:
 
         Хеш чувствителен к ПОРЯДКУ узлов (см. :meth:`to_dicts`): порядок
         влияет на меру сэмплера, поэтому обязан входить в отпечаток.
+        iter48/B4: ``group_order`` (приоритет GROUP_TOTAL-групп кампании)
+        тоже входит в отпечаток — его перестановка меняет хеш.
         Записывайте хеш в документацию кампании — через полгода по нему
         можно проверить, что геометрия не «уехала».
         """

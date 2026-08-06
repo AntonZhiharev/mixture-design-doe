@@ -1603,6 +1603,177 @@ class PhrSpec:
             moved_max=float(moved.max()) if moved.size else 0.0,
             violations=violations)
 
+    # ------------------------------------------------------------------
+    # Контракт-ответ ядра на точку (iter49/B7): effective_bounds + active,
+    # premix_required, phr nominal vs actual — раздельно
+    # ------------------------------------------------------------------
+    def point_report(self, p: Sequence[float] | np.ndarray,
+                     delta_phr: Optional[float] = None,
+                     tol: float = 1e-6) -> "PointReport":
+        """Структурированный ответ ядра на ОДНУ точку-рецепт (iter49/B7).
+
+        Вход — НОМИНАЛЬНЫЙ рецепт ``p`` в phr (листья DAG, порядок =
+        ``component_names``); внутренние узлы восстанавливаются суммой
+        детей. Выход — :class:`PointReport` с тремя слоями:
+
+        1. ``effective_bounds`` — для КАЖДОГО узла спеки (включая
+           внутренние тоталы и производные closure) эффективные границы
+           его СОБСТВЕННОЙ координаты В ЭТОЙ ТОЧКЕ и метки
+           ``active_lo``/``active_hi`` — какое ограничение задало границу:
+
+           * ``fixed``    — фиксированное значение узла;
+           * ``range``    — заявленный интервал (``range``/``share_range``);
+           * ``derived``  — производный диапазон closure
+             ``[1−φᵁ_free, 1−φᴸ_free]`` (iter46/B2);
+           * ``window``   — окно тотала группы по phr-лимитам членов
+             (iter45/B1);
+           * ``cap``      — динамический потолок ``cap_ratio·Σ(cap_to)``,
+             вычисленный ПО ЗНАЧЕНИЯМ ЭТОЙ ТОЧКИ;
+           * ``min_phr`` / ``max_phr`` — техлимиты узла при тотале точки;
+           * ``partners`` — партнёрское сужение Σφ=1
+             (``1 − Σ границ партнёров`` с учётом ИХ phr-лимитов).
+
+           При равенстве кандидатов (плато ``hi(T)``, LUB впритык)
+           приоритет у более ПРОСТОГО объяснения: range/derived →
+           min/max_phr → partners; метка «партнёры» появляется, только
+           когда партнёрское сужение СТРОГО активно. Границы
+           absolute-осей — ВСЕГДА в phr (у log-осей iter47/B5 тоже:
+           шкала — деталь сэмплера, контракт отвечает в физических
+           единицах).
+
+        2. ``premix`` — правило премикса :func:`premix_required` по
+           СТАТИЧЕСКОМУ интервалу phr листа (``phr_intervals``); без
+           ``delta_phr`` и на вырожденных интервалах (fixed-оси) —
+           ``None`` («правило неприменимо»), а не ``False``.
+
+        3. ``phr_nominal`` vs ``phr_actual`` — РАЗДЕЛЬНО: actual — снап к
+           δ-сетке весов (:meth:`quantize_recipe`), только при заданном
+           ``delta_phr``; его violations добавляются в общий список.
+
+        Ничего не блокируется молча (A0.6): номинал вне эффективных
+        границ и пустые границы — строки в ``violations`` (``ok=False``),
+        НЕ исключения. Исключения — только ошибки ДАННЫХ, при которых
+        координаты не определены: неверная длина ``p``, нулевой тотал
+        share-группы / референс ratio-узла, ``delta_phr ≤ 0``.
+        """
+        if delta_phr is not None and float(delta_phr) <= 0:
+            raise ValueError("point_report: delta_phr должен быть > 0.")
+        p = np.asarray(p, dtype=float).ravel()
+        if p.size != self.q:
+            raise ValueError(
+                f"point_report: ожидалось {self.q} компонентов "
+                f"({self.component_names}), получено {p.size}.")
+        leaf_col = {nm: j for j, nm in enumerate(self.component_names)}
+        vals: Dict[str, float] = {}
+        for nm in reversed(self._topo):        # дети раньше родителей
+            if nm in self._share_groups:
+                vals[nm] = float(sum(vals[m]
+                                     for m in self._share_groups[nm]))
+            else:
+                vals[nm] = float(p[leaf_col[nm]])
+        violations: List[str] = []
+
+        def _pick_max(cands):                  # lo = max кандидатов;
+            v0, lab0 = cands[0]                # тай-брейк — первый (простой)
+            for v, lab in cands[1:]:
+                if v > v0 + _TOL:
+                    v0, lab0 = v, lab
+            return v0, lab0
+
+        def _pick_min(cands):                  # hi = min; тот же приоритет
+            v0, lab0 = cands[0]
+            for v, lab in cands[1:]:
+                if v < v0 - _TOL:
+                    v0, lab0 = v, lab
+            return v0, lab0
+
+        bounds: Dict[str, EffectiveBound] = {}
+        for nd in self.nodes:                  # порядок спеки
+            nm = nd.name
+            v = vals[nm]
+            if nd.mode == MODE_FIXED:
+                coord = v
+                lo = hi = nd.value
+                al = ah = "fixed"
+            elif nd.mode == MODE_ABSOLUTE:
+                coord = v                      # phr (лог-ось — тоже в phr)
+                a_lo, a_hi = self._axis_bounds(nm)
+                narrowed = nm in self._total_window
+                lo = a_lo
+                al = ("window" if narrowed and a_lo > nd.lo + _TOL
+                      else "range")
+                hi_c = [(a_hi, "window" if narrowed and a_hi < nd.hi - _TOL
+                         else "range")]
+                if nd.cap_refs:
+                    cap = nd.cap_ratio * float(
+                        sum(vals[cr] for cr in nd.cap_refs))
+                    hi_c.append((cap, "cap"))
+                hi, ah = _pick_min(hi_c)
+            elif nd.mode == MODE_RATIO_TO:
+                ref_v = vals[nd.ref]
+                if ref_v <= _TOL:
+                    raise ValueError(
+                        f"point_report: референс '{nd.ref}' узла '{nm}' "
+                        f"равен {ref_v:g} — коэффициент не определён.")
+                coord = v / ref_v
+                lo, hi = nd.lo, nd.hi
+                al = ah = "range"
+            else:                              # share-режимы
+                T = vals[nd.ref]
+                if T <= _TOL:
+                    raise ValueError(
+                        f"point_report: тотал '{nd.ref}' группы узла "
+                        f"'{nm}' равен {T:g} — доли не определены.")
+                coord = v / T
+                base_lo, base_hi = self._share_base[nm]
+                base_lab = ("derived" if nd.mode == MODE_SHARE_CLOSURE
+                            else "range")
+                lo_c = [(base_lo, base_lab)]
+                hi_c = [(base_hi, base_lab)]
+                if nd.min_phr is not None:
+                    lo_c.append((nd.min_phr / T, "min_phr"))
+                if nd.max_phr is not None:
+                    hi_c.append((nd.max_phr / T, "max_phr"))
+                members = self._share_groups[nd.ref]
+                LO0, HI0 = self._share_box_at_total(members, np.array([T]))
+                i = members.index(nm)
+                lo_c.append((1.0 - (float(HI0[0].sum()) - float(HI0[0, i])),
+                             "partners"))
+                hi_c.append((1.0 - (float(LO0[0].sum()) - float(LO0[0, i])),
+                             "partners"))
+                lo, al = _pick_max(lo_c)
+                hi, ah = _pick_min(hi_c)
+            bounds[nm] = EffectiveBound(
+                name=nm, mode=nd.mode, coord=float(coord), phr=float(v),
+                lo=float(lo), hi=float(hi), active_lo=al, active_hi=ah)
+            if lo > hi + tol:
+                violations.append(
+                    f"{nm}: эффективные границы пусты в этой точке "
+                    f"([{lo:g}, {hi:g}], lo: {al}, hi: {ah}).")
+            elif coord < lo - tol or coord > hi + tol:
+                violations.append(
+                    f"{nm}: nominal {coord:g} вне эффективных границ "
+                    f"[{lo:g}, {hi:g}] (lo: {al}, hi: {ah}).")
+
+        premix: Dict[str, Optional[bool]] = {}
+        for nm in self.component_names:
+            lo_i, hi_i = self._interval[nm]
+            if delta_phr is None or hi_i <= lo_i + _TOL:
+                premix[nm] = None              # правило неприменимо
+            else:
+                premix[nm] = premix_required(delta_phr, lo_i, hi_i)
+
+        phr_actual: Optional[np.ndarray] = None
+        if delta_phr is not None:
+            qr = self.quantize_recipe(p, delta_phr)
+            phr_actual = qr.p_actual
+            violations.extend(qr.violations)
+
+        return PointReport(
+            phr_nominal=p.copy(), phr_actual=phr_actual,
+            delta_phr=None if delta_phr is None else float(delta_phr),
+            effective_bounds=bounds, premix=premix, violations=violations)
+
     def fraction_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """Консервативный fraction-бокс ``L_i ≤ x_i ≤ U_i`` по интервалам
         phr листьев (математика экстремальных тоталей
@@ -1633,6 +1804,52 @@ class QuantizeReport:
     p_actual: np.ndarray
     delta_phr: float
     moved_max: float
+    violations: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.violations
+
+
+@dataclass
+class EffectiveBound:
+    """Эффективные границы ОДНОГО узла в точке (iter49/B7, элемент
+    :class:`PointReport`). ``coord`` — значение узла в его СОБСТВЕННОЙ
+    координате (phr / доля / коэффициент), ``phr`` — значение в phr
+    (у листьев совпадает с рецептом, у тоталов — сумма детей);
+    ``lo``/``hi`` — эффективные границы координаты В ЭТОЙ ТОЧКЕ;
+    ``active_lo``/``active_hi`` — какое ограничение задало границу
+    (``fixed`` / ``range`` / ``derived`` / ``window`` / ``cap`` /
+    ``min_phr`` / ``max_phr`` / ``partners`` —
+    см. :meth:`PhrSpec.point_report`)."""
+    name: str
+    mode: str
+    coord: float
+    phr: float
+    lo: float
+    hi: float
+    active_lo: str
+    active_hi: str
+
+
+@dataclass
+class PointReport:
+    """Контракт-ответ ядра на точку (iter49/B7).
+
+    ``phr_nominal``/``phr_actual`` — РАЗДЕЛЬНО: номинал, как предложило
+    ядро, и факт после снапа к δ-сетке весов (``None`` без ``delta_phr``).
+    Дозируйте и фиксируйте actual — модель должна видеть actual, а не
+    nominal (CAMPAIGN_SPEC_PVC §5). ``effective_bounds`` — по КАЖДОМУ
+    узлу спеки: эффективные границы в точке + метки active;
+    ``premix`` — лист → нужен ли премикс (``None`` — правило
+    неприменимо: δ не задан или интервал вырожден); ``violations`` —
+    номинал вне геометрии + нарушения квантования (пусто ⇒ ``ok``).
+    """
+    phr_nominal: np.ndarray
+    phr_actual: Optional[np.ndarray]
+    delta_phr: Optional[float]
+    effective_bounds: Dict[str, EffectiveBound]
+    premix: Dict[str, Optional[bool]]
     violations: List[str] = field(default_factory=list)
 
     @property

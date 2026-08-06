@@ -40,7 +40,7 @@ from ..apps import campaign_state as cs
 
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 from ..design.blocking import blocking_diagnostics
-from ..design.phr_sampler import PhrSpec
+from ..design.phr_sampler import PhrSpec, premix_required
 
 
 
@@ -583,18 +583,31 @@ def preflight_details_dataframe(report) -> pd.DataFrame:
 
 
 def seed_design_excel_bytes(runner, Xs, Ys=None, *,
-                            batch_kg: Optional[float] = None) -> bytes:
+                            batch_kg: Optional[float] = None,
+                            spec: Optional[PhrSpec] = None,
+                            delta_phr: Optional[float] = None,
+                            grams_per_phr: Optional[float] = None) -> bytes:
     """§17.4 (C3): предложенный стартовый дизайн → xlsx-байты (кнопка скачивания).
 
     Лист «Стартовый дизайн» = :func:`seed_design_dataframe` (с расходом сырья, если
     задан ``batch_kg``; пустые «(lab)» — места под ручной ввод откликов). Чистый
-    хелпер (без Streamlit) — тестируется напрямую; отдаёт готовые байты .xlsx."""
+    хелпер (без Streamlit) — тестируется напрямую; отдаёт готовые байты .xlsx.
+
+    iter42.4: при активной phr-спеке и заданном ``delta_phr`` добавляется ЛИСТ
+    «Навеска» (:func:`seed_weighing_dataframe`) — phr nominal/actual, граммы,
+    премикс и нарушения по каждому опыту. Отдельный лист, а не 3·q колонок
+    в основном: при q≈19 широкая таблица нечитаема."""
     import io
     df = seed_design_dataframe(runner, Xs, Ys, batch_kg=batch_kg)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         (df if not df.empty else pd.DataFrame({"инфо": ["дизайн пуст"]})).to_excel(
             xw, sheet_name="Стартовый дизайн", index=False)
+        if spec is not None and delta_phr is not None:
+            wdf = seed_weighing_dataframe(runner, spec, Xs, float(delta_phr),
+                                          grams_per_phr=grams_per_phr)
+            if not wdf.empty:
+                wdf.to_excel(xw, sheet_name="Навеска", index=False)
     buf.seek(0)
     return buf.getvalue()
 
@@ -976,6 +989,135 @@ def phr_spec_fraction_dataframe(spec: PhrSpec) -> pd.DataFrame:
          "phr hi": [iv[nm][1] for nm in spec.component_names],
          "доля L": np.round(lo, 6), "доля U": np.round(hi, 6)},
         index=list(spec.component_names))
+
+
+def weighing_delta_phr(step_g: float, grams_per_phr: float) -> float:
+    """iter42.2: разрешение навески δ в phr из ПАРАМЕТРОВ ЛАБОРАТОРИИ.
+
+    ``δ = шаг весов (г) / (г на 1 phr)``. Пример CAMPAIGN_SPEC_PVC §5:
+    весы 0.1 г при загрузке 5 г на 1 phr → δ = 0.02 phr. Оба аргумента
+    строго положительны: нулевой шаг весов означал бы бесконечное
+    разрешение (правило премикса выродилось бы), нулевая загрузка —
+    неопределённый перевод г → phr. Чистая (без Streamlit)."""
+    step = float(step_g)
+    gpp = float(grams_per_phr)
+    if step <= 0:
+        raise ValueError("Шаг весов должен быть > 0 г (иначе разрешение "
+                         "навески не определено).")
+    if gpp <= 0:
+        raise ValueError("Загрузка «г на 1 phr» должна быть > 0 (иначе "
+                         "перевод граммов в phr не определён).")
+    return step / gpp
+
+
+def recipe_weighing_dataframe(spec: PhrSpec, x_fractions: Sequence[float],
+                              delta_phr: float, *,
+                              grams_per_phr: Optional[float] = None
+                              ) -> pd.DataFrame:
+    """iter42.3: карта НАВЕСКИ одного рецепта — nominal / actual / премикс.
+
+    Вход — состав в ДОЛЯХ (как его отдаёт движок: seed-план, x* ветки);
+    phr восстанавливается :meth:`PhrSpec.fractions_to_phr` по fixed-якорю
+    спеки. Всё остальное берётся из контракта ядра
+    :meth:`PhrSpec.point_report` (iter49) — логика навески не дублируется:
+
+    | колонка | источник |
+    |---|---|
+    | компонент | ``spec.component_names`` |
+    | phr nominal | ``fractions_to_phr(x)`` |
+    | phr actual | ``quantize_recipe(p, δ).p_actual`` (внутри point_report) |
+    | граммы actual | ``p_actual · г/phr`` (если задана загрузка) |
+    | премикс | ``premix_required`` по ``phr_intervals``; «—» = неприменимо |
+    | нарушение | строки ``violations``, относящиеся к этому узлу |
+
+    ⚠️ Дозируйте и фиксируйте ФАКТИЧЕСКИЕ значения (actual): модель должна
+    видеть actual, а не nominal (CAMPAIGN_SPEC_PVC §5). Нарушения НЕ
+    блокируют — это диагностика (A0.6), решение за пользователем.
+
+    Чистая (без Streamlit) — тестируется напрямую."""
+    p_nom = spec.fractions_to_phr(np.asarray(x_fractions, dtype=float).ravel())
+    rep = spec.point_report(p_nom, delta_phr=float(delta_phr))
+    actual = rep.phr_actual
+    rows: List[Dict[str, Any]] = []
+    for j, nm in enumerate(spec.component_names):
+        pm = rep.premix.get(nm)
+        row: Dict[str, Any] = {
+            "компонент": nm,
+            "phr nominal": round(float(p_nom[j]), 4),
+            "phr actual": round(float(actual[j]), 4),
+        }
+        if grams_per_phr is not None and float(grams_per_phr) > 0:
+            row["граммы actual"] = round(
+                float(actual[j]) * float(grams_per_phr), 4)
+        row["премикс"] = "—" if pm is None else ("да" if pm else "нет")
+        row["нарушение"] = "; ".join(
+            v.split(": ", 1)[1] if ": " in v else v
+            for v in rep.violations if v.startswith(f"{nm}: "))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def weighing_caption(spec: PhrSpec, delta_phr: float) -> str:
+    """iter42.3: подпись под картой навески — δ, сколько осей требует
+    премикса и обязательное требование фиксировать actual."""
+    iv = spec.phr_intervals()
+    need = [nm for nm in spec.component_names
+            if iv[nm][1] > iv[nm][0] + 1e-9
+            and premix_required(float(delta_phr), *iv[nm])]
+    part = (f"премикс нужен для {len(need)} осей ({', '.join(need)})"
+            if need else "все оси читаются прямой навеской")
+    return (f"δ = {float(delta_phr):g} phr · {part}. Дозируйте и фиксируйте "
+            f"ФАКТИЧЕСКИЕ значения (actual): модель должна видеть actual, "
+            f"а не nominal (CAMPAIGN_SPEC_PVC §5).")
+
+
+def snap_design_to_grid(spec: PhrSpec, X, delta_phr: float) -> np.ndarray:
+    """iter42.4: снап ПЛАНА к δ-сетке весов — фиксируется ACTUAL, не nominal.
+
+    Вход — составной план ``X`` (n × (q+d)): первые ``spec.q`` столбцов —
+    mixture-ДОЛИ, остальные (процесс) НЕ трогаются. Каждая строка идёт
+    ``доли → phr (fractions_to_phr) → quantize_recipe(δ).p_actual → доли``.
+
+    Зачем ДО фиксации: лаборант физически навесит кратное шагу весов, и если
+    зафиксировать номинал, модель будет учиться на координатах, которых в
+    стакане не было (CAMPAIGN_SPEC_PVC §5). Операция ИДЕМПОТЕНТНА: точка,
+    уже стоящая на δ-сетке, не двигается — поэтому безопасно применять на
+    каждом прогоне UI. Чистая (без Streamlit)."""
+    X = np.atleast_2d(np.asarray(X, dtype=float)).copy()
+    q = int(spec.q)
+    if X.shape[1] < q:
+        raise ValueError(
+            f"snap_design_to_grid: в плане {X.shape[1]} координат, а спека "
+            f"описывает {q} компонентов смеси.")
+    for i in range(len(X)):
+        p_nom = spec.fractions_to_phr(X[i, :q])
+        p_act = spec.quantize_recipe(p_nom, float(delta_phr)).p_actual
+        X[i, :q] = spec.to_fractions(p_act)
+    return X
+
+
+def seed_weighing_dataframe(runner, spec: PhrSpec, X, delta_phr: float, *,
+                            grams_per_phr: Optional[float] = None
+                            ) -> pd.DataFrame:
+    """iter42.4: карта навески ВСЕГО плана в ДЛИННОМ формате (показ/Excel).
+
+    Строка = «опыт × компонент» (а не 3·q колонок на опыт: при q≈19 широкая
+    таблица нечитаема и в Excel, и на экране). Колонки: «№ опыта» +
+    результат :func:`recipe_weighing_dataframe` по этой строке плана.
+    Номера опытов — БУДУЩИЕ номера в общей базе (:func:`experiment_index`).
+    Чистая (без Streamlit)."""
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    nums = list(experiment_index(len(getattr(runner, "points", []) or []),
+                                 len(X)))
+    frames: List[pd.DataFrame] = []
+    for i in range(len(X)):
+        df = recipe_weighing_dataframe(spec, X[i, :spec.q], delta_phr,
+                                       grams_per_phr=grams_per_phr)
+        df.insert(0, "№ опыта", nums[i])
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 # ----------------------------------------------------------------------
@@ -2055,6 +2197,72 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         return
     Xs = np.atleast_2d(np.asarray(Xs, float))
 
+    # iter42.2/42.4: слой НАВЕСКИ — только при активной phr-спеке, имена которой
+    # совпадают с mixture-компонентами текущей фазы (иначе доли не той спеки).
+    spec_w: Optional[PhrSpec] = getattr(runner, "phr_spec", None)
+    if spec_w is not None and (list(spec_w.component_names)
+                               != list(runner.current_schema.mixture_names)):
+        spec_w = None
+    delta_phr: Optional[float] = None
+    gpp_val: Optional[float] = None
+    if spec_w is not None:
+        with st.expander("⚖️ Навеска (phr): разрешение весов, премикс, actual",
+                         expanded=True):
+            st.caption(
+                "Слой навески (CAMPAIGN_SPEC_PVC §5): доли плана переводятся в "
+                "phr по fixed-якорю спеки, снапятся к сетке весов и "
+                "фиксируются как ACTUAL — модель должна видеть actual, а не "
+                "nominal. Задайте параметры лаборатории:")
+            wc = st.columns(2)
+            step_g = wc[0].number_input(
+                "Шаг весов, г", min_value=0.0, value=0.1, step=0.01,
+                format="%.4f", key="setup_weigh_step",
+                help="Дискретность лабораторных весов. 0 — слой навески "
+                     "выключен (план фиксируется как nominal).")
+            gpp = wc[1].number_input(
+                "г на 1 phr (загрузка)", min_value=0.0, value=5.0, step=0.5,
+                format="%.4f", key="setup_weigh_gpp",
+                help="Сколько граммов приходится на 1 phr при этой загрузке "
+                     "смесителя: δ_phr = шаг весов / (г на 1 phr).")
+            if float(step_g) > 0 and float(gpp) > 0:
+                try:
+                    delta_phr = weighing_delta_phr(step_g, gpp)
+                    gpp_val = float(gpp)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    delta_phr = None
+            else:
+                st.caption("Слой навески выключен (шаг весов или загрузка = 0): "
+                           "план фиксируется как NOMINAL.")
+            if delta_phr is not None:
+                Xs_snap = snap_design_to_grid(spec_w, Xs, delta_phr)
+                moved = float(np.abs(Xs_snap - Xs).max()) if len(Xs) else 0.0
+                if moved > 0:
+                    st.session_state["setup_seed_X"] = Xs_snap
+                    Xs = Xs_snap
+                st.caption(
+                    weighing_caption(spec_w, delta_phr)
+                    + (f" План СНАПНУТ к δ-сетке (макс. сдвиг доли "
+                       f"{moved:.2e}) — фиксируется actual."
+                       if moved > 0 else
+                       " План уже стоит на δ-сетке — фиксируется actual."))
+                nums_w = list(experiment_index(len(runner.points), len(Xs)))
+                sel_w = st.selectbox("Карта навески для опыта №", nums_w,
+                                     key="setup_weigh_row")
+                i_sel = nums_w.index(sel_w)
+                wdf_one = recipe_weighing_dataframe(
+                    spec_w, Xs[i_sel, :spec_w.q], delta_phr,
+                    grams_per_phr=gpp_val)
+                st.dataframe(wdf_one, use_container_width=True,
+                             hide_index=True)
+                bad = [v for v in wdf_one["нарушение"] if str(v).strip()]
+                if bad:
+                    st.warning(
+                        "Навеска этого опыта выходит за геометрию спеки "
+                        f"({len(bad)} узл.) — см. колонку «нарушение». "
+                        "Фиксация НЕ блокируется (A0.6): решение за вами "
+                        "(премикс, другая загрузка, пересчёт плана).")
+
     if st.button("🧪 Заполнить тестовыми (демо-оракул)", key="setup_fill_demo"):
         st.session_state["setup_seed_Y"] = np.vstack(
             [runner._measure(np.asarray(x, float)) for x in Xs])
@@ -2153,7 +2361,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # ввод в лаборатории), с расходом сырья, если задан размер пробы.
     st.download_button(
         "⬇️ Сохранить план в Excel (.xlsx)",
-        data=seed_design_excel_bytes(runner, Xs, Ys, batch_kg=batch_kg),
+        data=seed_design_excel_bytes(runner, Xs, Ys, batch_kg=batch_kg,
+                                     spec=spec_w, delta_phr=delta_phr,
+                                     grams_per_phr=gpp_val),
         file_name="seed_design.xlsx", key="setup_seed_dl",
         mime="application/vnd.openxmlformats-officedocument."
              "spreadsheetml.sheet")

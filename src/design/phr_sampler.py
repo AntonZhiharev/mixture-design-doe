@@ -1350,6 +1350,73 @@ class PhrSpec:
         X = P / s[:, None]
         return X[0] if single else X
 
+    def fractions_to_phr(self, x: Sequence[float] | np.ndarray,
+                         tol: float = 1e-6) -> np.ndarray:
+        """x → p: ОБРАТНОЕ к :meth:`to_fractions` (iter42/42.1, слой навески).
+
+        Доли масштаба не несут (``Σx = 1`` для любой загрузки), поэтому
+        суммарный phr восстанавливается по ЯКОРЮ — ``fixed``-листу спеки
+        (смола = 100, ESO = 2.5 phr и т.п.)::
+
+            Σp = value_fixed / x_fixed,      p = x · Σp
+
+        Якорь берётся ПЕРВЫМ (в порядке спеки) fixed-листом с ``value > 0``;
+        остальные fixed-листья служат ПРОВЕРКОЙ согласованности: если
+        восстановленный phr расходится с их константой больше ``tol``
+        (относительно величины константы), входные доли не принадлежат этой
+        спеке — ошибка ДАННЫХ, явный ``ValueError`` (как в :meth:`encode`),
+        а не тихое приближение.
+
+        Без fixed-листа масштаб неопределим В ПРИНЦИПЕ (все узлы задают лишь
+        пропорции) — тоже ``ValueError`` с объяснением, а не «принято 100».
+
+        Принимает один рецепт (q,) или матрицу (n × q) — для построчной
+        навески seed-плана. Вход нормируется на ``Σx`` (защита от накопленной
+        погрешности долей после clip/quantize), поэтому значение якорного
+        компонента в результате равно его константе точно.
+        """
+        x = np.asarray(x, dtype=float)
+        single = x.ndim == 1
+        X = np.atleast_2d(x)
+        if X.shape[1] != self.q:
+            raise ValueError(
+                f"fractions_to_phr: ожидалось {self.q} компонентов "
+                f"({self.component_names}), получено {X.shape[1]}.")
+        anchors = [(j, nm, float(self._by_name[nm].value))
+                   for j, nm in enumerate(self.component_names)
+                   if self._by_name[nm].mode == MODE_FIXED
+                   and self._by_name[nm].value > _TOL]
+        if not anchors:
+            raise ValueError(
+                "fractions_to_phr: в спеке нет fixed-листа с положительным "
+                "value — суммарный phr по долям НЕОПРЕДЕЛИМ (доли задают "
+                "только пропорции). Добавьте якорь (например, смола = 100 "
+                "phr) или ведите навеску сразу в phr.")
+        s = X.sum(axis=1)
+        if np.any(s <= _TOL):
+            raise ValueError("fractions_to_phr: сумма долей рецепта ≤ 0.")
+        Xn = X / s[:, None]
+        j0, nm0, v0 = anchors[0]
+        xf = Xn[:, j0]
+        if np.any(xf <= _TOL):
+            raise ValueError(
+                f"fractions_to_phr: доля якорного компонента '{nm0}' равна 0 "
+                f"— масштаб (Σp = {v0:g}/x) не определён.")
+        total = v0 / xf
+        P = Xn * total[:, None]
+        for j, nm, v in anchors[1:]:
+            scale = max(1.0, abs(v))
+            bad = np.abs(P[:, j] - v) > float(tol) * scale
+            if np.any(bad):
+                i = int(np.argmax(bad))
+                raise ValueError(
+                    f"fractions_to_phr: доли не согласованы со спекой — по "
+                    f"якорю '{nm0}' (={v0:g} phr) восстановленный phr узла "
+                    f"'{nm}' равен {P[i, j]:.6g}, а спека фиксирует {v:g} "
+                    f"(строка {i}). Проверьте, что доли получены из ЭТОЙ "
+                    f"спеки.")
+        return P[0] if single else P
+
     def sample_candidates(self, n: int,
                           seed: Optional[int] = None) -> np.ndarray:
         """``n`` кандидатов-долей (n × q, Σ=1): sample_z → decode →

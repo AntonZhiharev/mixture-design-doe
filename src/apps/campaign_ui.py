@@ -32,8 +32,10 @@ import streamlit as st
 
 from ..core.schema import ModelSpec, ProjectSchema, VariableBlock
 from ..core.simplex import parts_ranges_to_fraction_bounds
-from ..optimize.desirability import DesirabilitySpec
+from ..optimize.desirability import (ChanceConstraint, DesirabilitySpec,
+                                     hard_threshold_spec)
 from ..apps.mixture_process_runner import MixtureProcessRunner
+
 from ..apps import campaign as cv
 from ..apps import campaign_screening as csx
 from ..apps import campaign_state as cs
@@ -627,6 +629,16 @@ def branch_recipe_dataframe(runner, branch_id, *, batch_kg: Optional[float] = No
     res = runner.optimize_xbest(branch_id, n_candidates=int(n_candidates),
                                 refine_iters=int(refine_iters),
                                 n_starts=int(n_starts))
+    return _recipe_row_dataframe(runner, branch_id, res, batch_kg=batch_kg)
+
+
+def _recipe_row_dataframe(runner, branch_id, res, *,
+                          batch_kg: Optional[float] = None) -> pd.DataFrame:
+    """iter43: строка рецепта из ГОТОВОГО ``DesirabilityResult`` (общая часть).
+
+    Выделено из :func:`branch_recipe_dataframe`, чтобы
+    :func:`branch_recipe_with_binding` собирал ту же таблицу БЕЗ повторного
+    прогона M8-argmax (иначе binding-отчёт стоил бы второй оптимизации)."""
     coord_names = setup_coord_names(runner)
     mix_names = list(runner.current_schema.mixture_names)
     x = np.atleast_2d(np.asarray(res.x, float))
@@ -645,8 +657,107 @@ def branch_recipe_dataframe(runner, branch_id, *, batch_kg: Optional[float] = No
     return pd.DataFrame([row])
 
 
+
+def branch_recipe_with_binding(runner, branch_id, *,
+                               batch_kg: Optional[float] = None,
+                               n_candidates: int = 2000,
+                               refine_iters: int = 200, n_starts: int = 5):
+    """iter43.3 (§43.3): рецепт ветки x* + ``binding_report`` ОДНИМ прогоном.
+
+    :func:`branch_recipe_dataframe` возвращает только таблицу (её сигнатура и
+    Excel-выгрузка не меняются), а binding-отчёт нужен рядом — иначе пришлось бы
+    гонять M8-argmax дважды. Возвращает ``(df, binding_report)``; отчёт —
+    ``DesirabilityResult.binding_report`` (veto-статистика целей + chance).
+    Чистая (без Streamlit)."""
+    res = runner.optimize_xbest(branch_id, n_candidates=int(n_candidates),
+                               refine_iters=int(refine_iters),
+                               n_starts=int(n_starts))
+    df = _recipe_row_dataframe(runner, branch_id, res, batch_kg=batch_kg)
+    return df, dict(res.binding_report or {})
+
+
+def binding_report_dataframe(report: Mapping[str, Any]) -> pd.DataFrame:
+    """iter43.3 (§43.3): ``binding_report`` → таблица «что связывает оптимум».
+
+    Строки — ограничения ДВУХ типов (колонка «тип»):
+
+    * ``veto (цель)`` — desirability-цель: ``% пула`` = доля точек глобального
+      пула с ``d_i = 0`` (порог допустимости), «в x*» = ``d_i`` в оптимуме;
+    * ``вероятностное Pr`` — chance-ограничение: ``% пула`` = доля точек с
+      ``Pr < 1−α``, «в x*» = вероятность в оптимуме, «порог» = ``1−α``.
+
+    «выполнено в x*»: для цели — ``d_i > 0``; для chance — ``Pr ≥ 1−α`` (флаг
+    ядра ``satisfied_at_optimum``). Чистая (без Streamlit)."""
+    rows: List[Dict[str, Any]] = []
+    for name, st_ in (report.get("specs") or {}).items():
+        d_at = float(st_.get("d_at_optimum", 0.0))
+        rows.append({
+            "ограничение": name,
+            "тип": "veto (цель)",
+            "% пула под биндингом": round(100.0 * float(
+                st_.get("frac_veto", 0.0)), 1),
+            "в x*": round(d_at, 4),
+            "порог": "d > 0",
+            "выполнено в x*": "да" if d_at > 0.0 else "нет",
+        })
+    for name, ch in (report.get("chance") or {}).items():
+        alpha = float(ch.get("alpha", 0.05))
+        rows.append({
+            "ограничение": name,
+            "тип": "вероятностное Pr",
+            "% пула под биндингом": round(100.0 * float(
+                ch.get("frac_below", 0.0)), 1),
+            "в x*": round(float(ch.get("prob_at_optimum", 0.0)), 4),
+            "порог": round(1.0 - alpha, 4),
+            "выполнено в x*": ("да" if ch.get("satisfied_at_optimum")
+                               else "нет"),
+        })
+    return pd.DataFrame(rows)
+
+
+def binding_report_caption(report: Mapping[str, Any]) -> str:
+    """iter43.3 (§43.3): подпись «оптимум не найден» vs «оптимум ЗАПРЕЩЁН».
+
+    CAMPAIGN_SPEC_PVC §7 требует различать две принципиально разные ситуации:
+
+    * **оптимум ЗАПРЕЩЁН** — ограничение нарушено на ВСЁМ пуле (100 % точек под
+      биндингом): допустимой области в этой геометрии нет — ослаблять
+      ограничение или расширять область, добор точек не поможет;
+    * **оптимум НЕ НАЙДЕН** — допустимые точки в пуле есть, но x* их не достиг:
+      это вопрос поиска (n_candidates / refine / мультистарт), не постановки.
+
+    Если все ограничения выполнены в x* — зелёная строка. Чистая (без
+    Streamlit)."""
+    n_pool = int(report.get("n_pool", 0) or 0)
+    unmet: List[str] = []
+    forbidden: List[str] = []
+    for name, st_ in (report.get("specs") or {}).items():
+        if float(st_.get("d_at_optimum", 0.0)) <= 0.0:
+            unmet.append(name)
+        if float(st_.get("frac_veto", 0.0)) >= 1.0 - 1e-12:
+            forbidden.append(name)
+    for name, ch in (report.get("chance") or {}).items():
+        if not ch.get("satisfied_at_optimum", True):
+            unmet.append(name)
+        if float(ch.get("frac_below", 0.0)) >= 1.0 - 1e-12:
+            forbidden.append(name)
+    if forbidden:
+        return (f"⛔ Оптимум ЗАПРЕЩЁН: {', '.join(sorted(set(forbidden)))} "
+                f"нарушено во ВСЁМ пуле ({n_pool} точек) — допустимой области "
+                "в этой геометрии нет. Ослабьте ограничение или расширьте "
+                "область; добор точек не поможет (CAMPAIGN_SPEC_PVC §7).")
+    if unmet:
+        return (f"⚠️ Оптимум НЕ НАЙДЕН: {', '.join(sorted(set(unmet)))} не "
+                f"выполнено в x*, но допустимые точки в пуле есть ({n_pool}) — "
+                "это вопрос поиска: увеличьте пул кандидатов / итерации "
+                "уточнения / число стартов (CAMPAIGN_SPEC_PVC §7).")
+    return (f"✅ Все ограничения выполнены в x* (пул {n_pool} точек): оптимум "
+            "лежит в допустимой области.")
+
+
 def branch_recipe_excel_bytes(runner, branch_id, *,
                               batch_kg: Optional[float] = None,
+
                               n_candidates: int = 2000, refine_iters: int = 200,
                               n_starts: int = 5) -> bytes:
     """§17.6.1 (C3): рекомендованный рецепт ветки → xlsx-байты (кнопка скачивания).
@@ -2400,20 +2511,103 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
 # ----------------------------------------------------------------------
 # Чистые хелперы черновика целей ветки (без Streamlit — тестируются напрямую)
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# iter43 (UI_REVISION_SPEC §43.2): виды целей в UI. Первые три — «сырые»
+# DesirabilitySpec (min/max/target), последние два — ПОРОГИ на предсказанное
+# СРЕДНЕЕ, собираемые через :func:`hard_threshold_spec` (ramp = ШУМ ИЗМЕРЕНИЯ
+# отклика, iter39 замечание 1: узкий ramp = плоский нуль без градиента возврата).
+# ----------------------------------------------------------------------
+GOAL_KIND_GE = "порог ≥"
+GOAL_KIND_LE = "порог ≤"
+GOAL_KINDS: List[str] = ["max", "min", "target", GOAL_KIND_GE, GOAL_KIND_LE]
+
+_THRESHOLD_KINDS = {GOAL_KIND_GE: "ge", GOAL_KIND_LE: "le"}
+
+# Подсказка к «СКО шума измерения» (ширина ramp порога, iter39/§43.2).
+_NOISE_SD_HELP = (
+    "СКО шума измерения этого отклика (повторяемость метода). Порог реализуется "
+    "не «обрывом», а НАКЛОНОМ шириной в один шум: d=1 в допустимой области, d=0 "
+    "глубже порога на величину шума. Так у оптимизатора остаётся направление "
+    "возврата в допустимую область (нулевая ширина даёт плоский нуль и «слепой» "
+    "refine), а veto остаётся практически жёстким — различить «на пороге» и «чуть "
+    "ниже» точнее шума измерения всё равно нельзя."
+)
+
+# Подсказка к вероятностному ограничению (chance-constraint, §43.2).
+_CHANCE_HELP = (
+    "Вероятностное ограничение: требуем, чтобы отклик попадал в допуск НЕ в "
+    "среднем, а с заданной вероятностью — Pr(y в допуске) ≥ 1−α. Учитывает "
+    "неопределённость модели (σ прогноза), поэтому «в среднем проходит, но "
+    "разброс велик» уже не считается выполненным. Это НЕ цель: множитель к "
+    "итоговому d_overall (роль отклика не меняется)."
+)
+
+
+def build_goal_spec(kind: str, *, low: Optional[float] = None,
+                    high: Optional[float] = None,
+                    target: Optional[float] = None,
+                    weight: float = 1.0,
+                    threshold: Optional[float] = None,
+                    noise_sd: Optional[float] = None) -> DesirabilitySpec:
+    """iter43 (§43.2): UI-вид цели → :class:`DesirabilitySpec` (чистый билдер).
+
+    ``max``/``min``/``target`` — прямая сборка спеки по ``low``/``high``
+    (+``target``). ``«порог ≥»``/``«порог ≤»`` — :func:`hard_threshold_spec`
+    (порог на предсказанное СРЕДНЕЕ, ramp = ``noise_sd``): результат — обычный
+    ``DesirabilitySpec``, поэтому он сериализуется и переживает save/load штатно,
+    без нового вида в ядре. Нехватка обязательных полей — явный ``ValueError``
+    (A0.6: неполную цель молча не собираем).
+    """
+    if kind in _THRESHOLD_KINDS:
+        if threshold is None:
+            raise ValueError(f"Вид «{kind}» требует значение порога.")
+        if noise_sd is None or float(noise_sd) <= 0.0:
+            raise ValueError(
+                f"Вид «{kind}» требует СКО шума измерения > 0 (ширина наклона): "
+                f"нулевая ширина даёт плоский нуль без направления возврата.")
+        return hard_threshold_spec(float(threshold), float(noise_sd),
+                                   _THRESHOLD_KINDS[kind], weight=float(weight))
+    if kind not in ("max", "min", "target"):
+        raise ValueError(f"Неизвестный вид цели '{kind}' (есть: {GOAL_KINDS}).")
+    if low is None or high is None:
+        raise ValueError(f"Вид «{kind}» требует low и high.")
+    return DesirabilitySpec(kind, low=float(low), high=float(high),
+                            target=(float(target) if kind == "target"
+                                    and target is not None else None),
+                            weight=float(weight))
+
+
 def draft_add_goal(draft: Sequence[Dict[str, Any]], *, resp: str, kind: str,
-                   low: float, high: float, weight: float,
-                   target: Optional[float] = None) -> List[Dict[str, Any]]:
+                   low: Optional[float] = None, high: Optional[float] = None,
+                   weight: float = 1.0,
+                   target: Optional[float] = None,
+                   threshold: Optional[float] = None,
+                   noise_sd: Optional[float] = None) -> List[Dict[str, Any]]:
     """Добавить цель в черновик ветки (§17.5). Возвращает НОВЫЙ список.
 
     Цель по одному и тому же отклику НЕ дублируется: повторное добавление того же
     ``resp`` ЗАМЕНЯЕТ прежнюю запись (иначе при создании ветки дубли молча
     схлопнулись бы в ``goals[resp]`` — тихая потеря, A0.6). ``target`` хранится
     только для вида ``target``.
+
+    iter43 (§43.2): для порогов (``«порог ≥»``/``«порог ≤»``) хранятся СЫРЫЕ
+    входы ``threshold``/``noise_sd``, а не готовая спека — черновик остаётся
+    редактируемым и объяснимым; спека собирается на фиксации
+    (:func:`draft_goal_specs` → :func:`build_goal_spec`). Валидность вида
+    проверяется сразу (сборкой), чтобы ошибка всплыла при добавлении, а не при
+    создании ветки.
     """
-    entry = {"resp": resp, "kind": kind, "low": float(low), "high": float(high),
+    entry = {"resp": resp, "kind": kind,
+             "low": (float(low) if low is not None else None),
+             "high": (float(high) if high is not None else None),
              "weight": float(weight),
              "target": (float(target) if kind == "target" and target is not None
-                        else None)}
+                        else None),
+             "threshold": (float(threshold) if kind in _THRESHOLD_KINDS
+                           and threshold is not None else None),
+             "noise_sd": (float(noise_sd) if kind in _THRESHOLD_KINDS
+                          and noise_sd is not None else None)}
+    build_goal_spec(**{k: v for k, v in entry.items() if k != "resp"})  # валидация
     out = [dict(g) for g in draft]
     for i, g in enumerate(out):
         if g["resp"] == resp:
@@ -2421,6 +2615,107 @@ def draft_add_goal(draft: Sequence[Dict[str, Any]], *, resp: str, kind: str,
             return out
     out.append(entry)
     return out
+
+
+def draft_goal_specs(draft: Sequence[Dict[str, Any]]
+                     ) -> Dict[str, DesirabilitySpec]:
+    """iter43: черновик целей → ``{отклик: DesirabilitySpec}`` для создания ветки.
+
+    Единственная точка сборки спек из черновика (UI больше не собирает их
+    инлайном): порог превращается в ``hard_threshold_spec`` здесь.
+    """
+    out: Dict[str, DesirabilitySpec] = {}
+    for g in draft:
+        out[g["resp"]] = build_goal_spec(
+            g["kind"], low=g.get("low"), high=g.get("high"),
+            target=g.get("target"), weight=float(g.get("weight", 1.0)),
+            threshold=g.get("threshold"), noise_sd=g.get("noise_sd"))
+    return out
+
+
+def draft_goal_text(entry: Mapping[str, Any]) -> str:
+    """iter43: человекочитаемая строка одной цели черновика (для списка в UI)."""
+    kind = entry["kind"]
+    if kind in _THRESHOLD_KINDS:
+        body = (f"{kind} {entry.get('threshold')} "
+                f"(наклон = шум {entry.get('noise_sd')})")
+    elif kind == "target":
+        body = (f"target [{entry.get('low')}, {entry.get('high')}], "
+                f"пик {entry.get('target')}")
+    else:
+        body = f"{kind} [{entry.get('low')}, {entry.get('high')}]"
+    return (f"**{entry['resp']}** — {body}, "
+            f"значимость {entry.get('weight', 1.0)}")
+
+
+def draft_add_chance(draft: Sequence[Dict[str, Any]], *, resp: str,
+                     y_min: Optional[float] = None,
+                     y_max: Optional[float] = None,
+                     alpha: float = 0.05) -> List[Dict[str, Any]]:
+    """iter43 (§43.2): добавить/заменить вероятностное ограничение в черновике.
+
+    ``None`` у границы = «не ограничено» (``∓inf``): штатный односторонний случай
+    ``Pr(y ≤ y_max) ≥ 1−α``. Валидность проверяется сразу конструктором
+    :class:`ChanceConstraint` (α∈(0,1), y_min<y_max, хотя бы одна граница
+    конечна) — ошибка всплывает при добавлении, а не при оптимизации.
+    """
+    entry = {"resp": resp,
+             "y_min": (float(y_min) if y_min is not None else None),
+             "y_max": (float(y_max) if y_max is not None else None),
+             "alpha": float(alpha)}
+    _chance_from_entry(entry)                       # валидация (A0.6)
+    out = [dict(c) for c in draft]
+    for i, c in enumerate(out):
+        if c["resp"] == resp:
+            out[i] = entry
+            return out
+    out.append(entry)
+    return out
+
+
+def draft_remove_chance(draft: Sequence[Dict[str, Any]],
+                        index: int) -> List[Dict[str, Any]]:
+    """iter43: убрать ограничение по индексу (идемпотентно, как у целей)."""
+    out = [dict(c) for c in draft]
+    if 0 <= index < len(out):
+        del out[index]
+    return out
+
+
+def _chance_from_entry(entry: Mapping[str, Any]) -> ChanceConstraint:
+    """Запись черновика → :class:`ChanceConstraint` (``None`` → ``∓inf``)."""
+    return ChanceConstraint(
+        y_min=(-np.inf if entry.get("y_min") is None else float(entry["y_min"])),
+        y_max=(np.inf if entry.get("y_max") is None else float(entry["y_max"])),
+        alpha=float(entry.get("alpha", 0.05)))
+
+
+def draft_chance_constraints(draft: Sequence[Dict[str, Any]]
+                             ) -> Dict[str, ChanceConstraint]:
+    """iter43: черновик ограничений → ``{отклик: ChanceConstraint}`` для раннера."""
+    return {c["resp"]: _chance_from_entry(c) for c in draft}
+
+
+def chance_editor_dataframe(runner, branch_id: str) -> pd.DataFrame:
+    """iter43 (§43.2): вероятностные ограничения ветки → таблица ОТДЕЛЬНЫМ блоком.
+
+    Показывается НЕ вместе с целями: chance-ограничение — множитель к d_overall
+    (Pr(y∈допуск) ≥ 1−α), а не нога качества; смешивать его с целями в одной
+    таблице значит врать про роль отклика (§5). Пустой набор → пустая таблица.
+    """
+    rows = []
+    for prop, con in (runner.branch_chance(branch_id) or {}).items():
+        rows.append({
+            "ограничение (отклик)": prop,
+            "y_min": ("—" if not np.isfinite(con.y_min)
+                      else round(float(con.y_min), 4)),
+            "y_max": ("—" if not np.isfinite(con.y_max)
+                      else round(float(con.y_max), 4)),
+            "α": round(float(con.alpha), 4),
+            "требование": f"Pr(y в допуске) ≥ {1.0 - float(con.alpha):.3f}",
+        })
+    return pd.DataFrame(rows)
+
 
 
 def draft_remove_goal(draft: Sequence[Dict[str, Any]],
@@ -2691,17 +2986,19 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
             import io
             try:
                 bk = float(rec_batch) if float(rec_batch) > 0 else None
-                df_rec = branch_recipe_dataframe(runner, bsel, batch_kg=bk)
+                # iter43.3: рецепт + binding_report ОДНИМ прогоном argmax
+                df_rec, brep = branch_recipe_with_binding(
+                    runner, bsel, batch_kg=bk)
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as xw:
                     df_rec.to_excel(xw, sheet_name="Рецепт", index=False)
-                st.session_state[rkey] = (df_rec, buf.getvalue())
+                st.session_state[rkey] = (df_rec, buf.getvalue(), brep)
             except (ValueError, KeyError, RuntimeError) as exc:
                 st.session_state.pop(rkey, None)
                 st.error(f"Не удалось рассчитать рецепт ветки: {exc}")
         cached_rec = st.session_state.get(rkey)
         if cached_rec is not None:
-            df_rec, xls_bytes = cached_rec
+            df_rec, xls_bytes, brep = cached_rec
             st.dataframe(df_rec, use_container_width=True, hide_index=True)
             st.download_button(
                 "⬇️ Скачать рецепт ветки в Excel (.xlsx)", data=xls_bytes,
@@ -2709,6 +3006,15 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                 key=f"camp_wb_recipe_dl_{bsel}",
                 mime="application/vnd.openxmlformats-officedocument."
                      "spreadsheetml.sheet")
+            # iter43.3 (§43.3): binding_report ОБЯЗАТЕЛЕН к просмотру — без
+            # него «оптимум не найден» неотличим от «оптимум запрещён».
+            st.caption(binding_report_caption(brep))
+            bdf = binding_report_dataframe(brep)
+            if not bdf.empty:
+                st.caption("Что связывает оптимум (veto целей + вероятностные "
+                           "ограничения; % — доля точек пула под биндингом):")
+                st.dataframe(bdf, use_container_width=True, hide_index=True)
+
 
         # §17.3 (Ш2) гейт: перед предложением/пересчётом — проверка полноты данных
         ready = ctrl.validate_ready(bsel)

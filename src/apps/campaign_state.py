@@ -35,8 +35,9 @@ from ..core.schema import DataPoint, ProjectSchema
 from ..core.schema_evolution import SchemaHistory
 from ..design.branches import Branch
 from ..design.phr_sampler import PhrSpec
-from ..optimize.desirability import DesirabilitySpec
+from ..optimize.desirability import ChanceConstraint, DesirabilitySpec
 from .mixture_process_runner import MixtureProcessRunner
+
 
 FORMAT_VERSION = "campaign-v1"
 _STATE_FILE = "campaign.json"
@@ -112,8 +113,34 @@ def _spec_from_dict(d: Dict[str, Any]) -> DesirabilitySpec:
     return DesirabilitySpec(**dict(d))
 
 
+def _chance_to_dict(con: ChanceConstraint) -> Dict[str, Any]:
+    """iter43: ``ChanceConstraint`` → JSON-safe словарь.
+
+    ``±inf`` (односторонние ограничения — штатный случай ΔE ≤ max) пишется как
+    ``null``: `json.dump` умеет писать нестандартный литерал ``Infinity``, но
+    такой файл перестаёт быть валидным JSON для внешних читателей. ``None``
+    восстанавливается обратно в ``∓inf`` (см. :func:`_chance_from_dict`).
+    """
+    return {
+        "y_min": (float(con.y_min) if np.isfinite(con.y_min) else None),
+        "y_max": (float(con.y_max) if np.isfinite(con.y_max) else None),
+        "alpha": float(con.alpha),
+    }
+
+
+def _chance_from_dict(d: Dict[str, Any]) -> ChanceConstraint:
+    """iter43: словарь → ``ChanceConstraint`` (``null`` → ``∓inf``)."""
+    y_min = d.get("y_min", None)
+    y_max = d.get("y_max", None)
+    return ChanceConstraint(
+        y_min=(-np.inf if y_min is None else float(y_min)),
+        y_max=(np.inf if y_max is None else float(y_max)),
+        alpha=float(d.get("alpha", 0.05)))
+
+
 def _region_move_to_dict(mv: Dict[str, Any]) -> Dict[str, Any]:
     """JSON-safe копия записи журнала движений области (deltas-кортежи → списки)."""
+
     out = dict(mv)
     deltas = out.get("deltas")
     if isinstance(deltas, dict):
@@ -144,8 +171,15 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             "cost_name": str(cfg.get("cost_name", "price")),
             "rho_property": str(cfg["rho_property"]),
         }
+    # iter43 (§43.1): вероятностные ограничения ветки — dataclass без callable,
+    # сериализуется целиком (в отличие от ценовой ноги отказ невозможен).
+    branch_chance: Dict[str, Any] = {
+        bid: {prop: _chance_to_dict(con) for prop, con in cons.items()}
+        for bid, cons in (getattr(runner, "_branch_chance", {}) or {}).items()
+        if cons}
 
     state: Dict[str, Any] = {
+
         "format": FORMAT_VERSION,
         "oracle": {"kind": "manual",
                    "property_names": list(runner.property_names)},
@@ -169,7 +203,10 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             "branches": {bid: br.to_state()
                          for bid, br in runner.branches.items()},
             "branch_cost": branch_cost,
+            # iter43 (§43.1): вероятностные ограничения ветки
+            "branch_chance": branch_chance,
             "border_origin": dict(getattr(runner, "_border_origin", {}) or {}),
+
             # iter31: проектные функциональные группы (политика сэмплирования)
             "sampling_groups": [list(g) for g in
                                 (getattr(runner, "sampling_groups", []) or [])],
@@ -255,7 +292,14 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
             rho_property=str(cfg["rho_property"]),
             cost_name=str(cfg.get("cost_name", "price")))
 
+    # iter43 (§43.1): вероятностные ограничения ветки — ШТАТНЫМ сеттером
+    # (валидация имён откликов). Старые сейвы без ключа → ограничений нет.
+    for bid, cons in (r.get("branch_chance", {}) or {}).items():
+        runner.set_branch_chance(
+            bid, {prop: _chance_from_dict(d) for prop, d in (cons or {}).items()})
+
     runner.block_factor = str(r.get("block_factor", "") or "")
+
     runner.block_names = {int(k): str(v) for k, v in
                           (r.get("block_names", {}) or {}).items()}
     runner._border_origin = dict(r.get("border_origin", {}) or {})

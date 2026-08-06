@@ -78,9 +78,11 @@ from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget,
                                ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
                                ROLE_PRIORITY)
-from ..optimize.desirability import (Desirability, DesirabilitySpec,
+from ..optimize.desirability import (ChanceConstraint, Desirability,
+                                     DesirabilitySpec,
                                      DesirabilityResult, optimize_desirability,
                                      make_item_cost_fn)
+
 
 
 
@@ -168,12 +170,21 @@ class MixtureProcessRunner:
         # (ρ̂ меняется каждый раунд). {branch_id: {price_fn, cost_spec, cost_name,
         # rho_property}}. Пусто ⇒ ветка чисто техническая (обратная совместимость).
         self._branch_cost: Dict[str, Dict[str, Any]] = {}
+        # iter43 (UI_REVISION_SPEC §43.1): ВЕРОЯТНОСТНЫЕ ограничения ветки
+        # ``Pr(y∈[y_min,y_max]) ≥ 1−α`` (:class:`ChanceConstraint`). Хранятся в
+        # runner по образцу ценовой ноги (политика раннера, НЕ во frozen-схеме и
+        # НЕ в ``Branch``: канон контейнера намерения не трогаем, §5/§12).
+        # {branch_id: {property: ChanceConstraint}}. Подставляются в
+        # ``optimize_xbest`` автоматически — иначе ограничение, заданное из UI,
+        # молча не участвовало бы в argmax (A0.6).
+        self._branch_chance: Dict[str, Dict[str, ChanceConstraint]] = {}
 
         # §15.0.3: после движения границ области (move_region) точки, выпавшие из
         # НОВОЙ области, легально исключаются из активного pool по политике
-        # ``exclude`` (но ОСТАЮТСЯ в self.points — история ≠ активный pool, движение
-        # обратимо). Журнал движений области (для интроспекции/обратимости).
+        # ``exclude`` (но ОСТАЮТСЯ в self.points — история ≠ активный pool,
+        # движение обратимо). Журнал движений области (интроспекция/обратимость).
         self._region_moves: List[Dict[str, Any]] = []
+
         self._drop_policy: str = POLICY_EXCLUDE
         # §15.6 §6 / A0.5: происхождение границ (hard/soft). ДЕФОЛТ — soft (можно
         # двигать). hard (физика/закон/бюджет) двигать НЕЛЬЗЯ. Храним отдельно от
@@ -1320,6 +1331,50 @@ class MixtureProcessRunner:
         return cost_fn, cfg["cost_name"], cfg["cost_spec"]
 
     # ------------------------------------------------------------------
+    # iter43 (UI_REVISION_SPEC §43.1): ВЕРОЯТНОСТНЫЕ ограничения ветки
+    # ``Pr(y ∈ [y_min, y_max]) ≥ 1−α``. Хранятся в runner (образец ценовой
+    # ноги ``_branch_cost``): это ПОЛИТИКА постановки, а не цель — d-фактор
+    # ``clip(p/(1−α),0,1)`` МНОЖИТЕЛЬ к d_overall, в ``Branch.goal`` ему
+    # места нет (иначе роль отклика поехала бы в OPTIMIZED, §5).
+    # ------------------------------------------------------------------
+    def set_branch_chance(self, branch_id: str,
+                          constraints: Optional[Mapping[str, ChanceConstraint]]
+                          ) -> None:
+        """iter43: задать вероятностные ограничения ветки (``None``/пусто — снять).
+
+        ``constraints`` — ``{свойство: ChanceConstraint}``; свойство обязано быть
+        среди свойств оракула (σ-канал строится из ОБЩЕГО суррогата, §5/§12) —
+        иначе ``KeyError``. Ограничение может НЕ входить в ``goal`` ветки
+        (постановка ΔE: «не цель, а допуск»). Заданные здесь ограничения
+        ПОДСТАВЛЯЮТСЯ в :meth:`optimize_xbest` автоматически: молча
+        игнорировать введённое пользователем ограничение нельзя (A0.6).
+        """
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if not constraints:
+            self._branch_chance.pop(branch_id, None)
+            return
+        out: Dict[str, ChanceConstraint] = {}
+        for prop, con in constraints.items():
+            if prop not in self.property_names:
+                raise KeyError(
+                    f"Отклик '{prop}' вероятностного ограничения не среди "
+                    f"свойств оракула {self.property_names}.")
+            if not isinstance(con, ChanceConstraint):
+                raise TypeError(
+                    f"Ограничение по '{prop}' должно быть ChanceConstraint, "
+                    f"дано {type(con).__name__}.")
+            out[str(prop)] = con
+        self._branch_chance[branch_id] = out
+
+    def branch_chance(self, branch_id: str) -> Dict[str, ChanceConstraint]:
+        """iter43: вероятностные ограничения ветки (копия; пусто — их нет)."""
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        return dict(self._branch_chance.get(branch_id, {}))
+
+
+    # ------------------------------------------------------------------
     # §5/§12 РОЛЬ ОТКЛИКА в ветке — атрибут (ветка × отклик), ВЫВОДИТСЯ из
     # текущего намерения (goal + ценовая конфигурация), а НЕ хранится отдельно
     # (нет дубля состояния). Приоритет M2: OPTIMIZED > PRICE_INPUT > REFERENCE —
@@ -1721,13 +1776,22 @@ class MixtureProcessRunner:
         ``surrogate.predict(X).std`` — ПОЛНАЯ предиктивная σ (у MoE включает
         межэкспертное рассогласование — неопределённость гейта). Свойство
         ограничения может не входить в goal ветки — mean-предиктор
-        достраивается из того же суррогата."""
+        достраивается из того же суррогата.
+
+        iter43 (§43.1): при ``chance_constraints=None`` подставляются
+        СОХРАНЁННЫЕ ограничения ветки (:meth:`set_branch_chance`) — иначе
+        заданное из UI ограничение молча не участвовало бы в argmax (A0.6).
+        ЯВНЫЙ аргумент имеет приоритет (в т.ч. пустой ``{}`` — «считать без
+        ограничений на этот вызов»)."""
         if branch_id not in self.branches:
             raise KeyError(f"Нет ветки '{branch_id}'.")
         if not self.surrogates:
             self.fit_surrogates()
+        if chance_constraints is None:
+            chance_constraints = self._branch_chance.get(branch_id) or None
         br = self.branches[branch_id]
         region = self._mixture_region()
+
         predictors = {name: (lambda X, gp=self.surrogates[name]: gp.predict(X).mean)
                       for name in br.goal}
         kw: Dict[str, Any] = dict(

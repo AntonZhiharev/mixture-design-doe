@@ -500,11 +500,17 @@ class CampaignController:
         br = self.runner.branches[branch_id]
         cost = (self.runner._branch_cost.get(branch_id)
                 if hasattr(self.runner, "_branch_cost") else None)
+        # iter43 (§43.1): вероятностные ограничения — тоже намерение ветки,
+        # значит попадают в снимок undo (иначе откат правки целей оставил бы
+        # прежний argmax-контекст и «рекомендация сместилась» врало бы).
+        chance = (self.runner._branch_chance.get(branch_id)
+                  if hasattr(self.runner, "_branch_chance") else None)
         return {
             "goal": {k: replace(v) for k, v in (br.goal or {}).items()},
             "d_best": float(br.d_best),
             "x_best": (list(br.x_best) if br.x_best is not None else None),
             "cost": (dict(cost) if cost is not None else None),
+            "chance": (dict(chance) if chance is not None else None),
         }
 
     def _restore(self, branch_id: str, snap: Dict[str, Any]) -> None:
@@ -517,6 +523,14 @@ class CampaignController:
                 self.runner._branch_cost[branch_id] = dict(snap["cost"])
             else:
                 self.runner._branch_cost.pop(branch_id, None)
+        if hasattr(self.runner, "_branch_chance"):
+            # старые снимки (до iter43) ключа не несут — трактуем как «не трогать»
+            if "chance" in snap:
+                if snap["chance"]:
+                    self.runner._branch_chance[branch_id] = dict(snap["chance"])
+                else:
+                    self.runner._branch_chance.pop(branch_id, None)
+
 
     # -- per-branch re-score (оценка под текущий объектив, не правда) --
     def _rescore(self, branch_id: str) -> None:
@@ -656,6 +670,27 @@ class CampaignController:
             del br.goal[response]
 
         return self._apply("delete_goal", branch_id, response, _mut)
+
+    # -- iter43 (§43.2/§43.1): вероятностные ограничения ветки ---------
+    def set_chance(self, branch_id: str,
+                   constraints: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """iter43: задать/снять вероятностные ограничения ветки (обратимо, §7).
+
+        ``constraints`` — ``{свойство: ChanceConstraint}``; ``None``/пусто снимает
+        все. Ограничение — НЕ цель (это множитель ``clip(p/(1−α),0,1)`` к
+        d_overall), поэтому ``goal`` и роли откликов НЕ меняются, а измеренный
+        ``d_best`` остаётся тем же: эффект виден в argmax (``x_opt``/
+        ``recommendation_shift``) и в ``binding_report``. Валидация имён — в
+        :meth:`MixtureProcessRunner.set_branch_chance` (A0.6).
+        """
+        if branch_id not in self.runner.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+
+        def _mut():
+            self.runner.set_branch_chance(branch_id, constraints)
+
+        return self._apply("set_chance", branch_id, None, _mut)
+
 
     # -- §5: смена роли (ветка × отклик), per-branch -------------------
     def switch_role(self, branch_id: str, response: str, to_role: str, *,

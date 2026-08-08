@@ -850,18 +850,27 @@ def goal_editor_dataframe(runner, branch_id: str) -> pd.DataFrame:
     """Текущие цели ветки → таблица (§16.3): отклик, вид, диапазон, target, вес.
 
     Ветка — это НАБОР целей (мультицель): каждая цель несёт свой вид
-    (``min``/``max``/``target``), диапазон ``[low, high]`` (и ``target`` для
-    target-типа) и вес геом-среднего. Читает ``branch.goal`` (read-only)."""
+    (``min``/``max``/``target``/``target_range``), диапазон ``[low, high]``
+    (и ``target`` для target-типа; для плато P2.2 в колонке target показан
+    диапазон ``[target_low, target_high]``) и вес геом-среднего. Читает
+    ``branch.goal`` (read-only)."""
     br = runner.branches[branch_id]
     rows = []
     for resp, spec in (br.goal or {}).items():
+        if spec.kind == "target_range":
+            # P2.2: плато-таргет — в target-колонке диапазон, не точка
+            tgt_show = (f"[{round(float(spec.target_low), 4)}, "
+                        f"{round(float(spec.target_high), 4)}] (плато)")
+        elif spec.target is not None:
+            tgt_show = round(float(spec.target), 4)
+        else:
+            tgt_show = "—"
         rows.append({
             "цель (отклик)": resp,
             "вид": spec.kind,
             "low": round(float(spec.low), 4),
             "high": round(float(spec.high), 4),
-            "target": (round(float(spec.target), 4)
-                       if spec.target is not None else "—"),
+            "target": tgt_show,
             "вес": round(float(spec.weight), 4),
         })
     return pd.DataFrame(rows)
@@ -2841,7 +2850,11 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
 # ----------------------------------------------------------------------
 GOAL_KIND_GE = "порог ≥"
 GOAL_KIND_LE = "порог ≤"
-GOAL_KINDS: List[str] = ["max", "min", "target", GOAL_KIND_GE, GOAL_KIND_LE]
+# P2.2 (UI_REVISION_SPEC): плато-таргет — d=1 на [target_low, target_high],
+# рампы к 0 на low/high (двусторонний таргет-ДИАПАЗОН, а не пик в точке).
+GOAL_KIND_RANGE = "target-диапазон"
+GOAL_KINDS: List[str] = ["max", "min", "target", GOAL_KIND_RANGE,
+                         GOAL_KIND_GE, GOAL_KIND_LE]
 
 _THRESHOLD_KINDS = {GOAL_KIND_GE: "ge", GOAL_KIND_LE: "le"}
 
@@ -2853,6 +2866,14 @@ _NOISE_SD_HELP = (
     "возврата в допустимую область (нулевая ширина даёт плоский нуль и «слепой» "
     "refine), а veto остаётся практически жёстким — различить «на пороге» и «чуть "
     "ниже» точнее шума измерения всё равно нельзя."
+)
+
+# Подсказка к плато-таргету (P2.2 UI_REVISION_SPEC).
+_RANGE_HELP = (
+    "Плато-таргет: внутри [плато от, плато до] желательность d=1 — все значения "
+    "допуска РАВНОХОРОШИ (пример: желатинизация 60–70 %). Вне плато d линейно "
+    "спадает к 0 на краях low/high. Точечный target здесь не годится: пик "
+    "предпочёл бы середину допуска и тянул бы оптимум от его дешёвого края."
 )
 
 # Подсказка к вероятностному ограничению (chance-constraint, §43.2).
@@ -2870,14 +2891,18 @@ def build_goal_spec(kind: str, *, low: Optional[float] = None,
                     target: Optional[float] = None,
                     weight: float = 1.0,
                     threshold: Optional[float] = None,
-                    noise_sd: Optional[float] = None) -> DesirabilitySpec:
-    """iter43 (§43.2): UI-вид цели → :class:`DesirabilitySpec` (чистый билдер).
+                    noise_sd: Optional[float] = None,
+                    target_low: Optional[float] = None,
+                    target_high: Optional[float] = None) -> DesirabilitySpec:
+    """iter43 (§43.2) + P2.2: UI-вид цели → :class:`DesirabilitySpec` (чистый билдер).
 
     ``max``/``min``/``target`` — прямая сборка спеки по ``low``/``high``
     (+``target``). ``«порог ≥»``/``«порог ≤»`` — :func:`hard_threshold_spec`
     (порог на предсказанное СРЕДНЕЕ, ramp = ``noise_sd``): результат — обычный
     ``DesirabilitySpec``, поэтому он сериализуется и переживает save/load штатно,
-    без нового вида в ядре. Нехватка обязательных полей — явный ``ValueError``
+    без нового вида в ядре. ``«target-диапазон»`` (P2.2) — плато-таргет
+    ``kind='target_range'`` ядра: d=1 на ``[target_low, target_high]``, рампы
+    к 0 на ``low``/``high``. Нехватка обязательных полей — явный ``ValueError``
     (A0.6: неполную цель молча не собираем).
     """
     if kind in _THRESHOLD_KINDS:
@@ -2889,6 +2914,18 @@ def build_goal_spec(kind: str, *, low: Optional[float] = None,
                 f"нулевая ширина даёт плоский нуль без направления возврата.")
         return hard_threshold_spec(float(threshold), float(noise_sd),
                                    _THRESHOLD_KINDS[kind], weight=float(weight))
+    if kind == GOAL_KIND_RANGE:
+        if low is None or high is None:
+            raise ValueError(f"Вид «{kind}» требует low и high (края рамп).")
+        if target_low is None or target_high is None:
+            raise ValueError(
+                f"Вид «{kind}» требует границы плато «плато от»/«плато до» "
+                f"(low < плато от < плато до < high).")
+        return DesirabilitySpec("target_range", low=float(low),
+                                high=float(high),
+                                target_low=float(target_low),
+                                target_high=float(target_high),
+                                weight=float(weight))
     if kind not in ("max", "min", "target"):
         raise ValueError(f"Неизвестный вид цели '{kind}' (есть: {GOAL_KINDS}).")
     if low is None or high is None:
@@ -2904,7 +2941,9 @@ def draft_add_goal(draft: Sequence[Dict[str, Any]], *, resp: str, kind: str,
                    weight: float = 1.0,
                    target: Optional[float] = None,
                    threshold: Optional[float] = None,
-                   noise_sd: Optional[float] = None) -> List[Dict[str, Any]]:
+                   noise_sd: Optional[float] = None,
+                   target_low: Optional[float] = None,
+                   target_high: Optional[float] = None) -> List[Dict[str, Any]]:
     """Добавить цель в черновик ветки (§17.5). Возвращает НОВЫЙ список.
 
     Цель по одному и тому же отклику НЕ дублируется: повторное добавление того же
@@ -2928,7 +2967,11 @@ def draft_add_goal(draft: Sequence[Dict[str, Any]], *, resp: str, kind: str,
              "threshold": (float(threshold) if kind in _THRESHOLD_KINDS
                            and threshold is not None else None),
              "noise_sd": (float(noise_sd) if kind in _THRESHOLD_KINDS
-                          and noise_sd is not None else None)}
+                          and noise_sd is not None else None),
+             "target_low": (float(target_low) if kind == GOAL_KIND_RANGE
+                            and target_low is not None else None),
+             "target_high": (float(target_high) if kind == GOAL_KIND_RANGE
+                             and target_high is not None else None)}
     build_goal_spec(**{k: v for k, v in entry.items() if k != "resp"})  # валидация
     out = [dict(g) for g in draft]
     for i, g in enumerate(out):
@@ -2951,7 +2994,8 @@ def draft_goal_specs(draft: Sequence[Dict[str, Any]]
         out[g["resp"]] = build_goal_spec(
             g["kind"], low=g.get("low"), high=g.get("high"),
             target=g.get("target"), weight=float(g.get("weight", 1.0)),
-            threshold=g.get("threshold"), noise_sd=g.get("noise_sd"))
+            threshold=g.get("threshold"), noise_sd=g.get("noise_sd"),
+            target_low=g.get("target_low"), target_high=g.get("target_high"))
     return out
 
 
@@ -2961,6 +3005,9 @@ def draft_goal_text(entry: Mapping[str, Any]) -> str:
     if kind in _THRESHOLD_KINDS:
         body = (f"{kind} {entry.get('threshold')} "
                 f"(наклон = шум {entry.get('noise_sd')})")
+    elif kind == GOAL_KIND_RANGE:
+        body = (f"плато [{entry.get('target_low')}, {entry.get('target_high')}] "
+                f"(рампы от {entry.get('low')} до {entry.get('high')})")
     elif kind == "target":
         body = (f"target [{entry.get('low')}, {entry.get('high')}], "
                 f"пик {entry.get('target')}")
@@ -3104,22 +3151,49 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
             "ЗАМЕНЯЕТ прежнюю цель; удалить цель поштучно — кнопкой 🗑 ниже.")
         gc = st.columns([2, 2, 2, 2, 2])
         ng_resp = gc[0].selectbox("Цель (отклик)", props, key="camp_nb_resp")
-        ng_kind = gc[1].selectbox("вид", ["max", "min", "target"],
-                                  key="camp_nb_kind")
+        # iter43-хвост + P2.2: ПОЛНЫЙ набор видов и в форме создания ветки
+        # (пороги/плато раньше задавались только в редакторе после создания).
+        ng_kind = gc[1].selectbox("вид", GOAL_KINDS, key="camp_nb_kind")
         ng_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_nb_lo")
         ng_hi = gc[3].number_input("high", value=10.0, step=0.5, key="camp_nb_hi")
         ng_w = gc[4].number_input("Значимость цели", min_value=0.01, value=1.0,
                                   step=0.5, key="camp_nb_w", help=_WEIGHT_HELP)
 
-        ng_tgt = st.number_input("target (для вида target; low<target<high)",
-                                 value=5.0, step=0.5, key="camp_nb_tgt")
+        ng_tgt = ng_tl = ng_th = ng_thr = ng_noise = None
+        if ng_kind == "target":
+            ng_tgt = st.number_input(
+                "target (для вида target; low<target<high)",
+                value=5.0, step=0.5, key="camp_nb_tgt")
+        elif ng_kind == GOAL_KIND_RANGE:
+            prc = st.columns(2)
+            ng_tl = prc[0].number_input(
+                "плато от (target_low)", value=60.0, step=0.5,
+                key="camp_nb_tlo", help=_RANGE_HELP)
+            ng_th = prc[1].number_input(
+                "плато до (target_high)", value=70.0, step=0.5,
+                key="camp_nb_thi", help=_RANGE_HELP)
+        elif ng_kind in _THRESHOLD_KINDS:
+            prc = st.columns(2)
+            ng_thr = prc[0].number_input(
+                "порог", value=10.0, step=0.5, key="camp_nb_thr")
+            ng_noise = prc[1].number_input(
+                "СКО шума измерения", min_value=1e-9, value=0.5, step=0.1,
+                key="camp_nb_noise", help=_NOISE_SD_HELP)
         ac = st.columns([2, 2])
         if ac[0].button("➕ Добавить цель в ветку", key="camp_nb_add_goal"):
-            st.session_state["camp_new_goals"] = draft_add_goal(
-                draft, resp=ng_resp, kind=ng_kind, low=float(ng_lo),
-                high=float(ng_hi), weight=float(ng_w),
-                target=(float(ng_tgt) if ng_kind == "target" else None))
-            draft = st.session_state["camp_new_goals"]
+            try:
+                st.session_state["camp_new_goals"] = draft_add_goal(
+                    draft, resp=ng_resp, kind=ng_kind, low=float(ng_lo),
+                    high=float(ng_hi), weight=float(ng_w),
+                    target=(float(ng_tgt) if ng_tgt is not None else None),
+                    target_low=(float(ng_tl) if ng_tl is not None else None),
+                    target_high=(float(ng_th) if ng_th is not None else None),
+                    threshold=(float(ng_thr) if ng_thr is not None else None),
+                    noise_sd=(float(ng_noise) if ng_noise is not None
+                              else None))
+                draft = st.session_state["camp_new_goals"]
+            except ValueError as exc:
+                st.error(str(exc))
         if ac[1].button("🧹 Очистить цели", key="camp_nb_clear_goals"):
             st.session_state["camp_new_goals"] = []
             draft = []
@@ -3127,12 +3201,8 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
             st.caption("Цели ветки (черновик) — 🗑 удаляет цель поштучно:")
             for i, g in enumerate(draft):
                 rc = st.columns([9, 1])
-                tgt_txt = (f", target={g['target']}"
-                           if g.get("target") is not None else "")
-                rc[0].markdown(
-                    f"{i + 1}. **{g['resp']}** — {g['kind']} "
-                    f"[{g['low']}, {g['high']}]{tgt_txt}, "
-                    f"значимость {g['weight']}")
+                # P2.2: единый формат строки для всех видов (плато/пороги)
+                rc[0].markdown(f"{i + 1}. {draft_goal_text(g)}")
 
                 if rc[1].button("🗑", key=f"camp_nb_del_goal_{i}"):
                     st.session_state["camp_new_goals"] = draft_remove_goal(draft, i)
@@ -3223,11 +3293,9 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
             try:
                 if not draft:
                     raise ValueError("Добавьте хотя бы одну цель (§17.3).")
-                goals = {}
-                for g in draft:
-                    goals[g["resp"]] = DesirabilitySpec(
-                        g["kind"], low=g["low"], high=g["high"],
-                        target=g["target"], weight=g["weight"])
+                # iter43/P2.2: ЕДИНАЯ точка сборки спек из черновика —
+                # инлайн-сборка не знала порогов и плато (упала бы на них).
+                goals = draft_goal_specs(draft)
                 price_fn = cost_spec = None
                 if use_price:
                     prices = _parse_floats(prices_txt)
@@ -3843,20 +3911,43 @@ def render_campaign() -> None:
         g_resp = gc[0].selectbox("Цель (отклик)", list(runner.property_names),
                                  key="camp_goal_resp")
 
-        g_kind = gc[1].selectbox("вид", ["max", "min", "target"],
-                                 key="camp_goal_kind")
+        g_kind = gc[1].selectbox("вид", GOAL_KINDS, key="camp_goal_kind")
         g_lo = gc[2].number_input("low", value=0.0, step=0.5, key="camp_goal_lo")
         g_hi = gc[3].number_input("high", value=10.0, step=0.5, key="camp_goal_hi")
         g_w = gc[4].number_input("Значимость цели", min_value=0.01, value=1.0,
                                  step=0.5, key="camp_goal_w", help=_WEIGHT_HELP)
 
-        g_tgt = st.number_input("target (только для вида target; low<target<high)",
-                                value=5.0, step=0.5, key="camp_goal_tgt")
+        g_tgt = g_tl = g_th = g_thr = g_noise = None
+        if g_kind == "target":
+            g_tgt = st.number_input(
+                "target (только для вида target; low<target<high)",
+                value=5.0, step=0.5, key="camp_goal_tgt")
+        elif g_kind == GOAL_KIND_RANGE:
+            prc = st.columns(2)
+            g_tl = prc[0].number_input(
+                "плато от (target_low)", value=60.0, step=0.5,
+                key="camp_goal_tlo", help=_RANGE_HELP)
+            g_th = prc[1].number_input(
+                "плато до (target_high)", value=70.0, step=0.5,
+                key="camp_goal_thi", help=_RANGE_HELP)
+        elif g_kind in _THRESHOLD_KINDS:
+            prc = st.columns(2)
+            g_thr = prc[0].number_input(
+                "порог", value=10.0, step=0.5, key="camp_goal_thr")
+            g_noise = prc[1].number_input(
+                "СКО шума измерения", min_value=1e-9, value=0.5, step=0.1,
+                key="camp_goal_noise", help=_NOISE_SD_HELP)
         if st.button("💾 Задать / заменить цель", key="camp_goal_set"):
             try:
-                tgt = float(g_tgt) if g_kind == "target" else None
-                spec = DesirabilitySpec(g_kind, low=float(g_lo), high=float(g_hi),
-                                        target=tgt, weight=float(g_w))
+                # iter43/P2.2: сборка ЕДИНЫМ билдером (пороги/плато включ.)
+                spec = build_goal_spec(
+                    g_kind, low=float(g_lo), high=float(g_hi),
+                    target=(float(g_tgt) if g_tgt is not None else None),
+                    weight=float(g_w),
+                    threshold=(float(g_thr) if g_thr is not None else None),
+                    noise_sd=(float(g_noise) if g_noise is not None else None),
+                    target_low=(float(g_tl) if g_tl is not None else None),
+                    target_high=(float(g_th) if g_th is not None else None))
                 res = ctrl.set_desirability(bsel, g_resp, spec)
                 shift = res["recommendation_shift"]
                 _invalidate_branch_caches()

@@ -7,6 +7,11 @@ Derringer–Suich desirability (REBUILD_SPEC M8, §3):
       - "max"    (larger-is-better):  ramps 0 -> 1 as y goes low -> high;
       - "min"    (smaller-is-better): ramps 1 -> 0 as y goes low -> high;
       - "target" (target-is-best):    two-sided peak at the target value;
+      - "target_range" (P2.2 UI_REVISION_SPEC): two-sided PLATEAU —
+        d == 1 on [target_low, target_high], ramps to 0 towards low/high
+        (постановка «желатинизация 60–70 %»: внутри допуска все значения
+        РАВНОХОРОШИ; пик в точке ("target") искусственно предпочёл бы
+        середину плато и тянул бы оптимизатор от дешёвого края допуска);
     each with a shape exponent `s` (s>1 = stricter, s<1 = lenient).
 
   * overall (weighted geometric mean):
@@ -73,12 +78,16 @@ class DesirabilitySpec:
 
     Parameters
     ----------
-    kind   : "max" | "min" | "target".
+    kind   : "max" | "min" | "target" | "target_range".
     low    : lower bound of the active range.
     high   : upper bound of the active range.
     target : peak location (required for kind="target"; must satisfy low<target<high).
+    target_low, target_high : plateau bounds (required for kind="target_range";
+             must satisfy low < target_low < target_high < high). d == 1 on
+             [target_low, target_high]; ramps to 0 at low / high (P2.2).
     s      : shape exponent for the (lower) ramp  (s>0).
-    s2     : shape exponent for the upper ramp of a "target" spec (defaults to s).
+    s2     : shape exponent for the upper ramp of a "target"/"target_range"
+             spec (defaults to s).
     weight : importance exponent in the weighted geometric mean (w_i > 0).
     """
 
@@ -89,10 +98,13 @@ class DesirabilitySpec:
     s: float = 1.0
     s2: Optional[float] = None
     weight: float = 1.0
+    target_low: Optional[float] = None
+    target_high: Optional[float] = None
 
     def __post_init__(self) -> None:
-        if self.kind not in ("max", "min", "target"):
-            raise ValueError(f"Unknown kind '{self.kind}' (use max|min|target).")
+        if self.kind not in ("max", "min", "target", "target_range"):
+            raise ValueError(f"Unknown kind '{self.kind}' "
+                             "(use max|min|target|target_range).")
         if self.high <= self.low:
             raise ValueError("Require high > low.")
         if self.s <= 0 or (self.s2 is not None and self.s2 <= 0):
@@ -104,6 +116,22 @@ class DesirabilitySpec:
                 raise ValueError("kind='target' requires a `target` value.")
             if not (self.low < self.target < self.high):
                 raise ValueError("Require low < target < high for kind='target'.")
+        # P2.2: плато-таргет. Поля плато валидны ТОЛЬКО у "target_range", а
+        # точечный `target` у него запрещён: молча проигнорированное поле —
+        # это потерянное намерение пользователя (A0.6).
+        if self.kind == "target_range":
+            if self.target_low is None or self.target_high is None:
+                raise ValueError("kind='target_range' requires both "
+                                 "`target_low` and `target_high`.")
+            if not (self.low < self.target_low < self.target_high < self.high):
+                raise ValueError("Require low < target_low < target_high < high "
+                                 "for kind='target_range'.")
+            if self.target is not None:
+                raise ValueError("kind='target_range' has a plateau, not a peak: "
+                                 "`target` must be None (use target_low/high).")
+        elif self.target_low is not None or self.target_high is not None:
+            raise ValueError("target_low/target_high are only valid for "
+                             "kind='target_range'.")
         if self.s2 is None:
             self.s2 = self.s
 
@@ -125,7 +153,7 @@ def desirability_value(y, spec: DesirabilitySpec) -> np.ndarray:
         d = np.where(y <= lo, 1.0,
                      np.where(y >= hi, 0.0,
                               ((hi - y) / (hi - lo)) ** spec.s))
-    else:  # target
+    elif spec.kind == "target":
         t = spec.target
         lower = ((y - lo) / (t - lo))
         upper = ((hi - y) / (hi - t))
@@ -133,6 +161,16 @@ def desirability_value(y, spec: DesirabilitySpec) -> np.ndarray:
                      np.where(y <= t,
                               np.clip(lower, 0.0, 1.0) ** spec.s,
                               np.clip(upper, 0.0, 1.0) ** spec.s2))
+    else:  # target_range (P2.2): плато d=1 на [target_low, target_high]
+        tl, th = spec.target_low, spec.target_high
+        lower = ((y - lo) / (tl - lo))
+        upper = ((hi - y) / (hi - th))
+        d = np.where((y < lo) | (y > hi), 0.0,
+                     np.where(y < tl,
+                              np.clip(lower, 0.0, 1.0) ** spec.s,
+                              np.where(y > th,
+                                       np.clip(upper, 0.0, 1.0) ** spec.s2,
+                                       1.0)))
     return np.clip(d, 0.0, 1.0)
 
 

@@ -55,6 +55,11 @@ import numpy as np
 from scipy.special import ndtr
 
 from ..core.simplex import SimplexRegion
+# P2.1: проекция на сетку уровней — ОДНА реализация на проект (тай-брейк
+# «ближайший, при равенстве меньший» обязан совпадать у сэмплера и argmax,
+# иначе план и оптимум разойдутся на границе ячейки). design.levels ничего
+# не импортирует из optimize — цикла нет.
+from ..design.levels import snap_to_levels as _snap_to_grid
 
 Predictor = Callable[[np.ndarray], np.ndarray]
 
@@ -338,6 +343,7 @@ def optimize_desirability(region: SimplexRegion,
                           process_lower: Optional[Sequence[float]] = None,
                           process_upper: Optional[Sequence[float]] = None,
                           process_fixed: Optional[Mapping[int, float]] = None,
+                          process_levels: Optional[Mapping[int, Sequence[float]]] = None,
                           phr_spec=None,
                           chance_constraints: Optional[Mapping[str, ChanceConstraint]] = None,
                           sigma_predictors: Optional[Mapping[str, Predictor]] = None
@@ -363,6 +369,15 @@ def optimize_desirability(region: SimplexRegion,
                   поток ГСЧ ИДЕНТИЧНЫ прежним (обратная совместимость, §15.1.4).
     process_fixed : ``{idx: value}`` для ЗАКРЫТЫХ фазой process-координат (маска
                   свободы): эти координаты держатся на ``value`` и не варьируются.
+    process_levels : P2.1 (UI_REVISION_SPEC) — ``{idx: [уровни в КОДЕ]}``:
+                  ДИСКРЕТНЫЕ уровни process-оси. Кандидаты и refine-пробы по
+                  такой оси ПРОЕЦИРУЮТСЯ на ближайший уровень, поэтому x*
+                  выдаётся в достижимом режиме (иначе argmax предлагал бы
+                  «673 об/мин» при доступных 400/900, и модель училась бы на
+                  одном, а лаборатория ставила другое — A0.6). ``None``
+                  (дефолт) — прежнее поведение бит-в-бит: ни поток ГСЧ, ни
+                  число проб не меняются (снап — чистая проекция ПОСЛЕ
+                  розыгрыша).
     phr_spec    : опциональная phr/DAG-спека (``design.phr_sampler.PhrSpec``,
                   duck-typed; iter38, B1). ``None`` (дефолт) — прежний путь
                   бит-в-бит. Задана ⇒ оптимизация уважает phr-геометрию
@@ -442,6 +457,16 @@ def optimize_desirability(region: SimplexRegion,
     phi = np.asarray(process_upper, float) if d else None
     fixed = {int(k): float(v) for k, v in (process_fixed or {}).items()}
     free_proc = [j for j in range(d) if j not in fixed]
+    # P2.1: сетки уровней СВОБОДНЫХ осей (закрытые фазой держатся на value —
+    # снапить нечего); уровни отсортированы вызывающей стороной (levels.py).
+    grids = {int(k): np.asarray(v, float)
+             for k, v in (process_levels or {}).items()
+             if int(k) not in fixed}
+
+    def _snap_axis(j: int, values: np.ndarray) -> np.ndarray:
+        """Проекция координаты оси ``j`` на её сетку уровней (нет сетки — as is)."""
+        lv = grids.get(int(j))
+        return values if lv is None else _snap_to_grid(values, lv)
 
     def _augment(Xmix: np.ndarray, rng_proc) -> np.ndarray:
         """Дополнить mixture-кандидаты (m×q) process-координатами → (m×(q+d))."""
@@ -454,7 +479,7 @@ def optimize_desirability(region: SimplexRegion,
             if j in fixed:
                 Z[:, j] = fixed[j]
             else:
-                Z[:, j] = rng_proc.uniform(plo[j], phi[j], size=m)
+                Z[:, j] = _snap_axis(j, rng_proc.uniform(plo[j], phi[j], size=m))
         return np.hstack([Xmix, Z])
 
     # ---- global stage: score a feasible candidate set ----------------
@@ -549,8 +574,12 @@ def optimize_desirability(region: SimplexRegion,
             if d:
                 z_try = z_cur.copy()
                 for k, j in enumerate(free_proc):
-                    z_try[j] = float(np.clip(z_cur[j] + step[mix_dim + k],
-                                             plo[j], phi[j]))
+                    # сначала clip к боксу, затем снап к сетке уровней: шаг по
+                    # дискретной оси либо остаётся на месте, либо перепрыгивает
+                    # на соседний ДОСТИЖИМЫЙ режим
+                    z_try[j] = float(_snap_axis(j, np.asarray(
+                        np.clip(z_cur[j] + step[mix_dim + k], plo[j], phi[j]),
+                        float)))
                 x_try = np.concatenate([x_mix_try, z_try])
             else:
                 x_try = x_mix_try

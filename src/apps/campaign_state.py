@@ -219,6 +219,11 @@ def runner_to_state(runner: MixtureProcessRunner, *,
                          if getattr(runner, "phr_spec", None) is not None
                          else None),
             "campaign_label": str(getattr(runner, "campaign_label", "") or ""),
+            # P2.1: дискретные уровни process-осей (ФИЗИЧЕСКИЕ единицы).
+            # Без сохранения после load план снова стал бы непрерывным, и
+            # кампания молча начала бы предлагать недостижимые режимы (A0.6).
+            "process_levels": {str(k): [float(v) for v in vals] for k, vals in
+                               (getattr(runner, "process_levels", {}) or {}).items()},
             "preflight_pairs": [[list(a), list(b)] for a, b in
                                 (getattr(runner, "preflight_pairs", []) or [])],
             "region_moves": [_region_move_to_dict(m)
@@ -317,6 +322,11 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     pairs = r.get("preflight_pairs", []) or []
     if pairs:
         runner.set_preflight_pairs(pairs)
+    # P2.1: уровни восстанавливаются ШТАТНЫМ сеттером (валидация имён и
+    # границ); старый сейв без ключа → оси непрерывны, как и были.
+    levels = r.get("process_levels", {}) or {}
+    if levels:
+        runner.set_process_levels(levels)
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))
 

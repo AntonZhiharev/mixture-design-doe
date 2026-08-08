@@ -74,6 +74,8 @@ from ..design.augmented import build_moments
 from ..design.preflight import (PreflightReport, PreflightThresholds,
                                 preflight_design)
 from ..design.phr_sampler import PhrSpec
+from ..design.levels import (levels_to_code, normalize_levels,
+                             snap_matrix_to_levels)
 from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget,
                                ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
@@ -213,6 +215,13 @@ class MixtureProcessRunner:
         # относительно reference-пула. Элемент: (оси_A, оси_B), где ось —
         # список имён координат (сумма списка, напр. Σ_ACR = [PMPlus_8, DL_531]).
         self.preflight_pairs: List[Tuple[List[str], List[str]]] = []
+        # P2.1 (UI_REVISION_SPEC): ДИСКРЕТНЫЕ УРОВНИ process-осей — политика
+        # раннера (как sampling_groups/phr_spec), НЕ frozen-схема: сетка
+        # уровней принадлежит КАМПАНИИ (какое железо доступно), а не модели
+        # отклика, и меняется без bump'а версии схемы. Значения — в
+        # ФИЗИЧЕСКИХ единицах (400/900 об/мин); в код [0,1] переводятся на
+        # лету по границам ТЕКУЩЕЙ схемы. Пусто — все оси непрерывны.
+        self.process_levels: Dict[str, List[float]] = {}
 
 
     # ------------------------------------------------------------------
@@ -1054,13 +1063,21 @@ class MixtureProcessRunner:
         балансовые свойства Соболя не требуются, важна low-discrepancy
         равномерность. Детерминированно: seed вытягивается из общего
         rng-потока фазы (тот же контракт, что у mixture-части).
+
+        P2.1: если у оси заданы ДИСКРЕТНЫЕ уровни (:meth:`set_process_levels`),
+        её координата ПРОЕЦИРУЕТСЯ на сетку уровней ПОСЛЕ розыгрыша. Именно
+        проекция, а не «выбор из списка»: у ``qmc.Sobol`` поток общий на все
+        ``d`` координат, и подмена розыгрыша выбором сломала бы
+        low-discrepancy структуру по ОСТАЛЬНЫМ (непрерывным) осям.
         """
         from scipy.stats import qmc
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             sampler = qmc.Sobol(d=self.d, scramble=True,
                                 seed=int(rng.integers(0, 2**31 - 1)))
-            return sampler.random(int(n))
+            Z = sampler.random(int(n))
+        lv = self._levels_code_current()
+        return snap_matrix_to_levels(Z, lv) if lv else Z
 
     # ------------------------------------------------------------------
     # iter31: функциональные группы компонентов (стратификация суммы ниши)
@@ -1170,6 +1187,93 @@ class MixtureProcessRunner:
                         f"схемы {sorted(known)}.")
             norm.append((ax, bx))
         self.preflight_pairs = norm
+
+    # ------------------------------------------------------------------
+    # P2.1 (UI_REVISION_SPEC): ДИСКРЕТНЫЕ УРОВНИ process-осей
+    # ------------------------------------------------------------------
+    def set_process_levels(self,
+                           levels: Optional[Mapping[str, Sequence[float]]]
+                           ) -> None:
+        """P2.1: задать ДИСКРЕТНЫЕ уровни process-осей (ФИЗИЧЕСКИЕ единицы).
+
+        ``levels`` — ``{имя оси: [уровни]}`` в тех же единицах, что границы оси
+        в схеме (``rotor_rpm: [400, 900]``, а НЕ код [0,1]): код зависит от
+        границ, и при их правке уровни «поехали бы» молча. ``None``/пусто —
+        выключить (все оси непрерывны, поведение бит-в-бит прежнее); ось без
+        ключа остаётся непрерывной.
+
+        Уровни — ПОЛИТИКА кампании (что умеет железо), поэтому живут в раннере,
+        а не во frozen-схеме: смена доступных передач экструдера не обязана
+        поднимать версию схемы и перезапускать миграцию точек.
+
+        Имена валидируются против ПОЛНОГО process-блока (ось можно оснастить
+        уровнями до её раскрытия ``augment_phase_schema``; в генерации
+        кандидатов оси вне ТЕКУЩЕЙ фазы просто выпадают — как имена в
+        функциональных группах). Уровень обязан лежать в границах оси, иначе
+        план предлагал бы недостижимый режим — явная ошибка (A0.6).
+        """
+        if not levels:
+            self.process_levels = {}
+            return
+        if self._full_proc is None:
+            raise ValueError(
+                "Дискретные уровни требуют process-блок в схеме "
+                "(process-осей нет — задавать уровни нечему).")
+        names = list(self._full_proc.names)
+        out: Dict[str, List[float]] = {}
+        for nm, vals in levels.items():
+            nm = str(nm)
+            if nm not in names:
+                raise KeyError(
+                    f"Ось '{nm}' не найдена среди process-осей полной схемы "
+                    f"{names}.")
+            j = names.index(nm)
+            out[nm] = normalize_levels(
+                vals, lower=float(self._full_proc.lower[j]),
+                upper=float(self._full_proc.upper[j]), name=nm)
+        self.process_levels = out
+
+    def _levels_code_current(self) -> Dict[int, np.ndarray]:
+        """Уровни ТЕКУЩЕЙ фазы в коде ``[0,1]``: ``{индекс process-оси: уровни}``.
+
+        Индекс — позиция ВНУТРИ process-части (столбец ``q + j`` составного
+        вектора). Оси вне текущей фазы выпадают: их значение достраивается
+        baseline'ом при измерении и не варьируется — снапить нечего. Код
+        считается по границам ТЕКУЩЕЙ схемы: именно в них живут кандидаты.
+        """
+        if not self.process_levels or self.d == 0:
+            return {}
+        pb = self.current_schema.process_block()
+        if pb is None:
+            return {}
+        out: Dict[int, np.ndarray] = {}
+        for j, nm in enumerate(pb.names):
+            lv = self.process_levels.get(nm)
+            if lv:
+                out[j] = levels_to_code(lv, float(pb.lower[j]),
+                                        float(pb.upper[j]))
+        return out
+
+    def snap_process_axes(self, X: Any) -> np.ndarray:
+        """P2.1: спроецировать process-часть точек на сетки уровней (копия).
+
+        Вход — ``n×dim`` (или один вектор) в координатах ТЕКУЩЕЙ схемы;
+        непрерывные оси не трогаются, операция ИДЕМПОТЕНТНА. Публичный метод:
+        тем же снапом UI показывает план, который РЕАЛЬНО будет поставлен на
+        оборудовании — расхождение «план 673 об/мин, поставили 900» и есть та
+        тихая потеря, против которой A0.6.
+        """
+        X = np.atleast_2d(np.asarray(X, float)).copy()
+        lv = self._levels_code_current()
+        if not lv or X.size == 0:
+            return X
+        if X.shape[1] < self.q + self.d:
+            raise ValueError(
+                f"X: ожидалось ≥{self.q + self.d} координат на точку, "
+                f"дано {X.shape[1]}.")
+        X[:, self.q:self.q + self.d] = snap_matrix_to_levels(
+            X[:, self.q:self.q + self.d], lv)
+        return X
 
     def set_branch_sampling_groups(self, branch_id: str,
                                    groups: Optional[Sequence[Sequence[str]]]
@@ -1828,6 +1932,12 @@ class MixtureProcessRunner:
         if self.d > 0:
             kw.update(process_lower=[0.0] * self.d,
                       process_upper=[1.0] * self.d)
+            # P2.1: argmax ищет ТОЛЬКО среди достижимых режимов. Без этого
+            # оптимизатор возвращал бы рецепт при 673 об/мин, лаборатория
+            # ставила бы 900, и «оптимум» оказывался бы недостижимой точкой.
+            lv = self._levels_code_current()
+            if lv:
+                kw["process_levels"] = lv
         # §15.6 §3: argmax по desirability+цена (цена = price_состав·ρ̂ из суррогата)
         cost_fn, cost_name, cost_spec = self._branch_cost_fn(branch_id)
         if cost_fn is not None:

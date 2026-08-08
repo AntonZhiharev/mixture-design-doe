@@ -1577,17 +1577,21 @@ def phr_group_block(name: str, *, total_mode: str = "absolute",
 
 def phr_single_block(name: str, *, mode: str = "absolute", lo: float = 0.0,
                      hi: float = 0.0, value: float = 0.0, ref: str = "",
-                     cap_to: Any = "", cap_ratio: float = 0.0
-                     ) -> Dict[str, Any]:
+                     cap_to: Any = "", cap_ratio: float = 0.0,
+                     scale: str = "linear") -> Dict[str, Any]:
     """iter41.4: блок-ОДИНОЧНЫЙ узел дерева ввода (компонент вне групп).
 
     ``absolute`` — phr ∈ [lo, hi] (опц. динамический потолок ``cap_to`` /
     ``cap_ratio``); ``fixed`` — константа; ``ratio_to`` — коэффициент
-    [lo, hi] к узлу ``ref`` (SBM = 0.02…0.09 × Σ стабилизатора)."""
+    [lo, hi] к узлу ``ref`` (SBM = 0.02…0.09 × Σ стабилизатора).
+
+    iter56/P3.2: ``scale`` — шкала сэмплинга absolute-оси (``linear`` |
+    ``log``, iter47/B5); доступна только в схеме v2."""
     return {"kind": "single", "name": str(name), "mode": str(mode),
             "lo": float(lo), "hi": float(hi), "value": float(value),
             "ref": str(ref or ""), "cap_to": cap_to,
-            "cap_ratio": float(cap_ratio)}
+            "cap_ratio": float(cap_ratio),
+            "scale": str(scale or "linear")}
 
 
 def _phr_cap_refs(raw: Any) -> List[str]:
@@ -1603,7 +1607,8 @@ def _phr_cap_refs(raw: Any) -> List[str]:
     return _parse_names(str(raw))
 
 
-def validate_phr_tree(tree: Sequence[Mapping[str, Any]]) -> None:
+def validate_phr_tree(tree: Sequence[Mapping[str, Any]], *,
+                      schema_version: int = 1) -> None:
     """iter41.4: проверить дерево ввода ДО конструктора :class:`PhrSpec`.
 
     Ловит то, что конструктор поймать не может или сообщит невнятно:
@@ -1615,8 +1620,16 @@ def validate_phr_tree(tree: Sequence[Mapping[str, Any]]) -> None:
     * ``ratio_to`` без ссылки, ``cap_ratio`` без ``cap_to`` и наоборот,
       ``lo > hi``.
 
-    Ошибки конструктора (циклы, Σдолей, неизвестные ссылки) остаются за
-    :meth:`PhrSpec.from_dicts` — здесь их не дублируем."""
+    iter56/P3.2: ``schema_version`` — целевая схема сериализации.
+    v1 ОТВЕРГАЕТ v2-фичи (closure-пометка, техлимиты min/max phr,
+    ``scale='log'``) явной ошибкой: молча выброшенное поле — потерянное
+    намерение (A0.6). v2 проверяет то, что конструктор УВИДЕТЬ не может:
+    доли L/U у closure-компонента (в схему они не попадают — диапазон
+    производный) и min > max техлимитов.
+
+    Ошибки конструктора (циклы, Σдолей, неизвестные ссылки, состав ролей
+    k=2/k≥3) остаются за :meth:`PhrSpec.from_dicts` — здесь их не
+    дублируем (канон iter52: второй набор правил разошёлся бы с ядром)."""
     if not tree:
         raise ValueError("Спека пуста: добавьте хотя бы один узел "
                          "(группу или компонент).")
@@ -1656,6 +1669,28 @@ def validate_phr_tree(tree: Sequence[Mapping[str, Any]]) -> None:
                 _claim(ch.get("name", ""), cw)
                 if float(ch.get("lo", 0.0)) > float(ch.get("hi", 0.0)):
                     raise ValueError(f"{cw}: доля L больше доли U.")
+                closure = bool(ch.get("closure", False))
+                mn = ch.get("min_phr", None)
+                mx = ch.get("max_phr", None)
+                if int(schema_version) == 1:
+                    if closure:
+                        raise ValueError(
+                            f"{cw}: пометка closure доступна только в "
+                            "схеме v2 (роли) — переключите схему спеки.")
+                    if mn is not None or mx is not None:
+                        raise ValueError(
+                            f"{cw}: техлимиты min/max phr доступны только "
+                            "в схеме v2 (роли) — переключите схему спеки.")
+                    continue
+                if closure and (float(ch.get("lo", 0.0)) != 0.0
+                                or float(ch.get("hi", 0.0)) != 0.0):
+                    raise ValueError(
+                        f"{cw}: у closure-компонента доли L/U не задаются "
+                        "— диапазон ПРОИЗВОДНЫЙ [1−φᵁ, 1−φᴸ] от партнёра "
+                        "(B8); очистите значения (0).")
+                if (mn is not None and mx is not None
+                        and float(mn) > float(mx)):
+                    raise ValueError(f"{cw}: min phr больше max phr.")
         elif kind == "single":
             _claim(name, where)
             md = str(blk.get("mode", ""))
@@ -1678,56 +1713,149 @@ def validate_phr_tree(tree: Sequence[Mapping[str, Any]]) -> None:
             if ratio > 0 and not caps:
                 raise ValueError(f"{where}: задан cap_ratio, но не указан "
                                  "cap_to (узел или список узлов).")
+            scale = str(blk.get("scale", "linear") or "linear")
+            if scale not in ("linear", "log"):
+                raise ValueError(f"{where}: неизвестная шкала '{scale}' "
+                                 "(допустимо: linear, log).")
+            if scale == "log":
+                if int(schema_version) == 1:
+                    raise ValueError(
+                        f"{where}: scale='log' доступен только в схеме v2 "
+                        "(роли) — переключите схему спеки.")
+                if md != "absolute":
+                    raise ValueError(
+                        f"{where}: scale='log' допустим только для "
+                        "absolute (лог-шкала — свойство собственной "
+                        "phr-оси).")
         else:
             raise ValueError(f"{where}: неизвестный тип блока '{kind}' "
                              "(ожидается 'group' или 'single').")
 
 
-def phr_tree_to_dicts(tree: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    """iter41.4: дерево ввода → список узлов формата
+def phr_tree_to_dicts(tree: Sequence[Mapping[str, Any]], *,
+                      schema_version: int = 1,
+                      group_order: Optional[Sequence[str]] = None
+                      ) -> List[Dict[str, Any]] | Dict[str, Any]:
+    """iter41.4: дерево ввода → представление формата
     :meth:`PhrSpec.from_dicts`.
 
     Порядок результата = порядок блоков; внутри группы сначала идёт
-    узел-тотал, затем его дети ``share_of`` в порядке таблицы. Именно этот
-    порядок попадёт в ``spec_hash``. Перед разворотом вызывается
-    :func:`validate_phr_tree`."""
-    validate_phr_tree(tree)
-    out: List[Dict[str, Any]] = []
+    узел-тотал, затем его дети в порядке таблицы. Именно этот порядок
+    попадёт в ``spec_hash``. Перед разворотом вызывается
+    :func:`validate_phr_tree`.
+
+    iter56/P3.2: ``schema_version=2`` — сериализация в РОЛИ нового
+    контракта (iter46/B6): дети группы при k=2 — SHARE_FREE +
+    SHARE_CLOSURE (кто closure — пометка ``closure`` ребёнка), при k≠2 —
+    SHARE_SIMPLEX (closure-пометка эмитится как есть и отвергается
+    конструктором с внятным объяснением — состав ролей НЕ дублируем,
+    канон iter52); техлимиты ``min_phr``/``max_phr`` и ``scale``
+    прокидываются. Непустой ``group_order`` заворачивает результат в
+    обёртку ``{"spec_version": 2, "group_order": [...], "nodes": [...]}``
+    (iter48/B4 — порядок групп входит в отпечаток); с v1 ``group_order``
+    несовместим (ролей GROUP_TOTAL в legacy нет) — явная ошибка."""
+    validate_phr_tree(tree, schema_version=schema_version)
+    go = [str(g) for g in (group_order or [])]
+    if int(schema_version) == 1:
+        if go:
+            raise ValueError(
+                "group_order поддерживается только схемой v2 (роли): "
+                "в legacy-схеме v1 роли GROUP_TOTAL нет (iter48/B4).")
+        out: List[Dict[str, Any]] = []
+        for blk in tree:
+            name = str(blk["name"]).strip()
+            if str(blk.get("kind")) == "group":
+                if str(blk.get("total_mode")) == "fixed":
+                    out.append({"name": name, "mode": "fixed",
+                                "value": float(blk.get("value", 0.0))})
+                else:
+                    out.append({"name": name, "mode": "absolute",
+                                "lo": float(blk.get("lo", 0.0)),
+                                "hi": float(blk.get("hi", 0.0))})
+                for ch in blk.get("children") or []:
+                    out.append({"name": str(ch["name"]).strip(),
+                                "mode": "share_of", "of": name,
+                                "lo": float(ch.get("lo", 0.0)),
+                                "hi": float(ch.get("hi", 0.0))})
+                continue
+            md = str(blk.get("mode"))
+            if md == "fixed":
+                out.append({"name": name, "mode": "fixed",
+                            "value": float(blk.get("value", 0.0))})
+            elif md == "ratio_to":
+                out.append({"name": name, "mode": "ratio_to",
+                            "to": str(blk.get("ref", "")).strip(),
+                            "lo": float(blk.get("lo", 0.0)),
+                            "hi": float(blk.get("hi", 0.0))})
+            else:
+                node: Dict[str, Any] = {"name": name, "mode": "absolute",
+                                        "lo": float(blk.get("lo", 0.0)),
+                                        "hi": float(blk.get("hi", 0.0))}
+                caps = _phr_cap_refs(blk.get("cap_to", ""))
+                if caps:
+                    node["cap_to"] = caps[0] if len(caps) == 1 else caps
+                    node["cap_ratio"] = float(blk.get("cap_ratio", 0.0))
+                out.append(node)
+        return out
+    # --- схема v2 (роли, iter56/P3.2) ---
+    nodes: List[Dict[str, Any]] = []
     for blk in tree:
         name = str(blk["name"]).strip()
         if str(blk.get("kind")) == "group":
+            children = list(blk.get("children") or [])
+            members = [str(c["name"]).strip() for c in children]
             if str(blk.get("total_mode")) == "fixed":
-                out.append({"name": name, "mode": "fixed",
-                            "value": float(blk.get("value", 0.0))})
+                nodes.append({"name": name, "role": "GROUP_TOTAL_FIXED",
+                              "value": float(blk.get("value", 0.0)),
+                              "members": members})
             else:
-                out.append({"name": name, "mode": "absolute",
-                            "lo": float(blk.get("lo", 0.0)),
-                            "hi": float(blk.get("hi", 0.0))})
-            for ch in blk.get("children") or []:
-                out.append({"name": str(ch["name"]).strip(),
-                            "mode": "share_of", "of": name,
-                            "lo": float(ch.get("lo", 0.0)),
-                            "hi": float(ch.get("hi", 0.0))})
+                nodes.append({"name": name, "role": "GROUP_TOTAL",
+                              "range": [float(blk.get("lo", 0.0)),
+                                        float(blk.get("hi", 0.0))],
+                              "members": members})
+            k = len(children)
+            for ch in children:
+                cn = str(ch["name"]).strip()
+                if bool(ch.get("closure", False)):
+                    d: Dict[str, Any] = {"name": cn,
+                                         "role": "SHARE_CLOSURE",
+                                         "group": name}
+                else:
+                    d = {"name": cn,
+                         "role": "SHARE_FREE" if k == 2 else "SHARE_SIMPLEX",
+                         "group": name,
+                         "share_range": [float(ch.get("lo", 0.0)),
+                                         float(ch.get("hi", 0.0))]}
+                if ch.get("min_phr", None) is not None:
+                    d["min_phr"] = float(ch["min_phr"])
+                if ch.get("max_phr", None) is not None:
+                    d["max_phr"] = float(ch["max_phr"])
+                nodes.append(d)
             continue
         md = str(blk.get("mode"))
         if md == "fixed":
-            out.append({"name": name, "mode": "fixed",
-                        "value": float(blk.get("value", 0.0))})
+            nodes.append({"name": name, "role": "FIXED",
+                          "value": float(blk.get("value", 0.0))})
         elif md == "ratio_to":
-            out.append({"name": name, "mode": "ratio_to",
-                        "to": str(blk.get("ref", "")).strip(),
-                        "lo": float(blk.get("lo", 0.0)),
-                        "hi": float(blk.get("hi", 0.0))})
+            nodes.append({"name": name, "role": "RATIO_TO",
+                          "reference": str(blk.get("ref", "")).strip(),
+                          "range": [float(blk.get("lo", 0.0)),
+                                    float(blk.get("hi", 0.0))]})
         else:
-            node: Dict[str, Any] = {"name": name, "mode": "absolute",
-                                    "lo": float(blk.get("lo", 0.0)),
-                                    "hi": float(blk.get("hi", 0.0))}
             caps = _phr_cap_refs(blk.get("cap_to", ""))
+            d = {"name": name,
+                 "role": "ABSOLUTE_CAPPED" if caps else "ABSOLUTE",
+                 "range": [float(blk.get("lo", 0.0)),
+                           float(blk.get("hi", 0.0))]}
+            if str(blk.get("scale", "linear") or "linear") == "log":
+                d["scale"] = "log"
             if caps:
-                node["cap_to"] = caps[0] if len(caps) == 1 else caps
-                node["cap_ratio"] = float(blk.get("cap_ratio", 0.0))
-            out.append(node)
-    return out
+                d["cap_to"] = caps          # v2: cap_to — всегда СПИСОК
+                d["cap_ratio"] = float(blk.get("cap_ratio", 0.0))
+            nodes.append(d)
+    if go:
+        return {"spec_version": 2, "group_order": go, "nodes": nodes}
+    return nodes
 
 
 def phr_tree_from_spec(spec: PhrSpec) -> List[Dict[str, Any]]:
@@ -1735,24 +1863,71 @@ def phr_tree_from_spec(spec: PhrSpec) -> List[Dict[str, Any]]:
     :func:`phr_tree_to_dicts`).
 
     Нужно для префилла формы после загрузки проекта: узел, на который
-    ссылаются ``share_of``-дети, становится ГРУППОЙ; сами дети уходят
-    внутрь неё; остальные узлы — одиночные. Порядок сохраняется, поэтому
+    ссылаются share-дети, становится ГРУППОЙ; сами дети уходят внутрь
+    неё; остальные узлы — одиночные. Порядок сохраняется, поэтому
     round-trip даёт ТОТ ЖЕ ``spec_hash``.
 
-    iter46: дерево — редактор legacy-схемы v1 (``share_of``); спека схемы
-    v2 (роли SHARE_FREE/SHARE_CLOSURE/SHARE_SIMPLEX) в дерево не
-    проецируется — явная ошибка, а не искажённое дерево (A0.6)."""
+    iter56/P3.2: поддержана и схема v2 (роли) — закрыт хвост iter46,
+    когда дерево было legacy-only и единственным каналом ввода спеки
+    кампании оставался JSON. У v2 проекция требует, чтобы члены группы
+    шли в спеке СРАЗУ ЗА своим тоталом: дерево форсирует именно такой
+    порядок узлов при обратной сборке, и иная раскладка молча изменила
+    бы ``spec_hash`` на round-trip (A0.6 — явная ошибка с советом
+    использовать канал «JSON / файл», а не тихая смена отпечатка).
+    ``group_order`` — свойство спеки целиком, в дерево не входит
+    (его отражает поле формы; см. ``spec.group_order``)."""
     if getattr(spec, "schema_version", 1) == 2:
-        raise ValueError(
-            "Иерархический редактор поддерживает legacy-схему v1 (share_of); "
-            "спека схемы v2 (роли SHARE_FREE/SHARE_CLOSURE/SHARE_SIMPLEX) "
-            "редактируется через канал «JSON / файл».")
+        kids_v2: Dict[str, List[Any]] = {}
+        for nd in spec.nodes:
+            if nd.mode in ("share_free", "share_closure", "share_simplex"):
+                kids_v2.setdefault(nd.ref, []).append(nd)
+        tree: List[Dict[str, Any]] = []
+        nodes = list(spec.nodes)
+        i = 0
+        while i < len(nodes):
+            nd = nodes[i]
+            if nd.name in kids_v2:
+                members = kids_v2[nd.name]
+                expect = [m.name for m in members]
+                actual = [n.name for n in nodes[i + 1:i + 1 + len(members)]]
+                if actual != expect:
+                    raise ValueError(
+                        f"Группа '{nd.name}': члены {expect} идут в спеке "
+                        f"не сразу за тоталом (далее: {actual}) — такой "
+                        "порядок узлов не проецируется в дерево без "
+                        "изменения spec_hash; правьте спеку каналом "
+                        "«JSON / файл».")
+                children = [{"name": m.name, "lo": float(m.lo),
+                             "hi": float(m.hi), "min_phr": m.min_phr,
+                             "max_phr": m.max_phr,
+                             "closure": m.mode == "share_closure"}
+                            for m in members]
+                tree.append(phr_group_block(
+                    nd.name,
+                    total_mode="fixed" if nd.mode == "fixed" else "absolute",
+                    lo=float(nd.lo), hi=float(nd.hi), value=float(nd.value),
+                    children=children))
+                i += 1 + len(members)
+                continue
+            if nd.mode in ("share_free", "share_closure", "share_simplex"):
+                raise ValueError(
+                    f"Узел '{nd.name}': член группы '{nd.ref}' идёт в "
+                    "спеке ДО своего тотала — такой порядок узлов не "
+                    "проецируется в дерево без изменения spec_hash; "
+                    "правьте спеку каналом «JSON / файл».")
+            tree.append(phr_single_block(
+                nd.name, mode=nd.mode, lo=float(nd.lo), hi=float(nd.hi),
+                value=float(nd.value), ref=nd.ref or "",
+                cap_to=list(nd.cap_refs), cap_ratio=float(nd.cap_ratio),
+                scale=str(nd.scale or "linear")))
+            i += 1
+        return tree
     kids: Dict[str, List[Dict[str, Any]]] = {}
     for nd in spec.nodes:
         if nd.mode == "share_of":
             kids.setdefault(nd.ref, []).append(
                 {"name": nd.name, "lo": float(nd.lo), "hi": float(nd.hi)})
-    tree: List[Dict[str, Any]] = []
+    tree = []
     for nd in spec.nodes:
         if nd.mode == "share_of":
             continue
@@ -1784,22 +1959,44 @@ def phr_tree_move(tree: Sequence[Mapping[str, Any]], index: int, delta: int
     return items
 
 
-def phr_children_dataframe(block: Mapping[str, Any]) -> pd.DataFrame:
-    """iter41.4: дети группы → таблица редактора (компонент / доля L / U)."""
-    rows = [{"компонент": str(c.get("name", "")),
-             "доля L": float(c.get("lo", 0.0)),
-             "доля U": float(c.get("hi", 1.0))}
-            for c in (block.get("children") or [])]
+def phr_children_dataframe(block: Mapping[str, Any], *,
+                           schema_version: int = 1) -> pd.DataFrame:
+    """iter41.4: дети группы → таблица редактора (компонент / доля L / U).
+
+    iter56/P3.2: в схеме v2 добавляются колонки ``min phr`` / ``max phr``
+    (техлимиты узла в phr; NaN = не задан — нуль выглядел бы значением,
+    канон iter50) и ``closure`` (зависимый член k=2-группы без z-оси)."""
+    v2 = int(schema_version) == 2
+    rows = []
+    for c in (block.get("children") or []):
+        r: Dict[str, Any] = {"компонент": str(c.get("name", "")),
+                             "доля L": float(c.get("lo", 0.0)),
+                             "доля U": float(c.get("hi", 1.0))}
+        if v2:
+            mn = c.get("min_phr", None)
+            mx = c.get("max_phr", None)
+            r["min phr"] = float(mn) if mn is not None else np.nan
+            r["max phr"] = float(mx) if mx is not None else np.nan
+            r["closure"] = bool(c.get("closure", False))
+        rows.append(r)
     if not rows:
-        rows = [{"компонент": "", "доля L": 0.0, "доля U": 1.0}]
+        r = {"компонент": "", "доля L": 0.0, "доля U": 1.0}
+        if v2:
+            r.update({"min phr": np.nan, "max phr": np.nan,
+                      "closure": False})
+        rows = [r]
     return pd.DataFrame(rows)
 
 
-def phr_children_from_dataframe(df) -> List[Dict[str, Any]]:
+def phr_children_from_dataframe(df, *, schema_version: int = 1
+                                ) -> List[Dict[str, Any]]:
     """iter41.4: таблица редактора → дети группы (порядок строк сохраняется).
 
     Строки с пустым именем отбрасываются — это «пустой хвост» динамического
-    редактора, а не ошибка ввода."""
+    редактора, а не ошибка ввода. iter56/P3.2: в схеме v2 читаются
+    колонки ``min phr`` / ``max phr`` (NaN/пусто → None — «лимита нет»)
+    и ``closure``."""
+    v2 = int(schema_version) == 2
     out: List[Dict[str, Any]] = []
     for _, r in pd.DataFrame(df).iterrows():
         nm = str(r.get("компонент", "") or "").strip()
@@ -1811,7 +2008,21 @@ def phr_children_from_dataframe(df) -> List[Dict[str, Any]]:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Компонент '{nm}': доли должны быть числами "
                              "(0…1).") from exc
-        out.append({"name": nm, "lo": lo, "hi": hi})
+        ch: Dict[str, Any] = {"name": nm, "lo": lo, "hi": hi}
+        if v2:
+            mn = r.get("min phr", None)
+            mx = r.get("max phr", None)
+            try:
+                ch["min_phr"] = (None if mn is None or pd.isna(mn)
+                                 else float(mn))
+                ch["max_phr"] = (None if mx is None or pd.isna(mx)
+                                 else float(mx))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Компонент '{nm}': техлимиты min/max phr должны быть "
+                    "числами (phr) или пустыми.") from exc
+            ch["closure"] = bool(r.get("closure", False))
+        out.append(ch)
     return out
 
 
@@ -2040,6 +2251,12 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 _PHR_SRC_TREE = "Иерархия (ручной ввод)"
 _PHR_SRC_JSON = "JSON / файл"
+# iter56/P3.2: схема сериализации дерева — v1 (legacy share_of) или v2
+# (роли нового контракта). Схема входит в spec_hash: v1 и v2 одной и той
+# же геометрии дают РАЗНЫЕ отпечатки (и разную меру: у v1 каждая доля со
+# своей z-осью, у v2 closure/последний simplex-член — производные).
+_PHR_SCHEMA_V1 = "v1 (legacy: share_of)"
+_PHR_SCHEMA_V2 = "v2 (роли: closure/simplex)"
 
 
 def _phr_uid(block: Dict[str, Any], fallback: int) -> str:
@@ -2085,8 +2302,13 @@ def _render_phr_json_input(key_prefix: str) -> Optional[PhrSpec]:
 
 
 def _render_phr_group_block(blk: Dict[str, Any], uid: str,
-                            key_prefix: str) -> None:
-    """iter41.4: поля ГРУППЫ — имя, тотал (absolute/fixed) и таблица долей."""
+                            key_prefix: str,
+                            schema_version: int = 1) -> None:
+    """iter41.4: поля ГРУППЫ — имя, тотал (absolute/fixed) и таблица долей.
+
+    iter56/P3.2: в схеме v2 таблица детей получает колонки ``min phr`` /
+    ``max phr`` (техлимиты, пусто = нет) и ``closure`` (зависимый член
+    k=2-группы; у k≥3 все члены — SHARE_SIMPLEX, closure не помечается)."""
     gc = st.columns([3, 2, 2, 2])
     blk["name"] = gc[0].text_input(
         "Имя группы", value=str(blk.get("name", "")),
@@ -2113,22 +2335,35 @@ def _render_phr_group_block(blk: Dict[str, Any], uid: str,
 
     st.caption("Компоненты группы и их ДОЛИ группы (0…1). Сумма нижних ≤ 1 ≤ "
                "сумма верхних — иначе конструктор спеки откажет. Порядок "
-               "строк = порядок узлов (входит в spec_hash).")
-    dkey = f"{key_prefix}_phr_kids_df_{uid}"
+               "строк = порядок узлов (входит в spec_hash)."
+               + (" v2: closure — зависимый член k=2-группы (доли L/U "
+                  "оставьте 0 — диапазон производный); min/max phr — "
+                  "техлимиты узла в phr (пусто = нет)."
+                  if int(schema_version) == 2 else ""))
+    # dkey несёт версию схемы: при переключении v1↔v2 кэш таблицы со старым
+    # составом колонок должен пересобраться, а не показывать урезанный вид.
+    dkey = f"{key_prefix}_phr_kids_df_{uid}_v{int(schema_version)}"
     if dkey not in st.session_state:
-        st.session_state[dkey] = phr_children_dataframe(blk)
+        st.session_state[dkey] = phr_children_dataframe(
+            blk, schema_version=schema_version)
     edited = st.data_editor(st.session_state[dkey], num_rows="dynamic",
                             use_container_width=True, hide_index=True,
-                            key=f"{key_prefix}_phr_kids_{uid}")
+                            key=f"{key_prefix}_phr_kids_{uid}_v"
+                                f"{int(schema_version)}")
     try:
-        blk["children"] = phr_children_from_dataframe(edited)
+        blk["children"] = phr_children_from_dataframe(
+            edited, schema_version=schema_version)
     except ValueError as exc:
         st.error(str(exc))
 
 
 def _render_phr_single_block(blk: Dict[str, Any], uid: str,
-                             key_prefix: str) -> None:
-    """iter41.4: поля ОДИНОЧНОГО узла (absolute / fixed / ratio_to)."""
+                             key_prefix: str,
+                             schema_version: int = 1) -> None:
+    """iter41.4: поля ОДИНОЧНОГО узла (absolute / fixed / ratio_to).
+
+    iter56/P3.2: в схеме v2 у absolute-узла доступна шкала сэмплинга
+    ``scale`` (linear | log, iter47/B5)."""
     sc = st.columns([3, 2, 2, 2])
     blk["name"] = sc[0].text_input(
         "Имя компонента", value=str(blk.get("name", "")),
@@ -2170,6 +2405,14 @@ def _render_phr_single_block(blk: Dict[str, Any], uid: str,
     blk["cap_ratio"] = cc[1].number_input(
         "cap_ratio", value=float(blk.get("cap_ratio", 0.0)), step=0.01,
         format="%.4f", key=f"{key_prefix}_phr_scapr_{uid}")
+    if int(schema_version) == 2:
+        blk["scale"] = st.selectbox(
+            "Шкала оси (v2)", ["linear", "log"],
+            index=(1 if str(blk.get("scale", "linear")) == "log" else 0),
+            key=f"{key_prefix}_phr_sscale_{uid}",
+            help="log — сэмплинг равномерен по ln phr (iter47/B5: вся "
+                 "информация сатурирующих осей TiO2/УФ — в нижней декаде); "
+                 "требует lo > 0. Шкала входит в spec_hash.")
 
 
 def _render_phr_tree_input(key_prefix: str) -> Optional[PhrSpec]:
@@ -2186,6 +2429,29 @@ def _render_phr_tree_input(key_prefix: str) -> Optional[PhrSpec]:
         "компоненты группы в ДОЛЯХ, плюс одиночные компоненты вне групп. "
         "Поле «Компоненты смеси» выше ИГНОРИРУЕТСЯ — имена берутся отсюда. "
         "Порядок узлов входит в spec_hash: переставляйте кнопками ▲/▼.")
+    # iter56/P3.2: выбор схемы сериализации — контракт кампании, а не
+    # косметика: v1 и v2 дают разные z-оси (у v2 closure без оси) и разные
+    # отпечатки. Дерево одной геометрии в v1 и v2 — РАЗНЫЕ спеки.
+    sv_label = st.radio(
+        "Схема спеки", [_PHR_SCHEMA_V1, _PHR_SCHEMA_V2],
+        key=f"{key_prefix}_phr_schema", horizontal=True,
+        help="v1 — legacy share_of: каждая доля со своей z-осью (пары "
+             "(φ, 1−φ) коллинеарны). v2 — роли нового контракта: k=2 → "
+             "free+closure, k≥3 → simplex (замыкание без z-оси), техлимиты "
+             "min/max phr, scale='log', group_order. Схема входит в "
+             "spec_hash — v1 и v2 дают РАЗНЫЕ отпечатки.")
+    sv = 2 if sv_label == _PHR_SCHEMA_V2 else 1
+    group_order: List[str] = []
+    if sv == 2:
+        go_text = st.text_input(
+            "group_order — приоритет GROUP_TOTAL-групп (через запятую, опц.)",
+            key=f"{key_prefix}_phr_group_order",
+            placeholder="например: FILLER.total, SOFT.total",
+            help="ТОЧНАЯ перестановка множества GROUP_TOTAL-групп "
+                 "(CAMPAIGN_SPEC_PVC §1, iter48/B4) — приоритет осей "
+                 "кампании; входит в spec_hash. Пусто — не задан. "
+                 "Валидацию делает конструктор спеки.")
+        group_order = _parse_names(go_text)
 
     ac = st.columns([2, 2, 1])
     if ac[0].button("➕ Группа", key=f"{key_prefix}_phr_add_group",
@@ -2228,17 +2494,20 @@ def _render_phr_tree_input(key_prefix: str) -> Optional[PhrSpec]:
             st.rerun()
         if hc[3].button("🗑", key=f"{key_prefix}_phr_del_{uid}"):
             st.session_state[tkey] = [b for j, b in enumerate(tree) if j != i]
-            st.session_state.pop(f"{key_prefix}_phr_kids_df_{uid}", None)
+            for k in [k for k in st.session_state if str(k).startswith(
+                    f"{key_prefix}_phr_kids_df_{uid}")]:
+                st.session_state.pop(k, None)
             st.rerun()
         if is_group:
-            _render_phr_group_block(blk, uid, key_prefix)
+            _render_phr_group_block(blk, uid, key_prefix, sv)
         else:
-            _render_phr_single_block(blk, uid, key_prefix)
+            _render_phr_single_block(blk, uid, key_prefix, sv)
         st.divider()
 
     st.session_state[tkey] = tree
     try:
-        dicts = phr_tree_to_dicts(tree)
+        dicts = phr_tree_to_dicts(tree, schema_version=sv,
+                                  group_order=group_order)
     except ValueError as exc:      # ошибки дерева (пустая группа, дубли…)
         st.error(str(exc))
         return None
@@ -2480,10 +2749,21 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
                                            ensure_ascii=False, indent=2)
         # iter41.4: то же самое деревом — чтобы иерархический канал показывал
         # загруженную спеку, а не пустую форму (round-trip сохраняет hash).
-        # iter46: дерево — legacy-канал (v1); спека схемы v2 префиллится
-        # только JSON'ом (phr_tree_from_spec для v2 — явная ошибка).
-        if getattr(spec, "schema_version", 1) == 1:
+        # iter56/P3.2: дерево проецирует ОБЕ схемы (закрыт хвост iter46);
+        # схема и group_order префиллятся своими полями формы.
+        ver = int(getattr(spec, "schema_version", 1))
+        out["setup_phr_schema"] = (_PHR_SCHEMA_V2 if ver == 2
+                                   else _PHR_SCHEMA_V1)
+        if ver == 2:
+            out["setup_phr_group_order"] = ", ".join(
+                getattr(spec, "group_order", []) or [])
+        try:
             out["setup_phr_tree"] = phr_tree_from_spec(spec)
+        except ValueError:
+            # Непроецируемый порядок узлов v2 (члены группы не сразу за
+            # тоталом): дерево не префиллим — канал JSON выше остаётся
+            # полным источником истины, spec_hash не трогаем (A0.6).
+            pass
     return out
 
 

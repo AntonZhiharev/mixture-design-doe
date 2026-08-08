@@ -602,13 +602,23 @@ class TestUIHelpers:
         assert row["lo"] == pytest.approx(0.0)
         assert row["hi"] == pytest.approx(0.70)
 
-    def test_phr_tree_from_spec_rejects_v2(self):
-        with pytest.raises(ValueError, match="legacy-схему v1"):
-            ui.phr_tree_from_spec(_pvc())
+    def test_phr_tree_projects_v2_since_iter56(self):
+        # iter56/P3.2: дерево проецирует и v2 (закрыт хвост iter46) —
+        # round-trip сохраняет spec_hash; подробные инварианты в
+        # test_iteration56_phr_tree_v2.py.
+        spec = _pvc()
+        tree = ui.phr_tree_from_spec(spec)
+        rebuilt = PhrSpec.from_dicts(
+            ui.phr_tree_to_dicts(tree, schema_version=2))
+        assert rebuilt.spec_hash() == spec.spec_hash()
 
-    def test_setup_prefill_v2_uses_json_channel_only(self):
+    def test_setup_prefill_v2_fills_json_and_tree(self):
         runner = TestPersistenceAndLegacy()._v2_runner()
         out = ui.setup_prefill_from_runner(runner)
-        assert "setup_phr_tree" not in out          # дерево — только v1
         spec2 = ui.parse_phr_spec_json(out["setup_phr_json"])
         assert spec2.spec_hash() == runner.phr_spec.spec_hash()
+        # iter56/P3.2: дерево теперь тоже префиллится (схема v2)
+        assert out["setup_phr_schema"] == ui._PHR_SCHEMA_V2
+        rebuilt = PhrSpec.from_dicts(ui.phr_tree_to_dicts(
+            out["setup_phr_tree"], schema_version=2))
+        assert rebuilt.spec_hash() == runner.phr_spec.spec_hash()

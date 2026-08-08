@@ -1425,9 +1425,46 @@ class PhrSpec:
         return self.to_fractions(self.decode(self.sample_z(n, seed=seed)))
 
     # ------------------------------------------------------------------
+    # Роли узлов (iter50/P1.3): ЕДИНЫЙ источник ролей для сериализации и UI
+    # ------------------------------------------------------------------
+    def role_of(self, name: str) -> str:
+        """Роль узла контракта v2 (см. таблицу ролей UI_REVISION_SPEC).
+
+        Роль — не отдельное поле узла, а СЛЕДСТВИЕ структуры: fixed/absolute
+        родитель share-группы → ``GROUP_TOTAL_FIXED``/``GROUP_TOTAL``,
+        absolute с динамическим потолком → ``ABSOLUTE_CAPPED`` и т.д.
+        Метод — единственный источник этого вывода: им пользуются и
+        сериализация :meth:`_to_role_dicts`, и показ в UI (иначе роль в
+        таблице интерфейса и роль в отпечатке спеки могли бы разойтись).
+
+        Спека схемы v1 (legacy) ролей не имеет: её ``share_of``-узлы
+        отдаются как ``SHARE_OF`` — честная пометка «legacy-режим», а не
+        подмена одной из новых ролей (выбор «кто closure» изменил бы меру
+        сэмплера молча, A0.6; см. iter46, п.1)."""
+        nd = self._by_name.get(str(name))
+        if nd is None:
+            raise ValueError(
+                f"role_of: узел '{name}' не найден в спеке "
+                f"(узлы: {[n.name for n in self.nodes]}).")
+        is_group = nd.name in self._share_groups
+        if nd.mode == MODE_FIXED:
+            return "GROUP_TOTAL_FIXED" if is_group else "FIXED"
+        if nd.mode == MODE_ABSOLUTE:
+            if is_group:
+                return "GROUP_TOTAL"
+            return "ABSOLUTE_CAPPED" if nd.cap_refs else "ABSOLUTE"
+        if nd.mode == MODE_RATIO_TO:
+            return "RATIO_TO"
+        return {MODE_SHARE_FREE: "SHARE_FREE",
+                MODE_SHARE_CLOSURE: "SHARE_CLOSURE",
+                MODE_SHARE_SIMPLEX: "SHARE_SIMPLEX",
+                MODE_SHARE_OF: "SHARE_OF"}[nd.mode]
+
+    # ------------------------------------------------------------------
     # Версионирование спеки (iter35): порядок узлов — часть спеки
     # ------------------------------------------------------------------
     def to_dicts(self) -> List[Dict[str, Any]] | Dict[str, Any]:
+
         """Каноническая сериализация спеки (round-trip c :meth:`from_dicts`).
 
         ПОРЯДОК УЗЛОВ СОХРАНЯЕТСЯ: он определяет и порядок компонентов, и
@@ -1485,26 +1522,24 @@ class PhrSpec:
     def _to_role_dicts(self) -> List[Dict[str, Any]]:
         """iter46/B6: сериализация в схему v2 (роли) — обратное к
         :meth:`_nodes_from_roles`; round-trip сохраняет ``spec_hash``.
-        Роли восстанавливаются из структуры: fixed/absolute-родитель
-        share-группы → GROUP_TOTAL_FIXED/GROUP_TOTAL, absolute с cap →
-        ABSOLUTE_CAPPED; ``members`` — из фактических детей группы."""
+        Роли восстанавливаются из структуры ЕДИНЫМ источником
+        (:meth:`role_of`): fixed/absolute-родитель share-группы →
+        GROUP_TOTAL_FIXED/GROUP_TOTAL, absolute с cap → ABSOLUTE_CAPPED;
+        ``members`` — из фактических детей группы."""
         out: List[Dict[str, Any]] = []
         for nd in self.nodes:
             is_group = nd.name in self._share_groups
-            d: Dict[str, Any] = {"name": nd.name}
+            role = self.role_of(nd.name)
+            d: Dict[str, Any] = {"name": nd.name, "role": role}
             if nd.mode == MODE_FIXED:
-                d["role"] = "GROUP_TOTAL_FIXED" if is_group else "FIXED"
                 d["value"] = float(nd.value)
                 if is_group:
                     d["members"] = list(self._share_groups[nd.name])
             elif nd.mode == MODE_ABSOLUTE:
                 if is_group:
-                    d["role"] = "GROUP_TOTAL"
                     d["range"] = [float(nd.lo), float(nd.hi)]
                     d["members"] = list(self._share_groups[nd.name])
                 else:
-                    d["role"] = ("ABSOLUTE_CAPPED" if nd.cap_refs
-                                 else "ABSOLUTE")
                     d["range"] = [float(nd.lo), float(nd.hi)]
                     if nd.scale != "linear":
                         d["scale"] = nd.scale
@@ -1512,14 +1547,11 @@ class PhrSpec:
                         d["cap_to"] = list(nd.cap_refs)
                         d["cap_ratio"] = float(nd.cap_ratio)
             elif nd.mode == MODE_RATIO_TO:
-                d["role"] = "RATIO_TO"
                 d["reference"] = nd.ref
                 d["range"] = [float(nd.lo), float(nd.hi)]
             else:                              # share-роли нового контракта
-                d["role"] = {MODE_SHARE_FREE: "SHARE_FREE",
-                             MODE_SHARE_CLOSURE: "SHARE_CLOSURE",
-                             MODE_SHARE_SIMPLEX: "SHARE_SIMPLEX"}[nd.mode]
                 d["group"] = nd.ref
+
                 if nd.mode != MODE_SHARE_CLOSURE:
                     d["share_range"] = [float(nd.lo), float(nd.hi)]
                 if nd.min_phr is not None:

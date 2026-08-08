@@ -138,8 +138,12 @@ class TestSpecDataframes:
 
     def test_summary_structure_and_leaves(self):
         df = ui.phr_spec_summary_dataframe(self.spec)
-        assert list(df.columns) == ["узел", "режим", "lo", "hi", "ref",
-                                    "cap_to", "cap_ratio", "компонент смеси"]
+        # iter50/P1.3: сводка расширена ролью, техлимитами и шкалой оси —
+        # они входят в геометрию и spec_hash, но были не видны из UI.
+        assert list(df.columns) == ["узел", "роль", "режим", "lo", "hi", "ref",
+                                    "cap_to", "cap_ratio", "min_phr",
+                                    "max_phr", "scale", "компонент смеси"]
+
         assert len(df) == len(RECIPE_DICTS)                  # все узлы (20)
         # resin — внутренний узел share-группы, НЕ компонент смеси
         resin = df[df["узел"] == "resin"].iloc[0]

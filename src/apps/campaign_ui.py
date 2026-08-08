@@ -1063,10 +1063,21 @@ def parse_phr_spec_json(text: str) -> PhrSpec:
 
 
 def phr_spec_summary_dataframe(spec: PhrSpec) -> pd.DataFrame:
-    """iter41.1: сводка узлов спеки — узел / режим / lo / hi / ref /
-    cap_to / cap_ratio / «компонент смеси?» (лист DAG).
+    """iter41.1 (+iter50/P1.3): сводка узлов спеки — узел / РОЛЬ / режим /
+    lo / hi / ref / cap_to / cap_ratio / min_phr / max_phr / scale /
+    «компонент смеси?» (лист DAG).
 
-    Для ``fixed``-узлов lo=hi=value (честный вырожденный интервал).
+    Для ``fixed``-узлов lo=hi=value (честный вырожденный интервал);
+    у ``share_closure`` диапазон ПРОИЗВОДНЫЙ (iter46/B2).
+
+    iter50/P1.3: роль (:meth:`PhrSpec.role_of` — тот же источник, что и
+    сериализация), технологические лимиты ``min_phr``/``max_phr``
+    (iter45/B1) и шкала оси ``scale`` (iter47/B5) были невидимы из UI:
+    пользователь не мог сверить с таблицей кампании ни «CPE ≥ 3 phr», ни
+    «TiO₂ по логу» — а это ЧАСТЬ ГЕОМЕТРИИ и часть ``spec_hash``.
+    ``min_phr``/``max_phr`` отсутствуют как ``NaN`` (числовая колонка), а
+    не «—»: пустая ячейка не должна выглядеть как значение.
+
     Чистая (без Streamlit) — тестируется напрямую."""
     leaves = set(spec.component_names)
     rows: List[Dict[str, Any]] = []
@@ -1080,13 +1091,135 @@ def phr_spec_summary_dataframe(spec: PhrSpec) -> pd.DataFrame:
         else:
             lo, hi = float(nd.lo), float(nd.hi)
         rows.append({
-            "узел": nd.name, "режим": nd.mode, "lo": lo, "hi": hi,
+            "узел": nd.name, "роль": spec.role_of(nd.name),
+            "режим": nd.mode, "lo": lo, "hi": hi,
             "ref": nd.ref or "",
             "cap_to": ", ".join(nd.cap_refs),
             "cap_ratio": float(nd.cap_ratio) if nd.cap_refs else np.nan,
+            "min_phr": (np.nan if nd.min_phr is None else float(nd.min_phr)),
+            "max_phr": (np.nan if nd.max_phr is None else float(nd.max_phr)),
+            "scale": str(nd.scale),
             "компонент смеси": nd.name in leaves,
         })
     return pd.DataFrame(rows)
+
+
+def phr_spec_policy_caption(spec: PhrSpec) -> str:
+    """iter50/P1.3: одна строка о ГЕОМЕТРИЧЕСКОЙ политике спеки —
+    схема, q/dim_z, ``group_order``, лог-оси, узлы с техлимитами, хеш.
+
+    Всё перечисленное входит в ``spec_hash`` (iter46–48), но до iter50 в
+    интерфейсе не показывалось: две спеки с разным приоритетом групп или
+    разной шкалой оси выглядели одинаково, а планы давали разные. Чистая
+    (без Streamlit)."""
+    log_axes = [nd.name for nd in spec.nodes if nd.scale == "log"]
+    limited = [nd.name for nd in spec.nodes
+               if nd.min_phr is not None or nd.max_phr is not None]
+    order = list(getattr(spec, "group_order", []) or [])
+    parts = [f"схема v{int(getattr(spec, 'schema_version', 1))}",
+             f"компонентов q={spec.q}", f"z-осей {spec.dim_z}"]
+    parts.append("приоритет групп (group_order): " + (" → ".join(order)
+                 if order else "не задан"))
+    parts.append("лог-оси (сэмплинг по ln phr): "
+                 + (", ".join(log_axes) if log_axes else "нет"))
+    parts.append("техлимиты min/max_phr: "
+                 + (", ".join(limited) if limited else "нет"))
+    return (" · ".join(parts)
+            + f". spec_hash {spec.spec_hash()[:12]}… — всё перечисленное "
+              "входит в отпечаток: смена шкалы, лимита или порядка групп "
+              "меняет хеш и геометрию плана.")
+
+
+# --- iter50/P1.3: блок «эффективные границы точки» (контракт iter49/B7) ---
+# Метки active контракта — «что именно ограничивает точку». Словарь нужен
+# для подписи: сырые метки стабильны (часть контракта ядра, на них опираются
+# тесты), а лаборанту нужен русский смысл.
+ACTIVE_LABEL_RU: Dict[str, str] = {
+    "fixed": "фиксированное значение узла",
+    "range": "заявленный интервал спеки",
+    "derived": "производный диапазон замыкания (closure)",
+    "window": "окно тотала группы (phr-лимиты членов)",
+    "cap": "динамический потолок cap_ratio·Σ(cap_to) в ЭТОЙ точке",
+    "min_phr": "технологический минимум узла (phr)",
+    "max_phr": "технологический лимит узла (phr)",
+    "partners": "партнёры по группе (Σφ = 1)",
+}
+
+_COORD_KIND = {
+    "fixed": "phr", "absolute": "phr", "ratio_to": "коэффициент",
+    "share_of": "доля", "share_free": "доля", "share_closure": "доля",
+    "share_simplex": "доля",
+}
+
+
+def point_bounds_dataframe(spec: PhrSpec, x_fractions: Sequence[float], *,
+                           delta_phr: Optional[float] = None
+                           ) -> pd.DataFrame:
+    """iter50/P1.3: ЭФФЕКТИВНЫЕ границы каждого узла В ЭТОЙ ТОЧКЕ.
+
+    Вход — состав в ДОЛЯХ (как его отдаёт движок: строка seed-плана, x*
+    ветки); phr восстанавливается :meth:`PhrSpec.fractions_to_phr`, всё
+    остальное берётся из контракта ядра :meth:`PhrSpec.point_report`
+    (iter49/B7) — геометрия в UI НЕ дублируется.
+
+    | колонка | смысл |
+    |---|---|
+    | узел / роль | структура спеки (:meth:`PhrSpec.role_of`) |
+    | координата | в чём измеряется узел: phr / доля / коэффициент |
+    | значение | значение координаты в точке |
+    | phr | значение узла в phr (у тоталов — сумма детей) |
+    | lo / hi | эффективные границы координаты В ЭТОЙ точке |
+    | активна lo / активна hi | КАКОЕ ограничение задало границу |
+    | в границах | ✓ / ✗ (номинал внутри эффективных границ) |
+
+    Зачем: условные границы §4 спеки (немонотонная ``hi_φ(T)``) из
+    интерфейса не сверялись вообще — «почему план не даёт такую точку»
+    оставалось без ответа. Нарушения НЕ блокируют (A0.6): это диагностика.
+
+    Чистая (без Streamlit) — тестируется напрямую."""
+    p_nom = spec.fractions_to_phr(np.asarray(x_fractions, dtype=float).ravel())
+    rep = spec.point_report(p_nom, delta_phr=delta_phr)
+    rows: List[Dict[str, Any]] = []
+    for nm, b in rep.effective_bounds.items():
+        inside = (b.lo - 1e-6) <= b.coord <= (b.hi + 1e-6) and b.lo <= b.hi
+        rows.append({
+            "узел": nm,
+            "роль": spec.role_of(nm),
+            "координата": _COORD_KIND.get(b.mode, b.mode),
+            "значение": round(float(b.coord), 6),
+            "phr": round(float(b.phr), 4),
+            "lo": round(float(b.lo), 6),
+            "hi": round(float(b.hi), 6),
+            "активна lo": b.active_lo,
+            "активна hi": b.active_hi,
+            "в границах": "✓" if inside else "✗",
+        })
+    return pd.DataFrame(rows)
+
+
+def point_bounds_caption(df: pd.DataFrame) -> str:
+    """iter50/P1.3: подпись под таблицей эффективных границ — расшифровка
+    ТОЛЬКО тех меток ``active``, которые в этой точке реально встретились
+    (глоссарий на восемь строк никто не читает), и счётчик узлов вне
+    границ. Чистая (без Streamlit)."""
+    if df is None or df.empty:
+        return "Точка не разобрана: таблица границ пуста."
+    labels: List[str] = []
+    for col in ("активна lo", "активна hi"):
+        for v in df[col]:
+            if v not in labels:
+                labels.append(str(v))
+    gloss = "; ".join(f"{lab} — {ACTIVE_LABEL_RU.get(lab, lab)}"
+                      for lab in labels)
+    bad = int((df["в границах"] == "✗").sum())
+    tail = ("все узлы внутри эффективных границ"
+            if bad == 0 else
+            f"⚠️ вне границ: {bad} узл. — точка не принадлежит геометрии "
+            f"спеки (диагностика, фиксация не блокируется, A0.6)")
+    return (f"Границы посчитаны ДЛЯ ЭТОЙ точки (контракт ядра, iter49/B7): "
+            f"cap/окно тотала/партнёры зависят от самой точки. "
+            f"Метки: {gloss}. {tail}.")
+
 
 
 def phr_spec_fraction_dataframe(spec: PhrSpec) -> pd.DataFrame:
@@ -1834,8 +1967,13 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
                        f"{spec.dim_z}.")
             st.dataframe(phr_spec_summary_dataframe(spec),
                          use_container_width=True, hide_index=True)
+            # iter50/P1.3: политика геометрии (роли уже в таблице выше) —
+            # порядок групп, лог-оси и техлимиты входят в spec_hash, но были
+            # не видны: две «одинаковые» спеки давали разные планы.
+            st.caption(phr_spec_policy_caption(spec))
             st.caption("Интервалы phr компонентов и рассчитанные ДОЛИ для "
                        "mixture-блока схемы (fraction_bounds):")
+
             st.dataframe(phr_spec_fraction_dataframe(spec),
                          use_container_width=True)
             st.code(spec.spec_hash(), language=None)
@@ -2047,6 +2185,12 @@ def render_project_settings(runner) -> None:
             st.code(spec.spec_hash(), language=None)
             st.caption("spec_hash активной phr-спеки (полный hex) — сверяйте "
                        "с зафиксированным в документации кампании.")
+            # iter50/P1.3: геометрия спеки видна и ПОСЛЕ загрузки проекта —
+            # роли/техлимиты/шкалы/порядок групп, а не только хеш.
+            st.caption(phr_spec_policy_caption(spec))
+            st.dataframe(phr_spec_summary_dataframe(spec),
+                         use_container_width=True, hide_index=True)
+
 
 
 def render_setup_form() -> None:
@@ -2374,7 +2518,32 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                         "Фиксация НЕ блокируется (A0.6): решение за вами "
                         "(премикс, другая загрузка, пересчёт плана).")
 
+        # iter50/P1.3: «эффективные границы точки» — ОТДЕЛЬНЫЙ блок, доступный
+        # и БЕЗ δ (навеска — про весы, границы — про геометрию: cap, окно
+        # тотала, партнёры зависят от самой точки, §4 спеки).
+        with st.expander("🔎 Эффективные границы точки (контракт ядра, "
+                         "iter49/B7)"):
+            st.caption(
+                "«Почему план не даёт такую точку» — ответ ядра ПО ЭТОЙ точке: "
+                "какие границы действуют на каждый узел и КАКОЕ ограничение их "
+                "задало (заявленный интервал / потолок cap / окно тотала / "
+                "техлимит phr / партнёры по группе). Read-only, ничего не "
+                "блокирует (A0.6).")
+            nums_b = list(experiment_index(len(runner.points), len(Xs)))
+            sel_b = st.selectbox("Границы для опыта №", nums_b,
+                                 key="setup_bounds_row")
+            try:
+                bdf_pt = point_bounds_dataframe(
+                    spec_w, Xs[nums_b.index(sel_b), :spec_w.q],
+                    delta_phr=delta_phr)
+                st.dataframe(bdf_pt, use_container_width=True,
+                             hide_index=True)
+                st.caption(point_bounds_caption(bdf_pt))
+            except ValueError as exc:
+                st.error(f"Границы точки не рассчитаны: {exc}")
+
     if st.button("🧪 Заполнить тестовыми (демо-оракул)", key="setup_fill_demo"):
+
         st.session_state["setup_seed_Y"] = np.vstack(
             [runner._measure(np.asarray(x, float)) for x in Xs])
         st.session_state.pop("setup_seed_editor", None)

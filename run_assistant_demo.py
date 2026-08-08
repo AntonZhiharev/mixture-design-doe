@@ -32,7 +32,8 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
-from src.assistant import files, store, views  # noqa: E402
+from src.assistant import files, llm, store, views  # noqa: E402
+
 from src.assistant.session import (Artifact, StagedPatch,  # noqa: E402
                                     ToolCall, new_session)
 
@@ -317,14 +318,147 @@ def demo_iter59() -> None:
           f"{files.orphan_files(s, CAMPAIGN_ROOT) or 'нет'}")
 
 
+# ----------------------------------------------------------------------
+# iter60 — ход ассистента: модель ↔ инструменты (+ интернет, + прогресс)
+# ----------------------------------------------------------------------
+def _scripted_transport(script):
+    """Заглушка сети: демо показывает ПОВЕДЕНИЕ цикла, а не ответ конкретной
+    модели (для живого ответа нужен ключ OpenRouter — см. панель ассистента)."""
+    queue = list(script)
+
+    def _transport(payload, *, key="", timeout=0):
+        if not queue:
+            raise AssertionError("сценарий демо исчерпан")
+        return queue.pop(0)
+
+    return _transport
+
+
+def demo_iter60() -> None:
+    head("iter60 · ХОД АССИСТЕНТА: модель ↔ инструменты (tool-loop)")
+
+    import json as _json
+
+    s = store.load_session(CAMPAIGN_ROOT, DEMO_PROJECT)
+    question = ("Привяжи УФ-абсорбер к пигменту: их дозируют вместе, "
+                "поставь RATIO_TO.")
+    s.add_message("user", question)
+
+    def _fn(name, args):
+        return {"id": f"c_{name}", "type": "function",
+                "function": {"name": name, "arguments": _json.dumps(args)}}
+
+    def _answer(content, tool_calls=None, usage=None):
+        msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        body = {"choices": [{"message": msg}]}
+        if usage:
+            body["usage"] = usage
+        return body
+
+    # Сценарий: модель сверяется со спекой → считает корреляции → отвечает
+    script = [
+        _answer("", [_fn("get_spec", {})], {"total_tokens": 5200}),
+        _answer("", [_fn("simulate_bounds",
+                         {"patch": {"node": "UV_CSFCP", "role": "RATIO_TO",
+                                    "reference": "TiO2_BLR895"}})],
+                {"total_tokens": 1800}),
+        _answer(
+            "Отказ: TiO2 не задаёт эффективность УФ-абсорбера, он её ЗАМЕЩАЕТ "
+            "(антагонизм по светостойкости) — RATIO_TO вшил бы неверный "
+            "монотонный prior, который модель не сможет опровергнуть. "
+            "simulate_bounds: клин даёт corr(p_UV, p_TiO2) = 0.91, корректная "
+            "трапеция по пластификаторной фазе — 0.12. Оставляем "
+            "ABSOLUTE_CAPPED (cap_to = фаза DINP) + interacts_with = "
+            "TiO2_BLR895. Совместное дозирование — вопрос ПРЕМИКСА, а не "
+            "геометрии спеки.", None, {"total_tokens": 900}),
+    ]
+
+    # Инструменты исполняются локально (полноценный реестр — iter61)
+    def dispatch(name, args):
+        if name == "get_spec":
+            return {"spec_version": 2, "q": 19, "dim_z": 16,
+                    "spec_hash": "c63b7e1696e1c449",
+                    "group_order": ["FILLER.total", "SOFT.total", "ACR.total",
+                                    "LUB.total"],
+                    "UV_CSFCP": {"role": "ABSOLUTE_CAPPED", "scale": "log",
+                                 "range": [0.05, 0.30],
+                                 "cap_to": ["DINP", "ESO"], "cap_ratio": 0.03}}
+        if name == "simulate_bounds":
+            return {"proposed": {"role": "RATIO_TO", "corr_with_reference": 0.91},
+                    "current": {"role": "ABSOLUTE_CAPPED",
+                                "corr_with_reference": 0.12},
+                    "sigma_phr": [115.2, 249.8], "warning":
+                        "клин делает узел почти линейной функцией референса"}
+        raise ValueError(f"инструмент '{name}' не зарегистрирован")
+
+    print(f"\n👤 Вопрос: {question}")
+    print("\n⏳ Прогресс хода (это же увидит пользователь под чатом):")
+    events = []
+
+    def on_event(ev):
+        events.append(ev)
+        print(f"   {llm.progress_caption(ev)}")
+
+    res = llm.run_tool_loop(s.context_messages(max_tokens=8000),
+                            dispatch=dispatch, model=s.model,
+                            web=s.web_enabled, transport=_scripted_transport(script),
+                            on_event=on_event)
+
+    print(f"\n🤖 Ответ (модель `{res.model}`, шагов {res.iterations}, "
+          f"вызовов {res.n_tool_calls}, итог: {res.stopped_reason}):")
+    for line in res.text.splitlines():
+        print(f"   {line}")
+
+    # ход целиком ложится в память проекта
+    for m in res.new_messages:
+        s.add_message(m["role"], m.get("content", ""),
+                      tool_calls=m.get("tool_calls", []),
+                      tool_call_id=m.get("tool_call_id", ""),
+                      name=m.get("name", ""),
+                      model=res.model if m["role"] == "assistant" else "",
+                      web=res.web if m["role"] == "assistant" else False)
+    s.add_usage(res.usage)
+    for c in res.calls:
+        rec = ToolCall(tool=c["tool"], args=c["args"], ok=c["ok"],
+                       error=c["error"], duration_s=c["duration_s"],
+                       summary=c["summary"])
+        s.add_tool_call(rec)
+        store.append_log(CAMPAIGN_ROOT, DEMO_PROJECT, "tool_calls", rec.to_state())
+
+    print("\n🔧 Что реально вызывалось (аудит хода):")
+    show(views.tool_calls_dataframe(res.calls))
+
+    print("\n💬 Лента после хода (роль «инструмент» — часть переписки):")
+    show(views.messages_dataframe(s).tail(4))
+
+    print(f"\n📌 {views.session_caption(s)}")
+    print("   🌐 интернет включён ⇒ модель ушла с суффиксом ':online' "
+          f"(`{res.model}`) — источник ответа виден в ленте")
+
+    store.save_session(s, CAMPAIGN_ROOT)
+    print("\n⛔ Отказ инструмента возвращается МОДЕЛИ, а не пользователю:")
+    bad = llm.run_tool_loop(
+        [{"role": "user", "content": "?"}], dispatch=dispatch,
+        transport=_scripted_transport([
+            _answer("", [_fn("get_local_facts", {"scope": "cost"})]),
+            _answer("Инструмент недоступен — отвечаю по контексту проекта.")]))
+    print(f"   вызов: {bad.calls[0]['tool']} · ok={bad.calls[0]['ok']} · "
+          f"{bad.calls[0]['error']}")
+    print(f"   ответ модели: {bad.text}")
+
+
 def main() -> int:
     demo_iter58()
     demo_iter59()
+    demo_iter60()
     print("\n" + "═" * 100)
-    print("  Готово. Следующий шаг — iter60: вызов модели через OpenRouter "
-          "с инструментами (tool-loop) и тумблером интернета (:online).")
+    print("  Готово. Следующий шаг — iter61: настоящие read-only инструменты "
+          "(get_spec / explain_node / validate_spec / simulate_bounds / preflight).")
     print("═" * 100 + "\n")
     return 0
+
 
 
 

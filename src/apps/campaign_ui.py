@@ -42,7 +42,9 @@ from ..apps import campaign_state as cs
 
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 from ..design.blocking import blocking_diagnostics
+from ..design.levels import levels_caption
 from ..design.phr_sampler import PhrSpec, premix_required
+
 
 
 
@@ -1017,6 +1019,96 @@ def sampling_groups_to_text(groups) -> str:
 
 
 # ----------------------------------------------------------------------
+# iter52 / P2.1-UI (UI_REVISION_SPEC) — ДИСКРЕТНЫЕ УРОВНИ process-осей в UI.
+# Ядро (iter51) умеет проецировать план и argmax на сетку уровней, но задать
+# сетку было НЕЧЕМ: из интерфейса «rotor_rpm: 400, 900» не вводилось, в
+# паспорте не показывалось — политика кампании существовала только в коде.
+# Хелперы ниже ЧИСТЫЕ (без Streamlit); нормализацию (сортировка, дубли,
+# границы оси) делает ШТАТНЫЙ ``runner.set_process_levels`` (A0.6).
+# ----------------------------------------------------------------------
+def parse_process_levels(text: str) -> Dict[str, List[float]]:
+    """iter52/P2.1-UI: разобрать дискретные уровни process-осей из текста формы.
+
+    Формат: одна СТРОКА = одна ось, ``имя: уровень, уровень…`` в РЕАЛЬНЫХ
+    единицах (``rotor_rpm: 400, 900``). Пустые строки игнорируются; ось без
+    строки остаётся НЕПРЕРЫВНОЙ (выключать сетку надо отсутствием строки, а
+    не пустым списком — иначе «уровней нет» неотличимо от «оси нет в сетке»).
+
+    Здесь ловится только СИНТАКСИС (с номером строки). Смысловая валидация —
+    имя оси против схемы, попадание уровня в границы, дубли и сортировка —
+    остаётся за штатным :meth:`MixtureProcessRunner.set_process_levels`
+    (единый источник правил, A0.6). Чистая (без Streamlit) — round-trip с
+    :func:`process_levels_to_text`.
+    """
+    out: Dict[str, List[float]] = {}
+    for ln, line in enumerate(str(text or "").splitlines(), start=1):
+        if not line.strip():
+            continue
+        if ":" not in line:
+            raise ValueError(
+                f"Строка {ln}: ожидается «ось: уровень, уровень…» "
+                f"(нет разделителя «:»): {line.strip()!r}.")
+        name, rhs = line.split(":", 1)
+        nm = name.strip()
+        if not nm:
+            raise ValueError(f"Строка {ln}: пустое имя оси: {line.strip()!r}.")
+        vals = _parse_floats(rhs)
+        if vals is None:
+            raise ValueError(
+                f"Строка {ln}: уровни оси «{nm}» — числа через запятую "
+                f"(получено {rhs.strip()!r}).")
+        if not vals:
+            raise ValueError(
+                f"Строка {ln}: у оси «{nm}» не задано ни одного уровня. "
+                "Чтобы ось осталась непрерывной, не упоминайте её вовсе.")
+        if nm in out:
+            raise ValueError(
+                f"Строка {ln}: ось «{nm}» указана повторно — перечислите все "
+                "её уровни в ОДНОЙ строке.")
+        out[nm] = vals
+    return out
+
+
+def process_levels_to_text(levels) -> str:
+    """iter52: уровни → текст формы (обратное к :func:`parse_process_levels`)."""
+    return "\n".join(
+        f"{nm}: " + ", ".join(f"{float(v):g}" for v in vals)
+        for nm, vals in (levels or {}).items())
+
+
+def seed_levels_caption(runner, Xs) -> str:
+    """iter52/P2.1-UI: подпись «план стоит на достижимых режимах» (чистая).
+
+    Пусто (нет дискретных осей) → ПУСТАЯ строка: подпись «все оси непрерывны»
+    у каждой таблицы плана была бы шумом (в паспорте кампании это состояние
+    показывается явно). Если сетки заданы — перечисляем оси и проверяем сам
+    план: точки вне сетки означают, что уровни задали ПОСЛЕ построения плана
+    (например, загрузили проект и добавили политику) — это сигнал пересчитать
+    план, а не повод блокировать фиксацию (A0.6).
+    """
+    levels = dict(getattr(runner, "process_levels", {}) or {})
+    if not levels:
+        return ""
+    head = "⚙️ " + levels_caption(levels)
+    X = np.atleast_2d(np.asarray(Xs, float))
+    if X.size == 0:
+        return head
+    try:
+        off = int(np.count_nonzero(
+            np.abs(runner.snap_process_axes(X) - X).max(axis=1) > 1e-9))
+    except (ValueError, IndexError):
+        return head
+    if off == 0:
+        return (f"{head} Все {len(X)} точек плана стоят на уровнях — "
+                "лаборатория поставит ровно то, что в таблице.")
+    return (f"{head} ⚠️ {off} из {len(X)} точек ВНЕ сетки: уровни заданы "
+            "после построения плана. Предложите план заново, иначе оператор "
+            "поставит ближайший достижимый режим, а модель будет учиться на "
+            "координатах из таблицы (A0.6 — не блокируем, но предупреждаем).")
+
+
+
+# ----------------------------------------------------------------------
 # iter41 (UI_REVISION_SPEC §41) — чистые хелперы phr-спеки и паспорта
 # кампании (без Streamlit, тестируются напрямую)
 # ----------------------------------------------------------------------
@@ -1682,9 +1774,10 @@ def setup_mixture_names(field_names: Sequence[str],
 
 
 def campaign_passport_dataframe(runner) -> pd.DataFrame:
-    """iter41.3: паспорт кампании — phr-спека (q, dim_z, hash-префикс
-    12 симв.), метка, обязательные 2D-пары. «—» = политика не задана
-    (видимость по A0.6, ничего не скрываем). Чистая (без Streamlit)."""
+    """iter41.3 (+iter52/P2.1-UI): паспорт кампании — phr-спека (q, dim_z,
+    hash-префикс 12 симв.), метка, обязательные 2D-пары, ДИСКРЕТНЫЕ уровни
+    process-осей. «—» = политика не задана (видимость по A0.6, ничего не
+    скрываем). Чистая (без Streamlit)."""
     spec = getattr(runner, "phr_spec", None)
     if spec is not None:
         spec_val = (f"q={spec.q}, dim_z={spec.dim_z}, "
@@ -1694,11 +1787,18 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
     label = str(getattr(runner, "campaign_label", "") or "")
     pairs = getattr(runner, "preflight_pairs", []) or []
     pairs_val = preflight_pairs_to_text(pairs).replace("\n", " ; ")
+    # iter52: сетка режимов — такая же политика кампании, как метка и пары
+    # (что умеет железо), и точно так же обязана быть видна после загрузки.
+    levels_val = process_levels_to_text(
+        getattr(runner, "process_levels", {}) or {}).replace("\n", " ; ")
     return pd.DataFrame([
         {"параметр": "phr-спека (decode-слой)", "значение": spec_val},
         {"параметр": "метка кампании", "значение": label or "—"},
         {"параметр": "обязательные 2D-пары", "значение": pairs_val or "—"},
+        {"параметр": "дискретные уровни process-осей",
+         "значение": levels_val or "—"},
     ])
+
 
 
 # ----------------------------------------------------------------------
@@ -2117,6 +2217,12 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
         getattr(runner, "campaign_label", "") or "")
     out["setup_preflight_pairs"] = preflight_pairs_to_text(
         getattr(runner, "preflight_pairs", []) or [])
+    # iter52/P2.1-UI: дискретные уровни process-осей — политика кампании,
+    # которую после загрузки обязана показывать и ФОРМА (иначе повторная
+    # сборка проекта молча вернула бы непрерывные оси).
+    out["setup_process_levels"] = process_levels_to_text(
+        getattr(runner, "process_levels", {}) or {})
+
     # iter41.3: активная phr-спека → режим «phr-спека (JSON)» с каноническим
     # JSON to_dicts (round-trip: parse_phr_spec_json(json).spec_hash() == hash).
     spec = getattr(runner, "phr_spec", None)
@@ -2134,26 +2240,40 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
 
 
 def project_settings_dataframe(runner) -> pd.DataFrame:
-    """Сводка настроек ТЕКУЩЕГО проекта: переменная / тип / границы L…U.
+    """Сводка настроек ТЕКУЩЕГО проекта: переменная / тип / границы L…U /
+    уровни.
 
     Показывается после сборки/загрузки проекта, чтобы пользователь видел, какие
     доли компонентов и реальные границы процесс-параметров действуют в движке
     (единый источник истины — ``runner.current_schema``, а не поля формы).
+
+    iter52/P2.1-UI: колонка «уровни» помечает ДИСКРЕТНЫЕ process-оси
+    (``rotor_rpm: 400, 900``) — иначе строка «400…900» читалась бы как
+    непрерывный интервал, хотя план и оптимум выдаются только на сетке.
+    У компонентов смеси ячейка пустая (правило неприменимо), у непрерывных
+    process-осей — явное «непрерывная».
+
     Чистая (без Streamlit) — тестируется напрямую."""
     rows: List[Dict[str, Any]] = []
     sch = runner.current_schema
+    levels = dict(getattr(runner, "process_levels", {}) or {})
     mb = sch.mixture_block()
     if mb is not None:
         for nm, lo, hi in zip(mb.names, mb.lower, mb.upper):
             rows.append({"переменная": str(nm), "тип": "компонент смеси (доля)",
-                         "нижняя": float(lo), "верхняя": float(hi)})
+                         "нижняя": float(lo), "верхняя": float(hi),
+                         "уровни": ""})
     pb = sch.process_block()
     if pb is not None:
         for nm, lo, hi in zip(pb.names, pb.lower, pb.upper):
+            lv = levels.get(str(nm))
             rows.append({"переменная": str(nm),
                          "тип": "процесс-параметр (реальные единицы)",
-                         "нижняя": float(lo), "верхняя": float(hi)})
+                         "нижняя": float(lo), "верхняя": float(hi),
+                         "уровни": (", ".join(f"{float(v):g}" for v in lv)
+                                    if lv else "непрерывная")})
     return pd.DataFrame(rows)
+
 
 
 def render_project_settings(runner) -> None:
@@ -2174,9 +2294,14 @@ def render_project_settings(runner) -> None:
             st.caption("Функциональные группы (стратификация суммы ниши, "
                        "iter31): "
                        + " · ".join("{" + ", ".join(g) + "}" for g in groups))
+        # iter52/P2.1-UI: дискретные оси — политика кампании «что умеет
+        # железо»; тут состояние показывается ЯВНО (в т.ч. «все непрерывны»),
+        # чтобы после загрузки было видно, действует сетка или нет.
+        st.caption(levels_caption(getattr(runner, "process_levels", {}) or {}))
         st.dataframe(project_settings_dataframe(runner),
                      use_container_width=True, hide_index=True)
         # iter41.3: паспорт кампании — phr-спека / метка / пары (read-only).
+
         st.caption("🪪 Паспорт кампании (CAMPAIGN_SPEC_PVC §3):")
         st.dataframe(campaign_passport_dataframe(runner),
                      use_container_width=True, hide_index=True)
@@ -2269,7 +2394,21 @@ def render_setup_form() -> None:
         proc_live = _parse_names(proc_txt)
         plo, phi = render_process_bounds(proc_live, key_prefix="setup")
 
+        # iter52/P2.1-UI: ДИСКРЕТНЫЕ уровни process-осей (что умеет железо).
+        # Ядро (iter51) снапит и план, и argmax на сетку — но задать её было
+        # нечем: план предлагал 673 об/мин, оператор ставил 900 (A0.6).
+        levels_txt = st.text_area(
+            "Дискретные уровни process-осей (опц.)", value="",
+            key="setup_process_levels",
+            help="Одна строка = одна ось: «имя: уровень, уровень…» в РЕАЛЬНЫХ "
+                 "единицах (например, «rotor_rpm: 400, 900» — две передачи "
+                 "экструдера). Ось без строки остаётся НЕПРЕРЫВНОЙ. И план, и "
+                 "рекомендованный оптимум будут выдаваться ТОЛЬКО в этих "
+                 "режимах — иначе лаборатория ставит ближайший достижимый, а "
+                 "модель учится на другом значении.")
+
         # iter41.2: паспорт кампании — записать ДО первого замера
+
         # (CAMPAIGN_SPEC_PVC §3: задним числом не восстанавливается).
         st.markdown("**🪪 Паспорт кампании (опц., CAMPAIGN_SPEC_PVC §3)**")
         st.caption("Заполните ДО первого замера: метаданные точек задним "
@@ -2334,7 +2473,12 @@ def render_setup_form() -> None:
                 if str(label_txt).strip():
                     runner.set_campaign_label(str(label_txt).strip())
                 runner.set_preflight_pairs(parse_preflight_pairs(pairs_txt))
+                # iter52/P2.1-UI: дискретные уровни — ПОСЛЕ сборки схемы
+                # (валидация имён/границ — штатным set_process_levels, A0.6).
+                levels_now = parse_process_levels(levels_txt)
+                runner.set_process_levels(levels_now)
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
+
                 for k in ("setup_seed_X", "setup_seed_Y",
                           "setup_seed_df", "setup_seed_df_sig"):
                     st.session_state.pop(k, None)
@@ -2343,8 +2487,11 @@ def render_setup_form() -> None:
                     + (f" phr-спека активна (hash "
                        f"{phr_spec_live.spec_hash()[:12]}…)."
                        if phr_spec_live is not None else "")
+                    + (f" {levels_caption(runner.process_levels)}"
+                       if levels_now else "")
                     + " База пуста — предложите и измерьте стартовый дизайн "
                       "ниже.")
+
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
 
@@ -2600,6 +2747,12 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # Iteration 28+: blocking должен быть ВИДЕН всегда — и когда включён
     # (размеры партий + цена блокировки), и когда выключен (как включить).
     st.caption(seed_blocking_caption(runner, Xs))
+    # iter52/P2.1-UI: пометка дискретных осей у ПЛАНА — иначе колонка
+    # «rotor_rpm» читается как непрерывная, а лаборатория ставит уровень.
+    _lv_txt = seed_levels_caption(runner, Xs)
+    if _lv_txt:
+        st.caption(_lv_txt)
+
     # iter32: preflight-диагностика предложенного плана (read-only, A0.6 —
     # НЕ блокирует commit). Кэш по сигнатуре дизайна: reference-пул и SVD
     # пересчитываются только при смене предложенных точек.

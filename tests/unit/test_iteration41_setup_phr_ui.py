@@ -267,8 +267,12 @@ class TestPassportDataframe:
         assert "PMPlus_8, DL_531" in pairs_val
 
     def test_empty_policy_shows_dashes(self):
+        # iter52/P2.1-UI: в паспорт добавлена строка «дискретные уровни
+        # process-осей» — осознанная смена контракта таблицы (сетка режимов
+        # такая же политика кампании, как метка и пары).
         df = ui.campaign_passport_dataframe(_plain_runner())
-        assert list(df["значение"]) == ["—", "—", "—"]
+        assert list(df["значение"]) == ["—", "—", "—", "—"]
+
 
 
 # ======================================================================

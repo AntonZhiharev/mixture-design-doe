@@ -43,6 +43,7 @@ from ..apps import campaign_state as cs
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 from ..design.blocking import blocking_diagnostics
 from ..design.levels import levels_caption
+from ..design.linked_axes import links_caption
 from ..design.phr_sampler import PhrSpec, premix_required
 
 
@@ -1194,6 +1195,123 @@ def seed_levels_caption(runner, Xs) -> str:
             "координатах из таблицы (A0.6 — не блокируем, но предупреждаем).")
 
 
+# ----------------------------------------------------------------------
+# P3.3 (UI_REVISION_SPEC) — связанные process-оси: чистые парсеры формы.
+# Здесь ловится только СИНТАКСИС строки; смысловая валидация (имена осей,
+# lo<hi, пересечение с достижимым диапазоном, ось не в двух связках,
+# конфликт с уровнями) — за штатным ``runner.set_process_links`` (A0.6).
+# ----------------------------------------------------------------------
+def parse_process_links(text: str) -> List[Dict[str, Any]]:
+    """P3.3: разобрать СВЯЗКИ process-осей из текста формы.
+
+    Формат: одна СТРОКА = одна связка, ``имя: осьA - осьB : lo, hi`` в
+    РЕАЛЬНЫХ единицах (``dT_head: T_adapter - T_plast : 10, 60``). Границу
+    можно открыть звёздочкой (``*, 60`` — только верхний предел). Пустые
+    строки игнорируются. Разность парсится по ОДНОМУ дефису — имена осей с
+    дефисом этим каналом не задать (явная ошибка с подсказкой).
+
+    Чистая (без Streamlit); round-trip с :func:`process_links_to_text`.
+    Возвращает список словарей для
+    :meth:`MixtureProcessRunner.set_process_links`.
+    """
+    out: List[Dict[str, Any]] = []
+    for ln, line in enumerate(str(text or "").splitlines(), start=1):
+        if not line.strip():
+            continue
+        parts = line.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                f"Строка {ln}: ожидается «имя: осьA - осьB : lo, hi» "
+                f"(два разделителя «:»): {line.strip()!r}.")
+        name = parts[0].strip()
+        if not name:
+            raise ValueError(f"Строка {ln}: пустое имя производной величины: "
+                             f"{line.strip()!r}.")
+        expr = parts[1]
+        sides = expr.split("-")
+        if len(sides) != 2 or not sides[0].strip() or not sides[1].strip():
+            raise ValueError(
+                f"Строка {ln}: разность «{expr.strip()}» должна иметь вид "
+                f"«осьA - осьB» (ровно один «-»; имена осей с дефисом этим "
+                f"каналом задать нельзя).")
+        a, b = sides[0].strip(), sides[1].strip()
+        toks = [t.strip() for t in parts[2].split(",")]
+        if len(toks) != 2:
+            raise ValueError(
+                f"Строка {ln}: полоса «{parts[2].strip()}» — два значения "
+                f"через запятую («lo, hi»; открытая сторона — «*»).")
+        bounds: List[Optional[float]] = []
+        for t in toks:
+            if t in ("*", ""):
+                bounds.append(None)
+                continue
+            try:
+                bounds.append(float(t))
+            except ValueError:
+                raise ValueError(
+                    f"Строка {ln}: граница {t!r} не число (и не «*»).")
+        out.append({"name": name, "minuend": a, "subtrahend": b,
+                    "lo": bounds[0], "hi": bounds[1]})
+    return out
+
+
+def process_links_to_text(links) -> str:
+    """P3.3: связки → текст формы (обратное к :func:`parse_process_links`).
+
+    Принимает и ``ProcessLink``, и словари сериализации; ``±inf``/``None``
+    пишется звёздочкой (открытая сторона полосы).
+    """
+    def _b(v) -> str:
+        if v is None:
+            return "*"
+        v = float(v)
+        return f"{v:g}" if np.isfinite(v) else "*"
+
+    lines = []
+    for lk in (links or []):
+        if isinstance(lk, dict):
+            nm, a, b = lk.get("name"), lk.get("minuend"), lk.get("subtrahend")
+            lo, hi = lk.get("lo"), lk.get("hi")
+        else:
+            nm, a, b, lo, hi = (lk.name, lk.minuend, lk.subtrahend,
+                                lk.lo, lk.hi)
+        lines.append(f"{nm}: {a} - {b} : {_b(lo)}, {_b(hi)}")
+    return "\n".join(lines)
+
+
+def seed_links_caption(runner, Xs) -> str:
+    """P3.3: подпись «план реализуем по связкам осей» (чистая).
+
+    Пусто (связок нет) → ПУСТАЯ строка (как :func:`seed_levels_caption` —
+    подпись у каждой таблицы была бы шумом; в паспорте состояние показано
+    явно). Иначе — перечень связок + проверка реализуемости самого плана
+    (:meth:`linked_axes_report`): точки вне полосы означают, что связки
+    задали ПОСЛЕ построения плана — сигнал пересчитать, а не блокировка
+    (A0.6).
+    """
+    links = list(getattr(runner, "process_links", []) or [])
+    if not links:
+        return ""
+    head = "🔗 " + links_caption(links)
+    X = np.atleast_2d(np.asarray(Xs, float))
+    if X.size == 0:
+        return head
+    try:
+        reports = runner.linked_axes_report(X)
+    except (ValueError, IndexError):
+        return head
+    if not reports:
+        return head          # обе оси связки вне текущей фазы
+    off = int(sum(r["n_off"] for r in reports))
+    if off == 0:
+        return (f"{head} Все {len(X)} точек плана реализуемы — разности "
+                "осей в полосе железа.")
+    return (f"{head} ⚠️ {off} наруш. полосы в плане: связки заданы после "
+            "построения плана. Предложите план заново, иначе оператор "
+            "поставит достижимый перепад, а модель будет учиться на "
+            "координатах из таблицы (A0.6 — не блокируем, но предупреждаем).")
+
+
 
 # ----------------------------------------------------------------------
 # iter41 (UI_REVISION_SPEC §41) — чистые хелперы phr-спеки и паспорта
@@ -2210,6 +2328,9 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
     # (что умеет железо), и точно так же обязана быть видна после загрузки.
     levels_val = process_levels_to_text(
         getattr(runner, "process_levels", {}) or {}).replace("\n", " ; ")
+    # P3.3: связанные оси — политика «что умеет железо», как уровни.
+    links_val = process_links_to_text(
+        getattr(runner, "process_links", []) or []).replace("\n", " ; ")
     # P2.3: group_order — READ-ONLY из активной спеки (единый источник —
     # PhrSpec, iter48/B4: порядок входит в spec_hash; отдельного поля в
     # раннере нет — дубль состояния разошёлся бы с отпечатком).
@@ -2235,6 +2356,8 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
         {"параметр": "обязательные 2D-пары", "значение": pairs_val or "—"},
         {"параметр": "дискретные уровни process-осей",
          "значение": levels_val or "—"},
+        {"параметр": "связанные process-оси (разности)",
+         "значение": links_val or "—"},
         {"параметр": "порядок групп (group_order)",
          "значение": (" → ".join(order) if order else "—")},
         {"параметр": "лоты сырья", "значение": lots_val or "—"},
@@ -2735,6 +2858,10 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
     # сборка проекта молча вернула бы непрерывные оси).
     out["setup_process_levels"] = process_levels_to_text(
         getattr(runner, "process_levels", {}) or {})
+    # P3.3: связки осей — политика кампании; без префилла повторная сборка
+    # проекта молча вернула бы независимые оси.
+    out["setup_process_links"] = process_links_to_text(
+        getattr(runner, "process_links", []) or [])
     # P3.1: объявленные ковариаты базы — тоже политика кампании: без
     # префилла повторная сборка проекта молча стёрла бы объявление.
     out["setup_covariates"] = covariate_names_to_text(
@@ -2826,6 +2953,8 @@ def render_project_settings(runner) -> None:
         # железо»; тут состояние показывается ЯВНО (в т.ч. «все непрерывны»),
         # чтобы после загрузки было видно, действует сетка или нет.
         st.caption(levels_caption(getattr(runner, "process_levels", {}) or {}))
+        # P3.3: связанные оси — то же правило видимости, что у уровней.
+        st.caption(links_caption(getattr(runner, "process_links", []) or []))
         st.dataframe(project_settings_dataframe(runner),
                      use_container_width=True, hide_index=True)
         # iter41.3: паспорт кампании — phr-спека / метка / пары (read-only).
@@ -2934,6 +3063,19 @@ def render_setup_form() -> None:
                  "рекомендованный оптимум будут выдаваться ТОЛЬКО в этих "
                  "режимах — иначе лаборатория ставит ближайший достижимый, а "
                  "модель учится на другом значении.")
+
+        # P3.3: связанные оси — производная величина = разность двух осей с
+        # полосой реализуемости по железу (dT_head = T_адаптер − T_пласт).
+        links_txt = st.text_area(
+            "Связанные process-оси (опц.)", value="",
+            key="setup_process_links",
+            help="Одна строка = одна связка: «имя: осьA - осьB : lo, hi» в "
+                 "РЕАЛЬНЫХ единицах (например, «dT_head: T_adapter - "
+                 "T_plast : 10, 60» — перепад в голове экструдера, который "
+                 "держит нагреватель). Открытая сторона — «*». И план, и "
+                 "оптимум будут выдаваться только с реализуемой разностью; "
+                 "ось не может одновременно быть в связке и на дискретных "
+                 "уровнях.")
 
         # iter41.2: паспорт кампании — записать ДО первого замера
 
@@ -3049,6 +3191,10 @@ def render_setup_form() -> None:
                 # (валидация имён/границ — штатным set_process_levels, A0.6).
                 levels_now = parse_process_levels(levels_txt)
                 runner.set_process_levels(levels_now)
+                # P3.3: связки — ПОСЛЕ уровней (сеттеры проверяют конфликт
+                # осей «уровни × связка» в обе стороны, A0.6).
+                links_now = parse_process_links(links_txt)
+                runner.set_process_links(links_now)
                 # P3.1: ковариаты базы — валидация имён (дубли, коллизии с
                 # откликами/осями) ШТАТНЫМ set_covariate_names (A0.6).
                 runner.set_covariate_names(parse_covariate_names(cov_txt))
@@ -3064,6 +3210,8 @@ def render_setup_form() -> None:
                        if phr_spec_live is not None else "")
                     + (f" {levels_caption(runner.process_levels)}"
                        if levels_now else "")
+                    + (f" {links_caption(runner.process_links)}"
+                       if links_now else "")
                     + " База пуста — предложите и измерьте стартовый дизайн "
                       "ниже.")
 
@@ -3340,6 +3488,10 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     _lv_txt = seed_levels_caption(runner, Xs)
     if _lv_txt:
         st.caption(_lv_txt)
+    # P3.3: реализуемость связок осей — та же логика, что у уровней.
+    _lk_txt = seed_links_caption(runner, Xs)
+    if _lk_txt:
+        st.caption(_lk_txt)
 
     # iter32: preflight-диагностика предложенного плана (read-only, A0.6 —
     # НЕ блокирует commit). Кэш по сигнатуре дизайна: reference-пул и SVD

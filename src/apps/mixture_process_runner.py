@@ -76,6 +76,8 @@ from ..design.preflight import (PreflightReport, PreflightThresholds,
 from ..design.phr_sampler import PhrSpec
 from ..design.levels import (levels_to_code, normalize_levels,
                              snap_matrix_to_levels)
+from ..design.linked_axes import (ProcessLink, normalize_links,
+                                  snap_pair_to_band)
 from ..design.branches import (Branch, branch_scores, propose_by_score,
                                allocate_budget,
                                ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
@@ -222,6 +224,13 @@ class MixtureProcessRunner:
         # ФИЗИЧЕСКИХ единицах (400/900 об/мин); в код [0,1] переводятся на
         # лету по границам ТЕКУЩЕЙ схемы. Пусто — все оси непрерывны.
         self.process_levels: Dict[str, List[float]] = {}
+        # P3.3 (UI_REVISION_SPEC): СВЯЗАННЫЕ process-оси — производная
+        # величина = РАЗНОСТЬ двух осей с полосой реализуемости по железу
+        # (dT_head = T_адаптер − T_пласт ∈ [lo, hi]). Политика раннера (как
+        # process_levels, НЕ frozen-схема): «что умеет железо» меняется без
+        # bump'а версии. Полоса — в ФИЗИЧЕСКИХ единицах. Пусто — оси
+        # независимы (прежнее поведение бит-в-бит).
+        self.process_links: List[ProcessLink] = []
         # P2.3 (UI_REVISION_SPEC): ПАСПОРТ КАМПАНИИ (CAMPAIGN_SPEC_PVC §3) —
         # лоты сырья по компонентам, anchor-рецепты (производственные, phr)
         # и разрешение весов лаборатории (шаг весов, г / загрузка, г на
@@ -1116,7 +1125,15 @@ class MixtureProcessRunner:
                                 seed=int(rng.integers(0, 2**31 - 1)))
             Z = sampler.random(int(n))
         lv = self._levels_code_current()
-        return snap_matrix_to_levels(Z, lv) if lv else Z
+        if lv:
+            Z = snap_matrix_to_levels(Z, lv)
+        # P3.3: связанные оси — проекция пар на полосу lo ≤ A−B ≤ hi ПОСЛЕ
+        # розыгрыша (та же логика, что у уровней: подмена розыгрыша сломала
+        # бы low-discrepancy покрытие остальных осей). Оси связок и оси
+        # уровней не пересекаются (валидация сеттеров) — порядок безразличен.
+        if self._links_current():
+            Z = self._snap_links_code(Z)
+        return Z
 
     # ------------------------------------------------------------------
     # iter31: функциональные группы компонентов (стратификация суммы ниши)
@@ -1537,6 +1554,18 @@ class MixtureProcessRunner:
             out[nm] = normalize_levels(
                 vals, lower=float(self._full_proc.lower[j]),
                 upper=float(self._full_proc.upper[j]), name=nm)
+        # P3.3: ось не может одновременно нести сетку уровней и участвовать
+        # в связке — последовательные проекции ломали бы друг друга, а
+        # «почти на уровне / почти в полосе» было бы тихой ложью (A0.6).
+        busy = {ax for lk in self.process_links
+                for ax in (lk.minuend, lk.subtrahend)}
+        conflict = sorted(set(out) & busy)
+        if conflict:
+            raise ValueError(
+                f"Оси {conflict} участвуют в связках (process_links) — "
+                f"дискретные уровни на них недопустимы: проекция на сетку и "
+                f"проекция на полосу разности несовместимы. Уберите ось из "
+                f"связки или из уровней.")
         self.process_levels = out
 
     def _levels_code_current(self) -> Dict[int, np.ndarray]:
@@ -1580,6 +1609,155 @@ class MixtureProcessRunner:
         X[:, self.q:self.q + self.d] = snap_matrix_to_levels(
             X[:, self.q:self.q + self.d], lv)
         return X
+
+    # ------------------------------------------------------------------
+    # P3.3 (UI_REVISION_SPEC): СВЯЗАННЫЕ process-оси — разность двух осей
+    # с полосой реализуемости по железу (dT_head = T_адаптер − T_пласт)
+    # ------------------------------------------------------------------
+    def set_process_links(self, links: Optional[Sequence[Any]]) -> None:
+        """P3.3: задать СВЯЗКИ process-осей (``None``/пусто — снять).
+
+        ``links`` — последовательность словарей ``{name, minuend, subtrahend,
+        lo, hi}`` (или :class:`ProcessLink`): производная величина
+        ``name = minuend − subtrahend`` обязана лежать в полосе ``[lo, hi]``
+        (ФИЗИЧЕСКИЕ единицы; ``None`` у границы — односторонняя связка).
+        Пример ПВХ: ``dT_head = T_адаптер − T_пласт ∈ [10, 60]``.
+
+        Связки — ПОЛИТИКА кампании (что умеет железо), как
+        :attr:`process_levels`: живут в раннере, версию схемы не трогают.
+        Валидация — против ПОЛНОГО process-блока (:func:`normalize_links`:
+        имена, lo<hi, непустое пересечение полосы с достижимым диапазоном,
+        ось не более чем в одной связке). В генерации кандидатов связки, у
+        которых хотя бы одна ось вне ТЕКУЩЕЙ фазы, выпадают (ось на
+        baseline не варьируется — проецировать нечего, как уровни/группы).
+        Ось связки не может нести дискретные уровни (см.
+        :meth:`set_process_levels`) — явная ошибка.
+        """
+        if not links:
+            self.process_links = []
+            return
+        if self._full_proc is None:
+            raise ValueError(
+                "Связанные оси требуют process-блок в схеме "
+                "(process-осей нет — связывать нечего).")
+        norm = normalize_links(
+            links, names=list(self._full_proc.names),
+            lower=[float(v) for v in self._full_proc.lower],
+            upper=[float(v) for v in self._full_proc.upper])
+        busy = {ax for lk in norm for ax in (lk.minuend, lk.subtrahend)}
+        conflict = sorted(busy & set(self.process_levels))
+        if conflict:
+            raise ValueError(
+                f"Оси {conflict} несут дискретные уровни (process_levels) — "
+                f"связка на них недопустима: проекция на сетку и проекция на "
+                f"полосу разности несовместимы. Уберите ось из уровней или "
+                f"из связки.")
+        self.process_links = norm
+
+    def _links_current(self) -> List[Dict[str, Any]]:
+        """Связки ТЕКУЩЕЙ фазы: индексы столбцов process-части + границы осей.
+
+        Связка активна, только если ОБЕ её оси есть в текущей схеме (иначе
+        отсутствующая ось держится на baseline и не варьируется — как оси
+        уровней вне фазы). Границы — из ТЕКУЩЕЙ схемы: в них живут кандидаты.
+        """
+        if not self.process_links or self.d == 0:
+            return []
+        pb = self.current_schema.process_block()
+        if pb is None:
+            return []
+        names = list(pb.names)
+        out: List[Dict[str, Any]] = []
+        for lk in self.process_links:
+            if lk.minuend in names and lk.subtrahend in names:
+                ja, jb = names.index(lk.minuend), names.index(lk.subtrahend)
+                out.append({
+                    "link": lk, "ja": ja, "jb": jb,
+                    "a_bounds": (float(pb.lower[ja]), float(pb.upper[ja])),
+                    "b_bounds": (float(pb.lower[jb]), float(pb.upper[jb]))})
+        return out
+
+    def _snap_links_code(self, Z: Any) -> np.ndarray:
+        """Проекция process-части В КОДЕ [0,1] на полосы связок (копия).
+
+        Код переводится в физические единицы по границам ТЕКУЩЕЙ схемы,
+        пара (a, b) проецируется :func:`snap_pair_to_band` (минимальный L2 в
+        ФИЗИЧЕСКИХ единицах — метрика в градусах осмысленна, в коде оси с
+        разным размахом весились бы по-разному) и возвращается в код.
+        Столбцы вне связок не трогаются; операция ИДЕМПОТЕНТНА.
+        """
+        Z = np.array(np.atleast_2d(np.asarray(Z, float)), copy=True)
+        for e in self._links_current():
+            lk = e["link"]
+            ja, jb = e["ja"], e["jb"]
+            aL, aU = e["a_bounds"]
+            bL, bU = e["b_bounds"]
+            sa = (aU - aL) if (aU - aL) > 1e-12 else 1.0
+            sb = (bU - bL) if (bU - bL) > 1e-12 else 1.0
+            a = aL + Z[:, ja] * sa
+            b = bL + Z[:, jb] * sb
+            a2, b2 = snap_pair_to_band(a, b, lk.lo, lk.hi,
+                                       (aL, aU), (bL, bU))
+            Z[:, ja] = (a2 - aL) / sa
+            Z[:, jb] = (b2 - bL) / sb
+        return Z
+
+    def snap_linked_axes(self, X: Any) -> np.ndarray:
+        """P3.3: спроецировать process-часть точек на полосы связок (копия).
+
+        Вход — ``n×dim`` (или один вектор) в координатах ТЕКУЩЕЙ схемы (как
+        :meth:`snap_process_axes`). Публичный метод: тем же снапом UI
+        показывает план, который РЕАЛЬНО реализуем на железе — «план требует
+        перепад 85°, нагреватель держит 60» и есть тихая потеря A0.6.
+        """
+        X = np.atleast_2d(np.asarray(X, float)).copy()
+        if not self._links_current() or X.size == 0:
+            return X
+        if X.shape[1] < self.q + self.d:
+            raise ValueError(
+                f"X: ожидалось ≥{self.q + self.d} координат на точку, "
+                f"дано {X.shape[1]}.")
+        X[:, self.q:self.q + self.d] = self._snap_links_code(
+            X[:, self.q:self.q + self.d])
+        return X
+
+    def linked_axes_report(self, X: Any) -> List[Dict[str, Any]]:
+        """P3.3: ПРОВЕРКА РЕАЛИЗУЕМОСТИ точек по связкам (read-only, A0.6).
+
+        Для каждой активной связки текущей фазы возвращает словарь:
+        ``name`` / ``minuend`` / ``subtrahend`` / ``lo`` / ``hi`` /
+        ``values`` (разность в ФИЗИЧЕСКИХ единицах по точкам) / ``ok``
+        (пер-точечная реализуемость) / ``n_off`` (сколько точек вне полосы).
+        Ничего не меняет и не блокирует — сигнал пользователю/UI (например,
+        уровни/связки задали ПОСЛЕ построения плана).
+        """
+        X = np.atleast_2d(np.asarray(X, float))
+        out: List[Dict[str, Any]] = []
+        cur = self._links_current()
+        if not cur:
+            return out
+        if X.size and X.shape[1] < self.q + self.d:
+            raise ValueError(
+                f"X: ожидалось ≥{self.q + self.d} координат на точку, "
+                f"дано {X.shape[1]}.")
+        for e in cur:
+            lk = e["link"]
+            aL, aU = e["a_bounds"]
+            bL, bU = e["b_bounds"]
+            sa = (aU - aL) if (aU - aL) > 1e-12 else 1.0
+            sb = (bU - bL) if (bU - bL) > 1e-12 else 1.0
+            a = aL + X[:, self.q + e["ja"]] * sa
+            b = bL + X[:, self.q + e["jb"]] * sb
+            d = a - b
+            ok = (d >= lk.lo - 1e-9) & (d <= lk.hi + 1e-9)
+            out.append({
+                "name": lk.name, "minuend": lk.minuend,
+                "subtrahend": lk.subtrahend,
+                "lo": float(lk.lo), "hi": float(lk.hi),
+                "values": [float(v) for v in d],
+                "ok": [bool(v) for v in ok],
+                "n_off": int(np.count_nonzero(~ok))})
+        return out
 
     def set_branch_sampling_groups(self, branch_id: str,
                                    groups: Optional[Sequence[Sequence[str]]]
@@ -2250,6 +2428,11 @@ class MixtureProcessRunner:
             lv = self._levels_code_current()
             if lv:
                 kw["process_levels"] = lv
+            # P3.3: argmax ищет ТОЛЬКО среди реализуемых пар связанных осей.
+            # Без проекции оптимизатор мог бы вернуть перепад, который
+            # нагреватель физически не держит — «оптимум» был бы недостижим.
+            if self._links_current():
+                kw["process_project"] = self._snap_links_code
         # §15.6 §3: argmax по desirability+цена (цена = price_состав·ρ̂ из суррогата)
         cost_fn, cost_name, cost_spec = self._branch_cost_fn(branch_id)
         if cost_fn is not None:

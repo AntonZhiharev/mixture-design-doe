@@ -273,8 +273,9 @@ class TestPassportDataframe:
         # P2.3: паспорт расширен строками group_order / лоты / anchor'ы /
         # разрешение весов — осознанная смена контракта таблицы (8 строк).
         # P3.1 (iter55): + строка «ковариаты базы (телеметрия)» — 9 строк.
+        # P3.3 (iter57): + строка «связанные process-оси (разности)» — 10.
         df = ui.campaign_passport_dataframe(_plain_runner())
-        assert list(df["значение"]) == ["—"] * 9
+        assert list(df["значение"]) == ["—"] * 10
 
 
 

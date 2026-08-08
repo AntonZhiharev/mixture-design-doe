@@ -382,6 +382,7 @@ def optimize_desirability(region: SimplexRegion,
                           process_upper: Optional[Sequence[float]] = None,
                           process_fixed: Optional[Mapping[int, float]] = None,
                           process_levels: Optional[Mapping[int, Sequence[float]]] = None,
+                          process_project: Optional[Callable[[np.ndarray], np.ndarray]] = None,
                           phr_spec=None,
                           chance_constraints: Optional[Mapping[str, ChanceConstraint]] = None,
                           sigma_predictors: Optional[Mapping[str, Predictor]] = None
@@ -416,6 +417,16 @@ def optimize_desirability(region: SimplexRegion,
                   (дефолт) — прежнее поведение бит-в-бит: ни поток ГСЧ, ни
                   число проб не меняются (снап — чистая проекция ПОСЛЕ
                   розыгрыша).
+    process_project : P3.3 (UI_REVISION_SPEC) — необязательная ПРОЕКЦИЯ
+                  process-части В КОДЕ: ``callable(Z: n×d) -> n×d``,
+                  применяется к глобальному пулу (после снапа уровней) и к
+                  каждой refine-пробе (после clip/снапа). Канонический
+                  случай — связанные оси (``dT_head = A − B ∈ [lo, hi]``,
+                  ``runner._snap_links_code``): argmax обязан искать только
+                  среди РЕАЛИЗУЕМЫХ пар осей (A0.6). Требования к проекции:
+                  идемпотентность и «не трогать оси вне своей
+                  ответственности» (в т.ч. закрытые ``process_fixed``).
+                  ``None`` (дефолт) — прежнее поведение бит-в-бит.
     phr_spec    : опциональная phr/DAG-спека (``design.phr_sampler.PhrSpec``,
                   duck-typed; iter38, B1). ``None`` (дефолт) — прежний путь
                   бит-в-бит. Задана ⇒ оптимизация уважает phr-геометрию
@@ -518,6 +529,10 @@ def optimize_desirability(region: SimplexRegion,
                 Z[:, j] = fixed[j]
             else:
                 Z[:, j] = _snap_axis(j, rng_proc.uniform(plo[j], phi[j], size=m))
+        # P3.3: проекция связок ПОСЛЕ розыгрыша/снапа уровней — пул содержит
+        # только реализуемые пары осей.
+        if process_project is not None:
+            Z = np.asarray(process_project(Z), float)
         return np.hstack([Xmix, Z])
 
     # ---- global stage: score a feasible candidate set ----------------
@@ -618,6 +633,11 @@ def optimize_desirability(region: SimplexRegion,
                     z_try[j] = float(_snap_axis(j, np.asarray(
                         np.clip(z_cur[j] + step[mix_dim + k], plo[j], phi[j]),
                         float)))
+                # P3.3: refine-проба тоже проецируется на полосы связок —
+                # иначе локальный шаг вывел бы x* из реализуемой области.
+                if process_project is not None:
+                    z_try = np.asarray(
+                        process_project(z_try.reshape(1, -1)), float).ravel()
                 x_try = np.concatenate([x_mix_try, z_try])
             else:
                 x_try = x_mix_try

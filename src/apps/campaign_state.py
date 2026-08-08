@@ -34,6 +34,7 @@ import numpy as np
 from ..core.schema import DataPoint, ProjectSchema
 from ..core.schema_evolution import SchemaHistory
 from ..design.branches import Branch
+from ..design.linked_axes import ProcessLink
 from ..design.phr_sampler import PhrSpec
 from ..optimize.desirability import ChanceConstraint, DesirabilitySpec
 from .mixture_process_runner import MixtureProcessRunner
@@ -138,6 +139,20 @@ def _chance_from_dict(d: Dict[str, Any]) -> ChanceConstraint:
         alpha=float(d.get("alpha", 0.05)))
 
 
+def _link_to_dict(lk: ProcessLink) -> Dict[str, Any]:
+    """P3.3: ``ProcessLink`` → JSON-safe словарь (``±inf`` → ``null``).
+
+    Тот же приём, что у :func:`_chance_to_dict`: литерал ``Infinity`` сделал
+    бы файл невалидным JSON для внешних читателей.
+    """
+    return {
+        "name": str(lk.name), "minuend": str(lk.minuend),
+        "subtrahend": str(lk.subtrahend),
+        "lo": (float(lk.lo) if np.isfinite(lk.lo) else None),
+        "hi": (float(lk.hi) if np.isfinite(lk.hi) else None),
+    }
+
+
 def _region_move_to_dict(mv: Dict[str, Any]) -> Dict[str, Any]:
     """JSON-safe копия записи журнала движений области (deltas-кортежи → списки)."""
 
@@ -224,6 +239,11 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             # кампания молча начала бы предлагать недостижимые режимы (A0.6).
             "process_levels": {str(k): [float(v) for v in vals] for k, vals in
                                (getattr(runner, "process_levels", {}) or {}).items()},
+            # P3.3: связанные process-оси (dT_head = A − B ∈ [lo, hi]).
+            # Без сериализации save/load молча вернул бы независимые оси, и
+            # кампания предлагала бы нереализуемые перепады (A0.6).
+            "process_links": [_link_to_dict(lk) for lk in
+                              (getattr(runner, "process_links", []) or [])],
             "preflight_pairs": [[list(a), list(b)] for a, b in
                                 (getattr(runner, "preflight_pairs", []) or [])],
             # P2.3: паспорт кампании (CAMPAIGN_SPEC_PVC §3) — лоты сырья,
@@ -344,6 +364,11 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     levels = r.get("process_levels", {}) or {}
     if levels:
         runner.set_process_levels(levels)
+    # P3.3: связки — ШТАТНЫМ сеттером (валидация имён/полосы/конфликтов);
+    # старый сейв без ключа → оси независимы, как и были.
+    links = r.get("process_links", []) or []
+    if links:
+        runner.set_process_links(links)
     # P2.3: паспорт кампании — ШТАТНЫМИ сеттерами (валидация имён/значений);
     # старый сейв без ключей → паспорт пуст (лоты/anchor'ы/весы не заданы).
     lots = r.get("material_lots", {}) or {}

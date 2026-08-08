@@ -222,6 +222,18 @@ class MixtureProcessRunner:
         # ФИЗИЧЕСКИХ единицах (400/900 об/мин); в код [0,1] переводятся на
         # лету по границам ТЕКУЩЕЙ схемы. Пусто — все оси непрерывны.
         self.process_levels: Dict[str, List[float]] = {}
+        # P2.3 (UI_REVISION_SPEC): ПАСПОРТ КАМПАНИИ (CAMPAIGN_SPEC_PVC §3) —
+        # лоты сырья по компонентам, anchor-рецепты (производственные, phr)
+        # и разрешение весов лаборатории (шаг весов, г / загрузка, г на
+        # 1 phr). Политика раннера (как campaign_label): записывается ДО
+        # первого замера и задним числом не восстанавливается; влияет на
+        # интерпретацию данных (какая партия сырья стояла за точкой), а не
+        # на геометрию — потому НЕ frozen-схема. 0.0 у весов = «не задано»
+        # (слой навески в UI берёт свои поля как раньше).
+        self.material_lots: Dict[str, str] = {}
+        self.anchor_recipes: Dict[str, Dict[str, float]] = {}
+        self.weighing_step_g: float = 0.0
+        self.grams_per_phr: float = 0.0
 
 
     # ------------------------------------------------------------------
@@ -1187,6 +1199,119 @@ class MixtureProcessRunner:
                         f"схемы {sorted(known)}.")
             norm.append((ax, bx))
         self.preflight_pairs = norm
+
+    # ------------------------------------------------------------------
+    # P2.3 (UI_REVISION_SPEC): ПАСПОРТ КАМПАНИИ — лоты сырья,
+    # anchor-рецепты, разрешение весов (CAMPAIGN_SPEC_PVC §3)
+    # ------------------------------------------------------------------
+    def set_material_lots(self, lots: Optional[Mapping[str, str]]) -> None:
+        """P2.3: задать ЛОТЫ (партии) сырья по компонентам кампании.
+
+        ``lots`` — ``{имя компонента: обозначение лота}``. Записывается ДО
+        первого замера (CAMPAIGN_SPEC_PVC §3): постфактум не восстановить,
+        какая партия сырья стояла за точкой, и лотовый дрейф припишется
+        составу. Имена валидируются против ПОЛНОГО mixture-блока (лот можно
+        записать до раскрытия компонента append'ом — как preflight-пары);
+        пустое обозначение лота — явная ошибка, а не тихое «без лота»
+        (A0.6: пустая строка выглядела бы заполненным полем). ``None``/пусто
+        — очистить.
+        """
+        if not lots:
+            self.material_lots = {}
+            return
+        known = set(self._full_mix.names if self._full_mix is not None else [])
+        out: Dict[str, str] = {}
+        for nm, lot in lots.items():
+            nm = str(nm)
+            if nm not in known:
+                raise KeyError(
+                    f"Компонент '{nm}' лота не найден среди "
+                    f"mixture-компонентов полной схемы {sorted(known)}.")
+            lot_s = str(lot or "").strip()
+            if not lot_s:
+                raise ValueError(
+                    f"Пустое обозначение лота у компонента '{nm}': либо "
+                    f"укажите лот, либо уберите строку (тихое «без лота» "
+                    f"недопустимо, A0.6).")
+            out[nm] = lot_s
+        self.material_lots = out
+
+    def set_anchor_recipes(self,
+                           recipes: Optional[Mapping[str, Mapping[str, float]]]
+                           ) -> None:
+        """P2.3: задать ANCHOR-РЕЦЕПТЫ кампании (производственные, в phr).
+
+        ``recipes`` — ``{имя рецепта: {компонент: phr}}``. Anchor — реперная
+        точка кампании (CAMPAIGN_SPEC_PVC §3): против неё сверяются
+        round-trip спеки и дрейф между фазами. Компоненты валидируются
+        против ПОЛНОГО mixture-блока; значения — конечные числа ≥ 0
+        (anchor может содержать ПОДмножество компонентов — отсутствующие
+        читаются как «не входит», это не то же, что 0.0 в явном виде).
+        Пустой рецепт / пустое имя — явные ошибки. ``None``/пусто — очистить.
+        """
+        if not recipes:
+            self.anchor_recipes = {}
+            return
+        known = set(self._full_mix.names if self._full_mix is not None else [])
+        out: Dict[str, Dict[str, float]] = {}
+        for rname, rec in recipes.items():
+            rname = str(rname).strip()
+            if not rname:
+                raise ValueError("Пустое имя anchor-рецепта недопустимо.")
+            if rname in out:
+                raise ValueError(f"Anchor-рецепт '{rname}' задан дважды.")
+            if not rec:
+                raise ValueError(
+                    f"Anchor-рецепт '{rname}' пуст: укажите хотя бы один "
+                    f"компонент с дозой в phr.")
+            row: Dict[str, float] = {}
+            for nm, val in rec.items():
+                nm = str(nm)
+                if nm not in known:
+                    raise KeyError(
+                        f"Компонент '{nm}' anchor-рецепта '{rname}' не найден "
+                        f"среди mixture-компонентов полной схемы "
+                        f"{sorted(known)}.")
+                try:
+                    fv = float(val)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"Доза '{nm}' в anchor-рецепте '{rname}' не число: "
+                        f"{val!r}.")
+                if not np.isfinite(fv) or fv < 0:
+                    raise ValueError(
+                        f"Доза '{nm}' в anchor-рецепте '{rname}' должна быть "
+                        f"конечной и ≥ 0 phr, дано {val!r}.")
+                row[nm] = fv
+            out[rname] = row
+        self.anchor_recipes = out
+
+    def set_weighing_resolution(self, step_g: float,
+                                grams_per_phr: float) -> None:
+        """P2.3: задать РАЗРЕШЕНИЕ ВЕСОВ кампании (шаг весов, г / г на 1 phr).
+
+        Дефолт слоя навески (iter42): ``δ_phr = step_g / grams_per_phr``.
+        Оба значения > 0 — слой задан; оба = 0 — «не задано» (слой навески в
+        UI работает своими полями, как раньше). ОДНО из двух нулевое — явная
+        ошибка: δ при этом не определим, и молча считать слой «выключенным»
+        значило бы потерять половину введённого паспорта (A0.6). Значения —
+        параметры ЛАБОРАТОРИИ (весы и загрузка смесителя), не геометрии:
+        спеку/хеш они не трогают.
+        """
+        step = float(step_g)
+        gpp = float(grams_per_phr)
+        if not (np.isfinite(step) and np.isfinite(gpp)):
+            raise ValueError("Шаг весов и «г на 1 phr» должны быть конечными.")
+        if step < 0 or gpp < 0:
+            raise ValueError("Шаг весов и «г на 1 phr» не могут быть "
+                             "отрицательными.")
+        if (step > 0) != (gpp > 0):
+            raise ValueError(
+                "Разрешение весов задаётся ПАРОЙ: шаг весов (г) И «г на 1 "
+                "phr» — одно без другого δ не определяет. Заполните оба "
+                "поля или обнулите оба (паспорт без слоя навески).")
+        self.weighing_step_g = step
+        self.grams_per_phr = gpp
 
     # ------------------------------------------------------------------
     # P2.1 (UI_REVISION_SPEC): ДИСКРЕТНЫЕ УРОВНИ process-осей

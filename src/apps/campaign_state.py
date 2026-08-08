@@ -226,6 +226,17 @@ def runner_to_state(runner: MixtureProcessRunner, *,
                                (getattr(runner, "process_levels", {}) or {}).items()},
             "preflight_pairs": [[list(a), list(b)] for a, b in
                                 (getattr(runner, "preflight_pairs", []) or [])],
+            # P2.3: паспорт кампании (CAMPAIGN_SPEC_PVC §3) — лоты сырья,
+            # anchor-рецепты (phr), разрешение весов. Записывается ДО первого
+            # замера; без сериализации save/load молча терял бы паспорт (A0.6).
+            "material_lots": {str(k): str(v) for k, v in
+                              (getattr(runner, "material_lots", {}) or {}).items()},
+            "anchor_recipes": {str(rn): {str(c): float(v)
+                                         for c, v in (rec or {}).items()}
+                               for rn, rec in
+                               (getattr(runner, "anchor_recipes", {}) or {}).items()},
+            "weighing_step_g": float(getattr(runner, "weighing_step_g", 0.0) or 0.0),
+            "grams_per_phr": float(getattr(runner, "grams_per_phr", 0.0) or 0.0),
             "region_moves": [_region_move_to_dict(m)
                              for m in getattr(runner, "_region_moves", []) or []],
             "drop_policy": str(getattr(runner, "_drop_policy", "exclude")),
@@ -327,6 +338,18 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     levels = r.get("process_levels", {}) or {}
     if levels:
         runner.set_process_levels(levels)
+    # P2.3: паспорт кампании — ШТАТНЫМИ сеттерами (валидация имён/значений);
+    # старый сейв без ключей → паспорт пуст (лоты/anchor'ы/весы не заданы).
+    lots = r.get("material_lots", {}) or {}
+    if lots:
+        runner.set_material_lots(lots)
+    anchors = r.get("anchor_recipes", {}) or {}
+    if anchors:
+        runner.set_anchor_recipes(anchors)
+    step_g = float(r.get("weighing_step_g", 0.0) or 0.0)
+    gpp = float(r.get("grams_per_phr", 0.0) or 0.0)
+    if step_g > 0 or gpp > 0:
+        runner.set_weighing_resolution(step_g, gpp)
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))
 

@@ -1769,6 +1769,106 @@ def preflight_pairs_to_text(pairs) -> str:
                      for a, b in (pairs or []))
 
 
+def parse_material_lots(text: str) -> Dict[str, str]:
+    """P2.3: разобрать ЛОТЫ СЫРЬЯ из текста формы (паспорт кампании).
+
+    Формат: одна СТРОКА = один компонент, «компонент: лот» (первое «:» —
+    разделитель, лот может содержать пробелы/дефисы). Пустые строки
+    игнорируются. Здесь ловится только СИНТАКСИС (с номером строки);
+    валидацию имён против схемы делает штатный ``set_material_lots``
+    (канон iter52: второй набор правил в UI разошёлся бы с ядром, A0.6).
+    Чистая (без Streamlit) — round-trip с :func:`material_lots_to_text`.
+    """
+    out: Dict[str, str] = {}
+    for ln, line in enumerate(str(text or "").splitlines(), start=1):
+        if not line.strip():
+            continue
+        if ":" not in line:
+            raise ValueError(
+                f"Строка {ln}: ожидается «компонент: лот» (разделитель "
+                f"«:»): {line.strip()!r}.")
+        nm, lot = line.split(":", 1)
+        nm, lot = nm.strip(), lot.strip()
+        if not nm or not lot:
+            raise ValueError(
+                f"Строка {ln}: пустое имя компонента или лота: "
+                f"{line.strip()!r}.")
+        if nm in out:
+            raise ValueError(
+                f"Строка {ln}: компонент '{nm}' указан дважды — лот "
+                f"компонента должен быть один.")
+        out[nm] = lot
+    return out
+
+
+def material_lots_to_text(lots) -> str:
+    """P2.3: лоты → текст формы (обратное к :func:`parse_material_lots`)."""
+    return "\n".join(f"{nm}: {lot}" for nm, lot in (lots or {}).items())
+
+
+def parse_anchor_recipes(text: str) -> Dict[str, Dict[str, float]]:
+    """P2.3: разобрать ANCHOR-РЕЦЕПТЫ (phr) из текста формы.
+
+    Формат: одна СТРОКА = один рецепт — «имя: комп=phr, комп=phr, …»
+    (как референсный anchor CAMPAIGN_SPEC_PVC §3: ``anchor_main:
+    PVC_67=70, PVC_71=30, DINP=10``). Первое «:» отделяет имя; пары —
+    через запятую, значение — числом после «=». Здесь только СИНТАКСИС
+    (номер строки в ошибке); имена компонентов и диапазоны значений
+    проверяет штатный ``set_anchor_recipes``. Чистая (без Streamlit) —
+    round-trip с :func:`anchor_recipes_to_text`.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    for ln, line in enumerate(str(text or "").splitlines(), start=1):
+        if not line.strip():
+            continue
+        if ":" not in line:
+            raise ValueError(
+                f"Строка {ln}: ожидается «имя: комп=phr, комп=phr…» "
+                f"(разделитель «:»): {line.strip()!r}.")
+        rname, rest = line.split(":", 1)
+        rname = rname.strip()
+        if not rname:
+            raise ValueError(f"Строка {ln}: пустое имя anchor-рецепта.")
+        if rname in out:
+            raise ValueError(
+                f"Строка {ln}: anchor-рецепт '{rname}' указан дважды.")
+        rec: Dict[str, float] = {}
+        for tok in rest.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if "=" not in tok:
+                raise ValueError(
+                    f"Строка {ln}: ожидается «комп=phr», дано {tok!r}.")
+            comp, val = tok.split("=", 1)
+            comp = comp.strip()
+            if not comp:
+                raise ValueError(
+                    f"Строка {ln}: пустое имя компонента в {tok!r}.")
+            if comp in rec:
+                raise ValueError(
+                    f"Строка {ln}: компонент '{comp}' в рецепте "
+                    f"'{rname}' указан дважды.")
+            try:
+                rec[comp] = float(val)
+            except ValueError:
+                raise ValueError(
+                    f"Строка {ln}: доза '{comp}' не число: {val.strip()!r}.")
+        if not rec:
+            raise ValueError(
+                f"Строка {ln}: anchor-рецепт '{rname}' пуст — укажите "
+                f"хотя бы один «комп=phr».")
+        out[rname] = rec
+    return out
+
+
+def anchor_recipes_to_text(recipes) -> str:
+    """P2.3: anchor-рецепты → текст (обратное к :func:`parse_anchor_recipes`)."""
+    return "\n".join(
+        f"{rn}: " + ", ".join(f"{c}={float(v):g}" for c, v in rec.items())
+        for rn, rec in (recipes or {}).items())
+
+
 def setup_mixture_names(field_names: Sequence[str],
                         spec: Optional[PhrSpec]) -> List[str]:
     """iter41.1: имена компонентов при сборке проекта.
@@ -1783,10 +1883,11 @@ def setup_mixture_names(field_names: Sequence[str],
 
 
 def campaign_passport_dataframe(runner) -> pd.DataFrame:
-    """iter41.3 (+iter52/P2.1-UI): паспорт кампании — phr-спека (q, dim_z,
-    hash-префикс 12 симв.), метка, обязательные 2D-пары, ДИСКРЕТНЫЕ уровни
-    process-осей. «—» = политика не задана (видимость по A0.6, ничего не
-    скрываем). Чистая (без Streamlit)."""
+    """iter41.3 (+iter52/P2.1-UI, +P2.3): паспорт кампании — phr-спека (q,
+    dim_z, hash-префикс 12 симв.), метка, обязательные 2D-пары, ДИСКРЕТНЫЕ
+    уровни process-осей, ПОРЯДОК ГРУПП спеки, лоты сырья, anchor-рецепты и
+    разрешение весов. «—» = политика не задана (видимость по A0.6, ничего
+    не скрываем). Чистая (без Streamlit)."""
     spec = getattr(runner, "phr_spec", None)
     if spec is not None:
         spec_val = (f"q={spec.q}, dim_z={spec.dim_z}, "
@@ -1800,12 +1901,32 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
     # (что умеет железо), и точно так же обязана быть видна после загрузки.
     levels_val = process_levels_to_text(
         getattr(runner, "process_levels", {}) or {}).replace("\n", " ; ")
+    # P2.3: group_order — READ-ONLY из активной спеки (единый источник —
+    # PhrSpec, iter48/B4: порядок входит в spec_hash; отдельного поля в
+    # раннере нет — дубль состояния разошёлся бы с отпечатком).
+    order = list(getattr(spec, "group_order", []) or []) if spec else []
+    # P2.3: лоты сырья / anchor-рецепты / разрешение весов (CAMPAIGN_SPEC_PVC
+    # §3: «записать ДО первого замера»).
+    lots_val = material_lots_to_text(
+        getattr(runner, "material_lots", {}) or {}).replace("\n", " ; ")
+    anchors = getattr(runner, "anchor_recipes", {}) or {}
+    anchors_val = " ; ".join(f"{rn} ({len(rec)} комп.)"
+                             for rn, rec in anchors.items())
+    step_g = float(getattr(runner, "weighing_step_g", 0.0) or 0.0)
+    gpp = float(getattr(runner, "grams_per_phr", 0.0) or 0.0)
+    weigh_val = (f"шаг {step_g:g} г · {gpp:g} г/phr · "
+                 f"δ = {step_g / gpp:g} phr" if step_g > 0 and gpp > 0 else "")
     return pd.DataFrame([
         {"параметр": "phr-спека (decode-слой)", "значение": spec_val},
         {"параметр": "метка кампании", "значение": label or "—"},
         {"параметр": "обязательные 2D-пары", "значение": pairs_val or "—"},
         {"параметр": "дискретные уровни process-осей",
          "значение": levels_val or "—"},
+        {"параметр": "порядок групп (group_order)",
+         "значение": (" → ".join(order) if order else "—")},
+        {"параметр": "лоты сырья", "значение": lots_val or "—"},
+        {"параметр": "anchor-рецепты (phr)", "значение": anchors_val or "—"},
+        {"параметр": "разрешение весов (δ)", "значение": weigh_val or "—"},
     ])
 
 
@@ -2226,6 +2347,16 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
         getattr(runner, "campaign_label", "") or "")
     out["setup_preflight_pairs"] = preflight_pairs_to_text(
         getattr(runner, "preflight_pairs", []) or [])
+    # P2.3: паспорт кампании — лоты/anchor'ы/весы обязаны отражаться в форме
+    # после загрузки (иначе повторная сборка проекта молча стёрла бы паспорт).
+    out["setup_material_lots"] = material_lots_to_text(
+        getattr(runner, "material_lots", {}) or {})
+    out["setup_anchor_recipes"] = anchor_recipes_to_text(
+        getattr(runner, "anchor_recipes", {}) or {})
+    out["setup_pass_weigh_step"] = float(
+        getattr(runner, "weighing_step_g", 0.0) or 0.0)
+    out["setup_pass_weigh_gpp"] = float(
+        getattr(runner, "grams_per_phr", 0.0) or 0.0)
     # iter52/P2.1-UI: дискретные уровни process-осей — политика кампании,
     # которую после загрузки обязана показывать и ФОРМА (иначе повторная
     # сборка проекта молча вернула бы непрерывные оси).
@@ -2433,6 +2564,33 @@ def render_setup_form() -> None:
                  "через «|», ось-сумма — имена через запятую. Например:\n"
                  "UV_CSFCP | TiO2_BLR895\n"
                  "T | PMPlus_8, DL_531")
+        # P2.3: лоты сырья, anchor-рецепты и разрешение весов — часть
+        # паспорта (CAMPAIGN_SPEC_PVC §3: записать ДО первого замера).
+        lots_txt = st.text_area(
+            "Лоты сырья (опц.)", value="", key="setup_material_lots",
+            help="Партия (лот) сырья каждого компонента: одна строка = "
+                 "«компонент: лот» (например, «TiO2_BLR895: L-2408-17»). "
+                 "Постфактум не восстановить, какая партия стояла за точкой "
+                 "— лотовый дрейф припишется составу.")
+        anchors_txt = st.text_area(
+            "Anchor-рецепты, phr (опц.)", value="",
+            key="setup_anchor_recipes",
+            help="Реперные производственные рецепты в phr: одна строка = "
+                 "«имя: комп=phr, комп=phr, …» (например, «anchor_main: "
+                 "PVC_67=70, PVC_71=30, DINP=10»). Против anchor'а сверяется "
+                 "round-trip спеки и дрейф между фазами.")
+        pwc = st.columns(2)
+        pass_step = pwc[0].number_input(
+            "Шаг весов, г (паспорт)", min_value=0.0, value=0.0, step=0.01,
+            format="%.4f", key="setup_pass_weigh_step",
+            help="Дискретность лабораторных весов — дефолт слоя навески "
+                 "(iter42). 0 у ОБОИХ полей = не задано; заполнено ОДНО из "
+                 "двух — явная ошибка (δ не определим).")
+        pass_gpp = pwc[1].number_input(
+            "г на 1 phr (паспорт)", min_value=0.0, value=0.0, step=0.5,
+            format="%.4f", key="setup_pass_weigh_gpp",
+            help="Загрузка смесителя: сколько граммов приходится на 1 phr. "
+                 "Вместе с шагом весов даёт δ_phr = шаг / (г на 1 phr).")
 
         seed_v = st.number_input(
 
@@ -2482,6 +2640,12 @@ def render_setup_form() -> None:
                 if str(label_txt).strip():
                     runner.set_campaign_label(str(label_txt).strip())
                 runner.set_preflight_pairs(parse_preflight_pairs(pairs_txt))
+                # P2.3: паспорт — лоты/anchor'ы/весы. Синтаксис ловят чистые
+                # парсеры (номер строки), имена валидируют ШТАТНЫЕ сеттеры.
+                runner.set_material_lots(parse_material_lots(lots_txt))
+                runner.set_anchor_recipes(parse_anchor_recipes(anchors_txt))
+                runner.set_weighing_resolution(float(pass_step),
+                                               float(pass_gpp))
                 # iter52/P2.1-UI: дискретные уровни — ПОСЛЕ сборки схемы
                 # (валидация имён/границ — штатным set_process_levels, A0.6).
                 levels_now = parse_process_levels(levels_txt)
@@ -2625,16 +2789,23 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                 "фиксируются как ACTUAL — модель должна видеть actual, а не "
                 "nominal. Задайте параметры лаборатории:")
             wc = st.columns(2)
+            # P2.3: дефолты слоя навески — из ПАСПОРТА кампании (если задан):
+            # разрешение весов записывается при сетапе и переживает load, а
+            # прежние 0.1/5.0 остаются фолбэком для кампаний без паспорта.
             step_g = wc[0].number_input(
-                "Шаг весов, г", min_value=0.0, value=0.1, step=0.01,
-                format="%.4f", key="setup_weigh_step",
+                "Шаг весов, г", min_value=0.0,
+                value=float(getattr(runner, "weighing_step_g", 0.0) or 0.1),
+                step=0.01, format="%.4f", key="setup_weigh_step",
                 help="Дискретность лабораторных весов. 0 — слой навески "
-                     "выключен (план фиксируется как nominal).")
+                     "выключен (план фиксируется как nominal). Дефолт — из "
+                     "паспорта кампании (P2.3), если он задан.")
             gpp = wc[1].number_input(
-                "г на 1 phr (загрузка)", min_value=0.0, value=5.0, step=0.5,
-                format="%.4f", key="setup_weigh_gpp",
+                "г на 1 phr (загрузка)", min_value=0.0,
+                value=float(getattr(runner, "grams_per_phr", 0.0) or 5.0),
+                step=0.5, format="%.4f", key="setup_weigh_gpp",
                 help="Сколько граммов приходится на 1 phr при этой загрузке "
-                     "смесителя: δ_phr = шаг весов / (г на 1 phr).")
+                     "смесителя: δ_phr = шаг весов / (г на 1 phr). Дефолт — "
+                     "из паспорта кампании (P2.3), если он задан.")
             if float(step_g) > 0 and float(gpp) > 0:
                 try:
                     delta_phr = weighing_delta_phr(step_g, gpp)

@@ -10,3 +10,7 @@ reportlab>=4.0.0
 kaleido>=0.2.1
 Pillow>=9.0.0
 python-docx>=1.1.0
+# Вложения ассистента: паспорта сырья (TDS) приходят PDF-ом (ASSISTANT_SPEC iter59).
+pypdf>=4.0.0
+
+

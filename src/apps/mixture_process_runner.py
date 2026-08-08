@@ -234,6 +234,16 @@ class MixtureProcessRunner:
         self.anchor_recipes: Dict[str, Dict[str, float]] = {}
         self.weighing_step_g: float = 0.0
         self.grams_per_phr: float = 0.0
+        # P3.1 (UI_REVISION_SPEC): КОВАРИАТЫ БАЗЫ — телеметрия прогона,
+        # записываемая ПРИ ТОЧКЕ (M(t)/SME, Die_Pressure, торк, вытяжка,
+        # наработка вала). Это СТОЛБЦЫ общей базы, НЕ отклики модели: в Y и
+        # суррогаты не входят (телеметрия — не свойство продукта и не несёт
+        # желательности), но фиксируются при замере — постфактум телеметрию
+        # прогона не восстановить (как campaign_label/лоты). covariate_names
+        # — ПОЛИТИКА кампании (объявленные столбцы, как block_factor);
+        # значения живут per-point в ``origin_tag["covariates"]`` (переживают
+        # миграцию схемы и сериализацию точек без отдельного канала).
+        self.covariate_names: List[str] = []
 
 
     # ------------------------------------------------------------------
@@ -673,7 +683,9 @@ class MixtureProcessRunner:
         return np.atleast_2d(self.oracle.evaluate(full))
 
     def _make_point(self, coords_cur: np.ndarray, y_row: np.ndarray,
-                    origin: str, block: Optional[int] = None) -> DataPoint:
+                    origin: str, block: Optional[int] = None,
+                    covariates: Optional[Mapping[str, float]] = None
+                    ) -> DataPoint:
         coords_cur = np.asarray(coords_cur, float).ravel()
         X: Dict[str, List[float]] = {}
         if self.q > 0:
@@ -692,6 +704,11 @@ class MixtureProcessRunner:
             tag["spec_hash"] = self.phr_spec.spec_hash()
         if block is not None:
             tag["block"] = int(block)       # партия/день измерения (blocking)
+        # P3.1: ковариаты (телеметрия прогона) — per-point метаданные, как
+        # block: НЕ входят в Y/суррогаты, но переживают миграцию/сериализацию.
+        if covariates:
+            tag["covariates"] = {str(k): float(v)
+                                 for k, v in covariates.items()}
         return DataPoint(schema_version=self.current_schema_version,
                          X=X, Y=Y, origin_tag=tag)
 
@@ -890,7 +907,9 @@ class MixtureProcessRunner:
             d2[j] = -1.0                      # не выбирать повторно
         return np.vstack(chosen)
 
-    def commit_seed(self, X: Any, Y: Any) -> Dict[str, Any]:
+    def commit_seed(self, X: Any, Y: Any, *,
+                    covariates: Optional[Sequence[Any]] = None
+                    ) -> Dict[str, Any]:
         """§17.4: ЗАФИКСИРОВАТЬ измеренные ``Y`` стартового seed-дизайна.
 
         Вторая половина ручного стартового цикла: ``X`` — кандидаты из
@@ -900,6 +919,12 @@ class MixtureProcessRunner:
         (И-1, без урезания истории), суррогаты переобучаются. В отличие от
         :meth:`seed_initial` (авто-оракул), Y приходит от пользователя. Пустой
         ``X`` — no-op. Возвращает ``{added, n_base, P}``.
+
+        ``covariates`` (P3.1) — необязательная per-point телеметрия прогона:
+        последовательность длины ``n`` из ``{имя: значение}`` (``None``/пустой
+        словарь у строки — телеметрии нет, это допустимо: ковариата может
+        быть снята не на каждом опыте). Имена валидируются против ОБЪЯВЛЕННЫХ
+        :attr:`covariate_names` (A0.6 — опечатка не молчит).
         """
         newX = np.atleast_2d(np.asarray(X, float))
         Ynew = np.atleast_2d(np.asarray(Y, float))
@@ -916,6 +941,7 @@ class MixtureProcessRunner:
                 f"дано {Ynew.shape[1]}.")
         if newX.shape[0] == 0:
             return {"added": 0, "n_base": len(self.points), "P": P}
+        cov_rows = self._covariate_rows(covariates, len(newX))
         # стартовый blocking: оптимальные метки партий; если база уже непуста
         # (повторный seed-коммит) — сдвигаем номера за существующие блоки
         labels = self.seed_block_labels(newX)
@@ -923,7 +949,8 @@ class MixtureProcessRunner:
                   if self.points else 0)
         for i in range(len(newX)):
             self.points.append(self._make_point(newX[i], Ynew[i], "seed",
-                                                block=int(labels[i]) + offset))
+                                                block=int(labels[i]) + offset,
+                                                covariates=cov_rows[i]))
         self.fit_surrogates()
         return {"added": int(len(newX)), "n_base": len(self.points), "P": P}
 
@@ -1312,6 +1339,160 @@ class MixtureProcessRunner:
                 "поля или обнулите оба (паспорт без слоя навески).")
         self.weighing_step_g = step
         self.grams_per_phr = gpp
+
+    # ------------------------------------------------------------------
+    # P3.1 (UI_REVISION_SPEC): КОВАРИАТЫ БАЗЫ — телеметрия прогона при точке
+    # (M(t)/SME, Die_Pressure, торк, вытяжка, наработка вала)
+    # ------------------------------------------------------------------
+    def set_covariate_names(self, names: Optional[Sequence[str]]) -> None:
+        """P3.1: объявить СТОЛБЦЫ ковариат общей базы (политика кампании).
+
+        Ковариата — телеметрия прогона (SME, Die_Pressure, торк, вытяжка,
+        наработка вала): она НЕ отклик модели (в ``Y``/суррогаты не входит —
+        у телеметрии нет желательности и её не оптимизируют) и НЕ координата
+        (её не задают, её НАБЛЮДАЮТ). Значения записываются per-point при
+        фиксации замера (``commit_seed``/``commit_measured``/
+        :meth:`set_point_covariates`) — постфактум телеметрию прогона не
+        восстановить (как campaign_label/лоты, CAMPAIGN_SPEC_PVC §3).
+
+        Явные отказы (A0.6): пустое имя; дубль; коллизия с именем отклика
+        (столбец «SME» рядом с откликом «SME» — два разных смысла одного
+        имени) или координаты схемы (mixture/process — ковариата стала бы
+        двойником оси). ``None``/пусто — очистить объявление; уже записанные
+        значения при точках ОСТАЮТСЯ в ``origin_tag`` (история И-1, данные
+        не теряются — они лишь перестают показываться столбцами).
+        """
+        if not names:
+            self.covariate_names = []
+            return
+        taken = set(self.property_names)
+        taken |= set(self._full_mix.names if self._full_mix is not None else [])
+        if self._full_proc is not None:
+            taken |= set(self._full_proc.names)
+        out: List[str] = []
+        for nm in names:
+            nm = str(nm).strip()
+            if not nm:
+                raise ValueError("Пустое имя ковариаты недопустимо.")
+            if nm in out:
+                raise ValueError(f"Ковариата '{nm}' объявлена дважды.")
+            if nm in taken:
+                raise ValueError(
+                    f"Имя ковариаты '{nm}' совпадает с откликом или "
+                    f"координатой схемы: одно имя с двумя смыслами — тихая "
+                    f"путаница данных (A0.6). Переименуйте столбец "
+                    f"(например, '{nm}_телеметрия').")
+            out.append(nm)
+        self.covariate_names = out
+
+    def _clean_covariate_row(self, values: Optional[Mapping[str, Any]], *,
+                             where: str) -> Dict[str, float]:
+        """Валидация одной строки ковариат: имена объявлены, значения конечны.
+
+        ``None``/пусто → ``{}`` (телеметрии на этом опыте нет — допустимо).
+        """
+        if not values:
+            return {}
+        if not self.covariate_names:
+            raise ValueError(
+                f"{where}: ковариаты не объявлены (set_covariate_names) — "
+                f"сначала объявите столбцы, иначе опечатка имени молча "
+                f"создала бы новый столбец (A0.6).")
+        clean: Dict[str, float] = {}
+        for k, v in values.items():
+            k = str(k)
+            if k not in self.covariate_names:
+                raise KeyError(
+                    f"{where}: ковариата '{k}' не среди объявленных "
+                    f"{list(self.covariate_names)}.")
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{where}: значение ковариаты '{k}' не число: {v!r}.")
+            if not np.isfinite(fv):
+                raise ValueError(
+                    f"{where}: значение ковариаты '{k}' не конечно: {v!r}.")
+            clean[k] = fv
+        return clean
+
+    def _covariate_rows(self, covariates: Optional[Sequence[Any]],
+                        n: int) -> List[Dict[str, float]]:
+        """Пер-строчная валидация ковариат фиксации (длина обязана быть n)."""
+        if covariates is None:
+            return [{} for _ in range(n)]
+        rows = list(covariates)
+        if len(rows) != n:
+            raise ValueError(
+                f"covariates: строк {len(rows)} ≠ числу точек {n}.")
+        return [self._clean_covariate_row(r, where=f"covariates[{i}]")
+                for i, r in enumerate(rows)]
+
+    def set_point_covariates(self, point_index: int,
+                             values: Mapping[str, Any]) -> Dict[str, Any]:
+        """P3.1: записать/исправить ковариаты УЖЕ зафиксированной точки базы.
+
+        ``point_index`` — 0-based индекс в ``self.points`` («№ опыта» − 1, как
+        в :meth:`correct_measured`). ``values`` — ``{имя: значение | None}``;
+        ``None`` УДАЛЯЕТ значение (стереть ошибочный ввод — телеметрия,
+        в отличие от откликов, может быть честно «не снята»). Правятся ТОЛЬКО
+        перечисленные ковариаты; координаты, Y и происхождение точки не
+        меняются (И-1). Суррогаты НЕ переобучаются: ковариаты в модель не
+        входят — в этом и смысл P3.1 («столбцы базы, не Y модели»).
+        Возвращает ``{point_index, origin, changed:{имя:{old,new}}}``.
+        """
+        n = len(self.points)
+        idx = int(point_index)
+        if not (0 <= idx < n):
+            raise IndexError(
+                f"point_index={point_index} вне диапазона [0, {n}) общей базы.")
+        if not values:
+            raise ValueError(
+                "Нет значений: передайте {ковариата: значение | None}.")
+        removals = [str(k) for k, v in values.items() if v is None]
+        upd = self._clean_covariate_row(
+            {k: v for k, v in values.items() if v is not None},
+            where=f"точка №{idx + 1}")
+        for k in removals:
+            if k not in self.covariate_names:
+                raise KeyError(
+                    f"точка №{idx + 1}: ковариата '{k}' не среди объявленных "
+                    f"{list(self.covariate_names)}.")
+
+        pt = self.points[idx]
+        cov = dict(pt.origin_tag.get("covariates", {}) or {})
+        changed: Dict[str, Dict[str, Optional[float]]] = {}
+        for k, fv in upd.items():
+            old = cov.get(k, None)
+            cov[k] = fv
+            changed[k] = {"old": (float(old) if old is not None else None),
+                          "new": fv}
+        for k in removals:
+            old = cov.pop(k, None)
+            changed[k] = {"old": (float(old) if old is not None else None),
+                          "new": None}
+        if cov:
+            pt.origin_tag["covariates"] = cov
+        else:
+            pt.origin_tag.pop("covariates", None)
+        origin = (pt.origin_tag.get("origin", "seed")
+                  if getattr(pt, "origin_tag", None) else "seed")
+        return {"point_index": idx, "origin": origin, "changed": changed}
+
+    def point_covariates(self) -> List[Dict[str, float]]:
+        """P3.1: ковариаты точек В ПОРЯДКЕ базы ``self.points`` (копии).
+
+        Индекс строки = «№ опыта» − 1 (контракт :meth:`set_point_covariates`).
+        Точка без телеметрии → пустой словарь (честное «не снято», не 0.0).
+        """
+        return [dict(p.origin_tag.get("covariates", {}) or {})
+                for p in self.points]
+
+    def active_point_covariates(self) -> List[Dict[str, float]]:
+        """P3.1: ковариаты АКТИВНЫХ точек в порядке ``self.X`` (как
+        :meth:`point_blocks` — origin_tag переживает миграцию схемы)."""
+        return [dict(p.origin_tag.get("covariates", {}) or {})
+                for p in self._migrated_points()]
 
     # ------------------------------------------------------------------
     # P2.1 (UI_REVISION_SPEC): ДИСКРЕТНЫЕ УРОВНИ process-осей
@@ -1872,7 +2053,9 @@ class MixtureProcessRunner:
             newX_list.append(res.x[:self.dim].reshape(1, -1))
         return np.vstack(newX_list)
 
-    def commit_measured(self, branch_id: str, X: Any, Y: Any) -> Dict[str, Any]:
+    def commit_measured(self, branch_id: str, X: Any, Y: Any, *,
+                        covariates: Optional[Sequence[Any]] = None
+                        ) -> Dict[str, Any]:
         """§17.2: ЗАФИКСИРОВАТЬ измеренные отклики ``Y`` предложенных точек.
 
         Вторая половина ручного цикла: ``X`` — кандидаты из :meth:`propose_points`
@@ -1882,6 +2065,9 @@ class MixtureProcessRunner:
         origin-тегом ``branch:{id}`` (И-1, без копий), суррогаты переобучаются,
         ``d_best``/``x_best`` пересчитываются по ИЗМЕРЕННЫМ Y (не по суррогату).
         Контракт возврата — как у :meth:`run_branch_round`.
+
+        ``covariates`` (P3.1) — необязательная per-point телеметрия прогона
+        (контракт как у :meth:`commit_seed`).
         """
         if branch_id not in self.branches:
             raise KeyError(f"Нет ветки '{branch_id}'.")
@@ -1905,12 +2091,13 @@ class MixtureProcessRunner:
                     "d_best": br.d_best, "x_best": br.x_best,
                     "n_base": int(0 if self.X is None else len(self.X))}
 
+        cov_rows = self._covariate_rows(covariates, len(newX))
         # blocking добора: commit-раунд — НОВАЯ партия → ОДИН новый блок
         blk = self._next_block()
         for i in range(len(newX)):
             self.points.append(
                 self._make_point(newX[i], Ynew[i], f"branch:{branch_id}",
-                                 block=blk))
+                                 block=blk, covariates=cov_rows[i]))
         br.spent += len(newX)
 
         # измеренный d_best (§3): цена за изделие — по ИЗМЕРЕННОЙ ρ (в Ynew),

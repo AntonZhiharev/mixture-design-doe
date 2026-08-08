@@ -237,6 +237,12 @@ def runner_to_state(runner: MixtureProcessRunner, *,
                                (getattr(runner, "anchor_recipes", {}) or {}).items()},
             "weighing_step_g": float(getattr(runner, "weighing_step_g", 0.0) or 0.0),
             "grams_per_phr": float(getattr(runner, "grams_per_phr", 0.0) or 0.0),
+            # P3.1: объявленные КОВАРИАТЫ базы (телеметрия прогона). Значения
+            # per-point едут внутри origin_tag точек (points → to_dict) и
+            # отдельного канала не требуют; без сериализации ОБЪЯВЛЕНИЯ
+            # столбцы после load молча пропадали бы из таблиц (A0.6).
+            "covariate_names": [str(n) for n in
+                                (getattr(runner, "covariate_names", []) or [])],
             "region_moves": [_region_move_to_dict(m)
                              for m in getattr(runner, "_region_moves", []) or []],
             "drop_policy": str(getattr(runner, "_drop_policy", "exclude")),
@@ -350,6 +356,11 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     gpp = float(r.get("grams_per_phr", 0.0) or 0.0)
     if step_g > 0 or gpp > 0:
         runner.set_weighing_resolution(step_g, gpp)
+    # P3.1: ковариаты — ШТАТНЫМ сеттером (валидация имён); старый сейв без
+    # ключа → столбцы не объявлены (значения в origin_tag точек целы).
+    cov_names = r.get("covariate_names", []) or []
+    if cov_names:
+        runner.set_covariate_names(cov_names)
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))
 

@@ -788,15 +788,18 @@ class CampaignController:
         """
         return self.runner.propose_points(branch_id, n_points=n_points, **kw)
 
-    def commit_measured(self, branch_id: str, X: Any, Y: Any) -> Dict[str, Any]:
+    def commit_measured(self, branch_id: str, X: Any, Y: Any, *,
+                        covariates: Optional[Any] = None) -> Dict[str, Any]:
         """§17.2: зафиксировать ВНЕСЁННЫЕ Y предложенных точек ветки.
 
         Доливает измеренные точки в ОБЩУЮ базу (origin=branch:{id}, И-1) через
         :meth:`MixtureProcessRunner.commit_measured` и ЗАПЕЧАТЫВАЕТ дно undo:
         измеренная правда откату не подлежит (как :meth:`run_round`, Тр-7.2/7.3).
         Вторая половина ручного цикла «предложить → зафиксировать Y».
+        ``covariates`` (P3.1) — необязательная per-point телеметрия прогона.
         """
-        out = self.runner.commit_measured(branch_id, X, Y)
+        out = self.runner.commit_measured(branch_id, X, Y,
+                                          covariates=covariates)
         self._undo.clear()
         return out
 
@@ -809,16 +812,30 @@ class CampaignController:
         """
         return self.runner.propose_seed(n, **kw)
 
-    def commit_seed(self, X: Any, Y: Any) -> Dict[str, Any]:
+    def commit_seed(self, X: Any, Y: Any, *,
+                    covariates: Optional[Any] = None) -> Dict[str, Any]:
         """§17.4: зафиксировать ВНЕСЁННЫЕ Y стартового seed-дизайна.
 
         Проброс в :meth:`MixtureProcessRunner.commit_seed`: точки в ОБЩУЮ базу
         (origin "seed", И-1), суррогаты обучаются. Стартовые измерения — правда,
         поэтому дно undo запечатывается (как :meth:`commit_measured`).
+        ``covariates`` (P3.1) — необязательная per-point телеметрия прогона.
         """
-        out = self.runner.commit_seed(X, Y)
+        out = self.runner.commit_seed(X, Y, covariates=covariates)
         self._undo.clear()
         return out
+
+    # -- P3.1 (UI_REVISION_SPEC): ковариаты базы (телеметрия при точке) -------
+    def set_point_covariates(self, point_index: int,
+                             values: Dict[str, Any]) -> Dict[str, Any]:
+        """P3.1: записать/исправить ковариаты точки общей базы.
+
+        Тонкий проброс в :meth:`MixtureProcessRunner.set_point_covariates`.
+        Ковариаты — телеметрия прогона (столбцы базы, НЕ Y модели): суррогаты
+        и оценки веток от них не зависят, поэтому undo-стек интерпретации НЕ
+        трогается (в отличие от :meth:`correct_measured_point`, где меняется
+        измеренная правда и все ветки переоцениваются)."""
+        return self.runner.set_point_covariates(point_index, values)
 
     # -- §17.2.1 КОРРЕКЦИЯ ошибки ввода измеренных Y (правка опечатки) --------
     def correct_measured_point(self, point_index: int,

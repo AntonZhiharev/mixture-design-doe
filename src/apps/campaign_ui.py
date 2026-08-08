@@ -362,6 +362,16 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
     # процесс-оси денормализуем из внутреннего кода [0,1]. Расход сырья — по долям.
     Xreal = process_code_to_real(runner, X)
 
+    # P3.1: ковариаты (телеметрия прогона) — столбцы базы, НЕ отклики модели;
+    # выравнены с X (порядок активных точек, как point_blocks).
+    cov_names = list(getattr(runner, "covariate_names", []) or [])
+    covs: List[Dict[str, float]] = []
+    if cov_names:
+        try:
+            covs = list(runner.active_point_covariates())
+        except Exception:  # noqa: BLE001 — ковариаты не критичны для показа
+            covs = []
+
     rows: List[Dict[str, Any]] = []
     for i in range(len(X)):
         row: Dict[str, Any] = {"№ опыта": i + 1}
@@ -380,6 +390,10 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
         for k, pn in enumerate(props):
             row[f"{pn} (изм.)"] = (round(float(Y[i, k]), 4)
                                    if k < Y.shape[1] else np.nan)
+        for cn in cov_names:
+            v = (covs[i].get(cn) if i < len(covs) else None)
+            row[f"{cn} (ковариата)"] = (round(float(v), 4)
+                                        if v is not None else np.nan)
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -409,6 +423,65 @@ def measured_responses_editor_df(runner) -> pd.DataFrame:
                 row[pn] = None
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def covariates_editor_df(runner) -> pd.DataFrame:
+    """P3.1: общая база → таблица-редактор КОВАРИАТ (телеметрии прогона).
+
+    Строка на точку ``runner.points`` В ПОРЯДКЕ базы (индекс строки =
+    «№ опыта» − 1 = ``point_index`` для
+    :meth:`MixtureProcessRunner.set_point_covariates`): сквозной номер,
+    человекочитаемый источник и текущее значение каждой ОБЪЯВЛЕННОЙ ковариаты
+    (``None`` = телеметрия не снята — честная пустая ячейка, не 0.0).
+    Двойник :func:`measured_responses_editor_df` для ковариат: редактируются
+    только столбцы-ковариаты; координаты и Y не трогаются (И-1). Чистая
+    (без Streamlit) — тестируется напрямую."""
+    cov_names = list(getattr(runner, "covariate_names", []) or [])
+    covs = (runner.point_covariates()
+            if hasattr(runner, "point_covariates") else [])
+    rows: List[Dict[str, Any]] = []
+    for i, p in enumerate(getattr(runner, "points", []) or []):
+        og = (p.origin_tag.get("origin", "seed")
+              if getattr(p, "origin_tag", None) else "seed")
+        row: Dict[str, Any] = {"№ опыта": i + 1,
+                               "источник": origin_label(runner, og)}
+        vals = covs[i] if i < len(covs) else {}
+        for cn in cov_names:
+            v = vals.get(cn)
+            row[cn] = float(v) if v is not None else None
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def covariate_rows_from_editor(edited, names: Sequence[str],
+                               *, suffix: str = " (ковариата)"
+                               ) -> List[Dict[str, float]]:
+    """P3.1: собрать per-point строки ковариат из таблицы-редактора (чистая).
+
+    ``edited`` — DataFrame редактора (seed/workbench) со столбцами
+    ``{имя}{suffix}``; NaN/пустые ячейки ПРОПУСКАЮТСЯ (телеметрия не снята —
+    допустимо, в отличие от откликов «(lab)», где пустых быть не может).
+    Возвращает список словарей длиной в число строк — вход ``covariates=``
+    для ``commit_seed``/``commit_measured``. Валидацию имён/чисел делает
+    ШТАТНЫЙ раннер (канон iter52: правила в UI не дублируются)."""
+    out: List[Dict[str, float]] = []
+    for _, row in edited.iterrows():
+        vals: Dict[str, float] = {}
+        for nm in names:
+            col = f"{nm}{suffix}"
+            if col not in edited.columns:
+                continue
+            v = row[col]
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(fv):
+                vals[nm] = fv
+        out.append(vals)
+    return out
 
 
 def campaign_base_excel_bytes(runner, *, batch_kg: Optional[float] = None
@@ -441,6 +514,7 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
     """
     coord_names = setup_coord_names(runner)
     props = list(runner.property_names)
+    cov_names_seed = list(getattr(runner, "covariate_names", []) or [])
     Xs = np.atleast_2d(np.asarray(Xs, float))
     ncoord = Xs.shape[1]
     mix_names = list(runner.current_schema.mixture_names)
@@ -478,6 +552,10 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
             row[f"{pn} (lab)"] = (round(float(Ya[i, k]), 4)
                                   if Ya is not None and k < Ya.shape[1]
                                   else np.nan)
+        # P3.1: места под ТЕЛЕМЕТРИЮ прогона (объявленные ковариаты) —
+        # заполняются при измерении; пустые ячейки допустимы (не отклик).
+        for cn in cov_names_seed:
+            row[f"{cn} (ковариата)"] = np.nan
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1869,6 +1947,26 @@ def anchor_recipes_to_text(recipes) -> str:
         for rn, rec in (recipes or {}).items())
 
 
+def parse_covariate_names(text: str) -> List[str]:
+    """P3.1: разобрать ОБЪЯВЛЕНИЕ ковариат базы из текста формы.
+
+    Формат: имена через запятую / точку-с-запятой / перенос строки
+    (``SME, Die_Pressure, торк``). Здесь только СИНТАКСИС (пустые
+    отбрасываются); дубли, коллизии с откликами/координатами схемы ловит
+    ШТАТНЫЙ :meth:`MixtureProcessRunner.set_covariate_names` (канон iter52:
+    второй набор правил в UI разошёлся бы с ядром, A0.6). Чистая (без
+    Streamlit) — round-trip с :func:`covariate_names_to_text`."""
+    out: List[str] = []
+    for line in str(text or "").splitlines():
+        out.extend(_parse_names(line))
+    return out
+
+
+def covariate_names_to_text(names) -> str:
+    """P3.1: ковариаты → текст формы (обратное к :func:`parse_covariate_names`)."""
+    return ", ".join(str(n) for n in (names or []))
+
+
 def setup_mixture_names(field_names: Sequence[str],
                         spec: Optional[PhrSpec]) -> List[str]:
     """iter41.1: имена компонентов при сборке проекта.
@@ -1916,6 +2014,10 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
     gpp = float(getattr(runner, "grams_per_phr", 0.0) or 0.0)
     weigh_val = (f"шаг {step_g:g} г · {gpp:g} г/phr · "
                  f"δ = {step_g / gpp:g} phr" if step_g > 0 and gpp > 0 else "")
+    # P3.1: объявленные ковариаты базы (телеметрия прогона) — политика
+    # кампании, обязана быть видна после загрузки (как метка/пары/уровни).
+    cov_val = covariate_names_to_text(
+        getattr(runner, "covariate_names", []) or [])
     return pd.DataFrame([
         {"параметр": "phr-спека (decode-слой)", "значение": spec_val},
         {"параметр": "метка кампании", "значение": label or "—"},
@@ -1927,6 +2029,8 @@ def campaign_passport_dataframe(runner) -> pd.DataFrame:
         {"параметр": "лоты сырья", "значение": lots_val or "—"},
         {"параметр": "anchor-рецепты (phr)", "значение": anchors_val or "—"},
         {"параметр": "разрешение весов (δ)", "значение": weigh_val or "—"},
+        {"параметр": "ковариаты базы (телеметрия)",
+         "значение": cov_val or "—"},
     ])
 
 
@@ -2362,6 +2466,10 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
     # сборка проекта молча вернула бы непрерывные оси).
     out["setup_process_levels"] = process_levels_to_text(
         getattr(runner, "process_levels", {}) or {})
+    # P3.1: объявленные ковариаты базы — тоже политика кампании: без
+    # префилла повторная сборка проекта молча стёрла бы объявление.
+    out["setup_covariates"] = covariate_names_to_text(
+        getattr(runner, "covariate_names", []) or [])
 
     # iter41.3: активная phr-спека → режим «phr-спека (JSON)» с каноническим
     # JSON to_dicts (round-trip: parse_phr_spec_json(json).spec_hash() == hash).
@@ -2591,6 +2699,17 @@ def render_setup_form() -> None:
             format="%.4f", key="setup_pass_weigh_gpp",
             help="Загрузка смесителя: сколько граммов приходится на 1 phr. "
                  "Вместе с шагом весов даёт δ_phr = шаг / (г на 1 phr).")
+        # P3.1: ковариаты базы — телеметрия прогона (M(t)/SME, Die_Pressure,
+        # торк, вытяжка, наработка вала): столбцы базы, НЕ отклики модели.
+        cov_txt = st.text_input(
+            "Ковариаты базы — телеметрия прогона (опц.)", value="",
+            key="setup_covariates",
+            help="Имена через запятую (например: SME, Die_Pressure, торк, "
+                 "вытяжка, наработка_вала). Это СТОЛБЦЫ общей базы, а не "
+                 "отклики: в модель/суррогаты не входят, желательности не "
+                 "несут, но записываются при каждом замере — постфактум "
+                 "телеметрию прогона не восстановить. Значения вносятся в "
+                 "таблицах seed/добора (пустые ячейки допустимы).")
 
         seed_v = st.number_input(
 
@@ -2650,6 +2769,9 @@ def render_setup_form() -> None:
                 # (валидация имён/границ — штатным set_process_levels, A0.6).
                 levels_now = parse_process_levels(levels_txt)
                 runner.set_process_levels(levels_now)
+                # P3.1: ковариаты базы — валидация имён (дубли, коллизии с
+                # откликами/осями) ШТАТНЫМ set_covariate_names (A0.6).
+                runner.set_covariate_names(parse_covariate_names(cov_txt))
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
 
                 for k in ("setup_seed_X", "setup_seed_Y",
@@ -2905,7 +3027,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # проекта) — черновик Y вливается в кэш в этот момент, правки не теряются.
     sig = (Xs.tobytes(), Xs.shape, batch_kg,
            int(getattr(runner, "n_blocks_start", 1)),
-           tuple(sorted((getattr(runner, "block_names", {}) or {}).items())))
+           tuple(sorted((getattr(runner, "block_names", {}) or {}).items())),
+           # P3.1: смена объявленных ковариат меняет состав столбцов таблицы
+           tuple(getattr(runner, "covariate_names", []) or []))
     if (st.session_state.get("setup_seed_df_sig") != sig
             or "setup_seed_df" not in st.session_state):
         st.session_state["setup_seed_df"] = seed_design_dataframe(
@@ -2915,8 +3039,12 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         # коду, он ещё не создан в этом прогоне — ключ чистить безопасно).
         st.session_state.pop("setup_seed_editor", None)
     df = st.session_state["setup_seed_df"]
+    cov_names_ui = list(getattr(runner, "covariate_names", []) or [])
     st.caption("Составные координаты заблокированы; заполняются только столбцы "
-               "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»):")
+               "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»)"
+               + (" и «… (ковариата)» — телеметрия прогона, пустые ячейки "
+                  "допустимы (P3.1)" if cov_names_ui else "")
+               + ":")
     blk_cols = [c for c in ("Блок", "Партия") if c in df.columns]
     edited = st.data_editor(df, use_container_width=True, height=320,
                             hide_index=True,
@@ -2990,7 +3118,11 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                     "Заполните измеренные отклики (столбцы «… (lab)») для ВСЕХ "
                     "точек — вручную в таблице или кнопкой «🧪 Заполнить "
                     "тестовыми». Пустые ячейки (None) фиксировать нельзя.")
-            out = ctrl.commit_seed(Xs, Y)
+            # P3.1: телеметрия прогона из столбцов «(ковариата)» — NaN
+            # пропускаются (не снята); валидация имён/чисел — раннером.
+            covs_seed = (covariate_rows_from_editor(edited, cov_names_ui)
+                         if cov_names_ui else None)
+            out = ctrl.commit_seed(Xs, Y, covariates=covs_seed)
 
             for k in ("setup_seed_X", "setup_seed_Y",
                       "setup_seed_df", "setup_seed_df_sig"):
@@ -3630,13 +3762,20 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         for j, col in enumerate(lab_cols):
             df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
                        if Ys is not None else np.nan)
+        # P3.1: столбцы под телеметрию прогона (объявленные ковариаты) —
+        # заполняются при измерении; пустые ячейки допустимы (не отклик).
+        wb_cov_names = list(getattr(runner, "covariate_names", []) or [])
+        for cn in wb_cov_names:
+            df[f"{cn} (ковариата)"] = np.nan
         # Сквозная нумерация: предложенные точки ещё не залиты — показываем их
         # будущие номера в общей базе (len(points)+1 … +N). Явный read-only
         # столбец (st.data_editor игнорирует кастомный индекс — см. seed выше).
         df.insert(0, "№ опыта",
                   list(experiment_index(len(runner.points), len(df))))
         st.caption("Предложенные точки: координаты заблокированы, заполняются "
-                   "только столбцы «свойство (lab)» (вручную или демо-кнопкой):")
+                   "только столбцы «свойство (lab)» (вручную или демо-кнопкой)"
+                   + (" и «… (ковариата)» — телеметрия прогона (P3.1)"
+                      if wb_cov_names else "") + ":")
         edited = st.data_editor(df, use_container_width=True, height=280,
                                 hide_index=True,
                                 disabled=["№ опыта", *coord_names[:Xs.shape[1]]],
@@ -3654,7 +3793,10 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                         "ВСЕХ предложенных точек — вручную или кнопкой "
                         "«🧪 Заполнить тестовыми». Пустые ячейки (None) "
                         "доливать нельзя.")
-                res = ctrl.commit_measured(bsel, Xs, Y)
+                # P3.1: телеметрия прогона из столбцов «(ковариата)»
+                covs_wb = (covariate_rows_from_editor(edited, wb_cov_names)
+                           if wb_cov_names else None)
+                res = ctrl.commit_measured(bsel, Xs, Y, covariates=covs_wb)
 
                 st.session_state.pop(kx, None)
                 st.session_state.pop(ky, None)
@@ -4024,6 +4166,49 @@ def render_campaign() -> None:
                     st.info("Изменений не обнаружено — редактировать нечего.")
             except (ValueError, KeyError, IndexError, RuntimeError) as exc:
                 st.error(str(exc))
+
+    # P3.1: КОВАРИАТЫ базы (телеметрия прогона) — отдельный редактор:
+    # значения можно внести/исправить и ПОСЛЕ фиксации точки (телеметрия
+    # снимается на прогоне и часто вносится позже откликов лаборатории).
+    if list(getattr(runner, "covariate_names", []) or []):
+        with st.expander("📈 Ковариаты базы — телеметрия прогона (P3.1)"):
+            st.caption(
+                "Столбцы базы, НЕ отклики модели: телеметрия (SME, "
+                "Die_Pressure, торк…) в суррогаты не входит и желательности "
+                "не несёт, но объясняет условия прогона за точкой. Пустая "
+                "ячейка = «не снята» (допустимо); суррогаты при сохранении "
+                "НЕ переобучаются — координаты и Y не меняются (И-1).")
+            cov_names_base = list(runner.covariate_names)
+            cov_df = covariates_editor_df(runner)
+            edited_cov = st.data_editor(
+                cov_df, use_container_width=True, hide_index=True,
+                disabled=["№ опыта", "источник"], key="camp_cov_editor")
+            if st.button("💾 Сохранить ковариаты", key="camp_cov_save"):
+                try:
+                    n_upd = 0
+                    for ridx in range(len(edited_cov)):
+                        changes: Dict[str, Any] = {}
+                        for cn in cov_names_base:
+                            ov = cov_df.iloc[ridx][cn]
+                            nv = edited_cov.iloc[ridx][cn]
+                            if pd.isna(nv) and pd.isna(ov):
+                                continue
+                            if pd.isna(nv):
+                                changes[cn] = None      # стереть значение
+                            elif pd.isna(ov) or not np.isclose(float(ov),
+                                                               float(nv)):
+                                changes[cn] = float(nv)
+                        if changes:
+                            ctrl.set_point_covariates(ridx, changes)
+                            n_upd += 1
+                    if n_upd:
+                        _flash(f"Ковариаты обновлены у {n_upd} опытов "
+                               "(координаты/Y/суррогаты не тронуты, P3.1).")
+                        st.rerun()
+                    else:
+                        st.info("Изменений не обнаружено.")
+                except (ValueError, KeyError, IndexError) as exc:
+                    st.error(str(exc))
 
     bids = list(runner.branches)
 

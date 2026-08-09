@@ -449,15 +449,187 @@ def demo_iter60() -> None:
     print(f"   ответ модели: {bad.text}")
 
 
+# ----------------------------------------------------------------------
+# iter61 — read-only инструменты: ответ приходит ИЗ ЯДРА, а не по памяти
+# ----------------------------------------------------------------------
+#: Референсная v2-спека показа — та же геометрия, что в golden-тестах
+#: (iter45/49/50): SOFT-группа с техлимитами, лог-оси, cap-трапеция УФ.
+DEMO_NODES = [
+    {"name": "RESIN", "role": "FIXED", "value": 100.0},
+    {"name": "DINP", "role": "ABSOLUTE", "range": [4.0, 14.0]},
+    {"name": "ESO", "role": "FIXED", "value": 2.5},
+    {"name": "SOFT", "role": "GROUP_TOTAL", "range": [5.0, 15.0],
+     "members": ["PBNK", "CPE"]},
+    {"name": "PBNK", "role": "SHARE_FREE", "group": "SOFT",
+     "share_range": [0.0, 0.70], "max_phr": 8.0},
+    {"name": "CPE", "role": "SHARE_CLOSURE", "group": "SOFT", "min_phr": 3.0},
+    {"name": "TiO2", "role": "ABSOLUTE", "range": [0.3, 8.0], "scale": "log"},
+    {"name": "UV", "role": "ABSOLUTE_CAPPED", "range": [0.05, 0.30],
+     "scale": "log", "cap_to": ["DINP", "ESO"], "cap_ratio": 0.03},
+]
+
+#: «Привяжи УФ к пластификатору жёстко» — КЛИН вместо трапеции по фазе.
+DEMO_WEDGE = {"node": "UV",
+              "set": {"role": "RATIO_TO", "reference": "DINP",
+                      "range": [0.0125, 0.0214]},
+              "unset": ["cap_to", "cap_ratio", "scale"]}
+
+
+def demo_iter61() -> None:
+    head("iter61 · READ-ONLY ИНСТРУМЕНТЫ: числа из ядра, а не из памяти")
+
+    import json as _json
+
+    from src.assistant.tools import ToolContext, ToolError, dispatch, tool_specs
+    from src.assistant.tools.registry import READONLY, dispatcher, is_long_running
+    from src.design.phr_sampler import PhrSpec
+
+    s = store.load_session(CAMPAIGN_ROOT, DEMO_PROJECT)
+    spec = PhrSpec.from_dicts(DEMO_NODES)
+    ctx = ToolContext(spec=spec, session=s, root=CAMPAIGN_ROOT,
+                      project=DEMO_PROJECT)
+
+    print("\n🧰 Инструменты, которые видит модель (класс readonly):")
+    rows = [{"инструмент": f["function"]["name"],
+             "долгий": "да" if is_long_running(f["function"]["name"]) else "",
+             "аргументы": ", ".join(f["function"]["parameters"]["properties"])
+                          or "—"}
+            for f in tool_specs([READONLY])]
+    show(pd.DataFrame(rows))
+
+    def h(value: str) -> str:
+        """Короткий вид отпечатка: в тексте важен ФАКТ совпадения/сдвига."""
+        return f"{str(value)[:16]}…"
+
+    # --- 1. get_spec: снимок геометрии --------------------------------
+    snap = dispatch(ctx, "get_spec", {"include_nodes": False})
+    print(f"\n📐 get_spec → spec_hash={h(snap['spec_hash'])} · "
+          f"q={snap['q_components']} · dim_z={snap['dim_z']} · "
+          f"лог-оси {snap['log_axes']} · Σphr(статически) "
+          f"{snap['sigma_phr_static']}")
+
+    # --- 2. explain_node: НЕМОНОТОННОСТЬ hi_φ(T) ----------------------
+    node = dispatch(ctx, "explain_node",
+                    {"name": "PBNK", "totals": [5.0, 7.5, 10.5, 12.5, 15.0]})
+    print("\n🔎 explain_node('PBNK') — «почему верх доли не 0,70, как я ввёл»:")
+    show(pd.DataFrame(node["effective_shares"]).round(4))
+    print("   hi_φ(T) = min(0.70 · 8/T · 1−3/T): 0.40 @T=5 → полка 0.70 → "
+          "0.5333 @T=15 — по двум точкам вывод сделать НЕЛЬЗЯ.")
+    print(f"   L1-факты цеха по узлу: "
+          f"{[f['statement'] for f in node.get('local_facts', [])] or 'нет'}")
+
+    cap = dispatch(ctx, "explain_node", {"name": "UV"})["cap"]
+    print(f"\n🔎 explain_node('UV') → cap {cap['cap_ratio']}·Σ{cap['cap_to']} "
+          f"в точке: {cap['note'].splitlines()[0]}")
+
+    # --- 3. validate_spec: dry-run патча ------------------------------
+    print("\n🧪 validate_spec — сухой прогон, проект не меняется:")
+    ok = dispatch(ctx, "validate_spec",
+                  {"patch": {"node": "DINP", "field": "range",
+                             "value": [4.0, 20.0]}})
+    print(f"   • DINP 4–14 → 4–20: ok={ok['ok']} · "
+          f"отпечаток едет: {ok['affects_hash']} "
+          f"({h(ok['spec_hash_before'])} → {h(ok['spec_hash_after'])})")
+    for d in ok["changed_intervals"]:
+        print(f"       {d['node']}: {d['before']} → {d['after']}")
+    bad = dispatch(ctx, "validate_spec",
+                   {"patch": {"node": "CPE", "field": "share_range",
+                              "value": [0.1, 0.9]}})
+    print(f"   • CPE (SHARE_CLOSURE) задать share_range: ok={bad['ok']} · "
+          f"{bad['error']}")
+    print(f"     {bad['hint']}")
+    print(f"   спека проекта после dry-run: {h(spec.spec_hash())} (не тронута)")
+
+    # --- 4. simulate_bounds: КЛИН против ТРАПЕЦИИ ---------------------
+    sim = dispatch(ctx, "simulate_bounds",
+                   {"patch": DEMO_WEDGE, "n": 400, "seed": 0,
+                    "pair": ["UV", "DINP"]})
+    print("\n📊 simulate_bounds — тот самый аргумент против «привяжи УФ к "
+          "пластификатору»:")
+    show(pd.DataFrame([
+        {"вариант": "сейчас · ABSOLUTE_CAPPED (трапеция по фазе)",
+         "corr(UV,DINP)": sim["current"]["pair_corr"],
+         "Σphr": [round(v, 1) for v in sim["current"]["sigma_phr"]]},
+        {"вариант": "патч · RATIO_TO (клин)",
+         "corr(UV,DINP)": sim["proposed"]["pair_corr"],
+         "Σphr": [round(v, 1) for v in sim["proposed"]["sigma_phr"]]},
+    ]))
+    print(f"   сдвиг корреляции: +{sim['pair_corr_shift']} ⇒ клин вшивает "
+          f"монотонный prior, который данные уже НЕ ОПРОВЕРГНУТ.")
+
+    # --- 5. point_report: разбор конкретного рецепта ------------------
+    recipe = [100.0, 6.0, 2.5, 8.0, 7.0, 1.0, 0.10]   # T_soft = 15, PBNK = 8
+    rep = dispatch(ctx, "point_report",
+                   {"recipe_phr": recipe, "delta_phr": 0.02})
+    pbnk = rep["effective_bounds"]["PBNK"]
+    print(f"\n🧾 point_report(рецепт с T_soft=15, PBNK=8 phr): ok={rep['ok']}")
+    print(f"   PBNK: доля {pbnk['coord']:.4f} = {pbnk['phr']:.2f} phr, верх "
+          f"держит «{pbnk['active_hi']}» (складской лимит 8 phr, не share_range)")
+    print(f"   премикс нужен для: "
+          f"{[k for k, v in rep['premix'].items() if v] or 'нет'} "
+          f"(шаг весов δ=0.02 phr)")
+    over = dispatch(ctx, "encode_recipe",
+                    {"recipe_phr": [100.0, 25.0, 2.5, 5.0, 5.0, 1.0, 0.10]})
+    print(f"   серийный рецепт с DINP=25: представим={over['representable']} "
+          f"⇒ {over['hint'].splitlines()[0]}")
+
+    # --- 6. A0.6: отказы объясняют себя -------------------------------
+    print("\n⛔ Отказы объясняют причину (уходят МОДЕЛИ как результат):")
+    for name, args in (("explain_node", {"name": "Chalk_1T"}),
+                       ("simulate_bounds", {"n": 50, "pair": ["UV", "Chalk"]}),
+                       ("get_runs", {})):
+        try:
+            dispatch(ctx, name, args)
+        except ToolError as exc:
+            print(f"   • {name}: {str(exc)[:110]}…")
+
+    # --- 7. Стыковка с ходом модели (iter60) --------------------------
+    print("\n🔁 Тот же ход, что в iter60, но инструменты НАСТОЯЩИЕ:")
+    audit = []
+    call = dispatcher(ctx, on_call=audit.append)
+    script = [
+        {"choices": [{"message": {"role": "assistant", "content": "",
+                                  "tool_calls": [{"id": "c1", "function": {
+                                      "name": "explain_node",
+                                      "arguments": _json.dumps(
+                                          {"name": "PBNK",
+                                           "totals": [10.5, 15.0]})}}]}}]},
+        {"choices": [{"message": {"role": "assistant", "content": (
+            "Верх доли PBNK не постоянен: при T=10,5 это 0,70, при T=15 — "
+            "0,533 (давит складской лимит 8 phr). Диапазон в спеке НЕ "
+            "занижен — сужение делает conditional narrowing.")}}]},
+    ]
+    res = llm.run_tool_loop(
+        [{"role": "user", "content": "Почему верх PBNK не 0,70?"}],
+        dispatch=call, tools=tool_specs([READONLY]),
+        transport=_scripted_transport(script))
+    tool_msg = [m for m in res.new_messages if m["role"] == "tool"][0]
+    print(f"   инструмент вернул модели {len(tool_msg['content'])} симв. "
+          f"настоящих чисел ядра (spec_hash={h(spec.spec_hash())})")
+    for line in res.text.splitlines():
+        print(f"   🤖 {line}")
+
+    print("\n🔧 Аудит вызовов (пишется в assistant/tool_calls.jsonl):")
+    for rec in audit:
+        store.append_log(CAMPAIGN_ROOT, DEMO_PROJECT, "tool_calls",
+                         {"tool": rec["tool"], "args": rec["args"],
+                          "ok": rec["ok"], "error": rec["error"],
+                          "duration_s": rec["duration_s"],
+                          "summary": rec.get("summary", "")})
+    show(views.tool_calls_dataframe(audit))
+
+
 def main() -> int:
     demo_iter58()
     demo_iter59()
     demo_iter60()
+    demo_iter61()
     print("\n" + "═" * 100)
-    print("  Готово. Следующий шаг — iter61: настоящие read-only инструменты "
-          "(get_spec / explain_node / validate_spec / simulate_bounds / preflight).")
+    print("  Готово. Следующий шаг — iter62: песочница (SandboxBackend на "
+          "subprocess): тайм-аут, отказ сети, отказ записи, run_pytest.")
     print("═" * 100 + "\n")
     return 0
+
 
 
 

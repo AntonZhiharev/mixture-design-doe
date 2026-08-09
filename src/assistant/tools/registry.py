@@ -8,8 +8,17 @@
 Классы доступа (ASSISTANT_SPEC §3):
 
 * ``readonly`` — свободно;
-* ``write`` — только с подтверждением человека (`human_token`, iter63);
+* ``propose`` — модель ПРЕДЛАГАЕТ (патч уходит в стейдж сессии); состояние
+  проекта не меняется, поэтому такие вызовы разрешены ей наравне с чтением
+  (iter63);
+* ``write`` — только с подтверждением человека (`human_token`, iter63):
+  реальная правка спеки и записи в журналы решений/фактов;
 * ``sandbox`` — изолированное исполнение (iter62).
+
+Граница между ``propose`` и ``write`` — не «опасность операции», а ответ на
+вопрос «кто автор изменения». Предложение автора-модели обратимо и живёт в
+стейдже; применение — акт человека, и его нельзя получить удачной
+формулировкой запроса.
 
 ``long_running=True`` помечает инструменты, которым нужен прогресс-бар в UI
 (пользователь не должен думать, что приложение зависло).
@@ -21,9 +30,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 READONLY = "readonly"
+PROPOSE = "propose"
 WRITE = "write"
 SANDBOX = "sandbox"
-KINDS = (READONLY, WRITE, SANDBOX)
+KINDS = (READONLY, PROPOSE, WRITE, SANDBOX)
+
+#: Что разрешено МОДЕЛИ в обычном ходе: читать, предлагать, считать в
+#: песочнице. ``write`` сюда не входит по построению (iter63).
+AGENT_KINDS = (READONLY, PROPOSE, SANDBOX)
 
 
 class ToolError(RuntimeError):

@@ -717,15 +717,206 @@ def demo_iter62() -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+# ----------------------------------------------------------------------
+# iter63 — предлагает МОДЕЛЬ, применяет ЧЕЛОВЕК
+# ----------------------------------------------------------------------
+class _DemoRunner:
+    """Проект кампании в объёме, который нужен гейтам применения.
+
+    Настоящий раннер сюда тащить незачем: показываем, что гейт смотрит на
+    ОБЩУЮ БАЗУ ТОЧЕК и на preflight, а не на слова ассистента.
+    """
+
+    def __init__(self, spec, X):
+        self.phr_spec = spec
+        self.X = X
+
+    def set_phr_spec(self, spec):
+        self.phr_spec = spec
+
+    def preflight(self, X):                     # гейты кампании не ухудшаются
+        class _R:
+            passed = True
+            failures: list = []
+        return _R()
+
+
+def demo_iter63() -> None:
+    head("iter63 · WRITE-ИНСТРУМЕНТЫ: предлагает модель, применяет человек")
+
+    import json as _json
+
+    import numpy as np
+
+    from src.assistant.consent import ConsentRegistry
+    from src.assistant.tools import (AGENT_KINDS, PROPOSE, WRITE, ToolContext,
+                                     ToolError, dispatch, tool_names,
+                                     tool_specs)
+    from src.assistant.tools.registry import dispatcher
+    from src.assistant.tools.write import issue_apply_token, issue_reject_token
+    from src.design.phr_sampler import PhrSpec
+
+    s = store.load_session(CAMPAIGN_ROOT, DEMO_PROJECT)
+    spec = PhrSpec.from_dicts(DEMO_NODES)
+    # одна УЖЕ ИЗМЕРЕННАЯ точка проекта: DINP = 13 phr (верх прежней области)
+    measured = np.atleast_2d(spec.to_fractions(
+        np.array([100.0, 13.0, 2.5, 7.0, 8.0, 1.0, 0.10])))
+    runner = _DemoRunner(spec, measured)
+    consent = ConsentRegistry()
+    ctx = ToolContext(spec=spec, runner=runner, session=s, root=CAMPAIGN_ROOT,
+                      project=DEMO_PROJECT, extra={"consent": consent})
+
+    print(f"\n🧰 Модели выдаются классы {list(AGENT_KINDS)}:")
+    print(f"   предлагать может: {tool_names([PROPOSE])}")
+    print(f"   применять НЕ может (класс write): {tool_names([WRITE])}")
+
+    # --- 1. Ход модели: числа из ядра → предложение патча ---------------
+    audit = []
+    call = dispatcher(ctx, allowed_kinds=AGENT_KINDS, on_call=audit.append)
+    question = ("В цехе для белых компаундов льём DINP до 20 phr, а в спеке "
+                "верх 14 — расширь.")
+    s.add_message("user", question)
+    print(f"\n👤 {question}")
+
+    def _fn(name, args):
+        return {"id": f"c_{name}", "type": "function",
+                "function": {"name": name, "arguments": _json.dumps(args)}}
+
+    def _answer(content, tool_calls=None):
+        msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return {"choices": [{"message": msg}]}
+
+    script = [
+        _answer("", [_fn("explain_node", {"name": "DINP"})]),
+        _answer("", [_fn("propose_patch", {
+            "patch": {"node": "DINP", "field": "range", "value": [4.0, 20.0]},
+            "rationale": "L1-факт цеха: для белых компаундов DINP доходит до "
+                         "20 phr; прежний верх 14 — договорённость, а не "
+                         "физический предел.",
+            "bound_type": "CONVENTIONAL", "level": "L1",
+            "source": "технолог (устно, 09.08.2026)", "confidence": "high"})]),
+        _answer("Предложил патч: DINP.range 4–14 → 4–20 phr (CONVENTIONAL, L1). "
+                "Отпечаток спеки поедет ⇒ уже собранные точки относятся к "
+                "прежней геометрии. Применить может только человек — кнопка "
+                "«Применить» в панели патчей."),
+    ]
+    res = llm.run_tool_loop([{"role": "user", "content": question}],
+                            dispatch=call, tools=tool_specs(AGENT_KINDS),
+                            transport=_scripted_transport(script))
+    for line in res.text.splitlines():
+        print(f"   🤖 {line}")
+
+    pid = s.staged_patches()[-1].id
+    print("\n🧩 Патч лёг в СТЕЙДЖ (спека проекта не тронута, "
+          f"hash={spec.spec_hash()[:16]}…):")
+    show(views.staged_patches_dataframe(s, only_staged=True))
+
+    # --- 2. Модель не может применить сама -----------------------------
+    print("\n⛔ Попытка применить патч САМОЙ моделью (класс write ей не выдан):")
+    try:
+        call("apply_patch", {"patch_id": pid, "human_token": "я-сам"})
+    except ToolError as exc:
+        print(f"   {str(exc)[:150]}…")
+
+    print("\n⛔ Тот же вызов «с улицы», но без токена человека:")
+    try:
+        dispatch(ctx, "apply_patch", {"patch_id": pid, "human_token": ""},
+                 allowed_kinds=[WRITE])
+    except ToolError as exc:
+        print(f"   {str(exc)[:150]}…")
+
+    # --- 3. Гейт применения: измеренная точка выпадает из геометрии -----
+    print("\n🚧 А теперь патч НАОБОРОТ — сузить верх DINP до 8 phr:")
+    narrow = dispatch(ctx, "propose_patch",
+                      {"patch": {"node": "DINP", "field": "range",
+                                 "value": [4.0, 8.0]},
+                       "rationale": "гипотеза: выше 8 phr не нужно",
+                       "level": "L3", "confidence": "low"},
+                      allowed_kinds=[PROPOSE])
+    narrow_id = narrow["patch_ids"][0]
+    try:
+        dispatch(ctx, "apply_patch",
+                 {"patch_id": narrow_id,
+                  "human_token": issue_apply_token(ctx, narrow_id)},
+                 allowed_kinds=[WRITE])
+    except ToolError as exc:
+        for chunk in str(exc).split(". "):
+            print(f"   {chunk.strip()}")
+
+    # --- 4. Человек отклоняет патч — отказ ТОЖЕ решение -----------------
+    dispatch(ctx, "reject_patch",
+             {"patch_id": narrow_id,
+              "human_token": issue_reject_token(ctx, narrow_id),
+              "reason": "сужение обесценивает опыт с DINP=13 phr",
+              "author": "технолог"}, allowed_kinds=[WRITE])
+
+    # --- 5. Человек нажал «Применить»: кнопка = разовый токен -----------
+    token = issue_apply_token(ctx, pid, note="кнопка «Применить» в доке")
+    print(f"\n🔑 Кнопка выдала разовый токен {token[:6]}… "
+          f"(действие apply_patch, цель {pid}, привязан к spec_hash):")
+    show(views.consents_dataframe(consent.pending()))
+
+    out = dispatch(ctx, "apply_patch",
+                   {"patch_id": pid, "human_token": token,
+                    "note": "согласовано на планёрке", "author": "технолог"},
+                   allowed_kinds=[WRITE])
+    print(f"\n✅ {views.apply_result_caption(out)}")
+    print(f"   DINP теперь: {ctx.spec.phr_intervals()['DINP']} phr; "
+          f"проект получил новую спеку "
+          f"({runner.phr_spec.spec_hash()[:16]}…)")
+    print(f"   {out['warning']}")
+    print(f"   {out['persist_hint']}")
+
+    # --- 6. Повторное применение и токен «не от того» патча ------------
+    print("\n⛔ Границы подтверждения:")
+    try:
+        dispatch(ctx, "apply_patch",
+                 {"patch_id": pid, "human_token": issue_apply_token(ctx, pid)},
+                 allowed_kinds=[WRITE])
+    except ToolError as exc:
+        print(f"   • тот же патч второй раз: {str(exc)[:120]}…")
+
+    third = dispatch(ctx, "propose_patch",
+                     {"patch": {"node": "TiO2", "field": "range",
+                                "value": [0.3, 9.0]},
+                      "rationale": "новый лот пигмента", "level": "L2"},
+                     allowed_kinds=[PROPOSE])["patch_ids"][0]
+    try:
+        dispatch(ctx, "apply_patch",
+                 {"patch_id": third, "human_token": issue_apply_token(ctx, pid)},
+                 allowed_kinds=[WRITE])
+    except ToolError as exc:
+        print(f"   • токен ОТ ДРУГОГО патча: {str(exc)[:120]}…")
+
+    print("\n🧩 Патчи сессии после разбора (статусы — часть памяти проекта):")
+    show(views.staged_patches_dataframe(s))
+
+    print("\n📚 Журнал решений компании (применение И отказ — обе записи):")
+    show(views.decisions_dataframe(
+        store.read_log(CAMPAIGN_ROOT, DEMO_PROJECT, "decisions")))
+
+    for rec in audit:
+        store.append_log(CAMPAIGN_ROOT, DEMO_PROJECT, "tool_calls",
+                         {"tool": rec["tool"], "args": rec["args"],
+                          "ok": rec["ok"], "error": rec["error"],
+                          "duration_s": rec["duration_s"],
+                          "summary": rec.get("summary", "")})
+    store.save_session(s, CAMPAIGN_ROOT)
+    print(f"\n📌 {views.session_caption(s)}")
+
+
 def main() -> int:
     demo_iter58()
     demo_iter59()
     demo_iter60()
     demo_iter61()
     demo_iter62()
+    demo_iter63()
     print("\n" + "═" * 100)
-    print("  Готово. Следующий шаг — iter63: write-инструменты "
-          "(propose_patch/apply_patch с human_token) + decision_log.")
+    print("  Готово. Следующий шаг — iter64: системный промпт архитектора "
+          "+ golden-сценарии маршрутизации (§8).")
     print("═" * 100 + "\n")
     return 0
 

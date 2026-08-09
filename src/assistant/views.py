@@ -159,9 +159,57 @@ def decisions_dataframe(records: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
                                        "spec_hash", "обоснование"])
 
 
+def consents_dataframe(consents: Sequence[Any]) -> pd.DataFrame:
+    """Выданные подтверждения человека (iter63): что именно разрешено и до когда.
+
+    Пользователь должен видеть, на что он «нажал кнопку»: подтверждение
+    одноразовое, привязано к действию, цели и отпечатку спеки.
+    """
+    rows: List[Dict[str, Any]] = []
+    for c in consents or []:
+        d = c if isinstance(c, Mapping) else c.to_state()
+        rows.append({
+            "действие": d.get("action", ""),
+            "цель": _short(d.get("target", ""), 40),
+            "при spec_hash": str(d.get("context_hash", ""))[:12] or "—",
+            "живёт, с": round(float(d.get("ttl_s", 0.0) or 0.0)),
+            "использован": "да" if float(d.get("used_at", 0) or 0) > 0 else "",
+            "токен": str(d.get("token", ""))[:6] + "…",
+        })
+    return pd.DataFrame(rows, columns=["действие", "цель", "при spec_hash",
+                                       "живёт, с", "использован", "токен"])
+
+
 # ----------------------------------------------------------------------
 # Подписи
 # ----------------------------------------------------------------------
+def apply_result_caption(result: Mapping[str, Any]) -> str:
+    """Одна строка об итоге применения патча (iter63).
+
+    Сдвиг ``spec_hash`` называется вслух: после него уже собранные точки
+    относятся к ПРЕЖНЕЙ геометрии, и молчать об этом нельзя.
+    """
+    if not result:
+        return "патч не применён"
+    before = str(result.get("spec_hash_before", ""))[:12]
+    after = str(result.get("spec_hash_after", ""))[:12]
+    n = len(result.get("changed_intervals", []) or [])
+    parts = [f"патч {result.get('patch_id', '—')} · {result.get('status', '')}",
+             f"границ изменилось: {n}"]
+    parts.append(f"отпечаток: {before}… → {after}…" if result.get("affects_hash")
+                 else f"отпечаток не изменился ({before}…)")
+    gates = result.get("gates", {}) or {}
+    pts = (gates.get("points", {}) or {})
+    if pts.get("checked"):
+        parts.append(f"точек проверено: {pts.get('n_checked', 0)}, "
+                     f"выпало: {pts.get('n_lost', 0)}")
+    pre = (gates.get("preflight", {}) or {})
+    if pre.get("checked"):
+        parts.append("preflight: "
+                     + ("не ухудшился" if pre.get("ok") else "УХУДШИЛСЯ"))
+    return " · ".join(parts)
+
+
 def session_caption(session: AssistantSession) -> str:
     """Одна строка о состоянии сессии — заголовок дока и вывод демо."""
     staged = len(session.staged_patches())

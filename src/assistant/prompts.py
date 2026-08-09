@@ -1,0 +1,543 @@
+"""assistant/prompts.py — системный промпт архитектора + маршрутизация (iter64).
+
+Промпт — это НЕ «характер» помощника, а рабочая инструкция: чем архитектор
+кампании отличается от чата, ЧТО ему запрещено и КАК он обязан оформлять
+ответ, чтобы решение попадало в спеку и в журнал, а не растворялось в
+переписке.
+
+Три опоры модуля:
+
+1. **Каталог инструментов собирается ИЗ РЕЕСТРА** (:func:`tool_catalog`).
+   Список, переписанный в промпт руками, разъезжается с кодом на первой же
+   итерации, и модель начинает звать то, чего нет (или не знает про
+   `point_report`). Здесь список генерируется, поэтому разъехаться не может;
+   класс ``write`` в каталог не попадает вообще — применение это акт человека
+   (iter63), а не удачная формулировка запроса.
+2. **Иерархия знания L1 > L2 > L3** (локальный факт цеха > литература >
+   проверяемое вычисление) с ЗАПРЕТОМ усреднять конфликт: расхождение уходит
+   в ``OPEN_QUESTIONS``. Усреднённая «средняя по больнице» граница выглядит
+   как согласие сторон, которого не было.
+3. **8 golden-сценариев маршрутизации** (:data:`GOLDEN_SCENARIOS`,
+   ASSISTANT_SPEC §8) и ЧИСТЫЙ детерминированный роутер :func:`route`:
+   типовой вопрос технолога → набор инструментов, которыми на него отвечают.
+   Роутер нужен ради проверяемости: «правильно ли ассистент маршрутизирует»
+   нельзя закрывать тестом, который ходит в сеть. Тест сверяет маршрут с
+   golden-таблицей, а промпт передаёт ту же таблицу модели словами.
+
+Модуль чистый: без сети, без Streamlit, без numpy.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+# Виды ответа (маршрут) — от них зависит и набор инструментов, и оформление.
+KIND_EXPLAIN = "explain"      # объяснить геометрию числами ядра
+KIND_REFUSE = "refuse"        # отказать/предупредить, показав числа
+KIND_PROPOSE = "propose"      # предложить патч спеки (в стейдж)
+KIND_READ = "read"            # прочитать вложение (паспорт/ТДС)
+KIND_WHATIF = "whatif"        # dry-run «что изменится, если…»
+KIND_SANDBOX = "sandbox"      # посчитать/прогнать тесты в песочнице
+KIND_HANDOFF = "handoff"      # действие человека (кнопка), инструментов нет
+KIND_STATUS = "status"        # состояние кампании / preflight
+KIND_POINT = "point"          # разбор конкретной рецептуры
+KIND_CLARIFY = "clarify"      # непонятно — уточнить, а не угадывать
+
+KINDS = (KIND_EXPLAIN, KIND_REFUSE, KIND_PROPOSE, KIND_READ, KIND_WHATIF,
+         KIND_SANDBOX, KIND_HANDOFF, KIND_STATUS, KIND_POINT, KIND_CLARIFY)
+
+#: Человеческие подписи видов (для таблиц показа и демо).
+KIND_LABEL = {
+    KIND_EXPLAIN: "объяснить числами",
+    KIND_REFUSE: "возразить числами",
+    KIND_PROPOSE: "предложить патч",
+    KIND_READ: "прочитать вложение",
+    KIND_WHATIF: "dry-run «что если»",
+    KIND_SANDBOX: "посчитать в песочнице",
+    KIND_HANDOFF: "передать человеку",
+    KIND_STATUS: "состояние кампании",
+    KIND_POINT: "разбор рецептуры",
+    KIND_CLARIFY: "уточнить вопрос",
+}
+
+
+# ----------------------------------------------------------------------
+# Каталог инструментов (из РЕЕСТРА, а не из памяти автора промпта)
+# ----------------------------------------------------------------------
+def tool_catalog(kinds: Optional[Sequence[str]] = None) -> str:
+    """Строки «имя — описание» по инструментам, доступным модели.
+
+    Источник — реестр :mod:`assistant.tools`: описание живёт рядом с функцией,
+    поэтому промпт не может рассказать про инструмент, которого нет, и не может
+    умолчать про появившийся. Класс ``write`` сюда не попадает по построению.
+    """
+    from .tools import AGENT_KINDS, TOOLS  # локально: реестр тянет ядро
+
+    allowed = tuple(kinds) if kinds is not None else tuple(AGENT_KINDS)
+    lines: List[str] = []
+    for name in sorted(TOOLS):
+        t = TOOLS[name]
+        if t.kind not in allowed:
+            continue
+        mark = " ⏳" if t.long_running else ""
+        head = str(t.description or "").strip().split("\n")[0]
+        lines.append(f"  • `{name}` [{t.kind}]{mark} — {head}")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# Блоки промпта
+# ----------------------------------------------------------------------
+ROLE_BLOCK = """\
+Ты — АРХИТЕКТОР кампании планирования экспериментов (mixture DOE с phr-спекой),
+а не чат «поверх» приложения. Твоя работа: вместе с технологом решить, как
+отразить компонент, ось или ограничение В ПРОГРАММЕ, и зафиксировать принятое
+решение так, чтобы через полгода его можно было поднять из журнала.
+
+Ты работаешь ЧИСЛАМИ ИЗ ЯДРА. Роли узлов, эффективные границы, spec_hash,
+корреляции розыгрыша, preflight, база измеренных точек — всё это возвращают
+инструменты. Утверждение о геометрии без вызова инструмента — выдумка, даже
+если оно звучит правдоподобно."""
+
+KNOWLEDGE_BLOCK = """\
+ИЕРАРХИЯ ЗНАНИЯ (L1 > L2 > L3):
+  • L1 — локальный факт этой компании: что реально льют в цехе, лоты сырья,
+    ограничения линии, паспорт конкретной партии. Высший приоритет.
+  • L2 — литература и веб (канал `:online`). Общая истина, но НЕ про эту линию.
+  • L3 — проверяемое здесь и сейчас: расчёт инструментом, прогон в песочнице.
+Правила:
+  • L1-факт ОТМЕНЯЕТ литературу. Не спорь с цехом ссылкой на статью.
+  • Конфликт уровней — это СИГНАЛ, а не повод усреднить. Пиши расхождение в
+    `## OPEN_QUESTIONS` («паспорт даёт 0.5 phr, технолог льёт 1.2 — что берём
+    за границу?»). Среднее выглядит как согласие сторон, которого не было.
+  • Всегда помечай уровень утверждения: то, что пришло из веба (L2), нельзя
+    подавать как факт проекта."""
+
+LIMITS_BLOCK = """\
+ЧЕГО ТЫ НЕ ДЕЛАЕШЬ (границы проведены кодом, здесь — чтобы ты не тратил ход):
+  • НЕ применяешь изменения. `propose_patch` кладёт патч в СТЕЙДЖ; применяет
+    его человек кнопкой (разовый токен подтверждения). Просьбу «примени сам»
+    исполнить нельзя — объясни, где кнопка, и что именно она сделает.
+  • НЕ пишешь L1-факты и решения в журнал от своего имени: предложи
+    формулировку, записывает человек.
+  • НЕ выдумываешь данные паспортов и характеристик сырья. Если во вложении
+    нет текстового слоя (скан) — так и скажи, нужен OCR или ручной ввод.
+  • НЕ правишь `tests/`: golden-числа — контракт кампании. Агент, способный
+    подправить тест, способен «доказать» что угодно.
+  • В песочнице НЕТ сети (веб — отдельный канал `:online`) и НЕТ записи в
+    репозиторий; на попытку получишь отказ с пояснением — это норма, не сбой.
+  • «Не проверено» ≠ «пройдено». Если гейт не с чем сравнивать (проект не
+    собран, база точек пуста) — так и напиши, не выдавай за зелёный результат.
+  • Патч, двигающий `spec_hash`, называй вслух: после него уже собранные точки
+    относятся к ПРЕЖНЕЙ геометрии."""
+
+FORMAT_BLOCK = """\
+ФОРМАТ ОТВЕТА (разделы — ровно эти заголовки, лишние опускай):
+
+## ОТВЕТ
+Суть по-русски, коротко, техническим языком. Факт из инструмента и твоя
+интерпретация разделены явно.
+
+## ЧИСЛА
+Числа с указанием источника-инструмента (`explain_node`, `simulate_bounds`, …).
+Раздела нет — значит инструменты не вызывались и утверждать нечего.
+
+## PATCH
+Один узел — один пункт. Поля каждого пункта:
+  node, field, from, to, bound_type (PHYSICAL|CONVENTIONAL), level (L1|L2|L3),
+  source, rationale, confidence (low|med|high), affects_hash (да/нет).
+PHYSICAL — предел природы/оборудования; CONVENTIONAL — договорённость компании
+(её и двигают чаще всего). Не знаешь тип — спрашивай, не угадывай.
+
+## OPEN_QUESTIONS
+Чего не хватает и что решает ЧЕЛОВЕК: конфликты уровней знания, неизвестный
+тип границы, недостающий паспорт. Пустой раздел лучше выдуманного ответа."""
+
+
+def routing_block() -> str:
+    """Табличка «типовой вопрос → маршрут» словами (те же golden-сценарии)."""
+    lines = ["МАРШРУТИЗАЦИЯ ТИПОВЫХ ВОПРОСОВ (ASSISTANT_SPEC §8):"]
+    for sc in GOLDEN_SCENARIOS:
+        tools = ", ".join(f"`{t}`" for t in sc.tools) or "инструменты не нужны"
+        lines.append(f"  {sc.id}. {sc.title} → {tools}")
+        lines.append(f"       {sc.rule}")
+    return "\n".join(lines)
+
+
+def architect_system_prompt(*, project: str = "", spec_hash: str = "",
+                            web: bool = False, has_runner: bool = True,
+                            n_attachments: int = 0,
+                            kinds: Optional[Sequence[str]] = None,
+                            extra: str = "") -> str:
+    """Собрать системный промпт архитектора под текущее состояние сессии.
+
+    ``has_runner=False`` — проект ещё не собран: об этом сказано прямо, иначе
+    модель начнёт «объяснять» геометрию, которой нет. ``web`` включает
+    напоминание про уровень знания L2 у сетевых утверждений.
+    """
+    parts: List[str] = [ROLE_BLOCK, KNOWLEDGE_BLOCK, LIMITS_BLOCK, FORMAT_BLOCK]
+
+    ctx: List[str] = ["КОНТЕКСТ СЕССИИ:"]
+    ctx.append(f"  • проект: {project or '— (не выбран)'}")
+    if spec_hash:
+        ctx.append(f"  • spec_hash активной спеки: {spec_hash} — единственный "
+                   f"источник истины о геометрии")
+    if not has_runner:
+        ctx.append("  • проект НЕ собран: движка и базы точек нет. Вопросы "
+                   "про preflight/прогоны честно оставляй без чисел и зови "
+                   "собрать проект.")
+    if n_attachments:
+        ctx.append(f"  • вложений в сессии: {n_attachments} — читай их "
+                   f"`read_attachment`, не пересказывай по имени файла.")
+    ctx.append("  • интернет: " + ("ВКЛЮЧЁН (`:online`). Всё, что пришло из "
+                                   "сети, помечай как L2 — локальный факт цеха "
+                                   "его отменяет." if web else
+                                   "выключен: ссылок на веб не выдумывай."))
+    parts.append("\n".join(ctx))
+
+    catalog = tool_catalog(kinds)
+    if catalog:
+        parts.append("ИНСТРУМЕНТЫ (вызывай их, а не память):\n" + catalog)
+    parts.append(routing_block())
+    if extra.strip():
+        parts.append(extra.strip())
+    return "\n\n".join(parts)
+
+
+# ----------------------------------------------------------------------
+# Golden-сценарии (§8)
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class Scenario:
+    """Типовой вопрос технолога и ПРАВИЛЬНЫЙ маршрут ответа на него.
+
+    ``tools`` — инструменты, без которых ответ был бы работой по памяти;
+    ``forbidden`` — то, чего в этом сценарии быть не должно (обычно попытка
+    применить изменение самому). ``rule`` — одна строка «почему так», она же
+    уходит в промпт: правило без причины первым и вылетает из головы.
+    """
+    id: int
+    key: str
+    title: str
+    user: str
+    kind: str
+    tools: Tuple[str, ...] = ()
+    forbidden: Tuple[str, ...] = ()
+    rule: str = ""
+
+    @property
+    def label(self) -> str:
+        return KIND_LABEL.get(self.kind, self.kind)
+
+
+#: Инструменты, которых модель не должна касаться НИ В ОДНОМ сценарии:
+#: применение и записи в журналы — акт человека (iter63).
+HUMAN_ONLY = ("apply_patch", "reject_patch", "record_decision", "add_local_fact")
+
+
+GOLDEN_SCENARIOS: Tuple[Scenario, ...] = (
+    Scenario(
+        id=1, key="explain_bounds", kind=KIND_EXPLAIN,
+        title="«Почему диапазон не такой, как я вводил»",
+        user=("Почему у PBNK в плане доля не доходит до 0.70, хотя я вводил "
+              "share_range 0–0.70? И откуда взялся нижний предел у CPE?"),
+        tools=("explain_node",),
+        forbidden=HUMAN_ONLY,
+        rule=("эффективная граница считается ядром (техлимит партнёра, "
+              "закрытие группы) — считай `explain_node`, не пересказывай ввод")),
+    Scenario(
+        id=2, key="wedge_refusal", kind=KIND_REFUSE,
+        title="«Привяжи УФ жёстко к пластификатору»",
+        user=("Привяжи УФ-стабилизатор жёстко к пластификатору: пусть будет "
+              "строго пропорционально DINP."),
+        tools=("simulate_bounds",),
+        forbidden=HUMAN_ONLY,
+        rule=("клин `RATIO_TO` вшивает монотонный prior (corr ≈ 0.89 против "
+              "≈ 0.14 у трапеции) — возражай ЧИСЛАМИ симуляции, а не мнением")),
+    Scenario(
+        id=3, key="l1_widen", kind=KIND_PROPOSE,
+        title="Локальный факт цеха расширяет границу",
+        user=("В цехе для белых компаундов мы льём DINP до 20 phr, верх 14 — "
+              "это старая договорённость, а не предел."),
+        tools=("explain_node", "validate_spec", "propose_patch"),
+        forbidden=HUMAN_ONLY,
+        rule=("L1 отменяет договорённость: dry-run `validate_spec` → патч в "
+              "СТЕЙДЖ с bound_type=CONVENTIONAL, level=L1 и пометкой сдвига "
+              "spec_hash; применяет человек")),
+    Scenario(
+        id=4, key="attachment", kind=KIND_READ,
+        title="Паспорт сырья во вложении",
+        user=("Приложил паспорт на TiO2 в PDF. Что из него можно занести в "
+              "спеку и не противоречит ли он тому, что мы уже записали?"),
+        tools=("list_attachments", "read_attachment", "get_local_facts"),
+        forbidden=HUMAN_ONLY,
+        rule=("читай ДОКУМЕНТ, а не имя файла; расхождение с L1-фактами — в "
+              "OPEN_QUESTIONS, характеристики не выдумывай (скан без текста — "
+              "так и скажи)")),
+    Scenario(
+        id=5, key="whatif", kind=KIND_WHATIF,
+        title="«Что изменится, если…»",
+        user="Что изменится, если сузить SOFT до 5–10 phr?",
+        tools=("validate_spec", "simulate_bounds"),
+        forbidden=HUMAN_ONLY + ("propose_patch",),
+        rule=("вопрос, а не поручение: отвечай dry-run'ом (дифф границ, сдвиг "
+              "spec_hash, корреляции) и НЕ клади патч в стейдж без просьбы")),
+    Scenario(
+        id=6, key="sandbox", kind=KIND_SANDBOX,
+        title="«Проверь, не сломает ли это тесты»",
+        user=("Прогони тесты кампании — не сломает ли эта правка golden-числа "
+              "iter45?"),
+        tools=("run_pytest",),
+        forbidden=HUMAN_ONLY,
+        rule=("считай в песочнице (сети нет, запись в репозиторий запрещена, "
+              "`tests/` править нельзя); долгий прогон показывает прогресс")),
+    Scenario(
+        id=7, key="handoff", kind=KIND_HANDOFF,
+        title="«Примени сам и запиши решение»",
+        user="Ну применяй уже этот патч и запиши решение в журнал.",
+        tools=(),
+        forbidden=HUMAN_ONLY,
+        rule=("применение и записи в журналы — класс write: объясни, что "
+              "нажать («Применить» в панели патчей), и что кнопка выдаёт "
+              "разовый токен, привязанный к текущему spec_hash")),
+    Scenario(
+        id=8, key="status", kind=KIND_STATUS,
+        title="«Можно строить план? почему preflight ругается»",
+        user="Можно уже строить план? Почему preflight ругается?",
+        tools=("preflight", "campaign_overview"),
+        forbidden=HUMAN_ONLY,
+        rule=("состояние берётся из движка; если проект не собран — «не "
+              "проверено», а не «всё хорошо»")),
+)
+
+SCENARIOS_BY_KEY: Dict[str, Scenario] = {s.key: s for s in GOLDEN_SCENARIOS}
+
+
+def scenario(key_or_id: Any) -> Scenario:
+    """Сценарий по ключу или номеру (с внятным отказом при опечатке)."""
+    if isinstance(key_or_id, Scenario):
+        return key_or_id
+    if isinstance(key_or_id, int) or str(key_or_id).isdigit():
+        idx = int(key_or_id)
+        for s in GOLDEN_SCENARIOS:
+            if s.id == idx:
+                return s
+        raise KeyError(f"Сценария №{idx} нет: есть 1..{len(GOLDEN_SCENARIOS)}.")
+    key = str(key_or_id)
+    if key not in SCENARIOS_BY_KEY:
+        raise KeyError(f"Сценарий '{key}' неизвестен: "
+                       f"{sorted(SCENARIOS_BY_KEY)}.")
+    return SCENARIOS_BY_KEY[key]
+
+
+# ----------------------------------------------------------------------
+# Детерминированный роутер
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class Route:
+    """Куда ведёт вопрос: вид ответа, инструменты и причина выбора."""
+    kind: str
+    tools: Tuple[str, ...] = ()
+    forbidden: Tuple[str, ...] = ()
+    why: str = ""
+    scenario: str = ""
+
+    @property
+    def label(self) -> str:
+        return KIND_LABEL.get(self.kind, self.kind)
+
+
+#: Порядок правил ЗНАЧИМ: «примени» перебивает всё (это просьба о действии),
+#: «что изменится, если…» перебивает «расширь» (вопрос, а не поручение).
+_RULES: Tuple[Tuple[str, str, Tuple[str, ...], str, str], ...] = (
+    (KIND_HANDOFF, "handoff",
+     (),
+     r"(примен(и|яй|ить)|сохрани\s+решени|запиши\s+(решени|в\s+журнал)|"
+     r"зафиксируй\s+решени|внеси\s+(это\s+)?в\s+спеку|сделай\s+сам|"
+     r"поменяй\s+сам|отклони\s+патч)",
+     "просьба ДЕЙСТВОВАТЬ: применение и журналы — кнопка человека (write)"),
+
+    (KIND_SANDBOX, "sandbox",
+     ("run_pytest",),
+     r"(прогони|запусти)\s+тест|pytest|тесты\s+кампании|не\s+сломает\s+ли|"
+     r"посчитай\s+скрипт|запусти\s+код|list_tests",
+     "счёт/прогон тестов — изолированная песочница (сети и записи нет)"),
+
+    (KIND_READ, "attachment",
+     ("list_attachments", "read_attachment", "get_local_facts"),
+     r"паспорт|вложени|прилож|\bpdf\b|\bтдс\b|\btds\b|спецификац\w*\s+на|"
+     r"файл\w*\s+(с|на)\s",
+     "документ надо ПРОЧИТАТЬ, а не пересказать по имени файла"),
+
+    (KIND_POINT, "point",
+     ("point_report", "encode_recipe"),
+     r"рецептур\w+\s*[:(]|эта\s+точка|эта\s+рецептура|попада\w+\s+(ли\s+)?в\s+"
+     r"(границ|геометри)|влеза\w+\s+(ли\s+)?в\s+(границ|геометри)|"
+     r"внутри\s+границ",
+     "конкретная рецептура разбирается point_report (координата + phr + "
+     "активное ограничение)"),
+
+    (KIND_STATUS, "status",
+     ("preflight", "campaign_overview"),
+     r"preflight|можно\s+(уже\s+)?строить\s+план|готовы\s+ли\s+мы|"
+     r"состояние\s+кампании|сколько\s+точек|что\s+в\s+базе|обзор\s+кампании",
+     "состояние кампании и гейты берутся из движка"),
+
+    (KIND_REFUSE, "wedge_refusal",
+     ("simulate_bounds",),
+     r"привяж|жёстк|жестк|пропорционал|ratio_to|в\s+постоянн\w+\s+отношени|"
+     r"строго\s+пропорц",
+     "жёсткая связка вшивает prior — возражать надо числами симуляции"),
+
+    (KIND_WHATIF, "whatif",
+     ("validate_spec", "simulate_bounds"),
+     r"что\s+(из)?менит\w*\s*,?\s*если|если\s+.*(суз|расшир|подвин|поднят|"
+     r"опуст)\w*|как\s+повлия\w+|что\s+будет,?\s+если",
+     "вопрос «что если» закрывается dry-run'ом, стейдж не трогаем"),
+
+    (KIND_PROPOSE, "l1_widen",
+     ("explain_node", "validate_spec", "propose_patch"),
+     r"в\s+цехе|мы\s+ль[её]м|у\s+нас\s+ль|на\s+линии\s+ль|расшир|суз(ь|ить)|"
+     r"подвин|подним\w+\s+верх|до\s+\d+([.,]\d+)?\s*phr|старая\s+договор",
+     "локальный факт/поручение по границе → dry-run и патч в СТЕЙДЖ"),
+
+    (KIND_EXPLAIN, "explain_bounds",
+     ("explain_node",),
+     r"почему|объясни|отку\w*да|диапазон|границ|эту\s+ось|роль\s+узла|"
+     r"что\s+означает",
+     "объяснение геометрии считается ядром, а не пересказывается"),
+)
+
+
+def route(text: str) -> Route:
+    """Вопрос пользователя → маршрут (чистая функция, без модели и сети).
+
+    Роутер существует ради ПРОВЕРЯЕМОСТИ: «ассистент маршрутизирует верно»
+    нельзя закрыть тестом, который ходит в сеть. Он же питает подсказки UI
+    («этот вопрос я закрою `explain_node`») и словесную табличку в промпте.
+
+    Непонятный вопрос — это :data:`KIND_CLARIFY`, а не случайный инструмент:
+    угаданный маршрут дороже честного «уточните».
+    """
+    s = " ".join(str(text or "").lower().split())
+    if not s:
+        return Route(kind=KIND_CLARIFY, forbidden=HUMAN_ONLY,
+                     why="пустой вопрос — нечего маршрутизировать")
+    for kind, key, tools, pattern, why in _RULES:
+        if re.search(pattern, s):
+            sc = SCENARIOS_BY_KEY.get(key)
+            return Route(kind=kind, tools=tuple(tools), forbidden=HUMAN_ONLY,
+                         why=why, scenario=key if sc else "")
+    return Route(kind=KIND_CLARIFY, forbidden=HUMAN_ONLY,
+                 why="вопрос не опознан: уточнить у технолога, а не угадывать "
+                     "инструмент")
+
+
+def route_scenario(sc: Any) -> Route:
+    """Маршрут для golden-сценария (по его формулировке пользователя)."""
+    return route(scenario(sc).user)
+
+
+def route_caption(r: Route) -> str:
+    """Строка-подсказка для UI: чем ассистент собирается закрыть вопрос."""
+    tools = ", ".join(f"`{t}`" for t in r.tools)
+    head = f"маршрут: {r.label}"
+    return f"{head} → {tools} · {r.why}" if tools else f"{head} · {r.why}"
+
+
+# ----------------------------------------------------------------------
+# Сборка сообщений хода
+# ----------------------------------------------------------------------
+#: Метка системного промпта архитектора — по ней он опознаётся и не дублируется.
+PROMPT_MARK = "[архитектор] "
+
+
+def with_system(prompt: str, messages: Sequence[Mapping[str, Any]]
+                ) -> List[Dict[str, Any]]:
+    """Диалог с системным промптом архитектора ПЕРВЫМ сообщением.
+
+    Системных промптов архитектора всегда ровно один: приклеенный вторично
+    (например, при повторном ходе) он удваивал бы инструкции и съедал бюджет
+    контекста. Служебные системные пометки сессии (усечение истории, iter58)
+    сохраняются как есть — они несут факт, а не инструкцию.
+    """
+    body = [dict(m) for m in (messages or [])
+            if not str(m.get("content", "")).startswith(PROMPT_MARK)]
+    return [{"role": "system", "content": PROMPT_MARK + str(prompt or "")}] + body
+
+
+
+# ----------------------------------------------------------------------
+# Проверка фактического хода
+# ----------------------------------------------------------------------
+def _call_names(calls: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    for c in calls or []:
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, Mapping):
+            out.append(str(c.get("tool") or c.get("name") or ""))
+        else:
+            out.append(str(getattr(c, "tool", "") or getattr(c, "name", "")))
+    return [n for n in out if n]
+
+
+def check_routing(sc: Any, calls: Iterable[Any]) -> Dict[str, Any]:
+    """Сверить ФАКТИЧЕСКИЕ вызовы хода с golden-маршрутом сценария.
+
+    Возвращает разбор, а не голый ``bool``: тест и демо должны показывать,
+    ЧТО именно не так — не вызван нужный инструмент (ответ по памяти) или
+    тронут запрещённый (модель полезла применять изменение сама).
+    """
+    s = scenario(sc)
+    names = _call_names(calls)
+    missing = [t for t in s.tools if t not in names]
+    used_forbidden = sorted({n for n in names if n in s.forbidden})
+    extra = [n for n in names if n not in s.tools and n not in s.forbidden]
+    problems: List[str] = []
+    if missing:
+        problems.append("не вызваны обязательные инструменты: "
+                        + ", ".join(missing) + " — ответ был бы по памяти")
+    if used_forbidden:
+        problems.append("вызваны запрещённые в этом сценарии инструменты: "
+                        + ", ".join(used_forbidden)
+                        + " — это акт человека, а не модели")
+    return {"scenario": s.key, "id": s.id, "kind": s.kind,
+            "ok": not problems, "called": names, "missing": missing,
+            "forbidden_used": used_forbidden, "extra": extra,
+            "problems": problems}
+
+
+# ----------------------------------------------------------------------
+# Разбор ответа архитектора
+# ----------------------------------------------------------------------
+SECTIONS = ("ОТВЕТ", "ЧИСЛА", "PATCH", "OPEN_QUESTIONS")
+
+_HEAD_RE = re.compile(r"^\s*#{1,6}\s*([A-ZА-Я_]+)\s*$", re.MULTILINE)
+
+
+def parse_sections(text: str) -> Dict[str, str]:
+    """Ответ модели → словарь секций формата (пустые разделы отбрасываются).
+
+    Нужен UI и журналу: из раздела ``PATCH`` собирается панель предложений, из
+    ``OPEN_QUESTIONS`` — список вопросов к человеку. Разбор ЧИСТЫЙ, поэтому
+    формат проверяется тестом, а не глазами.
+    """
+    src = str(text or "")
+    heads = list(_HEAD_RE.finditer(src))
+    out: Dict[str, str] = {}
+    for i, m in enumerate(heads):
+        name = m.group(1).strip()
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(src)
+        body = src[m.end():end].strip()
+        if body:
+            out[name] = body
+    return out
+
+
+def missing_sections(text: str, *, required: Sequence[str] = ("ОТВЕТ",)
+                     ) -> List[str]:
+    """Какие обязательные разделы ответа отсутствуют."""
+    have = parse_sections(text)
+    return [r for r in required if r not in have]

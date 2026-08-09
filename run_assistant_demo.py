@@ -907,6 +907,126 @@ def demo_iter63() -> None:
     print(f"\n📌 {views.session_caption(s)}")
 
 
+# ----------------------------------------------------------------------
+# iter64 — промпт архитектора и маршрутизация типовых вопросов (§8)
+# ----------------------------------------------------------------------
+def demo_iter64() -> None:
+    head("iter64 · ПРОМПТ АРХИТЕКТОРА И МАРШРУТИЗАЦИЯ ТИПОВЫХ ВОПРОСОВ (§8)")
+
+    import json as _json
+
+    from src.assistant import prompts
+    from src.assistant.tools import (AGENT_KINDS, ToolContext, tool_names,
+                                     tool_specs)
+    from src.assistant.tools.registry import dispatcher
+    from src.design.phr_sampler import PhrSpec
+
+    s = store.load_session(CAMPAIGN_ROOT, DEMO_PROJECT)
+    spec = PhrSpec.from_dicts(DEMO_NODES)
+    ctx = ToolContext(spec=spec, session=s, root=CAMPAIGN_ROOT,
+                      project=DEMO_PROJECT)
+
+    prompt = prompts.architect_system_prompt(
+        project=DEMO_PROJECT, spec_hash=spec.spec_hash()[:16], web=True,
+        n_attachments=len(s.attachments))
+    print("\n📜 Системный промпт (это ИНСТРУКЦИЯ, а не «характер» помощника):")
+    for line in prompts.ROLE_BLOCK.splitlines()[:4]:
+        print(f"   {line}")
+    print("   …")
+    print("\n🎓 Иерархия знания — конфликт НЕ усредняется:")
+    for line in prompts.KNOWLEDGE_BLOCK.splitlines()[:4]:
+        print(f"   {line}")
+    print("\n🚧 Границы (проведены кодом, в промпте — чтобы не тратить ход):")
+    for line in prompts.LIMITS_BLOCK.splitlines()[1:5]:
+        print(f"   {line}")
+
+    print(f"\n🧰 Каталог инструментов собран ИЗ РЕЕСТРА "
+          f"({len(tool_names(AGENT_KINDS))} шт.), класс write в него не входит "
+          f"вовсе: {tool_names(['write'])}")
+    print(f"   длина промпта: {len(prompt)} символов "
+          f"(~{len(prompt) // 4} токенов)")
+
+    print("\n🧭 Golden-сценарии §8 — контракт «вопрос → чем отвечаем»:")
+    show(views.scenarios_dataframe())
+
+    # --- маршрутизация: чистая функция, без сети ------------------------
+    reports = []
+    for sc in prompts.GOLDEN_SCENARIOS:
+        r = prompts.route(sc.user)
+        reports.append(prompts.check_routing(sc, r.tools))
+    print("\n✅ Прогон роутера по всем восьми (сеть не нужна):")
+    show(views.routing_dataframe(reports))
+
+    print("\n🔎 Пограничные формулировки — порядок правил ЗНАЧИМ:")
+    for q in ("Сузь DINP до 8 phr",
+              "Что изменится, если сузить DINP до 8 phr?",
+              "Расширь DINP до 20 phr и примени сам.",
+              "расскажи анекдот про полимеры"):
+        print(f"   👤 {q}\n      → {prompts.route_caption(prompts.route(q))}")
+
+    # --- живой ход по сценарию 1: числа приходят из ядра -----------------
+    def _fn(name, args):
+        return {"id": f"c_{name}", "type": "function",
+                "function": {"name": name, "arguments": _json.dumps(args)}}
+
+    def _answer(content, tool_calls=None):
+        msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return {"choices": [{"message": msg}]}
+
+    def _scripted(script):
+        seq = list(script)
+
+        def transport(payload, *, key="", timeout=0):
+            return seq.pop(0) if seq else _answer("готово")
+
+        return transport
+
+    sc1 = prompts.scenario(1)
+    call = dispatcher(ctx, allowed_kinds=AGENT_KINDS)
+    print(f"\n👤 {sc1.user}")
+    res = llm.run_tool_loop(
+        prompts.with_system(prompt, [{"role": "user", "content": sc1.user}]),
+        dispatch=call, tools=tool_specs(AGENT_KINDS),
+        transport=_scripted([
+            _answer("", [_fn("explain_node", {"name": "PBNK",
+                                              "totals": [15.0]})]),
+            _answer("## ОТВЕТ\nПотолок доли PBNK зажат не вашим вводом, а "
+                    "техлимитом 8 phr на компонент.\n\n"
+                    "## ЧИСЛА\nexplain_node(PBNK, T=15): hi_φ = 0.5333 "
+                    "(активно max_phr=8), lo_CPE = 1 − 8/15.\n\n"
+                    "## OPEN_QUESTIONS\n8 phr — это PHYSICAL (склад/линия) "
+                    "или CONVENTIONAL (договорённость)?")]))
+    for line in res.text.splitlines():
+        print(f"   🤖 {line}")
+    rep = prompts.check_routing(sc1, res.calls)
+    print(f"\n   маршрут сценария 1: {'✅ верно' if rep['ok'] else '⛔'} "
+          f"(вызвано: {', '.join(rep['called'])})")
+    print(f"   разделы ответа: {list(prompts.parse_sections(res.text))}")
+
+    # --- нарушение маршрута видно НА ЧИСЛАХ, а не на глаз ---------------
+    sc7 = prompts.scenario(7)
+    print(f"\n👤 {sc7.user}")
+    res7 = llm.run_tool_loop(
+        prompts.with_system(prompt, [{"role": "user", "content": sc7.user}]),
+        dispatch=call, tools=tool_specs(AGENT_KINDS),
+        transport=_scripted([
+            _answer("", [_fn("apply_patch", {"patch_id": "p_1",
+                                             "human_token": "я-сам"})]),
+            _answer("## ОТВЕТ\nПрименить может только человек: кнопка "
+                    "«Применить» в панели патчей выдаёт разовый токен, "
+                    "привязанный к текущему spec_hash.")]))
+    for line in res7.text.splitlines():
+        print(f"   🤖 {line}")
+    show(views.routing_dataframe([prompts.check_routing(sc7, res7.calls)]))
+    print("   ⛔ отказ пришёл из ДИСПЕТЧЕРА (класс write модели не выдан), "
+          "ход при этом не сломался — модель объяснила, где кнопка.")
+
+    store.save_session(s, CAMPAIGN_ROOT)
+    print(f"\n📌 {views.session_caption(s)}")
+
+
 def main() -> int:
     demo_iter58()
     demo_iter59()
@@ -914,9 +1034,10 @@ def main() -> int:
     demo_iter61()
     demo_iter62()
     demo_iter63()
+    demo_iter64()
     print("\n" + "═" * 100)
-    print("  Готово. Следующий шаг — iter64: системный промпт архитектора "
-          "+ golden-сценарии маршрутизации (§8).")
+    print("  Готово. Следующий шаг — iter65: док ассистента справа "
+          "и контекст по месту (ui_focus).")
     print("═" * 100 + "\n")
     return 0
 

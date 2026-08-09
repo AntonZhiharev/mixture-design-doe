@@ -180,6 +180,52 @@ def consents_dataframe(consents: Sequence[Any]) -> pd.DataFrame:
                                        "живёт, с", "использован", "токен"])
 
 
+def scenarios_dataframe(scenarios: Optional[Sequence[Any]] = None
+                        ) -> pd.DataFrame:
+    """Golden-сценарии маршрутизации (iter64, ASSISTANT_SPEC §8) → таблица.
+
+    Показывает, чем ассистент ОБЯЗАН закрывать типовой вопрос технолога:
+    список инструментов здесь — контракт, а не пожелание (тест сверяет с ним
+    фактический ход).
+    """
+    from .prompts import GOLDEN_SCENARIOS  # локально: prompts тянет реестр
+
+    rows: List[Dict[str, Any]] = []
+    for sc in (scenarios if scenarios is not None else GOLDEN_SCENARIOS):
+        rows.append({
+            "№": sc.id,
+            "сценарий": sc.title,
+            "маршрут": sc.label,
+            "инструменты": ", ".join(sc.tools) or "— (кнопка человека)",
+            "нельзя": ", ".join(sc.forbidden),
+            "правило": _short(sc.rule, 90),
+        })
+    return pd.DataFrame(rows, columns=["№", "сценарий", "маршрут",
+                                       "инструменты", "нельзя", "правило"])
+
+
+def routing_dataframe(reports: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    """Итог сверки ходов с golden-маршрутами (:func:`prompts.check_routing`).
+
+    Отдельно называются ДВА разных провала: «не вызваны инструменты» (ответ по
+    памяти) и «тронуто запрещённое» (модель полезла применять сама) — лечатся
+    они по-разному.
+    """
+    rows: List[Dict[str, Any]] = []
+    for r in reports or []:
+        rows.append({
+            "№": r.get("id", ""),
+            "сценарий": r.get("scenario", ""),
+            "маршрут": r.get("kind", ""),
+            "вызвано": ", ".join(r.get("called", []) or []) or "—",
+            "не хватает": ", ".join(r.get("missing", []) or []) or "—",
+            "запрещённое": ", ".join(r.get("forbidden_used", []) or []) or "—",
+            "итог": "✅ верно" if r.get("ok") else "⛔ маршрут нарушен",
+        })
+    return pd.DataFrame(rows, columns=["№", "сценарий", "маршрут", "вызвано",
+                                       "не хватает", "запрещённое", "итог"])
+
+
 # ----------------------------------------------------------------------
 # Подписи
 # ----------------------------------------------------------------------

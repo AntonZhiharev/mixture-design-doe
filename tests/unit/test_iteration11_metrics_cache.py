@@ -11,8 +11,10 @@
 
 Проверяемый канон (по запросу пользователя):
   * после ``save_project`` → ``from_project`` метрики пройденных стадий доступны
-    БЕЗ повторного дорогого пересчёта (``cached_metrics`` восстановлены с диска),
-    хотя in-memory ``results`` после загрузки пуст;
+    БЕЗ повторного дорогого пересчёта (``cached_metrics`` восстановлены с диска);
+    ``rehydrate_results`` поднимает в ``results`` только ЛЁГКИЕ стадии
+    (M1/M2/M4/M5), тяжёлые (M3/M6) не воскрешаются;
+
   * ассистент после загрузки считает стадии пройденными
     (``build_context.stages_done``) и видит их числа (``metrics``), не помечая
     их как «без метрик»;
@@ -46,7 +48,12 @@ def _runner(tmp_path, name="m11"):
 
 # ----------------------------------------------------------------------
 def test_metrics_survive_save_load_without_results(tmp_path):
-    """Кэш метрик переживает перезагрузку, хотя results после load пуст."""
+    """Кэш метрик переживает перезагрузку без пересчёта тяжёлых стадий.
+
+    Канон после ``rehydrate_results``: ``from_project`` восстанавливает ЛЁГКИЕ
+    результаты дешёвых стадий (M1/M2/M4/M5) для отображения, но НЕ воскрешает
+    тяжёлые (M3_fit/M3_ard/M6) — их числа живут только в кэше метрик.
+    """
     r = _runner(tmp_path)
     fresh = r.stage_metrics()
     assert {"M1", "M2", "M3_fit", "M3_ard", "M4", "M6"} <= set(fresh)
@@ -54,8 +61,10 @@ def test_metrics_survive_save_load_without_results(tmp_path):
 
     root = str(tmp_path)
     r2 = PipelineRunner.from_project(root, "m11")
-    # in-memory results пуст — стадии в этой сессии не выполнялись
-    assert r2.results == {}
+    # регидрация: в results только лёгкие стадии, пересчёта в этой сессии не было
+    assert set(r2.results) <= {"M1", "M2", "M4", "M5"}
+    assert not ({"M3_fit", "M3_ard", "M6"} & set(r2.results))
+
     # но метрики восстановлены из кэша на диске
     cached = r2.stage_metrics()
     assert {"M1", "M2", "M3_fit", "M3_ard", "M4", "M6"} <= set(cached)

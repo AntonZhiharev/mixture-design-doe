@@ -998,6 +998,11 @@ def test_battle_step6_item_price_economy_white_branch():
     CEIL_FRAC, EPS, WARMUP = 0.99, 5e-3, 10
     rho_i = runner.prop_index["rho"]
     stop_reason, econ_last = {}, {}
+    # ред-флаг экономики и факт упора в потолок на момент остановки: нужны, чтобы
+    # различить «остановлено потолком» и «остановлено деньгами» (ceil имеет
+    # АБСОЛЮТНЫЙ приоритет в evaluate_stop, §4).
+    econ_flag, ceil_hit = {}, {}
+
     for bid in goals:
         br = runner.branches[bid]
         ceil = CEIL_FRAC * opt[bid]["d"]
@@ -1044,13 +1049,21 @@ def test_battle_step6_item_price_economy_white_branch():
             econ_last[bid] = (float(np.max(ei)), float(ev_raw), float(ev))
 
 
-            reason = decide_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
-                                 economic_value=ev,
-                                 cost_exp=5 * br.cost_exp, eps=EPS)
+            # evaluate_stop (а не строковая обёртка) — нужен ЕЩЁ и ред-флаг
+            # экономики: он поднимается ВСЕГДА на АТРИБУТИРОВАННОМ bestN$, даже
+            # когда связывающей причиной стал потолок (ceil — абсолютный
+            # приоритет §4). Так «невыгодно» не исчезает молча при ceil_reached.
+            dec = evaluate_stop(delta_d=delta, d_best=br.d_best, ceil=ceil,
+                                economic_value=ev,
+                                cost_exp=5 * br.cost_exp, eps=EPS)
+            reason = dec.reason
+            econ_flag[bid] = bool(dec.econ_red_flag)
+            ceil_hit[bid] = bool(br.d_best >= ceil)
             if br.spent >= WARMUP and reason is not None:
                 final_reason = reason
                 break
         stop_reason[bid] = final_reason
+
 
     # --- summary (pytest -s): теперь с ПРИЧИНОЙ остановки и экономикой ----
     # NB: prints are ASCII-only (Windows cp1252 console raises UnicodeEncodeError
@@ -1149,11 +1162,25 @@ def test_battle_step6_item_price_economy_white_branch():
         f"(rawN$={raw_p:.1f} > N*c_probe={probe_round_cost:.1f}) — иначе проб не "
         "различает два прочтения")
     assert gate_attributed != gate_raw, "вердикты не разошлись — проб не различает"
-    # и РЕАЛЬНЫЙ цикл выше скормил decide_stop именно bestN$ (ev) -> premium
-    # остановлен not_economical: гейт читает АТРИБУТИРОВАННОЕ, §5 не течёт.
-    assert stop_reason["premium"] == "not_economical", (
-        f"премиум остановлен не экономикой ({stop_reason['premium']}) — основной "
-        "цикл не подтверждает, что гейт ест атрибутированный bestN$")
+    # И РЕАЛЬНЫЙ цикл выше скормил evaluate_stop именно bestN$ (ev). Читаем это
+    # через РЕД-ФЛАГ экономики, а не через stop_reason: в evaluate_stop потолок —
+    # АБСОЛЮТНЫЙ приоритет (§4), поэтому ветка, дошедшая до >=99% аналитики,
+    # штатно репортит ceil_reached, даже когда экономика тоже говорит «невыгодно».
+    # Ред-флаг же поднимается ВСЕГДА и считается на АТРИБУТИРОВАННОМ bestN$.
+    assert econ_flag["premium"] is True, (
+        f"гейт не увидел «невыгодно» на атрибутированном bestN$={best_p:.1f} "
+        f"при Nc_exp={5 * runner.branches['premium'].cost_exp:.0f}")
+    # причина стопа — принципиальная, и приоритет причин соблюдён:
+    # ceil_reached допустим ТОЛЬКО когда потолок реально достигнут; иначе при
+    # поднятом ред-флаге экономика ОБЯЗАНА связать (not_economical).
+    assert stop_reason["premium"] in {"ceil_reached", "not_economical"}, (
+        f"премиум остановлен неожиданной причиной: {stop_reason['premium']}")
+    if stop_reason["premium"] == "ceil_reached":
+        assert ceil_hit["premium"] is True, (
+            "ceil_reached без реального упора в потолок — приоритет §4 нарушен")
+    else:
+        assert ceil_hit["premium"] is False
+
 
     # ---- проверки (робастные) ----
 
@@ -1199,10 +1226,12 @@ def test_battle_step6_item_price_economy_white_branch():
     # ==================================================================
     # STEP 6b: ОВЕРРАЙД ПОЛИТИКИ ЭКОНОМИКИ (ECON_BINDING -> ECON_ADVISORY).
     #
-    # На пассе 1 (выше) ветка остановилась по ЭКОНОМИКЕ (not_economical): её
-    # экономическая нога атрибутирована цене (§5) и у оптимума уходит в 0
-    # (ценовой рычаг исчерпан), поэтому при низком пороге она ветирует. Под
-    # ECON_BINDING это и есть мина §5.3 — price-only нога морозит ветку.
+    # На пассе 1 (выше) экономика ветки сказала «невыгодно» (econ_red_flag): её
+    # нога атрибутирована цене (§5) и у оптимума уходит в 0 (ценовой рычаг
+    # исчерпан). Под ECON_BINDING это и есть мина §5.3 — price-only нога готова
+    # заморозить ветку, как только техническая нога перестанет её опережать
+    # (при d_best < ceil причиной стопа стало бы именно ``not_economical``).
+
     #
     # Теперь пользователь ЯВНО снимает экономическое ограничение и запускает
     # ВТОРОЙ цикл той же ветки под ECON_ADVISORY: «тянем до потолка/стагнации,
@@ -1211,26 +1240,38 @@ def test_battle_step6_item_price_economy_white_branch():
     # Инвариант: под ADVISORY экономика НЕ может быть причиной стопа, но её
     # ред-флаг доносится наверх (econ_red_flag=True) — «невыгодно» видно.
     # ==================================================================
-    econ_stopped = [bid for bid in goals
-                    if stop_reason[bid] == "not_economical"]
+    # Берём ветки, у которых экономика ПОДНЯЛА ред-флаг (bestN$ <= N·c_exp).
+    # Раньше отбор шёл по ``stop_reason == not_economical``, но это ломается о
+    # приоритет §4: ветка, добравшаяся до потолка, репортит ceil_reached, хотя
+    # экономика ровно так же считает раунд невыгодным. Ред-флаг — устойчивый
+    # признак «мины §5.3», не зависящий от того, какая нога успела связать первой.
+    econ_flagged = [bid for bid in goals if econ_flag.get(bid)]
     print("\n=== STEP 6b: ECON_ADVISORY override (two passes, directive between) ===")
-    print(f"branches stopped by economics on pass 1 (BINDING): {econ_stopped}")
-    # сценарий должен реально содержать экономический стоп (premium на оптимуме)
-    assert "premium" in econ_stopped, (
-        f"ожидали not_economical у premium на пассе 1, получили: {stop_reason}")
+    print(f"branches with economic red flag on pass 1 (BINDING): {econ_flagged}")
+    print(f"  their binding stop reasons: "
+          f"{ {b: stop_reason[b] for b in econ_flagged} }")
+    # сценарий должен реально содержать экономическое «невыгодно» (premium на оптимуме)
+    assert "premium" in econ_flagged, (
+        f"ожидали econ_red_flag у premium на пассе 1, получили: {econ_flag}")
+
 
     advisory_stop, advisory_flag = {}, {}
-    for bid in econ_stopped:
+    for bid in econ_flagged:
         br = runner.branches[bid]
         ceil = CEIL_FRAC * opt[bid]["d"]
         d_before = br.d_best
         ei_v, raw_v, ev_v = econ_last.get(bid, (0.0, 0.0, 0.0))
-        # СТРОКА 1 — пасс 1 (BINDING): экономика связала. rawN$ (несатрибутир.
-        # best-of-N) >> bestN$ (атрибутированный) — батч считается, ноль bestN$
-        # от α=0 (ценовой рычаг не растит цель premium), НЕ заглушка.
+        # СТРОКА 1 — пасс 1 (BINDING): экономика подняла ред-флаг (bestN$ <=
+        # Nc_exp). rawN$ (несатрибутир. best-of-N) >> bestN$ (атрибутированный) —
+        # батч считается, ноль bestN$ от α=0 (ценовой рычаг не растит цель
+        # premium), НЕ заглушка. Печатаем ФАКТИЧЕСКУЮ связывающую причину: при
+        # достигнутом потолке это ceil_reached (приоритет §4), при недостигнутом
+        # — not_economical.
         print(f"  {bid:<9} pass1(BINDING)  d_best={d_before:.3f} "
               f"ceil={ceil:.3f}  EI$={ei_v:.2f} rawN$={raw_v:.1f} bestN$={ev_v:.1f} "
-              f"Nc_exp={5 * br.cost_exp:.0f}  stop=not_economical")
+              f"Nc_exp={5 * br.cost_exp:.0f}  stop={stop_reason[bid]} "
+              f"econ_red_flag=True")
+
 
         # --- ЗАФИКСИРОВАННОЕ УКАЗАНИЕ (между строкой 1 и строкой 2) ---
         print(f"  DIRECTIVE [{bid}]: user disables economic constraint -> "
@@ -1272,7 +1313,7 @@ def test_battle_step6_item_price_economy_white_branch():
               f"runs={br.spent}  stop={final_reason}  econ_red_flag={red}")
 
     # ---- проверки оверрайда ----
-    for bid in econ_stopped:
+    for bid in econ_flagged:
         br = runner.branches[bid]
         # под ADVISORY экономика НЕ может быть причиной стопа (нога не ветирует)
         assert advisory_stop[bid] != "not_economical", (
@@ -1283,6 +1324,7 @@ def test_battle_step6_item_price_economy_white_branch():
             f"{bid}: ред-флаг экономики потерян под ADVISORY")
         # дозабор не ухудшил лучшую desirability и не превзошёл оптимум
         assert br.d_best <= opt[bid]["d"] + 0.03
+
 
 
 # ======================================================================

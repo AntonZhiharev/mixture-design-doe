@@ -619,16 +619,116 @@ def demo_iter61() -> None:
     show(views.tool_calls_dataframe(audit))
 
 
+# ----------------------------------------------------------------------
+# iter62 — песочница: проверка исполнением, а не убеждением
+# ----------------------------------------------------------------------
+#: Тесты-однодневки для показа `run_pytest` с прогрессом: настоящий прогон
+#: профильного файла кампании занял бы минуту, а показать надо механику.
+DEMO_TESTS = '''\
+def test_share_hi_at_T15():
+    assert round(min(0.70, 8 / 15, 1 - 3 / 15), 4) == 0.5333
+
+
+def test_share_hi_shelf():
+    assert min(0.70, 8 / 10.5, 1 - 3 / 10.5) == 0.70
+
+
+def test_wrong_expectation():
+    assert min(0.70, 8 / 15, 1 - 3 / 15) == 0.70, "верх доли НЕ постоянен"
+'''
+
+
+def demo_iter62() -> None:
+    head("iter62 · ПЕСОЧНИЦА: тайм-аут, отказ сети, отказ записи, run_pytest")
+
+    import tempfile
+
+    from src.assistant.sandbox import (SandboxPolicy, SubprocessSandbox,
+                                       progress_caption)
+    from src.assistant.tools import ToolContext, dispatch
+    from src.assistant.tools.registry import SANDBOX
+
+    scratch = tempfile.mkdtemp(prefix="doe_demo_sandbox_")
+    sb = SubprocessSandbox(SandboxPolicy(repo_root=_REPO,
+                                         workdir=os.path.join(scratch, "work"),
+                                         timeout_s=60.0))
+    try:
+        info = sb.describe()
+        print(f"\n🧱 Бэкенд `{info['backend']}` · репозиторий: "
+              f"{info['repo_access']} · сеть: {info['network']} · тайм-аут "
+              f"{info['timeout_s']:.0f} с")
+        print(f"   писать можно только сюда: {info['write_roots'][0]}")
+        print(f"   защищено отдельно: {info['protected']}")
+
+        # --- 1. считает ТО, для чего нет готового инструмента -----------
+        res = sb.run_python(
+            "T = 15.0\n"
+            "hi = min(0.70, 8 / T, 1 - 3 / T)\n"
+            "print(f'hi_phi(T=15) = {hi:.4f}')")
+        print(f"\n🧮 run_python — счёт вместо рассуждения: {res.caption()}")
+        for line in res.stdout.splitlines():
+            print(f"   {line}")
+
+        # --- 2. отказ сети ---------------------------------------------
+        net = sb.run_python("import socket\nsocket.socket().connect(('1.1.1.1', 80))")
+        print(f"\n🌐 Попытка выйти в сеть: {net.caption()}")
+        print(f"   {net.note}")
+
+        # --- 3. отказ записи -------------------------------------------
+        target = os.path.join(_REPO, "tests", "unit",
+                              "test_iteration45_phr_spec.py").replace("\\", "\\\\")
+        wr = sb.run_python(f"open('{target}', 'a').write('# подправлю тест')")
+        print(f"\n✍️  Попытка подправить тест: {wr.caption()}")
+        print(f"   {wr.note}")
+
+        # --- 4. тайм-аут ------------------------------------------------
+        slow = sb.run_python("import time\nprint('считаю…', flush=True)\n"
+                             "time.sleep(30)", timeout_s=2.0)
+        print(f"\n⏱ Зависший расчёт: {slow.caption()} "
+              f"(частичный вывод: {slow.stdout.strip()!r})")
+
+        # --- 5. run_pytest с прогрессом ---------------------------------
+        target_tests = os.path.join(scratch, "test_demo_shares.py")
+        with open(target_tests, "w", encoding="utf-8") as fh:
+            fh.write(DEMO_TESTS)
+
+        print("\n🧪 run_pytest — так проверяется «патч ничего не ломает» "
+              "(строки ниже видит пользователь в доке):")
+        rep = sb.run_pytest([target_tests], timeout_s=180,
+                            on_progress=lambda ev: print(
+                                f"   {progress_caption(ev)}"))
+        print(f"\n   итог: {rep.caption()}")
+        print(f"   упало: {[os.path.basename(f) for f in rep.failures]}")
+
+        # --- 6. то же самое, но как ИНСТРУМЕНТ модели -------------------
+        s = store.load_session(CAMPAIGN_ROOT, DEMO_PROJECT)
+        ctx = ToolContext(session=s, root=CAMPAIGN_ROOT, project=DEMO_PROJECT,
+                          extra={"sandbox": sb})
+        out = dispatch(ctx, "run_pytest", {"targets": [target_tests]},
+                       allowed_kinds=[SANDBOX])
+        print(f"\n🔧 Инструмент run_pytest вернул модели: ok={out['ok']} · "
+              f"{out['passed']} прошло · {out['failed']} упало · "
+              f"артефакт сохранён в кампанию")
+        print("\n🗂 Артефакты сессии (выхлоп песочницы живёт в проекте):")
+        show(views.artifacts_dataframe(s))
+        store.save_session(s, CAMPAIGN_ROOT)
+    finally:
+        sb.close()
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def main() -> int:
     demo_iter58()
     demo_iter59()
     demo_iter60()
     demo_iter61()
+    demo_iter62()
     print("\n" + "═" * 100)
-    print("  Готово. Следующий шаг — iter62: песочница (SandboxBackend на "
-          "subprocess): тайм-аут, отказ сети, отказ записи, run_pytest.")
+    print("  Готово. Следующий шаг — iter63: write-инструменты "
+          "(propose_patch/apply_patch с human_token) + decision_log.")
     print("═" * 100 + "\n")
     return 0
+
 
 
 

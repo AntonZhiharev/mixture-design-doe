@@ -1020,6 +1020,26 @@ def get_campaign_controller() -> Optional["cv.CampaignController"]:
     return st.session_state.get("campaign_ctrl")
 
 
+def publish_ui_focus(section: str, **fields) -> None:
+    """iter65 (ASSISTANT_SPEC): сообщить доку ассистента, ГДЕ сейчас пользователь.
+
+    Док стоит в правой колонке и виден на каждом шаге; чтобы вопрос «объясни
+    эту ось» имел смысл, ему нужен ФАКТ о месте — шаг потока, узел спеки,
+    выбранная ветка. Пишем обычный словарь в ``st.session_state['ui_focus']``:
+    поток не должен импортировать слой ассистента ради одной записи, а разбор
+    словаря — чистая функция ``assistant.context.focus_from_state`` (её и
+    проверяет тест).
+
+    Страница показывает несколько секций сразу, поэтому фокусом объявляется
+    САМАЯ КОНКРЕТНАЯ из активных: пока база пуста — стартовый дизайн, дальше —
+    выбранная ветка. Ручной селектор узла в доке лишь уточняет этот факт.
+    """
+    focus = {"section": str(section)}
+    focus.update({k: v for k, v in fields.items()
+                  if v not in (None, "", [], ())})
+    st.session_state["ui_focus"] = focus
+
+
 def _flash(msg: str, kind: str = "success") -> None:
     """P0: отложенное уведомление — переживает ``st.rerun`` мутации.
 
@@ -3231,6 +3251,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     runner = ctrl.runner
     props = list(runner.property_names)
     coord_names = setup_coord_names(runner)
+    # iter65: пока база пуста, это ЕДИНСТВЕННАЯ активная секция — значит,
+    # пользователь именно здесь, и док ассистента должен спрашивать про seed.
+    publish_ui_focus("seed")
     st.markdown("### 🌱 Стартовый дизайн (seed) — ручной ввод откликов (§17.4)")
     st.caption(
         f"Отклики проекта: {', '.join(props)}. Предложите N точек по составной "
@@ -4660,6 +4683,9 @@ def render_campaign() -> None:
 
     bsel = st.selectbox("Ветка (линза контекста — Тр-3.3)", bids,
                         key="camp_branch", format_func=_branch_label)
+    # iter65: после измеренного seed самый конкретный контекст — ВЫБРАННАЯ
+    # ветка (её линза определяет и роли, и рабочий стол ниже).
+    publish_ui_focus("branch", branch=bsel)
     rep = ctrl.role_report(bsel)
     st.caption(f"Линза ветки: **{rep['branch_name']}** (`{bsel}`). Role-tag "
                "валиден ТОЛЬКО в этом контексте; смена ветки меняет теги.")

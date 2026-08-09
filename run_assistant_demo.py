@@ -1027,6 +1027,139 @@ def demo_iter64() -> None:
     print(f"\n📌 {views.session_caption(s)}")
 
 
+# ----------------------------------------------------------------------
+# iter65 — док справа и контекст ПО МЕСТУ (ui_focus)
+# ----------------------------------------------------------------------
+def demo_iter65() -> None:
+    head("iter65 · ДОК СПРАВА И КОНТЕКСТ ПО МЕСТУ (ui_focus)")
+
+    import json as _json
+
+    from src.assistant import context as actx
+    from src.assistant.context import UiFocus
+    from src.assistant.tools import AGENT_KINDS, ToolContext
+    from src.design.phr_sampler import PhrSpec
+
+    s = store.load_session(CAMPAIGN_ROOT, DEMO_PROJECT)
+    spec = PhrSpec.from_dicts(DEMO_NODES)
+    ctx = ToolContext(spec=spec, session=s, root=CAMPAIGN_ROOT,
+                      project=DEMO_PROJECT)
+
+    def _fn(name, args):
+        return {"id": f"c_{name}", "type": "function",
+                "function": {"name": name, "arguments": _json.dumps(args)}}
+
+    def _answer(content, tool_calls=None):
+        msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return {"choices": [{"message": msg}]}
+
+    def _scripted(script):
+        seq = list(script)
+
+        def transport(payload, *, key="", timeout=0):
+            return seq.pop(0) if seq else _answer("готово")
+
+        return transport
+
+    # --- 1. Фокус читается из session_state ЧИСТОЙ функцией --------------
+    state = {"ui_focus": {"section": "spec", "node": "DINP"},
+             "camp_branch": "b_soft"}
+    focus = actx.focus_from_state(state)
+    print("\n📍 Секция UI опубликовала обычный словарь в session_state:")
+    print(f"   {state['ui_focus']}  (+ выбранная ветка camp_branch)")
+    print(f"   → {actx.focus_caption(focus)}")
+    print("\n🧭 Так фокус выглядит для модели (кусок системного сообщения):")
+    for line in actx.focus_block(focus).splitlines():
+        print(f"   {line}")
+
+    # --- 2. Подсказки по месту (каждая маршрутизируется) ----------------
+    print("\n💬 «Спросить по месту» на шаге «phr-спека» (узел выбран):")
+    show(views.suggestions_dataframe(actx.suggested_questions(focus)))
+    print("\n⛔ Тот же шаг БЕЗ выбранного узла — кнопка не исчезает, "
+          "а выключается с причиной:")
+    show(views.suggestions_dataframe(
+        actx.suggested_questions(UiFocus(section_key="spec"))))
+
+    # --- 3. Ход по месту: «Объясни эту ось» ------------------------------
+    print("\n👤 Объясни эту ось   (человек нажал подсказку, узел — из фокуса)")
+    res = actx.run_turn(
+        s, ctx, "Объясни эту ось", focus=focus, spec_hash=spec.spec_hash(),
+        kinds=AGENT_KINDS, persist=False,
+        transport=_scripted([
+            _answer("", [_fn("explain_node", {"name": "DINP",
+                                              "totals": [15.0]})]),
+            _answer("## ОТВЕТ\nВерх DINP (14 phr) — договорённость компании, "
+                    "а не предел: эффективная граница считается спекой.\n\n"
+                    "## ЧИСЛА\nexplain_node(DINP): интервал [4, 14] phr, "
+                    "роль ABSOLUTE.\n\n"
+                    "## OPEN_QUESTIONS\n14 phr — PHYSICAL (линия) или "
+                    "CONVENTIONAL (договорённость)?")]))
+    print(f"   в истории сохранено: «{res.question}»")
+    print(f"   модели ушло:         «{res.resolved}»")
+    for line in res.text.splitlines():
+        print(f"   🤖 {line}")
+    print(f"\n   {views.turn_caption(res)}")
+
+    # --- 4. Ход «что изменится, если…» → патч в СТЕЙДЖ --------------------
+    print("\n👤 В цехе льём DINP до 20 phr")
+    res2 = actx.run_turn(
+        s, ctx, "В цехе льём DINP до 20 phr", focus=focus,
+        spec_hash=spec.spec_hash(), kinds=AGENT_KINDS, persist=False,
+        transport=_scripted([
+            _answer("", [_fn("propose_patch",
+                             {"patch": {"node": "DINP", "field": "range",
+                                        "value": [4.0, 20.0]},
+                              "rationale": "практика цеха (L1) отменяет "
+                                           "старую договорённость",
+                              "level": "L1", "bound_type": "CONVENTIONAL",
+                              "confidence": "high"})]),
+            _answer("## ОТВЕТ\nПоложил патч в стейдж: применяет ЧЕЛОВЕК "
+                    "кнопкой в панели патчей.\n\n"
+                    "## PATCH\nnode=DINP, field=range, from=[4,14], "
+                    "to=[4,20], bound_type=CONVENTIONAL, level=L1, "
+                    "affects_hash=да")]))
+    for line in res2.text.splitlines():
+        print(f"   🤖 {line}")
+    print(f"\n   {views.turn_caption(res2)}")
+    print("\n🧩 Панель предложений дока (кнопки «Применить»/«Отклонить»):")
+    show(views.staged_patches_dataframe(s, only_staged=True))
+
+    # --- 5. Кнопку нажимает ЧЕЛОВЕК --------------------------------------
+    pid = res2.new_patches[0] if res2.new_patches else None
+    if pid:
+        out = actx.human_apply(ctx, pid, note="решили на планёрке",
+                               author="технолог")
+        print(f"\n✅ Кнопка «Применить» (разовый токен): "
+              f"{views.apply_result_caption(out)}")
+        print(f"   ⚠️ {out['warning']}" if out.get("warning") else "")
+        try:
+            actx.human_apply(ctx, pid)
+        except Exception as exc:            # noqa: BLE001 — показываем отказ
+            print(f"   ⛔ повторное нажатие: {str(exc)[:110]}…")
+
+    # --- 6. Модель к кнопке не дотягивается ------------------------------
+    print("\n👤 Примени сам и запиши решение")
+    res3 = actx.run_turn(
+        s, ctx, "Примени сам и запиши решение", focus=focus,
+        kinds=AGENT_KINDS, persist=False,
+        transport=_scripted([
+            _answer("", [_fn("apply_patch", {"patch_id": "p_1",
+                                             "human_token": "я-сам"})]),
+            _answer("## ОТВЕТ\nПрименяет человек: кнопка «Применить» в панели "
+                    "патчей справа выдаёт разовый токен, привязанный к "
+                    "текущему spec_hash.")]))
+    for line in res3.text.splitlines():
+        print(f"   🤖 {line}")
+    print(f"   ⛔ отказ пришёл из ДИСПЕТЧЕРА: "
+          f"{res3.calls[0]['error'][:100] if res3.calls else '—'}…")
+    print(f"   {views.turn_caption(res3)}")
+
+    store.save_session(s, CAMPAIGN_ROOT)
+    print(f"\n📌 {views.session_caption(s)}")
+
+
 def main() -> int:
     demo_iter58()
     demo_iter59()
@@ -1035,9 +1168,10 @@ def main() -> int:
     demo_iter62()
     demo_iter63()
     demo_iter64()
+    demo_iter65()
     print("\n" + "═" * 100)
-    print("  Готово. Следующий шаг — iter65: док ассистента справа "
-          "и контекст по месту (ui_focus).")
+    print("  Готово. Следующий шаг — iter66: MCP-сервер `doe-campaign` "
+          "(те же read-only инструменты для Cline).")
     print("═" * 100 + "\n")
     return 0
 

@@ -38,6 +38,7 @@ from src.apps import admin  # noqa: E402
 from src.apps import assistant as ai  # noqa: E402
 from src.apps import campaign as cv  # noqa: E402
 from src.apps import campaign_state as cs  # noqa: E402
+from src.apps.assistant_dock import render_assistant_dock  # noqa: E402
 from src.apps.campaign_ui import (render_campaign,  # noqa: E402
                                    campaign_assistant_overview,
                                    get_campaign_controller,
@@ -322,9 +323,19 @@ def main():
     render_campaign_persistence(CAMPAIGN_ROOT)   # 📁 сохранить/загрузить проект
     render_campaign_deleter(CAMPAIGN_ROOT)       # 🗑 удалить проект (под паролём)
 
-    tab_camp, tab_ai = st.tabs(["🧬 Проект", "💬 Ассистент"])
+    tab_camp, tab_ai = st.tabs(["🧬 Проект", "💬 Ассистент (обзор)"])
     with tab_camp:
-        render_campaign()
+        # iter65: поток слева, ДОК архитектора справа — чат виден на каждом
+        # шаге. Порядок важен: поток рисуется ПЕРВЫМ и публикует `ui_focus`
+        # (шаг, узел, ветка), из которого док берёт контекст «по месту».
+        flow, dock = st.columns([3, 1])
+        with flow:
+            render_campaign()
+        with dock:
+            ctrl_now = get_campaign_controller()
+            render_assistant_dock(
+                getattr(ctrl_now, "runner", None) if ctrl_now else None,
+                root=CAMPAIGN_ROOT)
     with tab_ai:
         render_campaign_assistant()
 

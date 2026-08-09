@@ -226,9 +226,64 @@ def routing_dataframe(reports: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
                                        "не хватает", "запрещённое", "итог"])
 
 
+def suggestions_dataframe(suggestions: Sequence[Any]) -> pd.DataFrame:
+    """Подсказки «спросить по месту» (iter65) → таблица.
+
+    Выключенная подсказка ОСТАЁТСЯ в таблице с причиной: исчезнувшая кнопка
+    читалась бы как «здесь так спрашивать нельзя», хотя не хватает всего лишь
+    выбранного узла.
+    """
+    rows: List[Dict[str, Any]] = []
+    for s in suggestions or []:
+        d = s if isinstance(s, Mapping) else {
+            "label": s.label, "question": s.question, "kind": s.kind_label,
+            "tools": s.tools, "enabled": s.enabled, "why": s.why}
+        rows.append({
+            "кнопка": d.get("label", ""),
+            "вопрос": _short(d.get("question", ""), 70),
+            "маршрут": d.get("kind", ""),
+            "инструменты": ", ".join(d.get("tools", []) or []) or "—",
+            "доступна": "да" if d.get("enabled", True) else "нет",
+            "почему": _short(d.get("why", ""), 70) or "—",
+        })
+    return pd.DataFrame(rows, columns=["кнопка", "вопрос", "маршрут",
+                                       "инструменты", "доступна", "почему"])
+
+
 # ----------------------------------------------------------------------
 # Подписи
 # ----------------------------------------------------------------------
+def turn_caption(res: Any) -> str:
+    """Одна строка об итоге хода ассистента (iter65): маршрут, вызовы, патчи.
+
+    Показывается под ответом в доке: пользователь должен видеть, ЧЕМ был
+    закрыт его вопрос (инструментами ядра или разговором) и появилось ли что-то
+    в панели патчей — иначе предложение легко не заметить.
+    """
+    if res is None:
+        return "хода не было"
+    get = (res.get if isinstance(res, Mapping) else lambda k, d=None:
+           getattr(res, k, d))
+    parts = [f"маршрут: {get('kind_label', '') or get('kind', '')}",
+             f"вызовов инструментов: {len(get('calls', []) or [])}",
+             f"{float(get('duration_s', 0.0) or 0.0):.1f} с"]
+    if get("web", False):
+        parts.append("🌐 веб включён (уровень знания L2)")
+    new_patches = list(get("new_patches", []) or [])
+    if new_patches:
+        parts.append(f"новых патчей в стейдже: {len(new_patches)} — "
+                     f"применяет ЧЕЛОВЕК кнопкой")
+    reason = str(get("stopped_reason", "") or "")
+    if reason and reason != "final":
+        parts.append(f"ход прерван: {reason}")
+    if not get("ok", True):
+        parts.append(f"⛔ {get('error', '')}")
+    sections = list((get("sections", {}) or {}))
+    if sections:
+        parts.append("разделы: " + ", ".join(sections))
+    return " · ".join(parts)
+
+
 def apply_result_caption(result: Mapping[str, Any]) -> str:
     """Одна строка об итоге применения патча (iter63).
 

@@ -1160,6 +1160,90 @@ def demo_iter65() -> None:
     print(f"\n📌 {views.session_caption(s)}")
 
 
+# ----------------------------------------------------------------------
+# iter66 — MCP-сервер `doe-campaign`: те же числа для Cline
+# ----------------------------------------------------------------------
+def demo_iter66() -> None:
+    head("iter66 · MCP-СЕРВЕР doe-campaign: те же числа для внешнего агента")
+
+    import inspect
+
+    from src.apps.campaign_state import save_campaign
+    from src.apps.campaign_ui import build_setup_runner
+    from src.design.phr_sampler import PhrSpec
+    from src.mcp import campaign_tools as ct
+
+    # Сервер смотрит в каталог кампаний — тот же, что у приложения.
+    os.environ[ct.ROOT_ENV] = CAMPAIGN_ROOT
+    ct.clear_cache()
+
+    spec = PhrSpec.from_dicts(DEMO_NODES)
+    lo, hi = spec.fraction_bounds()
+    runner = build_setup_runner(
+        mixture_names=list(spec.component_names), process_names=["T"],
+        process_lower=[150.0], process_upper=[200.0],
+        response_names=["gloss"],
+        mixture_lower=lo.tolist(), mixture_upper=hi.tolist(), seed=1)
+    runner.set_phr_spec(spec)
+    runner.set_campaign_label("PVC-кромка-2026")
+    save_campaign(runner, CAMPAIGN_ROOT, DEMO_PROJECT)
+
+    # --- 1. Что Cline получает, а чего не получает НИКОГДА ---------------
+    print("\n🧰 Инструменты сервера doe-campaign (класс readonly, "
+          f"{len(ct.exported_names())} шт.):")
+    show(pd.DataFrame([{"инструмент": d["tool"],
+                        "обязательные": ", ".join(d["required"]) or "—",
+                        "аргументы": ", ".join(d["args"]) or "—",
+                        "долгий": "да" if d["long_running"] else ""}
+                       for d in ct.tool_catalog()]))
+    print(f"\n⛔ НЕ экспортируется вообще (write/propose/sandbox): "
+          f"{ct.hidden_names()}")
+
+    # --- 2. Обёртки генерируются из реестра ------------------------------
+    print("\n🧬 Сигнатуры MCP-инструментов ГЕНЕРИРУЮТСЯ из JSON-схем реестра:")
+    wrappers = ct.build_wrappers()
+    for name in ("explain_node", "point_report", "simulate_bounds"):
+        print(f"   {name}{inspect.signature(wrappers[name])}")
+
+    # --- 3. Состояние проекта без сборки движка --------------------------
+    st = ct.project_status(DEMO_PROJECT)
+    print(f"\n📌 project_status('{DEMO_PROJECT}'): метка «{st['campaign_label']}» · "
+          f"свойства {st['property_names']} · точек {st['n_points']} · "
+          f"узлов {st['n_nodes']} · spec_hash={st['spec_hash'][:16]}… ")
+    print(f"   переписка ассистента: {st['session']}")
+
+    # --- 4. Золотые числа доходят без искажения --------------------------
+    out = ct.call_tool(DEMO_PROJECT, "explain_node",
+                       {"name": "PBNK", "totals": [5.0, 10.5, 15.0]})
+    print("\n🔎 Вызов Cline: explain_node(PBNK, totals=[5, 10.5, 15]) — те же "
+          "числа, что в доке:")
+    show(pd.DataFrame(out["result"]["effective_shares"]).round(4))
+    print(f"   ok={out['ok']} · {out['duration_s']} с · проект "
+          f"«{out['project']}»")
+
+    # --- 5. Класс write наружу не выходит --------------------------------
+    refused = ct.call_tool(DEMO_PROJECT, "apply_patch", {"patch_id": "p_1"})
+    print(f"\n⛔ Cline пробует применить патч сам: ok={refused['ok']}")
+    print(f"   {refused['error'][:190]}…")
+
+    # --- 6. Проект без движка отвечает «не проверено» --------------------
+    store.save_session(new_session("_assistant_demo_notes"), CAMPAIGN_ROOT,
+                       "_assistant_demo_notes")
+    ct.clear_cache()
+    empty = ct.call_tool("_assistant_demo_notes", "preflight", {})
+    print(f"\n🚧 Проект без campaign.json: ok={empty['ok']} · "
+          f"{empty['error'][:120]}…")
+
+    # --- 7. Аудит: видно, что разбор шёл из Cline ------------------------
+    recs = store.read_log(CAMPAIGN_ROOT, DEMO_PROJECT, "tool_calls", limit=5)
+    print("\n📜 Хвост assistant/tool_calls.jsonl проекта (пометка via):")
+    show(pd.DataFrame([{"инструмент": r.get("tool"), "ok": r.get("ok"),
+                        "via": r.get("via", "док"),
+                        "сек": r.get("duration_s"),
+                        "ошибка": str(r.get("error", ""))[:60]}
+                       for r in recs]))
+
+
 def main() -> int:
     demo_iter58()
     demo_iter59()
@@ -1169,9 +1253,12 @@ def main() -> int:
     demo_iter63()
     demo_iter64()
     demo_iter65()
+    demo_iter66()
     print("\n" + "═" * 100)
-    print("  Готово. Следующий шаг — iter66: MCP-сервер `doe-campaign` "
-          "(те же read-only инструменты для Cline).")
+    print("  Готово. Слой ассистента iter58–iter66 показан целиком: сессия, "
+          "файлы, ход, инструменты,")
+    print("  песочница, write-путь человека, промпт, док по месту и "
+          "MCP-сервер `doe-campaign` для Cline.")
     print("═" * 100 + "\n")
     return 0
 

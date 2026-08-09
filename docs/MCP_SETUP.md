@@ -1,4 +1,4 @@
-# Продолжение проекта на другой машине + MCP-сервер `doe-introspect`
+# Продолжение проекта на другой машине + MCP-серверы `doe-introspect` / `doe-campaign`
 
 Памятка для переноса работы в новую сессию / на другую машину. Всё необходимое
 лежит в git; единственное, что НЕ хранится в репозитории — локальная регистрация
@@ -110,7 +110,60 @@ $env:DOE_TRACE_ROOT = "<REPO>\project_demo\trace"  # тот же, что у MCP-
 Без ключа чат отключён, но кнопка публикации снапшота в trace работает —
 наблюдение через Cline доступно и без LLM.
 
-## 7. Где продолжать по плану
+## 7. MCP-сервер `doe-campaign` (iter66): числа кампании прямо в Cline
+
+`doe-introspect` читает ПРОГОНЫ pipeline (trace). `doe-campaign` — другое:
+это те же read-only инструменты, что у ассистента-архитектора в приложении
+(`src/assistant/tools`), только для Cline. Смысл — не рассуждать о геометрии
+по исходникам: эффективные границы, `spec_hash`, `preflight`, разбор рецепта
+считает ЯДРО.
+
+Инструменты: `list_projects`, `project_status`, `list_tools` + весь класс
+`readonly` реестра (`get_spec`, `explain_node`, `validate_spec` (dry-run),
+`simulate_bounds`, `preflight`, `point_report`, `encode_recipe`, `get_runs`,
+`campaign_overview`, `get_local_facts`, `get_decisions`, `list_attachments`,
+`read_attachment`, `sandbox_info`). У каждого есть аргумент `project` — имя
+проекта в каталоге кампаний; его можно опустить, если проект один.
+
+**Класс `write` не экспортируется вообще**: применение патча, запись решения
+и L1-факта — акт человека кнопкой в приложении (разовый токен). Класс
+`propose` (патч в стейдж сессии) и `sandbox` тоже не выдаются. Попытка
+позвать их возвращает объяснение, а не выполнение.
+
+Самопроверка (пакет `mcp` не нужен):
+```powershell
+$env:DOE_CAMPAIGN_ROOT = "<REPO>\project_campaigns"
+.venv\Scripts\python.exe src/mcp/campaign_server.py --selftest
+```
+Регистрация в `cline_mcp_settings.json` (рядом с `doe-introspect`):
+```json
+{
+  "mcpServers": {
+    "doe-campaign": {
+      "command": "d:\\DOE\\.venv\\Scripts\\python.exe",
+      "args": ["d:\\DOE\\src\\mcp\\campaign_server.py"],
+      "env": {
+        "DOE_CAMPAIGN_ROOT": "d:\\DOE\\project_campaigns",
+        "PYTHONPATH": "d:\\DOE"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+Каталог проектов по умолчанию — `<repo>/project_campaigns` (тот же, что у
+приложения), переопределяется `DOE_CAMPAIGN_ROOT`. Проекты создаются
+сохранением кампании в интерфейсе; проект без `campaign.json` честно
+отвечает «движка нет — это не проверено, а не «всё хорошо»».
+
+Каждый вызов дописывается в аудит проекта
+(`project_campaigns/<проект>/assistant/tool_calls.jsonl`) с пометкой
+`via="mcp"` — разбор через Cline виден там же, где разбор через док;
+сессия ассистента при этом не переписывается.
+
+## 8. Где продолжать по плану
 - `docs/REBUILD_SPEC.md` — спецификация (канон §5/§12).
 - `docs/FinalCheckList.md` + `docs/FinalCheckList_audit.md` — чек-лист и статус по блокам.
 - `.clinerules` — правила работы и синхронизации с git в каждой сессии.
+- `docs/ASSISTANT_SPEC.md` — слой ассистента (iter58–iter66) и MCP-контракт.

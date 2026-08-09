@@ -1,8 +1,24 @@
-# Продолжение проекта на другой машине + MCP-серверы `doe-introspect` / `doe-campaign`
+# Продолжение проекта на другой машине + MCP-сервер `doe-campaign`
 
 Памятка для переноса работы в новую сессию / на другую машину. Всё необходимое
 лежит в git; единственное, что НЕ хранится в репозитории — локальная регистрация
 MCP-сервера в настройках Cline (она машинно-зависимая). Ниже — как всё поднять.
+
+## 0. Какой сервер актуален (состояние на 09.08.2026)
+
+| Сервер | Что отдаёт | Статус |
+|---|---|---|
+| **`doe-campaign`** (§7) | read-only инструменты КАМПАНИИ из ядра: `get_spec`, `explain_node`, `simulate_bounds`, `preflight`, `point_report`, `encode_recipe`, … | **рабочий, единственный включённый** |
+| `doe-introspect` (§3–5) | прогоны pipeline M1–M8 из каталога trace (`list_runs`, `run_overview`, `get_stage`, …) | **легаси**: `"disabled": true` в настройках Cline; код и тесты оставлены |
+
+Истина по слою ассистента — `docs/ASSISTANT_SPEC.md` (iter58–iter66). По нему
+разбор кампании ведётся ТОЛЬКО через `doe-campaign`: числа считает ядро, а не
+пересказ исходников. `doe-introspect` — про другой артефакт (trace старого
+pipeline-потока) и в кампанийном потоке не нужен; включать его стоит, только
+если вернулись к разбору прогонов `run_iteration7_demo.py` / benchmark.
+Два включённых сервера с похожими именами — источник путаницы, поэтому
+легаси держим выключенным, а не удалённым.
+
 
 ## 1. Клонирование и окружение
 ```powershell
@@ -24,8 +40,12 @@ macOS/Linux: `python3 -m venv .venv && . .venv/bin/activate && pip install -r re
 > Заноза: `tests/unit/test_precision.py` падает на сборке (`No module named 'core'`) —
 > давняя несвязанная проблема. Перечисляй нужные файлы явно, не гоняй `tests/unit` целиком.
 
-## 3. Данные для интроспекции (trace)
-MCP-сервер читает сохранённые прогоны pipeline из каталога trace. Артефакты
+> **Настраиваешь с нуля? Переходи сразу к §7 (`doe-campaign`).**
+> Разделы §3–§5 ниже — про легаси-сервер `doe-introspect`, он выключен.
+
+## 3. Данные для интроспекции (trace) — ЛЕГАСИ
+MCP-сервер `doe-introspect` читает сохранённые прогоны pipeline из каталога trace. Артефакты
+
 прогонов в git НЕ коммитятся (`project_demo/`, `project_ui/` в `.gitignore`),
 поэтому на новой машине их надо СГЕНЕРИРОВАТЬ:
 ```powershell
@@ -33,14 +53,16 @@ MCP-сервер читает сохранённые прогоны pipeline и�
 ```
 Каталог trace задаётся переменной `DOE_TRACE_ROOT` (по умолчанию `<repo>/project_demo/trace`).
 
-## 4. Самопроверка сервера (без MCP-транспорта)
+## 4. Самопроверка `doe-introspect` (без MCP-транспорта) — ЛЕГАСИ
+
 ```powershell
 .venv\Scripts\python.exe src/mcp/introspect_server.py --selftest
 ```
 Должен напечатать `TRACE_ROOT` и список прогонов. Если пусто — сначала шаг 3.
 
-## 5. Регистрация MCP-сервера в Cline
+## 5. Регистрация `doe-introspect` в Cline — ЛЕГАСИ (по умолчанию выключен)
 Открой настройки MCP Cline (файл `cline_mcp_settings.json`):
+
 - Windows: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
 - macOS: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
 - Linux: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
@@ -135,7 +157,10 @@ $env:DOE_TRACE_ROOT = "<REPO>\project_demo\trace"  # тот же, что у MCP-
 $env:DOE_CAMPAIGN_ROOT = "<REPO>\project_campaigns"
 .venv\Scripts\python.exe src/mcp/campaign_server.py --selftest
 ```
-Регистрация в `cline_mcp_settings.json` (рядом с `doe-introspect`):
+Регистрация в `cline_mcp_settings.json` (путь к файлу — см. §5). Это и есть
+рабочая конфигурация текущей машины; легаси-сервер лежит рядом с
+`"disabled": true`:
+
 ```json
 {
   "mcpServers": {

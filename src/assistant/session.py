@@ -263,6 +263,79 @@ class StagedPatch:
 
 
 @dataclass
+class StagedSpec:
+    """Предложенный ПАКЕТ phr-спеки целиком — стейдж, а не применение (iter71).
+
+    Зачем отдельная запись, а не список :class:`StagedPatch`: патч правит ПОЛЕ
+    существующего узла, а здесь предлагается ГЕОМЕТРИЯ — первичный ввод спеки
+    (узлов ещё нет вовсе) и её эволюция: добавить узел, удалить узел, сменить
+    роль. Такое изменение нельзя ни собрать из пофайловых правок, ни принять
+    по частям: спека валидна только целиком (инварианты k=2/k≥3, ``members``,
+    ``group_order``), поэтому и решение по ней одно — принять пакет или нет.
+
+    ``nodes``/``group_order``/``spec_version`` — сам пакет в формате
+    :meth:`PhrSpec.to_dicts`. ``summary`` — вычисленный ядром разбор
+    (``q``, ``dim_z``, ``spec_hash``, состав добавленных/удалённых узлов,
+    смена ролей): человек в UI видит, ЧТО он утверждает, не читая JSON глазами.
+    """
+    nodes: List[Dict[str, Any]] = field(default_factory=list)
+    group_order: List[str] = field(default_factory=list)
+    spec_version: int = 2
+    label: str = ""
+    rationale: str = ""
+    level: str = ""
+    source: str = ""
+    confidence: str = ""
+    summary: Dict[str, Any] = field(default_factory=dict)
+    status: str = PATCH_STAGED
+    applied_ts: str = ""
+    reason: str = ""
+    ts: str = field(default_factory=_now)
+    id: str = field(default_factory=lambda: _new_id("spec"))
+
+    def payload(self) -> Any:
+        """Пакет в том виде, который принимает ``PhrSpec.from_dicts``.
+
+        ``group_order`` пуст → плоский список узлов: спека без порядка групп
+        сериализуется байт-в-байт как до iter48, и её отпечаток не должен
+        зависеть от того, через какой канал она пришла.
+        """
+        if self.group_order:
+            return {"spec_version": int(self.spec_version or 2),
+                    "group_order": list(self.group_order),
+                    "nodes": [dict(d) for d in self.nodes]}
+        return [dict(d) for d in self.nodes]
+
+    def to_state(self) -> Dict[str, Any]:
+        return {"id": self.id, "nodes": [dict(d) for d in self.nodes],
+                "group_order": list(self.group_order),
+                "spec_version": int(self.spec_version or 2),
+                "label": self.label, "rationale": self.rationale,
+                "level": self.level, "source": self.source,
+                "confidence": self.confidence, "summary": dict(self.summary),
+                "status": self.status, "applied_ts": self.applied_ts,
+                "reason": self.reason, "ts": self.ts}
+
+    @classmethod
+    def from_state(cls, d: Dict[str, Any]) -> "StagedSpec":
+        d = dict(d or {})
+        return cls(nodes=[dict(x) for x in (d.get("nodes") or [])],
+                   group_order=[str(x) for x in (d.get("group_order") or [])],
+                   spec_version=int(d.get("spec_version", 2) or 2),
+                   label=str(d.get("label", "")),
+                   rationale=str(d.get("rationale", "")),
+                   level=str(d.get("level", "")),
+                   source=str(d.get("source", "")),
+                   confidence=str(d.get("confidence", "")),
+                   summary=dict(d.get("summary", {}) or {}),
+                   status=str(d.get("status", PATCH_STAGED)),
+                   applied_ts=str(d.get("applied_ts", "")),
+                   reason=str(d.get("reason", "")),
+                   ts=str(d.get("ts", "")) or _now(),
+                   id=str(d.get("id", "")) or _new_id("spec"))
+
+
+@dataclass
 class ToolCall:
     """Запись аудита вызова инструмента (дублируется в ``tool_calls.jsonl``)."""
     tool: str
@@ -311,6 +384,7 @@ class AssistantSession:
     attachments: List[Attachment] = field(default_factory=list)
     artifacts: List[Artifact] = field(default_factory=list)
     patches: List[StagedPatch] = field(default_factory=list)
+    specs: List[StagedSpec] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
 
@@ -446,6 +520,51 @@ class AssistantSession:
     def staged_patches(self) -> List[StagedPatch]:
         return [p for p in self.patches if p.status == PATCH_STAGED]
 
+    # -- пакеты спеки (iter71) ------------------------------------------
+    def stage_spec(self, spec: StagedSpec) -> StagedSpec:
+        """Положить ПАКЕТ спеки в стейдж (применяет человек кнопкой).
+
+        Пустой пакет не принимается: «спека без узлов» — не предложение, а
+        потеря геометрии, и предлагать её молча нельзя (A0.6).
+        """
+        if not spec.nodes:
+            raise ValueError(
+                "Пакет спеки без узлов не принимается: предлагать пустую "
+                "геометрию нельзя (это не правка, а потеря спеки).")
+        spec.status = PATCH_STAGED
+        self.specs.append(spec)
+        self.updated_at = _now()
+        return spec
+
+    def spec_by_id(self, spec_id: str) -> Optional[StagedSpec]:
+        for s in self.specs:
+            if s.id == spec_id:
+                return s
+        return None
+
+    def set_spec_status(self, spec_id: str, status: str, *,
+                        reason: str = "") -> StagedSpec:
+        """Перевести пакет спеки в терминальный статус (тот же протокол, что
+        у патчей: повторный переход — явная ошибка)."""
+        if status not in PATCH_STATUSES:
+            raise ValueError(f"Неизвестный статус пакета спеки {status!r}: "
+                             f"допустимы {PATCH_STATUSES}.")
+        s = self.spec_by_id(spec_id)
+        if s is None:
+            raise KeyError(f"Пакет спеки '{spec_id}' не найден в сессии.")
+        if s.status != PATCH_STAGED:
+            raise ValueError(
+                f"Пакет спеки '{spec_id}' уже в статусе '{s.status}' — "
+                f"повторный переход запрещён (предложите новый пакет).")
+        s.status = status
+        s.reason = reason
+        s.applied_ts = _now()
+        self.updated_at = _now()
+        return s
+
+    def staged_specs(self) -> List[StagedSpec]:
+        return [s for s in self.specs if s.status == PATCH_STAGED]
+
     # -- аудит вызовов --------------------------------------------------
     def add_tool_call(self, call: ToolCall) -> ToolCall:
         self.tool_calls.append(call)
@@ -464,7 +583,7 @@ class AssistantSession:
 
     def is_empty(self) -> bool:
         return not (self.messages or self.attachments or self.patches
-                    or self.artifacts or self.tool_calls)
+                    or self.specs or self.artifacts or self.tool_calls)
 
     def to_state(self) -> Dict[str, Any]:
         return {
@@ -479,6 +598,7 @@ class AssistantSession:
             "attachments": [a.to_state() for a in self.attachments],
             "artifacts": [a.to_state() for a in self.artifacts],
             "patches": [p.to_state() for p in self.patches],
+            "specs": [s.to_state() for s in self.specs],
             "tool_calls": [c.to_state() for c in self.tool_calls],
         }
 
@@ -505,6 +625,10 @@ class AssistantSession:
                        (state.get("artifacts", []) or [])]
         s.patches = [StagedPatch.from_state(d) for d in
                      (state.get("patches", []) or [])]
+        # iter71: сессии, записанные до пакетов спеки, ключа 'specs' не имеют —
+        # это НЕ повод отказать в загрузке (старые проекты открываются как были).
+        s.specs = [StagedSpec.from_state(d) for d in
+                   (state.get("specs", []) or [])]
         s.tool_calls = [ToolCall.from_state(d) for d in
                         (state.get("tool_calls", []) or [])]
         return s

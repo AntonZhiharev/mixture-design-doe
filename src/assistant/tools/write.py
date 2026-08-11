@@ -35,9 +35,11 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from ..consent import DEFAULT_REGISTRY, ConsentError, ConsentRegistry
-from ..session import PATCH_APPLIED, PATCH_REJECTED, StagedPatch
+from ..session import (PATCH_APPLIED, PATCH_REJECTED, StagedPatch, StagedSpec)
 from ..store import append_log
-from .readonly import (_f, build_patched_spec, normalize_patch, spec_payload,
+from .readonly import (_f, active_spec, build_patched_spec,
+                       build_spec_from_package, normalize_patch,
+                       normalize_spec_package, spec_package_diff, spec_payload,
                        validate_spec)
 from .registry import PROPOSE, WRITE, ToolContext, ToolError, register
 
@@ -180,6 +182,91 @@ def propose_patch(ctx: ToolContext, patch: Any, rationale: str,
                      "(разовый токен подтверждения). Скажи пользователю, что "
                      "именно поедет и что изменится в отпечатке спеки."),
             "warning": check.get("warning", "")}
+
+
+# ----------------------------------------------------------------------
+# propose_spec — ПАКЕТ спеки целиком (iter71)
+# ----------------------------------------------------------------------
+@register(
+    "propose_spec",
+    description=(
+        "ПРЕДЛОЖИТЬ phr-спеку ПАКЕТОМ целиком: первичный ввод геометрии (когда "
+        "спеки в проекте ещё нет) и её ЭВОЛЮЦИЯ — добавить узел, удалить узел, "
+        "сменить роль, перестроить группы. Патчем (propose_patch) такое "
+        "невозможно: он правит поля СУЩЕСТВУЮЩИХ узлов. Пакет валидируется "
+        "ядром и кладётся в стейдж сессии; спека проекта этим вызовом НЕ "
+        "меняется — применяет человек кнопкой в интерфейсе. Формат пакета "
+        "возьми из spec_schema, не из памяти. Обязательно объясни, что "
+        "меняется и почему (уровень знания L1|L2|L3 и источник)."),
+    parameters={"type": "object", "properties": {
+        "package": {"type": "object",
+                    "description": "спека ЦЕЛИКОМ: {'spec_version': 2, "
+                                   "'nodes': [...], 'group_order': [...]}"},
+        "rationale": {"type": "string",
+                      "description": "почему такая геометрия: физика, паспорт, "
+                                     "практика цеха, расчёт"},
+        "label": {"type": "string",
+                  "description": "короткая метка пакета (например "
+                                 "«кромка ПВХ: первичный ввод»)"},
+        "level": {"type": "string", "description": "L1 | L2 | L3"},
+        "source": {"type": "string", "description": "источник сведений"},
+        "confidence": {"type": "string", "description": "high | med | low"}},
+        "required": ["package", "rationale"]},
+    kind=PROPOSE)
+def propose_spec(ctx: ToolContext, package: Any, rationale: str,
+                 label: str = "", level: str = "", source: str = "",
+                 confidence: str = "") -> Dict[str, Any]:
+    """Пакет спеки → стейдж сессии (после валидации ЯДРОМ).
+
+    Отказ валидации возвращается РЕЗУЛЬТАТОМ, а в стейдж не попадает: пункт,
+    заведомо неприменимый, перекладывал бы разбор на человека — тот нажал бы
+    «Применить» и получил ошибку вместо решения.
+    """
+    session = ctx.require_session()
+    spec = active_spec(ctx)                  # может отсутствовать: первичный ввод
+    nodes, order, version = normalize_spec_package(package)
+
+    try:
+        candidate = build_spec_from_package(package)
+    except ToolError:
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        return {"staged": False, "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "hint": ("Пакет отклонён валидатором ядра и в стейдж НЕ "
+                         "положен: геометрия проекта не тронута. Сверь ключи и "
+                         "инварианты со spec_schema и предложи заново.")}
+
+    diff = spec_package_diff(spec, candidate)
+    staged = StagedSpec(
+        nodes=nodes, group_order=order, spec_version=version,
+        label=str(label or ""), rationale=str(rationale or ""),
+        level=str(level or ""), source=str(source or ""),
+        confidence=str(confidence or ""),
+        summary={**diff, "nodes_total": len(nodes)})
+    session.stage_spec(staged)
+
+    out: Dict[str, Any] = {
+        "staged": True, "ok": True, "spec_id": staged.id,
+        "diff": diff, "nodes_total": len(nodes),
+        "note": ("Пакет НЕ применён: он в стейдже. Применяет человек кнопкой "
+                 "(разовый токен подтверждения). Скажи пользователю, что "
+                 "именно поедет: состав, роли, отпечаток спеки."),
+    }
+    if diff.get("first_spec"):
+        out["warning"] = ("Первичный ввод геометрии: после применения "
+                          f"spec_hash = {diff['spec_hash_after'][:12]}… — "
+                          f"именно к нему будут отнесены все дальнейшие точки.")
+    elif diff.get("removed") or diff.get("components_removed"):
+        out["warning"] = (
+            f"Пакет УДАЛЯЕТ узлы {diff.get('removed')} (компоненты: "
+            f"{diff.get('components_removed')}). Уже собранные точки "
+            f"относятся к прежней геометрии — назови это вслух.")
+    elif diff.get("affects_hash"):
+        out["warning"] = ("spec_hash меняется ⇒ другая геометрия кампании: "
+                          "ранее собранные точки относятся к прежнему "
+                          "отпечатку.")
+    return _f(out)
 
 
 # ----------------------------------------------------------------------
@@ -406,6 +493,216 @@ def reject_patch(ctx: ToolContext, patch_id: str, human_token: str,
             "decision": decision}
 
 
+# ----------------------------------------------------------------------
+# apply_spec / reject_spec — решение человека по ПАКЕТУ спеки (iter71)
+# ----------------------------------------------------------------------
+def spec_package_gates(ctx: ToolContext, spec, candidate) -> Dict[str, Any]:
+    """Гейты применения ПАКЕТА спеки.
+
+    Отличие от :func:`patch_gates` — в честности сравнения:
+
+    * **спеки не было** (первичный ввод) — сравнивать не с чем, гейты
+      неприменимы; это называется словами, а не выдаётся за «проверено»;
+    * **состав компонентов изменился** (узел добавлен/удалён) — прежние точки
+      живут в ДРУГОМ пространстве координат, и прогон их через новую спеку дал
+      бы бессмысленный вердикт. Такой пакет не блокируется гейтом точек, но
+      помечается как разрыв истории: решение осознанное, а не молчаливое (A0.6);
+    * состав тот же (сменились роли/границы) — работают обычные гейты патча.
+    """
+    if spec is None:
+        return {"ok": True, "checked": False, "blocked": [],
+                "history_break": False,
+                "reason": "первичный ввод геометрии: сравнивать не с чем",
+                "points": {"checked": False,
+                           "reason": "спеки до применения не было"},
+                "preflight": {"checked": False,
+                              "reason": "спеки до применения не было"}}
+    if list(spec.component_names) != list(candidate.component_names):
+        return {
+            "ok": True, "checked": False, "blocked": [], "history_break": True,
+            "reason": ("состав компонентов изменился — прежние точки лежат в "
+                       "другом пространстве координат, гейт точек неприменим"),
+            "components_before": list(spec.component_names),
+            "components_after": list(candidate.component_names),
+            "points": {"checked": False, "reason": "иной состав компонентов"},
+            "preflight": {"checked": False,
+                          "reason": "иной состав компонентов"}}
+    gates = patch_gates(ctx, spec, candidate)
+    return {**gates, "checked": True, "history_break": False}
+
+
+def _spec_decision_record(staged: StagedSpec, diff: Dict[str, Any],
+                          gates: Dict[str, Any], hash_before: str,
+                          hash_after: str, author: str, note: str
+                          ) -> Dict[str, Any]:
+    """Запись в журнал решений о применении пакета спеки.
+
+    Заголовок собирается ИЗ ДИФФА, а не из вольной формулировки: через полгода
+    по журналу должно быть видно, был это первичный ввод или эволюция и какие
+    узлы затронуты.
+    """
+    if staged.label:
+        title = staged.label
+    elif diff.get("first_spec"):
+        title = (f"phr-спека: первичный ввод "
+                 f"({diff.get('q_after', 0)} компонентов)")
+    else:
+        title = (f"phr-спека: эволюция геометрии "
+                 f"(+{len(diff.get('added', []))} / "
+                 f"−{len(diff.get('removed', []))} узлов, "
+                 f"ролей изменено: {len(diff.get('role_changed', []))})")
+    nodes = sorted(set(list(diff.get("added", []))
+                       + list(diff.get("removed", []))
+                       + [str(r.get("node")) for r
+                          in diff.get("role_changed", [])]))
+    return {
+        "ts": _now(), "title": title, "nodes": nodes,
+        "author": str(author or "человек"),
+        "spec_hash": hash_before, "spec_hash_after": hash_after,
+        "rationale": staged.rationale, "level": staged.level,
+        "source": staged.source, "confidence": staged.confidence,
+        "spec_id": staged.id, "affects_hash": hash_before != hash_after,
+        "note": str(note or ""), "kind": "apply_spec",
+        "first_spec": bool(diff.get("first_spec")),
+        "history_break": bool(gates.get("history_break")),
+        "gates": {"points": (gates.get("points", {}) or {}).get("ok"),
+                  "preflight": (gates.get("preflight", {}) or {}).get("ok")},
+    }
+
+
+@register(
+    "apply_spec",
+    description=(
+        "ПРИМЕНИТЬ пакет спеки из стейджа к проекту (первичный ввод геометрии "
+        "или её эволюция). Требует разового токена подтверждения человека — "
+        "кнопка в интерфейсе. Блокируется, если пакет не собирается ядром или "
+        "(при НЕИЗМЕННОМ составе компонентов) выбрасывает уже измеренные точки "
+        "и ломает preflight-гейты, которые до этого проходили. Применение "
+        "записывается в журнал решений компании."),
+    parameters={"type": "object", "properties": {
+        "spec_id": {"type": "string",
+                    "description": "id пакета спеки из стейджа"},
+        "human_token": {"type": "string",
+                        "description": "разовый токен подтверждения человека"},
+        "note": {"type": "string", "description": "комментарий к применению"},
+        "author": {"type": "string", "description": "кто принял решение"}},
+        "required": ["spec_id", "human_token"]},
+    kind=WRITE, long_running=True)
+def apply_spec(ctx: ToolContext, spec_id: str, human_token: str,
+               note: str = "", author: str = "") -> Dict[str, Any]:
+    session = ctx.require_session()
+    staged = session.spec_by_id(str(spec_id))
+    if staged is None:
+        raise ToolError(
+            f"Пакета спеки '{spec_id}' нет в сессии. В стейдже: "
+            f"{[s.id for s in session.staged_specs()] or 'пусто'}.")
+    if staged.status != "staged":
+        raise ToolError(
+            f"Пакет '{spec_id}' уже в статусе '{staged.status}': повторное "
+            f"применение запрещено — предложите новый пакет.")
+
+    spec = active_spec(ctx)
+    # Токен привязан к отпечатку спеки НА МОМЕНТ нажатия кнопки. При первичном
+    # вводе отпечатка нет — привязка к пустой строке, и это честно: человек
+    # подтверждал именно состояние «спеки нет».
+    hash_before = spec.spec_hash() if spec is not None else ""
+    _consume(ctx, human_token, action="apply_spec", target=str(spec_id),
+             context_hash=hash_before)
+
+    try:
+        candidate = build_spec_from_package(staged.payload())
+    except ToolError:
+        raise
+    except Exception as exc:                          # noqa: BLE001
+        raise ToolError(
+            f"ГЕЙТ ВАЛИДАЦИИ: пакет не даёт корректной спеки "
+            f"({type(exc).__name__}: {exc}). Изменение НЕ применено, геометрия "
+            f"прежняя.") from exc
+
+    gates = spec_package_gates(ctx, spec, candidate)
+    if not gates["ok"]:
+        raise ToolError(
+            "ГЕЙТ ПРИМЕНЕНИЯ: пакет НЕ применён. "
+            + "; ".join(gates.get("blocked", []))
+            + ". Пакет остаётся в стейдже: смягчите правку или обсудите "
+              "последствия с технологом.")
+
+    runner = ctx.runner
+    if runner is not None and hasattr(runner, "set_phr_spec"):
+        try:
+            runner.set_phr_spec(candidate)
+        except Exception as exc:                      # noqa: BLE001
+            raise ToolError(
+                f"Спека не принята проектом ({type(exc).__name__}: {exc}). "
+                f"Компоненты пакета должны существовать среди "
+                f"mixture-компонентов схемы: если состав кампании расширяется, "
+                f"это эволюция СХЕМЫ проекта — её делает человек в сетапе, а "
+                f"не применение пакета.") from exc
+    ctx.spec = candidate
+
+    hash_after = candidate.spec_hash()
+    diff = spec_package_diff(spec, candidate)
+    session.set_spec_status(staged.id, PATCH_APPLIED, reason=str(note or ""))
+    decision = _log(ctx, "decisions", _spec_decision_record(
+        staged, diff, gates, hash_before, hash_after, author, note))
+
+    warning = ""
+    if diff.get("first_spec"):
+        warning = (f"Геометрия кампании зафиксирована: spec_hash "
+                   f"{hash_after[:12]}…. Дальнейшие точки относятся к нему.")
+    elif gates.get("history_break"):
+        warning = ("Состав компонентов изменился ⇒ ранее собранные точки "
+                   "принадлежат ДРУГОМУ пространству координат: они остаются в "
+                   "базе, но к новой геометрии не относятся.")
+    elif hash_before != hash_after:
+        warning = ("spec_hash изменился ⇒ ранее собранные точки относятся к "
+                   "ПРЕЖНЕЙ геометрии: план дальше строится в новой области.")
+
+    return _f({
+        "ok": True, "spec_id": staged.id, "status": PATCH_APPLIED,
+        "spec_hash_before": hash_before, "spec_hash_after": hash_after,
+        "affects_hash": hash_before != hash_after,
+        "diff": diff, "gates": gates, "decision": decision,
+        "warning": warning,
+        "persist_hint": ("Спека изменена в памяти проекта — сохраните "
+                         "кампанию, чтобы правка пережила перезапуск."),
+    })
+
+
+@register(
+    "reject_spec",
+    description=(
+        "Отклонить пакет спеки из стейджа (решение человека, требует токен "
+        "подтверждения). Отказ ТОЖЕ идёт в журнал решений: «почему не приняли "
+        "эту геометрию» должно разрешаться журналом, а не памятью участников."),
+    parameters={"type": "object", "properties": {
+        "spec_id": {"type": "string", "description": "id пакета из стейджа"},
+        "human_token": {"type": "string", "description": "разовый токен"},
+        "reason": {"type": "string", "description": "почему отклонён"},
+        "author": {"type": "string", "description": "кто решил"}},
+        "required": ["spec_id", "human_token", "reason"]},
+    kind=WRITE)
+def reject_spec(ctx: ToolContext, spec_id: str, human_token: str,
+                reason: str, author: str = "") -> Dict[str, Any]:
+    session = ctx.require_session()
+    staged = session.spec_by_id(str(spec_id))
+    if staged is None:
+        raise ToolError(f"Пакета спеки '{spec_id}' нет в сессии.")
+    _consume(ctx, human_token, action="reject_spec", target=str(spec_id))
+    session.set_spec_status(staged.id, PATCH_REJECTED, reason=str(reason))
+    summary = staged.summary or {}
+    decision = _log(ctx, "decisions", {
+        "ts": _now(),
+        "title": f"ОТКЛОНЕНО: пакет спеки {staged.label or staged.id}",
+        "nodes": sorted(summary.get("added", []) or []),
+        "author": str(author or "человек"),
+        "spec_hash": str(summary.get("spec_hash_before", "") or ""),
+        "rationale": str(reason), "spec_id": staged.id,
+        "kind": "reject_spec"})
+    return {"ok": True, "spec_id": staged.id, "status": PATCH_REJECTED,
+            "decision": decision}
+
+
 @register(
     "record_decision",
     description=(
@@ -490,6 +787,29 @@ def issue_reject_token(ctx: ToolContext, patch_id: str, *,
                        ttl_s: Optional[float] = None) -> str:
     """Токен на отклонение патча (кнопка «Отклонить»)."""
     return registry_for(ctx).issue("reject_patch", str(patch_id),
+                                   ttl_s=ttl_s).token
+
+
+def issue_apply_spec_token(ctx: ToolContext, spec_id: str, *,
+                           ttl_s: Optional[float] = None,
+                           note: str = "") -> str:
+    """Токен на применение ПАКЕТА спеки (кнопка «Применить спеку», iter71).
+
+    Привязан к отпечатку спеки на момент нажатия. При первичном вводе спеки
+    нет — ``context_hash`` пуст, и это единственный корректный вариант:
+    подтверждается состояние «геометрии ещё не было».
+    """
+    spec = active_spec(ctx)
+    return registry_for(ctx).issue(
+        "apply_spec", str(spec_id),
+        context_hash=spec.spec_hash() if spec is not None else "",
+        ttl_s=ttl_s, note=note).token
+
+
+def issue_reject_spec_token(ctx: ToolContext, spec_id: str, *,
+                            ttl_s: Optional[float] = None) -> str:
+    """Токен на отклонение пакета спеки (кнопка «Отклонить спеку»)."""
+    return registry_for(ctx).issue("reject_spec", str(spec_id),
                                    ttl_s=ttl_s).token
 
 

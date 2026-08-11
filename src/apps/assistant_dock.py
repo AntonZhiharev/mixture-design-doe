@@ -1,4 +1,4 @@
-"""apps/assistant_dock.py — ПАНЕЛЬ ДИАЛОГА с ассистентом-архитектором (iter65/69).
+"""apps/assistant_dock.py — ПАНЕЛЬ ДИАЛОГА с ассистентом-архитектором (iter65/69/72).
 
 Отдельная вкладка «💬 Ассистент» была устроена так, что спросить «почему у
 этой оси такой диапазон» можно было только уйдя с экрана, где эта ось видна.
@@ -14,6 +14,14 @@
 не ползёт. Служебные панели (фокус, интернет, ключ, подсказки) собраны в
 свёрнутый экспандер НАД лентой: раньше они стояли между лентой и вводом, и
 переписка «плавала». Чистая логика ленты — :mod:`src.apps.workspace`.
+
+**iter72 — три зоны (эскиз пользователя).** Левая колонка целиком отдана
+ассистенту: диалог + панели УТВЕРЖДЕНИЯ его предложений (пакеты спеки, патчи) —
+применить/отклонить может только человек, и это часть работы с ассистентом.
+Постоянная же ДОП-ИНФОРМАЦИЯ (📎 вложения, 🖼 выхлоп песочницы, 📌 состояние
+сессии) переехала в ОТДЕЛЬНУЮ правую колонку (:func:`render_assistant_info`):
+она нужна на разных закладках рабочей области, а под перепиской её было не
+видно, пока не проскроллишь весь диалог.
 
 Слой намеренно ТОНКИЙ. Вся логика — в :mod:`src.assistant.context` и
 :mod:`src.assistant.views` (чистые функции, покрытые
@@ -249,6 +257,67 @@ def _render_patches(ctx: ToolContext, session) -> None:
                     st.error(str(exc))
                 else:
                     st.success("Патч отклонён, решение записано в журнал.")
+
+
+def _render_spec_packages(ctx: ToolContext, session) -> None:
+    """Панель ПАКЕТОВ спеки: первичный ввод и эволюция геометрии (iter71).
+
+    Отдельно от панели патчей намеренно: патч двигает границу, а пакет меняет
+    СОСТАВ и роли — цена решения другая, и показывать их одной таблицей значило
+    бы уравнять «поднять верх DINP» и «переписать геометрию кампании».
+
+    JSON пакета доступен целиком (свёрнутым блоком): человек утверждает то, что
+    может прочитать, а не то, что ему пересказали.
+    """
+    staged = session.staged_specs()
+    st.markdown(f"**🧬 Предложенные спеки (пакетом): {len(staged)}**")
+    if not staged:
+        st.caption("Пусто. Пакет появляется здесь, когда ассистент собирает "
+                   "спеку целиком — первичный ввод геометрии или эволюция "
+                   "(новый узел, удаление, смена роли). Сам он её не применяет.")
+        return
+    st.dataframe(views.staged_specs_dataframe(session, only_staged=True),
+                 use_container_width=True, hide_index=True)
+    for s in staged:
+        d = s.summary or {}
+        head = (f"`{s.id}` · {s.label or 'без метки'} · "
+                f"{'первичный ввод' if d.get('first_spec') else 'эволюция'} · "
+                f"{d.get('q_after', 0)} компонентов, dim z = "
+                f"{d.get('dim_z_after', 0)}")
+        st.caption(head + (" · ⚠️ отпечаток спеки изменится"
+                           if d.get("affects_hash") else ""))
+        if d.get("removed"):
+            st.warning(f"Пакет УДАЛЯЕТ узлы: {', '.join(d['removed'])}. "
+                       f"Точки, собранные в прежней геометрии, к новой не "
+                       f"относятся.")
+        with st.expander(f"JSON пакета {s.id} ({len(s.nodes)} узлов)",
+                         expanded=False):
+            st.json(s.payload())
+        c = st.columns(2)
+        if c[0].button("✅ Применить спеку", key=f"dock_apply_spec_{s.id}"):
+            try:
+                out = actx.human_apply_spec(ctx, s.id, author="человек (UI)")
+            except ToolError as exc:
+                st.error(str(exc))
+            else:
+                st.success(views.spec_apply_caption(out))
+                if out.get("warning"):
+                    st.warning(out["warning"])
+                st.info(out.get("persist_hint", ""))
+        reason = st.text_input("причина отказа", key=f"dock_spec_reason_{s.id}",
+                              label_visibility="collapsed",
+                              placeholder="почему не берём эту геометрию")
+        if c[1].button("⛔ Отклонить спеку", key=f"dock_reject_spec_{s.id}"):
+            if not reason.strip():
+                st.error("Отказ тоже идёт в журнал решений — назовите причину.")
+            else:
+                try:
+                    actx.human_reject_spec(ctx, s.id, reason.strip(),
+                                           author="человек (UI)")
+                except ToolError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Пакет отклонён, решение записано в журнал.")
 
 
 def _show_attachment_image(session, root: str, project: str, ident: str) -> None:
@@ -527,7 +596,33 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
         # кнопка повтора живёт до успешного ответа или до нового вопроса.
         _render_retry(st.session_state.get(K_LAST_TURN))
 
+    # iter71: пакеты спеки ВЫШЕ патчей — первичный ввод геометрии это первое,
+    # что делается в проекте, и он не должен прятаться под панелью правок.
+    # Панели УТВЕРЖДЕНИЯ (спеки/патчи) остаются в зоне ассистента: применить
+    # или отклонить предложение — часть работы с ним, а не справка (iter72).
+    _render_spec_packages(ctx, session)
     _render_patches(ctx, session)
+
+
+def render_assistant_info(runner: Any = None, *, root: str = "") -> None:
+    """Правая колонка (iter72): постоянная ДОП-ИНФОРМАЦИЯ работы ассистента.
+
+    По эскизу пользователя крайняя правая зона — то, что нужно ПОСТОЯННО на
+    разных закладках рабочей области и большей частью связано с ассистентом:
+    📎 вложения сессии, 🖼 выхлоп песочницы, 📌 состояние сессии. Раньше эти
+    панели жили в левой колонке ПОД перепиской — до них приходилось скроллить
+    сквозь весь диалог, а видны они были только когда диалог короткий.
+
+    Сессия и проект берутся тем же путём, что у дока (:func:`dock_session`):
+    обе колонки показывают ОДНО состояние, а не две копии.
+    """
+    root = root or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "project_campaigns")
+    project = current_project() or "_scratch"
+    session = dock_session(root, project)
+
+    st.subheader("📋 Инфо")
     _render_attachments(session, root, project)
     _render_artifacts(session)
 

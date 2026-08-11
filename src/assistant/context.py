@@ -664,6 +664,40 @@ def human_apply(ctx: Any, patch_id: str, *, note: str = "", author: str = "",
                     allowed_kinds=[WRITE])
 
 
+def human_apply_spec(ctx: Any, spec_id: str, *, note: str = "",
+                     author: str = "", ttl_s: Optional[float] = None
+                     ) -> Dict[str, Any]:
+    """Применить ПАКЕТ спеки от имени человека — кнопка «Применить» (iter71).
+
+    Тот же путь, что :func:`human_apply`, но для геометрии целиком: первичный
+    ввод спеки и её эволюция (добавленный/удалённый узел, смена роли). Токен
+    выдаётся здесь же, живёт доли секунды и привязан к отпечатку спеки на
+    момент нажатия; модели этот путь недоступен (класс ``write`` ей не выдан).
+    """
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_apply_spec_token
+
+    token = issue_apply_spec_token(ctx, spec_id, ttl_s=ttl_s, note=note)
+    return dispatch(ctx, "apply_spec",
+                    {"spec_id": spec_id, "human_token": token,
+                     "note": note, "author": author},
+                    allowed_kinds=[WRITE])
+
+
+def human_reject_spec(ctx: Any, spec_id: str, reason: str, *,
+                      author: str = "", ttl_s: Optional[float] = None
+                      ) -> Dict[str, Any]:
+    """Отклонить пакет спеки от имени человека — с записью в журнал решений."""
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_reject_spec_token
+
+    token = issue_reject_spec_token(ctx, spec_id, ttl_s=ttl_s)
+    return dispatch(ctx, "reject_spec",
+                    {"spec_id": spec_id, "human_token": token,
+                     "reason": reason, "author": author},
+                    allowed_kinds=[WRITE])
+
+
 def human_reject(ctx: Any, patch_id: str, reason: str, *, author: str = "",
                  ttl_s: Optional[float] = None) -> Dict[str, Any]:
     """Отклонить патч от имени человека — с записью в журнал решений.

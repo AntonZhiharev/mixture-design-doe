@@ -195,12 +195,15 @@ class TestSystemPrompt:
 # 2. Golden-сценарии как таблица-контракт
 # ======================================================================
 class TestScenarios:
-    def test_exactly_eight(self):
-        assert len(GOLDEN_SCENARIOS) == 8
+    def test_exactly_nine(self):
+        # iter71: добавлен сценарий №9 (spec_intake) — первичный ввод и
+        # эволюция спеки ПАКЕТОМ. Число сценариев — контракт каталога
+        # маршрутизации: расширение осознанное, а не молчаливое.
+        assert len(GOLDEN_SCENARIOS) == 9
 
     def test_ids_and_keys_unique(self):
-        assert [s.id for s in GOLDEN_SCENARIOS] == list(range(1, 9))
-        assert len({s.key for s in GOLDEN_SCENARIOS}) == 8
+        assert [s.id for s in GOLDEN_SCENARIOS] == list(range(1, 10))
+        assert len({s.key for s in GOLDEN_SCENARIOS}) == 9
 
     def test_every_tool_exists_in_registry(self):
         agent = set(tool_names(AGENT_KINDS))
@@ -432,7 +435,7 @@ class TestAnswerSections:
 class TestViews:
     def test_scenarios_table(self):
         df = scenarios_dataframe()
-        assert len(df) == 8
+        assert len(df) == 9                     # iter71: +spec_intake
         assert list(df.columns) == ["№", "сценарий", "маршрут", "инструменты",
                                     "нельзя", "правило"]
         handoff = df[df["№"] == 7].iloc[0]

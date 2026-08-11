@@ -8,9 +8,11 @@
 M1…M8 на ``PipelineRunner`` (демо-синтетика, авто-M7) ВЫВЕДЕН из UI (§17.6). Сам
 ``PipelineRunner`` остаётся в ``src/`` как библиотека/для юнит-тестов ядра.
 
-iter69 — РАСКЛАДКА ЭКРАНА: диалог с помощником слева, рабочая область справа
-(``st.columns(workspace.MAIN_COLUMNS)``). Шаги потока разложены по ЗАКЛАДКАМ
-рабочей области (второй ряд закладок — ветки проекта), содержимое закладки живёт
+iter69/iter72 — РАСКЛАДКА ЭКРАНА: ТРИ зоны ``st.columns(workspace.MAIN_COLUMNS)``.
+Слева — диалог с помощником (ассистент как инструмент взаимодействия с
+программой), в центре — рабочая область на ЗАКЛАДКАХ (второй ряд закладок —
+ветки проекта), справа — инфо-панель постоянной дополнительной информации
+(вложения, выхлоп песочницы, состояние сессии). Содержимое закладки живёт
 в контейнере фиксированной высоты со своим скроллом. Смысл: лента диалога и
 рабочая область прокручиваются НЕЗАВИСИМО — ответ ассистента больше не уводит
 страницу с таблицы, над которой человек работает. Логика раскладки —
@@ -47,7 +49,8 @@ from src.apps import assistant as ai  # noqa: E402
 from src.apps import campaign as cv  # noqa: E402
 from src.apps import campaign_state as cs  # noqa: E402
 from src.apps import workspace as wsx  # noqa: E402
-from src.apps.assistant_dock import render_assistant_dock  # noqa: E402
+from src.apps.assistant_dock import (render_assistant_dock,  # noqa: E402
+                                      render_assistant_info)
 from src.apps.campaign_ui import (render_campaign,  # noqa: E402
                                    campaign_assistant_overview,
                                    get_campaign_controller,
@@ -329,29 +332,34 @@ def main():
     st.caption("Единый поток (§17): сетап → стартовый дизайн (seed) → ветки → "
                "рабочий стол (ручной ввод откликов) → эволюция схемы. Слева — "
                "диалог с помощником (лента прокручивается вверх, ввод внизу), "
-               "справа — рабочая область на закладках: она от переписки НЕ "
-               "двигается.")
+               "в центре — рабочая область на закладках (от переписки НЕ "
+               "двигается), справа — постоянная инфо-панель: вложения, выхлоп "
+               "песочницы, состояние сессии.")
 
     render_campaign_persistence(CAMPAIGN_ROOT)   # 📁 сохранить/загрузить проект
     render_campaign_deleter(CAMPAIGN_ROOT)       # 🗑 удалить проект (под паролём)
 
-    # iter69: раскладка по эскизу — ДИАЛОГ слева, РАБОЧАЯ ОБЛАСТЬ справа.
+    # iter72: раскладка по эскизу — ТРИ зоны: ДИАЛОГ слева (ассистент —
+    # инструмент взаимодействия с программой), РАБОЧАЯ ОБЛАСТЬ в центре
+    # (закладки), ИНФО-ПАНЕЛЬ справа (вложения, выхлоп песочницы, состояние
+    # сессии — нужны постоянно на разных закладках).
     #
     # Порядок рендера обратный порядку колонок: рабочая область рисуется ПЕРВОЙ,
     # потому что именно она публикует `ui_focus` (активная закладка, ветка), из
     # которого диалог берёт контекст «по месту» (iter65). Streamlit это
     # позволяет: содержимое колонки пишется в её контейнер, а не по порядку
     # вызовов на странице.
-    dock_col, work_col = st.columns(list(wsx.MAIN_COLUMNS))
+    dock_col, work_col, info_col = st.columns(list(wsx.MAIN_COLUMNS))
     with work_col:
         # Обзор ассистента — закладка рабочей области, а не отдельная вкладка
         # верхнего уровня: иначе «💬 Ассистент (обзор)» уводил с проекта целиком.
         render_campaign(overview_renderer=render_campaign_assistant)
+    ctrl_now = get_campaign_controller()
+    runner_now = getattr(ctrl_now, "runner", None) if ctrl_now else None
     with dock_col:
-        ctrl_now = get_campaign_controller()
-        render_assistant_dock(
-            getattr(ctrl_now, "runner", None) if ctrl_now else None,
-            root=CAMPAIGN_ROOT)
+        render_assistant_dock(runner_now, root=CAMPAIGN_ROOT)
+    with info_col:
+        render_assistant_info(runner_now, root=CAMPAIGN_ROOT)
 
 
 if __name__ == "__main__":

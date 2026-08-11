@@ -172,6 +172,134 @@ def build_patched_spec(spec, patch: Any):
 
 
 # ----------------------------------------------------------------------
+# spec_schema (iter71)
+# ----------------------------------------------------------------------
+#: Пример-минимум ВАЛИДНОГО пакета: по одному представителю каждого класса
+#: узлов (тотал + пара долей при k=2, техлимиты, лог-ось, cap-фаза, fixed).
+#: Модель, которой формат пересказан словами, восстанавливает его по памяти о
+#: markdown-таблицах и промахивается ключами; пример ИЗ ЯДРА — единственный
+#: способ передать формат без искажения.
+SPEC_EXAMPLE: Dict[str, Any] = {
+    "spec_version": 2,
+    "group_order": ["SOFT"],
+    "nodes": [
+        {"name": "RESIN", "role": "FIXED", "value": 100.0},
+        {"name": "DINP", "role": "ABSOLUTE", "range": [4.0, 14.0]},
+        {"name": "ESO", "role": "FIXED", "value": 2.5},
+        {"name": "SOFT", "role": "GROUP_TOTAL", "range": [3.0, 15.0],
+         "members": ["CPE", "PBNK"]},
+        {"name": "CPE", "role": "SHARE_CLOSURE", "group": "SOFT",
+         "min_phr": 3.0},
+        {"name": "PBNK", "role": "SHARE_FREE", "group": "SOFT",
+         "share_range": [0.0, 0.70], "max_phr": 8.0},
+        {"name": "TiO2", "role": "ABSOLUTE", "range": [0.3, 8.0],
+         "scale": "log"},
+        {"name": "UV", "role": "ABSOLUTE_CAPPED", "range": [0.05, 0.30],
+         "scale": "log", "cap_to": ["DINP", "ESO"], "cap_ratio": 0.03},
+    ],
+}
+
+#: Чего в спеке НЕТ, хотя туда постоянно пытаются положить. Каждый пункт —
+#: не запрет ради запрета, а указание, где эта сущность живёт на самом деле.
+SPEC_NOT_HERE: Dict[str, str] = {
+    "levels": "число уровней оси — политика ПЛАНА, не геометрии: для "
+              "process-осей задаётся в сетапе («rotor_rpm: 400, 900» → "
+              "runner.set_process_levels), для состава уровней нет вовсе.",
+    "premix": "премикс не флаг узла, а ВЫВОД из разрешения весов: "
+              "premix_required(delta_phr, lo, hi) — см. point_report "
+              "(аргумент delta_phr) и разрешение весов в паспорте кампании.",
+    "process": "process-оси (температуры, обороты) — отдельный блок схемы; в "
+               "phr-спеке их нет, она описывает только состав.",
+    "components/groups": "узлы НЕ делятся на «компоненты» и «группы»: это ОДИН "
+                         "плоский список 'nodes', где тотал группы — такой же "
+                         "узел с role GROUP_TOTAL(_FIXED) и 'members'.",
+    "version": "метка версии кампании живёт в паспорте (campaign_label); в "
+               "обёртке спеки допустим только 'spec_version': 2.",
+    "lo/hi/of/to": "legacy-ключи схемы v1: в v2 это 'range'/'share_range' "
+                   "(пара [lo, hi]) и 'group'/'reference'.",
+}
+
+
+@register(
+    "spec_schema",
+    description=(
+        "СХЕМА phr-спеки из ядра: все роли узлов с обязательными и допустимыми "
+        "ключами, формат обёртки (spec_version/group_order/nodes), инварианты "
+        "валидатора (k=2 → ровно один SHARE_CLOSURE; k≥3 → только "
+        "SHARE_SIMPLEX; closure и FIXED без диапазона), готовый ВАЛИДНЫЙ "
+        "пример и список ключей, которых в спеке НЕТ (levels, premix, "
+        "process…). Работает БЕЗ активной спеки — вызывай ПЕРЕД тем, как "
+        "предлагать пакет (propose_spec): формат по памяти не восстанавливай."),
+    parameters={"type": "object", "properties": {
+        "include_example": {"type": "boolean",
+                            "description": "включить пример пакета "
+                                           "(по умолчанию да)"}}})
+def spec_schema(ctx: ToolContext, include_example: bool = True
+                ) -> Dict[str, Any]:
+    """Схема v2 как ДАННЫЕ — прямо из ``_ROLE_TABLE`` ядра.
+
+    Спека здесь не требуется НАМЕРЕННО: именно этот инструмент нужен, когда
+    геометрии ещё нет и её предстоит ввести впервые. Источник — таблица ролей
+    конструктора, поэтому схема не может разъехаться с валидатором: такой
+    разъезд и есть тот отказ, который инструмент закрывает.
+    """
+    from ...design.phr_sampler import _ROLE_TABLE, _SCALES   # тяжёлый импорт
+
+    roles: Dict[str, Any] = {}
+    for role, (mode, required, allowed) in sorted(_ROLE_TABLE.items()):
+        roles[role] = {
+            "mode": mode,
+            "required": sorted(required),
+            "allowed": sorted(allowed),
+            "optional": sorted(set(allowed) - set(required) - {"name", "role"}),
+        }
+    out: Dict[str, Any] = {
+        "spec_version": 2,
+        "wrapper": {
+            "keys": ["spec_version", "nodes", "group_order"],
+            "note": "Пакет — либо СПИСОК узлов, либо обёртка "
+                    "{'spec_version': 2, 'nodes': [...], 'group_order': "
+                    "[...]}. Иных ключей верхнего уровня нет.",
+        },
+        "roles": roles,
+        "scales": list(_SCALES),
+        "invariants": [
+            "Группа из k=2 членов: РОВНО один SHARE_CLOSURE и один SHARE_FREE "
+            "(доля closure производная 1−φ, поэтому share_range у него нет).",
+            "Группа из k≥3 членов: ВСЕ члены SHARE_SIMPLEX, SHARE_CLOSURE "
+            "запрещён; симплекс должен быть совместен: Σlo ≤ 1 ≤ Σhi.",
+            "SHARE_CLOSURE / FIXED / GROUP_TOTAL_FIXED — без 'range' и "
+            "'share_range': наличие это ошибка, а не тихое игнорирование.",
+            "'members' тотала обязаны ТОЧНО совпадать (состав и порядок) с "
+            "узлами, у которых 'group' равен имени этого тотала.",
+            "group_order — ТОЧНАЯ перестановка множества GROUP_TOTAL-групп "
+            "(GROUP_TOTAL_FIXED исключается); входит в spec_hash.",
+            "Лишние ключи узла — ошибка валидации (в т.ч. legacy lo/hi/of/to).",
+        ],
+        "not_in_spec": dict(SPEC_NOT_HERE),
+        "hint": "Собрал пакет — зови propose_spec: он валидирует его ЯДРОМ и "
+                "кладёт в стейдж, откуда человек применяет кнопкой.",
+    }
+    if include_example:
+        out["example"] = copy.deepcopy(SPEC_EXAMPLE)
+
+    # «Схему знаю» и «текущая геометрия такая» — разные утверждения, поэтому
+    # отпечаток активной спеки показывается отдельным полем (или его отсутствие
+    # называется прямо: это первичный ввод).
+    spec = ctx.spec
+    if spec is None and ctx.runner is not None:
+        spec = getattr(ctx.runner, "phr_spec", None)
+    out["current"] = ({"present": True, "spec_hash": spec.spec_hash(),
+                       "q_components": int(spec.q), "dim_z": int(spec.dim_z)}
+                      if spec is not None else
+                      {"present": False,
+                       "note": "Активной спеки нет: геометрия ещё не введена. "
+                               "Это ПЕРВИЧНЫЙ ввод — предлагай полный пакет "
+                               "(propose_spec); патчем узлы не добавляются."})
+    return out
+
+
+# ----------------------------------------------------------------------
 # get_spec
 # ----------------------------------------------------------------------
 @register(
@@ -360,6 +488,193 @@ def validate_spec(ctx: ToolContext, patch: Any) -> Dict[str, Any]:
                     "план и уже собранные точки относятся к прежнему "
                     "отпечатку." if hash_before != hash_after else ""),
     }
+
+
+# ----------------------------------------------------------------------
+# validate_spec_package (iter71)
+# ----------------------------------------------------------------------
+def normalize_spec_package(package: Any) -> Tuple[List[Dict[str, Any]],
+                                                  List[str], int]:
+    """Пакет спеки из модели → ``(узлы, group_order, spec_version)``.
+
+    Принимаем и обёртку, и плоский список — то же, что ``PhrSpec.from_dicts``.
+    Отказ формулируется УКАЗАНИЕМ на верный вид: именно здесь модель, знающая
+    геометрию словами, но не знающая схему, теряет ход (её JSON приходит с
+    ключами вроде ``components``/``groups``/``process``).
+    """
+    if package is None:
+        raise ToolError("Пакет спеки пуст: нечего валидировать. Формат — "
+                        "вызови spec_schema.")
+    if isinstance(package, (list, tuple)):
+        nodes = list(package)
+        order: List[str] = []
+        version = 2
+    elif isinstance(package, dict):
+        if "nodes" not in package:
+            raise ToolError(
+                f"В пакете нет ключа 'nodes' (пришли: {sorted(package)}). "
+                f"Узлы НЕ делятся на 'components'/'groups'/'process': это ОДИН "
+                f"плоский список 'nodes', где тотал группы — узел с role "
+                f"GROUP_TOTAL(_FIXED) и 'members'. Вызови spec_schema.")
+        extra = set(package) - {"spec_version", "nodes", "group_order"}
+        if extra:
+            raise ToolError(
+                f"Лишние ключи обёртки пакета: {sorted(extra)}. Допустимы "
+                f"только 'spec_version', 'nodes', 'group_order' (см. "
+                f"spec_schema): метка версии кампании живёт в паспорте, "
+                f"process-оси и уровни в спеке не задаются.")
+        raw = package.get("nodes")
+        if not isinstance(raw, (list, tuple)):
+            raise ToolError("'nodes' должен быть СПИСКОМ узлов-объектов.")
+        nodes = list(raw)
+        go = package.get("group_order") or []
+        if isinstance(go, str) or not isinstance(go, (list, tuple)):
+            raise ToolError("'group_order' должен быть СПИСКОМ имён "
+                            "GROUP_TOTAL-узлов.")
+        order = [str(x) for x in go]
+        version = int(package.get("spec_version", 2) or 2)
+    else:
+        raise ToolError(f"Пакет спеки должен быть объектом-обёрткой или "
+                        f"списком узлов, получено: {type(package).__name__}.")
+    if not nodes:
+        raise ToolError("Пакет спеки без узлов: предлагать пустую геометрию "
+                        "нельзя.")
+    bad = [i for i, d in enumerate(nodes, 1) if not isinstance(d, dict)]
+    if bad:
+        raise ToolError(f"Узлы пакета должны быть объектами "
+                        f"{{'name': …, 'role': …}}; не объекты в позициях {bad}.")
+    return [dict(d) for d in nodes], order, version
+
+
+def build_spec_from_package(package: Any):
+    """Собрать :class:`PhrSpec` из пакета (конструктор валидирует)."""
+    from ...design.phr_sampler import PhrSpec           # тяжёлый импорт
+
+    nodes, order, version = normalize_spec_package(package)
+    payload: Any = ({"spec_version": version, "group_order": order,
+                     "nodes": nodes} if order else nodes)
+    return PhrSpec.from_dicts(payload)
+
+
+def spec_package_diff(spec, candidate) -> Dict[str, Any]:
+    """Чем НОВАЯ спека отличается от текущей: состав, роли, границы, отпечаток.
+
+    Именно этот разбор человек видит рядом с кнопкой подтверждения. Показываем
+    не «спека изменилась», а ЧТО именно: добавленные и удалённые узлы, смена
+    ролей, съехавшие интервалы — иначе решение принимается вслепую (A0.6).
+    """
+    new_iv = candidate.phr_intervals()
+    new_roles = {nm: candidate.role_of(nm) for nm in new_iv}
+    out: Dict[str, Any] = {
+        "spec_hash_after": candidate.spec_hash(),
+        "q_after": int(candidate.q), "dim_z_after": int(candidate.dim_z),
+        "component_names_after": list(candidate.component_names),
+        "group_order_after": list(getattr(candidate, "group_order", []) or []),
+        "first_spec": spec is None,
+    }
+    if spec is None:
+        # Первичный ввод: сравнивать не с чем, и делать вид, будто «ничего не
+        # изменилось», нельзя — геометрия появляется там, где её не было.
+        out.update({"spec_hash_before": "", "added": sorted(new_iv),
+                    "removed": [], "role_changed": [], "changed_intervals": [],
+                    "components_added": list(candidate.component_names),
+                    "components_removed": [], "affects_hash": True,
+                    "q_before": 0, "dim_z_before": 0})
+        return _f(out)
+
+    old_iv = spec.phr_intervals()
+    old_roles = {nm: spec.role_of(nm) for nm in old_iv}
+    common = sorted(set(old_iv) & set(new_iv))
+    changed = []
+    for nm in common:
+        b, a = old_iv[nm], new_iv[nm]
+        if abs(a[0] - b[0]) > 1e-12 or abs(a[1] - b[1]) > 1e-12:
+            changed.append({"node": nm,
+                            "before": [float(b[0]), float(b[1])],
+                            "after": [float(a[0]), float(a[1])]})
+    hash_before = spec.spec_hash()
+    out.update({
+        "spec_hash_before": hash_before,
+        "affects_hash": hash_before != out["spec_hash_after"],
+        "q_before": int(spec.q), "dim_z_before": int(spec.dim_z),
+        "added": sorted(set(new_iv) - set(old_iv)),
+        "removed": sorted(set(old_iv) - set(new_iv)),
+        "role_changed": [{"node": nm, "before": old_roles[nm],
+                          "after": new_roles[nm]}
+                         for nm in common if old_roles[nm] != new_roles[nm]],
+        "changed_intervals": changed,
+        "components_added": sorted(set(candidate.component_names)
+                                   - set(spec.component_names)),
+        "components_removed": sorted(set(spec.component_names)
+                                     - set(candidate.component_names)),
+    })
+    return _f(out)
+
+
+def active_spec(ctx: ToolContext):
+    """Активная спека или ``None`` — БЕЗ отказа.
+
+    Отличается от :meth:`ToolContext.require_spec` намеренно: инструментам
+    первичного ввода отсутствие спеки не мешает, оно и есть их случай.
+    """
+    if ctx.spec is not None:
+        return ctx.spec
+    return getattr(ctx.runner, "phr_spec", None) if ctx.runner else None
+
+
+@register(
+    "validate_spec_package",
+    description=(
+        "Сухой прогон ПАКЕТА спеки целиком — первичный ввод геометрии или её "
+        "эволюция (добавить узел, удалить узел, сменить роль, расширить "
+        "границы): собрать ядром, показать ошибки валидации, эффективные phr, "
+        "dim_z, spec_hash и ДИФФ против текущей спеки (что добавлено, удалено, "
+        "где сменилась роль). Ничего не применяет и в стейдж не кладёт. "
+        "Работает и когда активной спеки ещё нет. Формат — spec_schema."),
+    parameters={"type": "object", "properties": {
+        "package": {"type": "object",
+                    "description": "спека ЦЕЛИКОМ: {'spec_version': 2, "
+                                   "'nodes': [...], 'group_order': [...]} "
+                                   "или просто список узлов"}},
+        "required": ["package"]})
+def validate_spec_package(ctx: ToolContext, package: Any) -> Dict[str, Any]:
+    spec = active_spec(ctx)
+    try:
+        candidate = build_spec_from_package(package)
+    except ToolError:
+        raise
+    except Exception as exc:      # noqa: BLE001 — отказ валидации это РЕЗУЛЬТАТ
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "hint": "Пакет отклонён валидатором ЯДРА — геометрия проекта "
+                        "не тронута. Это ответ по существу, а не сбой: сверь "
+                        "ключи и инварианты со spec_schema и собери заново."}
+
+    nodes, _ = spec_payload(candidate)
+    diff = spec_package_diff(spec, candidate)
+    out: Dict[str, Any] = {
+        "ok": True,
+        "diff": diff,
+        "phr_intervals": {k: [float(v[0]), float(v[1])]
+                          for k, v in candidate.phr_intervals().items()},
+        "log_axes": [str(d["name"]) for d in nodes if d.get("scale") == "log"],
+        "nodes_total": len(nodes),
+        "q_components": int(candidate.q),
+        "dim_z": int(candidate.dim_z),
+        "spec_hash": candidate.spec_hash(),
+    }
+    if diff.get("first_spec"):
+        out["warning"] = ("Это ПЕРВИЧНЫЙ ввод геометрии: у проекта спеки нет, "
+                          "сравнивать не с чем.")
+    elif diff.get("removed") or diff.get("components_removed"):
+        out["warning"] = (
+            f"Пакет УДАЛЯЕТ узлы {diff.get('removed')} (компоненты: "
+            f"{diff.get('components_removed')}): точки, собранные в прежней "
+            f"геометрии, к новой не относятся.")
+    elif diff.get("affects_hash"):
+        out["warning"] = ("spec_hash меняется ⇒ это ДРУГАЯ геометрия кампании: "
+                          "ранее собранные точки относятся к прежнему "
+                          "отпечатку.")
+    return _f(out)
 
 
 # ----------------------------------------------------------------------

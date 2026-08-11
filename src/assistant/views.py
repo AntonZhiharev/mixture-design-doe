@@ -113,6 +113,90 @@ def staged_patches_dataframe(session: AssistantSession, *,
                                        "хеш", "статус", "обоснование"])
 
 
+def staged_specs_dataframe(session: AssistantSession, *,
+                           only_staged: bool = False) -> pd.DataFrame:
+    """Предложенные ПАКЕТЫ спеки: что за геометрия и чем отличается (iter71).
+
+    Патч показывается как «узел.поле: было → стало», а пакет так показать
+    нельзя — меняется структура. Поэтому колонки отвечают на другие вопросы:
+    первичный ввод это или эволюция, сколько узлов добавлено/удалено, где
+    сменилась роль, поедет ли отпечаток. Иначе человек нажимает «Применить»,
+    не понимая, что применяет.
+    """
+    rows: List[Dict[str, Any]] = []
+    for s in session.specs:
+        if only_staged and s.status != PATCH_STAGED:
+            continue
+        d = s.summary or {}
+        added = list(d.get("added", []) or [])
+        removed = list(d.get("removed", []) or [])
+        roles = list(d.get("role_changed", []) or [])
+        rows.append({
+            "id": s.id,
+            "метка": s.label or "—",
+            "вид": ("первичный ввод" if d.get("first_spec")
+                    else "эволюция геометрии"),
+            "узлов": int(d.get("nodes_total", len(s.nodes))),
+            "компонентов": int(d.get("q_after", 0)),
+            "dim z": int(d.get("dim_z_after", 0)),
+            "+узлы": ", ".join(added[:4]) + ("…" if len(added) > 4 else "")
+                     or "—",
+            "−узлы": ", ".join(removed[:4]) + ("…" if len(removed) > 4 else "")
+                     or "—",
+            "смена роли": ", ".join(f"{r.get('node')}: {r.get('before')}→"
+                                    f"{r.get('after')}" for r in roles[:2])
+                          or "—",
+            "хеш": ("⚠️ меняется" if d.get("affects_hash") else "не меняется"),
+            "знание": s.level or "—",
+            "статус": _STATUS_LABEL.get(s.status, s.status),
+            "обоснование": _short(s.rationale, 90),
+        })
+    return pd.DataFrame(rows, columns=["id", "метка", "вид", "узлов",
+                                       "компонентов", "dim z", "+узлы",
+                                       "−узлы", "смена роли", "хеш", "знание",
+                                       "статус", "обоснование"])
+
+
+def spec_apply_caption(result: Mapping[str, Any]) -> str:
+    """Одна строка об итоге применения ПАКЕТА спеки (iter71).
+
+    Первичный ввод и разрыв истории (сменился состав компонентов) называются
+    прямо: это разные по последствиям события, и «спека применена» одинаково
+    для них было бы полуправдой.
+    """
+    if not result:
+        return "пакет спеки не применён"
+    diff = result.get("diff", {}) or {}
+    after = str(result.get("spec_hash_after", ""))[:12]
+    before = str(result.get("spec_hash_before", ""))[:12]
+    parts = [f"пакет {result.get('spec_id', '—')} · {result.get('status', '')}"]
+    if diff.get("first_spec"):
+        parts.append(f"геометрия задана впервые: {diff.get('q_after', 0)} "
+                     f"компонентов, dim z = {diff.get('dim_z_after', 0)}")
+        parts.append(f"отпечаток: {after}…")
+    else:
+        parts.append(f"компонентов: {diff.get('q_before', 0)} → "
+                     f"{diff.get('q_after', 0)}")
+        parts.append(f"+{len(diff.get('added', []) or [])} / "
+                     f"−{len(diff.get('removed', []) or [])} узлов, "
+                     f"ролей: {len(diff.get('role_changed', []) or [])}")
+        parts.append(f"отпечаток: {before}… → {after}…"
+                     if result.get("affects_hash")
+                     else f"отпечаток не изменился ({before}…)")
+    gates = result.get("gates", {}) or {}
+    if gates.get("history_break"):
+        parts.append("⚠️ состав компонентов изменён: прежние точки в другой "
+                     "геометрии")
+    elif gates.get("checked"):
+        pts = gates.get("points", {}) or {}
+        if pts.get("checked"):
+            parts.append(f"точек проверено: {pts.get('n_checked', 0)}, "
+                         f"выпало: {pts.get('n_lost', 0)}")
+    else:
+        parts.append(f"гейты неприменимы ({gates.get('reason', '—')})")
+    return " · ".join(parts)
+
+
 def artifacts_dataframe(session: AssistantSession) -> pd.DataFrame:
     """Артефакты песочницы: время / имя / вид / инструмент / подпись."""
     rows = [{
@@ -528,6 +612,7 @@ def session_caption(session: AssistantSession) -> str:
         f"сообщений: {len(session.messages)}",
         f"файлов: {len(session.attachments)}",
         f"патчей в стейдже: {staged}",
+        f"пакетов спеки в стейдже: {len(session.staged_specs())}",
         f"артефактов: {len(session.artifacts)}",
         f"вызовов инструментов: {len(session.tool_calls)}",
     ]

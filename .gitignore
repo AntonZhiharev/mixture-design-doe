@@ -85,5 +85,10 @@ project_ui/
 project_demo/
 project_campaigns/
 
+# Логи запуска UI и прочие артефакты выполнения
+*.log
+_ui_run.log
+_ui_run.err.log
+
 
 

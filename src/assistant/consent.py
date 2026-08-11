@@ -32,7 +32,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 #: Действия, которые вообще можно подтвердить (белый список: неизвестное
 #: действие — ошибка выдачи, а не «подтверждено на всякий случай»).
-ACTIONS = ("apply_patch", "reject_patch", "record_decision", "add_local_fact")
+#:
+#: ``apply_spec`` (iter71) — применение ПАКЕТА спеки: первичный ввод геометрии
+#: и её эволюция (добавить/удалить узел, сменить роль). Отдельное действие, а
+#: не разновидность ``apply_patch``: подтверждение сдвига одной границы не
+#: должно годиться для замены всей спеки.
+ACTIONS = ("apply_patch", "reject_patch", "record_decision", "add_local_fact",
+           "apply_spec", "reject_spec")
 
 #: Срок жизни подтверждения по умолчанию, сек.
 DEFAULT_TTL_S = 600.0

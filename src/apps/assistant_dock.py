@@ -288,15 +288,22 @@ def _render_answer(text: str) -> None:
             st.markdown(view.numbers)
 
 
-def _render_outputs(outputs: List[views.OutputFile]) -> None:
+def _render_outputs(outputs: List[views.OutputFile], *, scope: str) -> None:
     """Выхлоп песочницы КАРТИНКОЙ и ТАБЛИЦЕЙ, а не только строкой пути (iter68).
 
     До этого шага график, построенный кодом модели, оставался во временном
     каталоге и до человека не доходил вообще: «вывод песочницы» выглядел чисто
     текстовым. Файлы уже перенесены в кампанию
     (:func:`assistant.tools.sandbox_tools.collect_outputs`), здесь только показ.
+
+    ``scope`` — МЕСТО показа (``turn`` — в ответе хода, ``panel`` — в панели
+    артефактов). Один и тот же файл рисуется в ОБОИХ местах, а ключ виджета
+    Streamlit обязан быть уникальным на странице: ключ только по имени файла
+    ронял страницу целиком (``StreamlitDuplicateElementKey``) как раз тогда,
+    когда свежий артефакт попадал ещё и в хвост последних — то есть после
+    нескольких прогонов подряд.
     """
-    for o in outputs:
+    for i, o in enumerate(outputs):
         st.caption(o.caption)
         if o.kind == "image":
             st.image(o.path, use_container_width=True)
@@ -314,8 +321,10 @@ def _render_outputs(outputs: List[views.OutputFile]) -> None:
                 st.dataframe(df, use_container_width=True, hide_index=True)
         try:
             with open(o.path, "rb") as fh:
+                # Ключ уникален по МЕСТУ показа и позиции в списке: имени файла
+                # недостаточно — один артефакт виден и в ходе, и в панели.
                 st.download_button("⬇️ Скачать", fh.read(), file_name=o.name,
-                                   key=f"dock_dl_{o.name}")
+                                   key=f"dock_dl_{scope}_{i}_{o.name}")
         except OSError:
             pass                       # файл исчез — показ уже состоялся
 
@@ -413,7 +422,7 @@ def _render_artifacts(session) -> None:
                        "ассистент построил в песочнице (`run_python` с "
                        "`savefig`/`to_csv`).")
             return
-        _render_outputs(shown)
+        _render_outputs(shown, scope="panel")
 
 
 # ----------------------------------------------------------------------
@@ -502,7 +511,8 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
                 _render_answer(res.text)
                 # Графики/таблицы, посчитанные в ходе, — сразу в ответе: файл,
                 # который надо искать в другой панели, разговору не помогает.
-                _render_outputs(views.turn_outputs(session, res.new_artifacts))
+                _render_outputs(views.turn_outputs(session, res.new_artifacts),
+                                scope="turn")
         for err in res.image_errors:
             st.warning(f"Изображение не дошло до модели — {err}")
         st.caption(views.turn_caption(res))

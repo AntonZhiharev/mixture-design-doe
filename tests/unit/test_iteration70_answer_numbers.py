@@ -35,6 +35,33 @@ from src.assistant.prompts import (FORMAT_BLOCK, SECTIONS,
                                    architect_system_prompt, parse_sections,
                                    pop_section)
 
+class _FakeSt:
+    """Минимальная заглушка ``streamlit`` для показа артефактов.
+
+    Нужна, чтобы проверить КЛЮЧИ виджетов, которые запросил настоящий код дока,
+    без запуска Streamlit: реальный ``st.download_button`` вне сессии не
+    работает, а именно на его ключах падала страница.
+    """
+    def __init__(self, seen_keys: list) -> None:
+        self.seen_keys = seen_keys
+
+    def download_button(self, *_args, key: str = "", **_kw) -> bool:
+        self.seen_keys.append(key)
+        return False
+
+    def caption(self, *_args, **_kw) -> None:
+        pass
+
+    def image(self, *_args, **_kw) -> None:
+        pass
+
+    def dataframe(self, *_args, **_kw) -> None:
+        pass
+
+    def warning(self, *_args, **_kw) -> None:
+        pass
+
+
 ANSWER = ("## ОТВЕТ\n"
           "Жёсткая привязка вшивает монотонный prior: оси неразличимы "
           "(corr +0.982 против +0.154 у трапеции).\n\n"
@@ -152,3 +179,60 @@ class TestDockUsesView:
         src = inspect.getsource(dock.render_assistant_dock)
         assert src.count("_render_answer(") == 2
         assert "st.markdown(res.text" not in src
+
+
+# ======================================================================
+# Багфикс: ключ кнопки скачивания РОНЯЛ страницу целиком
+# ======================================================================
+class TestDownloadKeysUnique:
+    """``StreamlitDuplicateElementKey`` в ``_render_outputs`` (баг iter68).
+
+    Один и тот же артефакт рисуется ДВАЖДЫ: в ответе хода
+    (``views.turn_outputs``) и в панели «Выхлоп песочницы»
+    (``views.artifact_outputs``). Ключ строился только из имени файла, поэтому
+    после нескольких прогонов подряд свежий файл совпадал сам с собой и
+    Streamlit валил ВСЮ страницу — дока не было видно вообще, включая ответ.
+    """
+    def _keys(self, monkeypatch, tmp_path, names, scope):
+        """РЕАЛЬНЫЕ ключи из :func:`dock._render_outputs` (через заглушку ``st``).
+
+        Сверять с переписанной в тесте той же f-строкой смысла нет — такой тест
+        проверяет сам себя. Здесь вызывается настоящий код показа, а заглушка
+        лишь записывает ключи, которые он попросил у Streamlit.
+        """
+        seen: list = []
+        path = tmp_path / "a.csv"
+        path.write_text("x,y\n1,2\n", encoding="utf-8")
+        monkeypatch.setattr(dock, "st", _FakeSt(seen), raising=True)
+        outputs = [views.OutputFile(name=n, kind="table", path=str(path),
+                                    size=7, tool="run_python") for n in names]
+        dock._render_outputs(outputs, scope=scope)
+        return seen
+
+    def test_same_file_in_two_places(self, monkeypatch, tmp_path):
+        # Ровно упавший случай: свежий артефакт хода попал и в панель последних.
+        same = ["20260811T125240_corr_demo.csv"]
+        keys = (self._keys(monkeypatch, tmp_path, same, "turn")
+                + self._keys(monkeypatch, tmp_path, same, "panel"))
+        assert len(keys) == 2
+        assert len(set(keys)) == 2
+
+    def test_same_name_twice_in_one_place(self, monkeypatch, tmp_path):
+        # Артефакты разных прогонов могут носить одно имя — позиция разводит.
+        keys = self._keys(monkeypatch, tmp_path, ["plot.csv", "plot.csv"],
+                          "panel")
+        assert len(set(keys)) == 2
+
+    def test_scope_is_required(self):
+        params = inspect.signature(dock._render_outputs).parameters
+        assert "scope" in params
+        # keyword-only и без умолчания: место показа обязан назвать вызывающий,
+        # иначе «panel по умолчанию» тихо вернёт совпадение ключей.
+        assert params["scope"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["scope"].default is inspect.Parameter.empty
+
+    def test_both_call_sites_pass_distinct_scope(self):
+        turn = inspect.getsource(dock.render_assistant_dock)
+        panel = inspect.getsource(dock._render_artifacts)
+        assert 'scope="turn"' in turn
+        assert 'scope="panel"' in panel

@@ -698,6 +698,68 @@ def human_reject_spec(ctx: Any, spec_id: str, reason: str, *,
                     allowed_kinds=[WRITE])
 
 
+def human_apply_project(ctx: Any, project_id: str, *, note: str = "",
+                        author: str = "", ttl_s: Optional[float] = None
+                        ) -> Dict[str, Any]:
+    """Принять ПАКЕТ ПРОЕКТА от имени человека — кнопка «Принять проект» (iter73).
+
+    Закрывает тот отказ, из-за которого «Применить спеку» в пустой сессии
+    отрабатывало «успешно» и не давало результата: пакет спеки применять было
+    некуда, потому что проекта не существовало. Здесь принимается ПРОЕКТ
+    целиком, а результат — заполненные поля формы сетапа (``setup_prefill``):
+    собирает проект штатная кнопка «🏗 Построить проект», путь сборки один.
+    """
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_apply_project_token
+
+    token = issue_apply_project_token(ctx, project_id, ttl_s=ttl_s, note=note)
+    return dispatch(ctx, "apply_project",
+                    {"project_id": project_id, "human_token": token,
+                     "note": note, "author": author},
+                    allowed_kinds=[WRITE])
+
+
+def human_reject_project(ctx: Any, project_id: str, reason: str, *,
+                         author: str = "", ttl_s: Optional[float] = None
+                         ) -> Dict[str, Any]:
+    """Отклонить пакет проекта от имени человека — с записью в журнал решений."""
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_reject_project_token
+
+    token = issue_reject_project_token(ctx, project_id, ttl_s=ttl_s)
+    return dispatch(ctx, "reject_project",
+                    {"project_id": project_id, "human_token": token,
+                     "reason": reason, "author": author},
+                    allowed_kinds=[WRITE])
+
+
+def persist_session(ctx: Any) -> bool:
+    """Сохранить сессию проекта на диск; вернуть, состоялась ли запись.
+
+    Отдельная функция, потому что кнопки человека (применение/отклонение
+    патчей, пакетов спеки и проекта) меняют СТАТУС записи в сессии, а сохранял
+    сессию до iter73 только ход модели (:func:`run_turn`). Из-за этого
+    применённый пакет спеки на диске оставался ``staged``: после перезапуска
+    приложения он снова предлагался к применению, хотя решение уже принято и
+    записано в журнал.
+
+    Отказ записи не поднимается наружу: решение уже состоялось и в журнал
+    попало — терять ответ пользователю из-за файловой ошибки нельзя (A0.6).
+    Возвращаемое значение позволяет UI сказать об этом словами.
+    """
+    session = getattr(ctx, "session", None)
+    root, project = str(getattr(ctx, "root", "") or ""), \
+        str(getattr(ctx, "project", "") or "")
+    if session is None or not (root and project):
+        return False
+    from .store import save_session
+    try:
+        save_session(session, root, project)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def human_reject(ctx: Any, patch_id: str, reason: str, *, author: str = "",
                  ttl_s: Optional[float] = None) -> Dict[str, Any]:
     """Отклонить патч от имени человека — с записью в журнал решений.

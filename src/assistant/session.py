@@ -336,6 +336,65 @@ class StagedSpec:
 
 
 @dataclass
+class StagedProject:
+    """Предложенный ПАКЕТ ПРОЕКТА: состав + отклики + процесс-оси (iter73).
+
+    Зачем отдельно от :class:`StagedSpec`. Пакет спеки описывает ГЕОМЕТРИЮ и
+    применим лишь к СУЩЕСТВУЮЩЕМУ проекту (``runner.set_phr_spec``). Но проект
+    рождается из ТРЁХ блоков: состава (phr-спека), откликов и процесс-осей —
+    откликов и осей в спеке нет по схеме. Из-за этого «Применить спеку» в пустой
+    сессии отрабатывало «успешно» и не давало результата: писать было некуда.
+    Здесь предлагается проект ЦЕЛИКОМ, и применение имеет смысл.
+
+    ``package`` — самодокументируемый JSON (блоки ``spec``/``responses``/
+    ``process``/``covariates``/``passport``), ``summary`` — разбор ядром
+    (:func:`design.project_package.package_manifest`): человек видит по блокам,
+    ЧТО именно приедет, не читая JSON глазами. Ввод идёт в несколько подходов,
+    поэтому пакетов в сессии может быть много — статус у каждого свой.
+    """
+    package: Dict[str, Any] = field(default_factory=dict)
+    label: str = ""
+    rationale: str = ""
+    level: str = ""
+    source: str = ""
+    confidence: str = ""
+    summary: Dict[str, Any] = field(default_factory=dict)
+    status: str = PATCH_STAGED
+    applied_ts: str = ""
+    reason: str = ""
+    ts: str = field(default_factory=_now)
+    id: str = field(default_factory=lambda: _new_id("proj"))
+
+    def payload(self) -> Dict[str, Any]:
+        """Пакет в том виде, который принимает ``parse_project_package``."""
+        return {k: v for k, v in dict(self.package).items()}
+
+    def to_state(self) -> Dict[str, Any]:
+        return {"id": self.id, "package": dict(self.package),
+                "label": self.label, "rationale": self.rationale,
+                "level": self.level, "source": self.source,
+                "confidence": self.confidence, "summary": dict(self.summary),
+                "status": self.status, "applied_ts": self.applied_ts,
+                "reason": self.reason, "ts": self.ts}
+
+    @classmethod
+    def from_state(cls, d: Dict[str, Any]) -> "StagedProject":
+        d = dict(d or {})
+        return cls(package=dict(d.get("package", {}) or {}),
+                   label=str(d.get("label", "")),
+                   rationale=str(d.get("rationale", "")),
+                   level=str(d.get("level", "")),
+                   source=str(d.get("source", "")),
+                   confidence=str(d.get("confidence", "")),
+                   summary=dict(d.get("summary", {}) or {}),
+                   status=str(d.get("status", PATCH_STAGED)),
+                   applied_ts=str(d.get("applied_ts", "")),
+                   reason=str(d.get("reason", "")),
+                   ts=str(d.get("ts", "")) or _now(),
+                   id=str(d.get("id", "")) or _new_id("proj"))
+
+
+@dataclass
 class ToolCall:
     """Запись аудита вызова инструмента (дублируется в ``tool_calls.jsonl``)."""
     tool: str
@@ -385,6 +444,7 @@ class AssistantSession:
     artifacts: List[Artifact] = field(default_factory=list)
     patches: List[StagedPatch] = field(default_factory=list)
     specs: List[StagedSpec] = field(default_factory=list)
+    projects: List[StagedProject] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
 
@@ -565,6 +625,52 @@ class AssistantSession:
     def staged_specs(self) -> List[StagedSpec]:
         return [s for s in self.specs if s.status == PATCH_STAGED]
 
+    # -- пакеты проекта (iter73) ----------------------------------------
+    def stage_project(self, proj: StagedProject) -> StagedProject:
+        """Положить ПАКЕТ ПРОЕКТА в стейдж (применяет человек кнопкой).
+
+        Пустой пакет не принимается: «проект без блоков» — не предложение, а
+        видимость работы. Полноту блоков проверяет ядро
+        (:func:`design.project_package.parse_project_package`) ДО стейджа.
+        """
+        if not proj.package:
+            raise ValueError(
+                "Пакет проекта пуст: предлагать нечего. Проект рождается из "
+                "блоков 'spec' (состав), 'responses' (отклики) и 'process' "
+                "(оси процесса с границами).")
+        proj.status = PATCH_STAGED
+        self.projects.append(proj)
+        self.updated_at = _now()
+        return proj
+
+    def project_by_id(self, project_id: str) -> Optional[StagedProject]:
+        for p in self.projects:
+            if p.id == project_id:
+                return p
+        return None
+
+    def set_project_status(self, project_id: str, status: str, *,
+                           reason: str = "") -> StagedProject:
+        """Перевести пакет проекта в терминальный статус (протокол патчей)."""
+        if status not in PATCH_STATUSES:
+            raise ValueError(f"Неизвестный статус пакета проекта {status!r}: "
+                             f"допустимы {PATCH_STATUSES}.")
+        p = self.project_by_id(project_id)
+        if p is None:
+            raise KeyError(f"Пакет проекта '{project_id}' не найден в сессии.")
+        if p.status != PATCH_STAGED:
+            raise ValueError(
+                f"Пакет проекта '{project_id}' уже в статусе '{p.status}' — "
+                f"повторный переход запрещён (предложите новый пакет).")
+        p.status = status
+        p.reason = reason
+        p.applied_ts = _now()
+        self.updated_at = _now()
+        return p
+
+    def staged_projects(self) -> List[StagedProject]:
+        return [p for p in self.projects if p.status == PATCH_STAGED]
+
     # -- аудит вызовов --------------------------------------------------
     def add_tool_call(self, call: ToolCall) -> ToolCall:
         self.tool_calls.append(call)
@@ -583,7 +689,8 @@ class AssistantSession:
 
     def is_empty(self) -> bool:
         return not (self.messages or self.attachments or self.patches
-                    or self.specs or self.artifacts or self.tool_calls)
+                    or self.specs or self.projects or self.artifacts
+                    or self.tool_calls)
 
     def to_state(self) -> Dict[str, Any]:
         return {
@@ -599,6 +706,7 @@ class AssistantSession:
             "artifacts": [a.to_state() for a in self.artifacts],
             "patches": [p.to_state() for p in self.patches],
             "specs": [s.to_state() for s in self.specs],
+            "projects": [p.to_state() for p in self.projects],
             "tool_calls": [c.to_state() for c in self.tool_calls],
         }
 
@@ -629,6 +737,10 @@ class AssistantSession:
         # это НЕ повод отказать в загрузке (старые проекты открываются как были).
         s.specs = [StagedSpec.from_state(d) for d in
                    (state.get("specs", []) or [])]
+        # iter73: то же правило совместимости для пакетов ПРОЕКТА — сессии,
+        # записанные до них, ключа 'projects' не имеют и должны открываться.
+        s.projects = [StagedProject.from_state(d) for d in
+                      (state.get("projects", []) or [])]
         s.tool_calls = [ToolCall.from_state(d) for d in
                         (state.get("tool_calls", []) or [])]
         return s

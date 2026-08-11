@@ -678,6 +678,123 @@ def validate_spec_package(ctx: ToolContext, package: Any) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
+# Пакет ПРОЕКТА (iter73): схема и dry-run
+# ----------------------------------------------------------------------
+def has_project(ctx: ToolContext) -> bool:
+    """Собран ли проект в этой сессии (движок есть) — БЕЗ отказа.
+
+    Отличать «проекта нет» от «спеки нет» обязательно: первое означает, что
+    проект надо РОЖДАТЬ (пакетом проекта), второе — что в существующем проекте
+    не задана геометрия (пакетом спеки). Смешение этих случаев и было причиной
+    «нажал Применить, ничего не изменилось».
+    """
+    return ctx.runner is not None
+
+
+@register(
+    "project_schema",
+    description=(
+        "СХЕМА ПАКЕТА ПРОЕКТА из ядра: какие блоки нужны, чтобы РОДИТЬ проект "
+        "(состав 'spec' = phr-спека, 'responses' = отклики, 'process' = "
+        "процесс-оси с границами в реальных единицах), какие необязательны "
+        "('covariates', 'passport', 'seed'), в каких ЕДИНИЦАХ что задаётся, "
+        "инварианты и готовый ВАЛИДНЫЙ пример. Работает без проекта и без "
+        "спеки — это инструмент ПЕРВИЧНОГО ввода. Зови ПЕРЕД propose_project: "
+        "формат по памяти не восстанавливай. Одной phr-спеки для рождения "
+        "проекта НЕ хватает: откликов и осей в ней нет по схеме."),
+    parameters={"type": "object", "properties": {
+        "include_example": {"type": "boolean",
+                            "description": "включить пример пакета "
+                                           "(по умолчанию да)"}}})
+def project_schema(ctx: ToolContext, include_example: bool = True
+                   ) -> Dict[str, Any]:
+    """Схема пакета проекта как ДАННЫЕ (источник — :mod:`design.project_package`).
+
+    Состояние проекта отдаётся отдельным полем ``current``: «схему знаю» и «в
+    проекте уже есть движок» — разные утверждения, и от второго зависит, какой
+    инструмент уместен (``propose_project`` против ``propose_spec``).
+    """
+    from ...design.project_package import project_package_schema
+
+    out = project_package_schema(include_example=bool(include_example))
+    spec = active_spec(ctx)
+    if has_project(ctx):
+        runner = ctx.runner
+        out["current"] = {
+            "project_present": True,
+            "responses": [str(p) for p in
+                          (getattr(runner, "property_names", []) or [])],
+            "process": [str(p) for p in
+                        (getattr(getattr(runner, "current_schema", None),
+                                 "process_names", []) or [])],
+            "points": int(len(getattr(runner, "points", []) or [])),
+            "spec_hash": spec.spec_hash() if spec is not None else "",
+            "note": "Проект уже собран: пакетом ПРОЕКТА он не заводится "
+                    "заново. Геометрию правь пакетом спеки (propose_spec), "
+                    "отклики и оси меняет человек в сетапе.",
+        }
+    else:
+        out["current"] = {
+            "project_present": False,
+            "note": "Проекта в сессии нет — это ПЕРВИЧНЫЙ ввод: собери пакет "
+                    "проекта целиком (propose_project). Отклики и границы "
+                    "процесс-осей НЕ выдумывай: их называет технолог; если их "
+                    "не назвали, спроси в OPEN_QUESTIONS.",
+        }
+    return out
+
+
+@register(
+    "validate_project_package",
+    description=(
+        "Сухой прогон ПАКЕТА ПРОЕКТА: разобрать блоки ядром (спека — тем же "
+        "конструктором PhrSpec), показать МАНИФЕСТ «что именно загружается» по "
+        "блокам (компоненты, отклики с единицами, процесс-оси с границами и "
+        "режимами, ковариаты, паспорт), список недостающего и ошибки. Ничего "
+        "не применяет и в стейдж не кладёт. Формат — project_schema."),
+    parameters={"type": "object", "properties": {
+        "package": {"type": "object",
+                    "description": "пакет проекта ЦЕЛИКОМ: {'package_kind': "
+                                   "'project', 'spec': {...}, 'responses': "
+                                   "[...], 'process': [...]}"}},
+        "required": ["package"]})
+def validate_project_package(ctx: ToolContext, package: Any) -> Dict[str, Any]:
+    """Dry-run пакета проекта: отказ — это РЕЗУЛЬТАТ, а не исключение.
+
+    Ход модели не должен падать из-за неверного пакета: она обязана прочитать
+    причину и собрать пакет заново. Поэтому :class:`PackageError` (пакет собран
+    неверно) превращается в ``ok=False`` с подсказкой, а не в ``ToolError``.
+    """
+    from ...design.project_package import (PackageError, manifest_caption,
+                                           package_manifest,
+                                           parse_project_package)
+    try:
+        pkg = parse_project_package(package)
+    except PackageError as exc:
+        return {"ok": False, "error": str(exc),
+                "hint": "Пакет отклонён ядром — проект не тронут. Это ответ по "
+                        "существу, а не сбой: сверь блоки и единицы со "
+                        "project_schema и собери заново."}
+    out: Dict[str, Any] = {
+        "ok": True,
+        "manifest": package_manifest(pkg),
+        "caption": manifest_caption(pkg),
+        "spec_hash": pkg.spec_hash,
+        "q_components": int(pkg.spec.q),
+        "dim_z": int(pkg.spec.dim_z),
+        "phr_intervals": {k: [float(v[0]), float(v[1])]
+                          for k, v in pkg.spec.phr_intervals().items()},
+        "project_present": has_project(ctx),
+    }
+    if has_project(ctx):
+        out["warning"] = (
+            "Проект в сессии УЖЕ собран: пакет проекта его не заменяет и "
+            "применён не будет. Правку геометрии предлагай пакетом спеки "
+            "(propose_spec); отклики и оси меняет человек в сетапе.")
+    return _f(out)
+
+
+# ----------------------------------------------------------------------
 # simulate_bounds
 # ----------------------------------------------------------------------
 @register(

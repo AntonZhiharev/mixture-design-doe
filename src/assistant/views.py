@@ -157,6 +157,123 @@ def staged_specs_dataframe(session: AssistantSession, *,
                                        "статус", "обоснование"])
 
 
+def staged_projects_dataframe(session: AssistantSession, *,
+                              only_staged: bool = False) -> pd.DataFrame:
+    """Предложенные ПАКЕТЫ ПРОЕКТА: что за проект приедет по блокам (iter73).
+
+    Колонки отвечают на требование «из пакета должно быть понятно, что именно
+    загружается»: состав, отклики, оси — раздельно, с числами. Ввод идёт в
+    несколько подходов, поэтому список пакетов — это история заходов, и по ней
+    должно быть видно, чем заходы отличались.
+    """
+    rows: List[Dict[str, Any]] = []
+    for p in session.projects:
+        if only_staged and p.status != PATCH_STAGED:
+            continue
+        m = p.summary or {}
+        resp = list(m.get("responses", []) or [])
+        proc = list(m.get("process", []) or [])
+        comps = list(m.get("components", []) or [])
+        rows.append({
+            "id": p.id,
+            "метка": p.label or "—",
+            "компонентов": len(comps),
+            "откликов": len(resp),
+            "процесс-осей": len(proc),
+            "состав": _short(", ".join(comps), 60) or "—",
+            "отклики": _short(", ".join(_unit_name(d) for d in resp), 60) or "—",
+            "оси": _short("; ".join(_axis_name(d) for d in proc), 70) or "—",
+            "ковариат": len(list(m.get("covariates", []) or [])),
+            "хеш спеки": str(m.get("spec_hash", ""))[:12] or "—",
+            "знание": p.level or "—",
+            "статус": _STATUS_LABEL.get(p.status, p.status),
+            "обоснование": _short(p.rationale, 90),
+        })
+    return pd.DataFrame(rows, columns=[
+        "id", "метка", "компонентов", "откликов", "процесс-осей", "состав",
+        "отклики", "оси", "ковариат", "хеш спеки", "знание", "статус",
+        "обоснование"])
+
+
+def _unit_name(d: Mapping[str, Any]) -> str:
+    """«имя [ед.]» — единицы отклика видны сразу (их вносят в лаборатории)."""
+    unit = str(d.get("unit", "") or "")
+    return f"{d.get('name', '')}" + (f" [{unit}]" if unit else "")
+
+
+def _axis_name(d: Mapping[str, Any]) -> str:
+    """«имя lo…hi ед.» — ось без границ не имеет смысла, поэтому они в строке."""
+    rng = list(d.get("range", []) or [])
+    unit = str(d.get("unit", "") or "")
+    body = f"{d.get('name', '')}"
+    if len(rng) == 2:
+        body += f" {float(rng[0]):g}…{float(rng[1]):g}"
+    return body + (f" {unit}" if unit else "")
+
+
+def project_blocks_dataframe(summary: Mapping[str, Any]) -> pd.DataFrame:
+    """МАНИФЕСТ пакета проекта таблицей: блок / что / детали / единицы.
+
+    Источник — ``design.project_package.package_manifest`` (лежит в ``summary``
+    записи стейджа). Человек утверждает то, что может прочитать: сверять он
+    будет построчно с таблицей технолога, а не по общей фразе «пакет проекта».
+    """
+    blocks = list((summary or {}).get("blocks", []) or [])
+    rows = [{"блок": str(b.get("блок", "")), "что": str(b.get("что", "")),
+             "детали": str(b.get("детали", "")),
+             "единицы": str(b.get("единицы", ""))} for b in blocks]
+    return pd.DataFrame(rows, columns=["блок", "что", "детали", "единицы"])
+
+
+def project_apply_caption(result: Mapping[str, Any]) -> str:
+    """Одна строка об итоге ПРИНЯТИЯ пакета проекта (iter73).
+
+    Говорит и то, что произошло, и то, что осталось сделать: проект принятием
+    ещё НЕ собран — поля формы заполнены, сборка за человеком. Молчать об этом
+    нельзя, иначе повторится исходный отказ «нажал и ничего не изменилось».
+    """
+    if not result:
+        return "пакет проекта не принят"
+    m = result.get("manifest", {}) or {}
+    parts = [f"пакет {result.get('project_id', '—')} · "
+             f"{result.get('status', '')}"]
+    parts.append(f"компонентов: {len(list(m.get('components', []) or []))}")
+    parts.append(f"откликов: {len(list(m.get('responses', []) or []))}")
+    parts.append(f"процесс-осей: {len(list(m.get('process', []) or []))}")
+    parts.append(f"отпечаток спеки: {str(result.get('spec_hash', ''))[:12]}…")
+    parts.append("поля сетапа заполнены — проект собирает кнопка "
+                 "«🏗 Построить проект»")
+    return " · ".join(parts)
+
+
+def project_status_caption(runner: Any, *, project: str = "") -> str:
+    """Есть ли в сессии СОБРАННЫЙ проект — строкой, а не по косвенным признакам.
+
+    До iter73 состояние читалось по догадкам: поле «Имя проекта» показывало
+    ``my_project`` всегда, даже когда проекта не существовало, а единственная
+    явная надпись «проекта в сессии нет» стояла НИЖЕ длинной формы сетапа. Из-за
+    этого человек нажимал «Применить спеку», не зная, что применять некуда.
+    """
+    if runner is None:
+        return ("⚠️ Проекта в сессии НЕТ: движка, геометрии и базы точек не "
+                "существует. Имя в поле «Имя проекта» — это имя ДЛЯ "
+                "СОХРАНЕНИЯ, а не признак открытого проекта. Соберите проект "
+                "формой «🆕 Новый проект» ниже, загрузите сохранённый или "
+                "примите пакет проекта от ассистента.")
+    spec = getattr(runner, "phr_spec", None)
+    props = list(getattr(runner, "property_names", []) or [])
+    sch = getattr(runner, "current_schema", None)
+    proc = list(getattr(sch, "process_names", []) or []) if sch else []
+    comps = list(getattr(sch, "mixture_names", []) or []) if sch else []
+    n = len(getattr(runner, "points", []) or [])
+    head = (f"✅ Проект собран{f' «{project}»' if project else ''}: "
+            f"{len(comps)} компонентов × {len(proc)} процесс-осей, "
+            f"отклики: {', '.join(props) or '—'}, база: {n} точек")
+    if spec is None:
+        return head + " · phr-спека НЕ задана (геометрия не определена)"
+    return head + f" · spec_hash {spec.spec_hash()[:12]}…"
+
+
 def spec_apply_caption(result: Mapping[str, Any]) -> str:
     """Одна строка об итоге применения ПАКЕТА спеки (iter71).
 

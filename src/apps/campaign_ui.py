@@ -41,6 +41,10 @@ from ..apps import campaign_screening as csx
 from ..apps import campaign_state as cs
 from ..apps import workspace as wsx
 
+# iter73: ЧИСТЫЕ подписи состояния ассистента/проекта (без Streamlit) — один
+# источник формулировок для дока и для закладки «Старт».
+from ..assistant import views as ai_views
+
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 from ..design.blocking import blocking_diagnostics
 from ..design.levels import levels_caption
@@ -4697,6 +4701,22 @@ def render_start_panel(ctrl: Optional["cv.CampaignController"], *,
     план → внести измеренные Y → зафиксировать. После фиксации закладка
     остаётся справочной: видно сводку настроек движка и что seed уже снят.
     """
+    # iter73: СОСТОЯНИЕ ПРОЕКТА — первой строкой, ДО всех экспандеров. Раньше
+    # «есть проект или нет» читалось по косвенным признакам: поле «Имя проекта»
+    # показывало `my_project` всегда, раскрытость формы сетапа выглядела как
+    # «уже заполнял», а единственная явная надпись стояла НИЖЕ длинной формы.
+    # Из-за этого человек нажимал «Применить» у ассистента, не зная, что
+    # применять некуда (наблюдалось в живой сессии 11.08.2026).
+    _runner_now = getattr(ctrl, "runner", None) if ctrl is not None else None
+    _status = ai_views.project_status_caption(
+        _runner_now, project=str(st.session_state.get("campaign_name", "") or ""))
+    (st.success if _runner_now is not None else st.warning)(_status)
+    # Подсказка после принятия пакета проекта ассистентом: поля формы заполнены,
+    # но проект ещё НЕ собран — молчать об этом нельзя (иначе исходный отказ
+    # «нажал, и ничего не изменилось» повторится уже здесь).
+    if st.session_state.get("camp_project_pkg_msg"):
+        st.info(st.session_state.pop("camp_project_pkg_msg"))
+
     if project_renderer is not None:
         project_renderer()          # 📁 Проект: сохранить/загрузить/удалить
     render_setup_form()             # 🆕 Новый проект — реальный сетап (§17.4)

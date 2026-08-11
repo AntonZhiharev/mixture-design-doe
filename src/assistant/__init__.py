@@ -22,13 +22,13 @@ from __future__ import annotations
 
 from .consent import Consent, ConsentError, ConsentRegistry, issue_token
 from .session import (Artifact, Attachment, AssistantSession, Message,
-                      StagedPatch, ToolCall)
+                      StagedPatch, StagedProject, StagedSpec, ToolCall)
 from .store import (append_log, assistant_dir, artifacts_dir, files_dir,
                     load_session, read_log, save_session, session_path)
 
 __all__ = [
     "AssistantSession", "Message", "Attachment", "Artifact", "StagedPatch",
-    "ToolCall",
+    "StagedSpec", "StagedProject", "ToolCall",
     "assistant_dir", "files_dir", "artifacts_dir", "session_path",
     "save_session", "load_session", "append_log", "read_log",
     "Consent", "ConsentError", "ConsentRegistry", "issue_token",

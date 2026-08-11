@@ -35,10 +35,11 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from ..consent import DEFAULT_REGISTRY, ConsentError, ConsentRegistry
-from ..session import (PATCH_APPLIED, PATCH_REJECTED, StagedPatch, StagedSpec)
+from ..session import (PATCH_APPLIED, PATCH_REJECTED, StagedPatch,
+                       StagedProject, StagedSpec)
 from ..store import append_log
 from .readonly import (_f, active_spec, build_patched_spec,
-                       build_spec_from_package, normalize_patch,
+                       build_spec_from_package, has_project, normalize_patch,
                        normalize_spec_package, spec_package_diff, spec_payload,
                        validate_spec)
 from .registry import PROPOSE, WRITE, ToolContext, ToolError, register
@@ -703,6 +704,219 @@ def reject_spec(ctx: ToolContext, spec_id: str, human_token: str,
             "decision": decision}
 
 
+# ----------------------------------------------------------------------
+# Пакет ПРОЕКТА (iter73): предложить → принять человеком
+# ----------------------------------------------------------------------
+@register(
+    "propose_project",
+    description=(
+        "ПРЕДЛОЖИТЬ ПРОЕКТ ЦЕЛИКОМ, когда его в сессии ещё нет: состав "
+        "('spec' — phr-спека), отклики ('responses') и процесс-оси с границами "
+        "('process'), плюс необязательные 'covariates', 'passport', 'seed'. "
+        "Именно этим инструментом закрывается первичный ввод: одной phr-спеки "
+        "не хватает, потому что откликов и осей в ней нет по схеме, а без них "
+        "движок не собирается. Пакет проверяется ядром и кладётся в СТЕЙДЖ; "
+        "проект этим вызовом НЕ создаётся — принимает человек кнопкой. Формат "
+        "бери из project_schema. Отклики и границы осей НЕ выдумывай: не "
+        "назвали — спроси."),
+    parameters={"type": "object", "properties": {
+        "package": {"type": "object",
+                    "description": "пакет проекта ЦЕЛИКОМ (см. project_schema)"},
+        "rationale": {"type": "string",
+                      "description": "почему такой состав, отклики и оси: "
+                                     "физика, паспорт, практика цеха"},
+        "label": {"type": "string",
+                  "description": "короткая метка пакета (например «кромка ПВХ: "
+                                 "первичный ввод проекта»)"},
+        "level": {"type": "string", "description": "L1 | L2 | L3"},
+        "source": {"type": "string", "description": "источник сведений"},
+        "confidence": {"type": "string", "description": "high | med | low"}},
+        "required": ["package", "rationale"]},
+    kind=PROPOSE)
+def propose_project(ctx: ToolContext, package: Any, rationale: str,
+                    label: str = "", level: str = "", source: str = "",
+                    confidence: str = "") -> Dict[str, Any]:
+    """Пакет проекта → стейдж сессии (после разбора ЯДРОМ).
+
+    Отказ разбора возвращается РЕЗУЛЬТАТОМ: пункт, заведомо неприменимый, в
+    стейдже был бы ловушкой — человек нажал бы «Принять» и получил ошибку
+    вместо проекта (ровно то, что случилось с пакетом спеки в живой сессии).
+    """
+    from ...design.project_package import (PackageError, manifest_caption,
+                                           package_manifest,
+                                           parse_project_package)
+    session = ctx.require_session()
+    try:
+        pkg = parse_project_package(package)
+    except PackageError as exc:
+        return {"staged": False, "ok": False, "error": str(exc),
+                "hint": ("Пакет отклонён ядром и в стейдж НЕ положен: проект не "
+                         "тронут. Сверь блоки и единицы со project_schema и "
+                         "предложи заново.")}
+
+    manifest = package_manifest(pkg)
+    staged = StagedProject(
+        package=dict(pkg.raw), label=str(label or pkg.label or ""),
+        rationale=str(rationale or ""), level=str(level or ""),
+        source=str(source or ""), confidence=str(confidence or ""),
+        summary=manifest)
+    session.stage_project(staged)
+
+    out: Dict[str, Any] = {
+        "staged": True, "ok": True, "project_id": staged.id,
+        "manifest": manifest, "caption": manifest_caption(pkg),
+        "note": ("Пакет НЕ применён: он в стейдже. Принимает человек кнопкой "
+                 "(разовый токен). Перечисли ему по блокам, что приедет: "
+                 "компоненты, отклики с единицами, оси с границами."),
+    }
+    if has_project(ctx):
+        out["warning"] = (
+            "В сессии УЖЕ есть собранный проект: пакет проекта его не заменяет "
+            "и применён не будет. Для правки геометрии нужен пакет спеки "
+            "(propose_spec), отклики и оси меняет человек в сетапе.")
+    return _f(out)
+
+
+@register(
+    "apply_project",
+    description=(
+        "ПРИНЯТЬ пакет проекта из стейджа: блоки пакета переносятся в поля "
+        "формы сетапа («🆕 Новый проект»), после чего проект собирает штатная "
+        "кнопка «🏗 Построить проект». Требует разового токена подтверждения "
+        "человека — кнопка в интерфейсе. Отклоняется, если проект в сессии уже "
+        "собран: это рождение проекта, а не его правка."),
+    parameters={"type": "object", "properties": {
+        "project_id": {"type": "string",
+                       "description": "id пакета проекта из стейджа"},
+        "human_token": {"type": "string",
+                        "description": "разовый токен подтверждения человека"},
+        "note": {"type": "string", "description": "комментарий к принятию"},
+        "author": {"type": "string", "description": "кто принял решение"}},
+        "required": ["project_id", "human_token"]},
+    kind=WRITE)
+def apply_project(ctx: ToolContext, project_id: str, human_token: str,
+                  note: str = "", author: str = "") -> Dict[str, Any]:
+    """Принять пакет проекта: вернуть ПРЕФИЛЛ формы сетапа и записать решение.
+
+    Раннер здесь НЕ собирается сознательно: сборка проекта в приложении
+    остаётся одна — штатная кнопка формы. Инструмент отвечает за другое:
+    проверить пакет, погасить токен, отдать значения полей и зафиксировать
+    решение в журнале компании.
+    """
+    from ...design.project_package import (PackageError, manifest_caption,
+                                           package_manifest,
+                                           package_to_setup_prefill,
+                                           parse_project_package)
+    session = ctx.require_session()
+    staged = session.project_by_id(str(project_id))
+    if staged is None:
+        raise ToolError(
+            f"Пакета проекта '{project_id}' нет в сессии. В стейдже: "
+            f"{[p.id for p in session.staged_projects()] or 'пусто'}.")
+    if staged.status != "staged":
+        raise ToolError(
+            f"Пакет '{project_id}' уже в статусе '{staged.status}': повторное "
+            f"применение запрещено — предложите новый пакет.")
+    if has_project(ctx):
+        raise ToolError(
+            "В сессии уже собран проект: пакетом проекта он не заводится "
+            "заново — иначе молча пропали бы измеренные точки и ветки. Пакет "
+            "остаётся в стейдже. Правку геометрии применяйте пакетом спеки, а "
+            "отклики и оси меняйте в сетапе, собрав проект заново осознанно.")
+
+    try:
+        pkg = parse_project_package(staged.payload())
+    except PackageError as exc:
+        raise ToolError(
+            f"ГЕЙТ ВАЛИДАЦИИ: пакет проекта не разбирается ядром ({exc}). "
+            f"Проект НЕ создан, состояние прежнее.") from exc
+    # Токен привязан к отпечатку СПЕКИ пакета: подменить пакет между нажатием
+    # кнопки и вызовом нельзя.
+    _consume(ctx, human_token, action="apply_project", target=str(project_id),
+             context_hash=pkg.spec_hash)
+
+    prefill = package_to_setup_prefill(pkg)
+    manifest = package_manifest(pkg)
+    session.set_project_status(staged.id, PATCH_APPLIED, reason=str(note or ""))
+    decision = _log(ctx, "decisions", _project_decision_record(
+        staged, pkg, author=author, note=note))
+    return _f({
+        "ok": True, "project_id": staged.id, "status": PATCH_APPLIED,
+        "spec_hash": pkg.spec_hash, "manifest": manifest,
+        "caption": manifest_caption(pkg),
+        "setup_prefill": prefill, "decision": decision,
+        "next_step": ("Поля формы «🆕 Новый проект» на закладке «🌱 Старт» "
+                      "заполнены из пакета. Проверьте их и нажмите "
+                      "«🏗 Построить проект» — сборка проекта в приложении "
+                      "одна, и она остаётся за вами."),
+        "persist_hint": ("После сборки сохраните проект (панель «📁 Проект»), "
+                         "иначе он не переживёт перезапуск."),
+    })
+
+
+def _project_decision_record(staged: StagedProject, pkg: Any, *,
+                             author: str, note: str) -> Dict[str, Any]:
+    """Запись в журнал о принятии пакета проекта.
+
+    Заголовок собирается ИЗ ПАКЕТА, а не из вольной формулировки: через полгода
+    по журналу должно быть видно, из чего проект родился — сколько компонентов,
+    какие отклики и оси.
+    """
+    return {
+        "ts": _now(),
+        "title": (staged.label
+                  or f"проект: первичный ввод ({len(pkg.component_names)} "
+                     f"компонентов, {len(pkg.responses)} откликов, "
+                     f"{len(pkg.process)} процесс-осей)"),
+        "nodes": sorted(pkg.spec.phr_intervals()),
+        "author": str(author or "человек"),
+        "spec_hash": "", "spec_hash_after": pkg.spec_hash,
+        "rationale": staged.rationale, "level": staged.level,
+        "source": staged.source, "confidence": staged.confidence,
+        "project_id": staged.id, "affects_hash": True,
+        "note": str(note or ""), "kind": "apply_project",
+        "responses": list(pkg.response_names),
+        "process": list(pkg.process_names),
+        "covariates": list(pkg.covariates),
+    }
+
+
+@register(
+    "reject_project",
+    description=(
+        "Отклонить пакет проекта из стейджа (решение человека, требует токен). "
+        "Отказ ТОЖЕ идёт в журнал решений: «почему не завели проект в таком "
+        "виде» должно разрешаться журналом, а не памятью участников."),
+    parameters={"type": "object", "properties": {
+        "project_id": {"type": "string", "description": "id пакета из стейджа"},
+        "human_token": {"type": "string", "description": "разовый токен"},
+        "reason": {"type": "string", "description": "почему отклонён"},
+        "author": {"type": "string", "description": "кто решил"}},
+        "required": ["project_id", "human_token", "reason"]},
+    kind=WRITE)
+def reject_project(ctx: ToolContext, project_id: str, human_token: str,
+                   reason: str, author: str = "") -> Dict[str, Any]:
+    session = ctx.require_session()
+    staged = session.project_by_id(str(project_id))
+    if staged is None:
+        raise ToolError(f"Пакета проекта '{project_id}' нет в сессии.")
+    _consume(ctx, human_token, action="reject_project", target=str(project_id))
+    session.set_project_status(staged.id, PATCH_REJECTED, reason=str(reason))
+    summary = staged.summary or {}
+    decision = _log(ctx, "decisions", {
+        "ts": _now(),
+        "title": f"ОТКЛОНЕНО: пакет проекта {staged.label or staged.id}",
+        "nodes": sorted(summary.get("components", []) or []),
+        "author": str(author or "человек"),
+        "spec_hash": str(summary.get("spec_hash", "") or ""),
+        "rationale": str(reason), "project_id": staged.id,
+        "level": staged.level, "source": staged.source,
+        "kind": "reject_project",
+    })
+    return {"ok": True, "project_id": staged.id, "status": PATCH_REJECTED,
+            "decision": decision}
+
+
 @register(
     "record_decision",
     description=(
@@ -810,6 +1024,38 @@ def issue_reject_spec_token(ctx: ToolContext, spec_id: str, *,
                             ttl_s: Optional[float] = None) -> str:
     """Токен на отклонение пакета спеки (кнопка «Отклонить спеку»)."""
     return registry_for(ctx).issue("reject_spec", str(spec_id),
+                                   ttl_s=ttl_s).token
+
+
+def issue_apply_project_token(ctx: ToolContext, project_id: str, *,
+                              ttl_s: Optional[float] = None,
+                              note: str = "") -> str:
+    """Токен на принятие ПАКЕТА ПРОЕКТА (кнопка «Принять проект», iter73).
+
+    Привязан к отпечатку СПЕКИ ИЗ ПАКЕТА, а не к активной спеке проекта: проекта
+    в этот момент нет по определению, а подменить пакет между нажатием кнопки и
+    вызовом инструмента нельзя.
+    """
+    from ...design.project_package import PackageError, parse_project_package
+
+    session = ctx.require_session()
+    staged = session.project_by_id(str(project_id))
+    if staged is None:
+        raise ToolError(f"Пакета проекта '{project_id}' нет в сессии.")
+    try:
+        spec_hash = parse_project_package(staged.payload()).spec_hash
+    except PackageError as exc:
+        raise ToolError(f"Пакет проекта '{project_id}' не разбирается ядром "
+                        f"({exc}) — подтверждать нечего.") from exc
+    return registry_for(ctx).issue("apply_project", str(project_id),
+                                   context_hash=spec_hash, ttl_s=ttl_s,
+                                   note=note).token
+
+
+def issue_reject_project_token(ctx: ToolContext, project_id: str, *,
+                               ttl_s: Optional[float] = None) -> str:
+    """Токен на отклонение пакета проекта (кнопка «Отклонить проект»)."""
+    return registry_for(ctx).issue("reject_project", str(project_id),
                                    ttl_s=ttl_s).token
 
 

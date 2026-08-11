@@ -239,6 +239,10 @@ def _render_patches(ctx: ToolContext, session) -> None:
             except ToolError as exc:
                 st.error(str(exc))
             else:
+                # iter73: статус патча живёт в СЕССИИ — без записи на диск он
+                # терялся при перезапуске, и применённый патч снова предлагался
+                # к применению, хотя решение уже в журнале.
+                actx.persist_session(ctx)
                 st.success(views.apply_result_caption(out))
                 if out.get("warning"):
                     st.warning(out["warning"])
@@ -256,7 +260,90 @@ def _render_patches(ctx: ToolContext, session) -> None:
                 except ToolError as exc:
                     st.error(str(exc))
                 else:
+                    actx.persist_session(ctx)
                     st.success("Патч отклонён, решение записано в журнал.")
+
+
+def _render_project_packages(ctx: ToolContext, session, runner: Any) -> None:
+    """Панель ПАКЕТОВ ПРОЕКТА: рождение проекта из предложения ассистента (iter73).
+
+    Закрывает отказ, с которого начался шаг: «Применить спеку» в пустой сессии
+    отрабатывало «успешно» и ничего не меняло — писать геометрию было некуда,
+    потому что проекта не существовало. Здесь принимается ПРОЕКТ целиком, а
+    принятие заполняет поля формы «🆕 Новый проект»: собирает проект штатная
+    кнопка «🏗 Построить проект», путь сборки в приложении один.
+
+    Манифест показывается ТАБЛИЦЕЙ по блокам (состав / отклики / оси / режимы /
+    ковариаты / паспорт) — по требованию: из пакета должно быть видно, что
+    именно загружается, потому что ввод идёт в несколько подходов.
+    """
+    staged = session.staged_projects()
+    st.markdown(f"**🏗 Предложенные проекты (пакетом): {len(staged)}**")
+    if not staged:
+        st.caption("Пусто. Пакет появляется здесь, когда проекта в сессии нет и "
+                   "ассистент собирает его целиком: состав (phr-спека) + "
+                   "отклики + процесс-оси с границами. Одной спекой проект не "
+                   "заводится — откликов и осей в ней нет по схеме.")
+        return
+    st.dataframe(views.staged_projects_dataframe(session, only_staged=True),
+                 use_container_width=True, hide_index=True)
+    if runner is not None:
+        st.warning("В сессии УЖЕ собран проект: принять пакет проекта нельзя — "
+                   "иначе молча пропали бы измеренные точки и ветки. Для правки "
+                   "геометрии нужен пакет спеки, отклики и оси меняются в "
+                   "сетапе при осознанной пересборке.")
+    for p in staged:
+        m = p.summary or {}
+        st.caption(f"`{p.id}` · {p.label or 'без метки'} · "
+                   f"{len(list(m.get('components', []) or []))} компонентов · "
+                   f"{len(list(m.get('responses', []) or []))} откликов · "
+                   f"{len(list(m.get('process', []) or []))} процесс-осей · "
+                   f"hash {str(m.get('spec_hash', ''))[:12]}…")
+        # Блоки таблицей — «что именно загружается» без чтения JSON глазами.
+        st.dataframe(views.project_blocks_dataframe(m),
+                     use_container_width=True, hide_index=True)
+        with st.expander(f"JSON пакета проекта {p.id}", expanded=False):
+            st.json(p.payload())
+        c = st.columns(2)
+        if c[0].button("✅ Принять проект", key=f"dock_apply_proj_{p.id}",
+                       disabled=runner is not None,
+                       help=("Заполнит поля формы «🆕 Новый проект» на закладке "
+                             "«🌱 Старт»; собрать проект останется кнопкой "
+                             "«🏗 Построить проект»")
+                            if runner is None else
+                            "Проект уже собран — пакетом он не заводится заново"):
+            try:
+                out = actx.human_apply_project(ctx, p.id, author="человек (UI)")
+            except ToolError as exc:
+                st.error(str(exc))
+            else:
+                # Префилл применяется ОТЛОЖЕННО (тот же механизм, что у
+                # загрузки проекта): менять ключ уже созданного виджета
+                # Streamlit запрещает, а форма сетапа рисуется в этом же прогоне.
+                st.session_state["setup_prefill_pending"] = dict(
+                    out.get("setup_prefill", {}) or {})
+                st.session_state["camp_project_pkg_msg"] = out.get(
+                    "next_step", "")
+                actx.persist_session(ctx)
+                st.success(views.project_apply_caption(out))
+                st.info(out.get("next_step", ""))
+                st.rerun()
+        reason = st.text_input("причина отказа", key=f"dock_proj_reason_{p.id}",
+                               label_visibility="collapsed",
+                               placeholder="почему не берём такой проект")
+        if c[1].button("⛔ Отклонить проект", key=f"dock_reject_proj_{p.id}"):
+            if not reason.strip():
+                st.error("Отказ тоже идёт в журнал решений — назовите причину.")
+            else:
+                try:
+                    actx.human_reject_project(ctx, p.id, reason.strip(),
+                                              author="человек (UI)")
+                except ToolError as exc:
+                    st.error(str(exc))
+                else:
+                    actx.persist_session(ctx)
+                    st.success("Пакет проекта отклонён, решение записано в "
+                               "журнал.")
 
 
 def _render_spec_packages(ctx: ToolContext, session) -> None:
@@ -300,6 +387,10 @@ def _render_spec_packages(ctx: ToolContext, session) -> None:
             except ToolError as exc:
                 st.error(str(exc))
             else:
+                # iter73: см. панель патчей — статус пакета обязан пережить
+                # перезапуск приложения (наблюдалось: applied в журнале, staged
+                # в session.json).
+                actx.persist_session(ctx)
                 st.success(views.spec_apply_caption(out))
                 if out.get("warning"):
                     st.warning(out["warning"])
@@ -317,6 +408,7 @@ def _render_spec_packages(ctx: ToolContext, session) -> None:
                 except ToolError as exc:
                     st.error(str(exc))
                 else:
+                    actx.persist_session(ctx)
                     st.success("Пакет отклонён, решение записано в журнал.")
 
 
@@ -596,10 +688,14 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
         # кнопка повтора живёт до успешного ответа или до нового вопроса.
         _render_retry(st.session_state.get(K_LAST_TURN))
 
+    # iter73: пакеты ПРОЕКТА — самая верхняя панель утверждения: пока проекта
+    # нет, всё остальное (патчи, пакеты спеки) применять некуда, и держать их
+    # выше значило бы предлагать человеку кнопки без последствий.
     # iter71: пакеты спеки ВЫШЕ патчей — первичный ввод геометрии это первое,
     # что делается в проекте, и он не должен прятаться под панелью правок.
-    # Панели УТВЕРЖДЕНИЯ (спеки/патчи) остаются в зоне ассистента: применить
-    # или отклонить предложение — часть работы с ним, а не справка (iter72).
+    # Панели УТВЕРЖДЕНИЯ (проект/спеки/патчи) остаются в зоне ассистента:
+    # применить или отклонить предложение — часть работы с ним (iter72).
+    _render_project_packages(ctx, session, runner)
     _render_spec_packages(ctx, session)
     _render_patches(ctx, session)
 

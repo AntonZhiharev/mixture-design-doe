@@ -27,12 +27,21 @@ def _click(at, key):
     b[0].click().run()
 
 
+def _open_tab(at, tab_key):
+    """iter69: рабочая область на закладках — открыть нужную (ряд кнопок)."""
+    _click(at, f"ws_tab_{tab_key}")
+
+
 def test_screening_section_renders_and_computes():
     at = AppTest.from_file(_APP, default_timeout=300).run()
     assert not at.exception
 
     # создать демо-кампанию (seed измерен, 2 ветки) → секция M3 доступна
     _click(at, "camp_create")
+    assert not at.exception
+
+    # iter69: анализ скрининга живёт на закладке «📊 Анализ» рабочей области
+    _open_tab(at, "screening")
     assert not at.exception
 
     # кнопки секции «Анализ скрининга (M3)» присутствуют

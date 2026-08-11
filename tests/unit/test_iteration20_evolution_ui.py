@@ -69,6 +69,10 @@ def test_schema_evolution_reveals_process_axis_from_ui():
     at.run()
     assert not at.exception
 
+    # iter69: эволюция схемы живёт на закладке «🧬 Схема» рабочей области
+    _click(at, "ws_tab_evolution")
+    assert not at.exception
+
     # Ш6: раскрыть процесс-ось T (дефолт первый скрытый; миграция known_constant=0)
     _click(at, "camp_ev_proc_btn")
     assert not at.exception

@@ -1,10 +1,19 @@
-"""apps/assistant_dock.py — ДОК ассистента-архитектора в правой колонке (iter65).
+"""apps/assistant_dock.py — ПАНЕЛЬ ДИАЛОГА с ассистентом-архитектором (iter65/69).
 
 Отдельная вкладка «💬 Ассистент» была устроена так, что спросить «почему у
 этой оси такой диапазон» можно было только уйдя с экрана, где эта ось видна.
-Док решает ровно это: он стоит справа (`st.columns([3, 1])`) и виден на КАЖДОМ
-шаге потока, а контекст берёт из ``st.session_state['ui_focus']``, который
-публикует активная секция.
+Док решает ровно это: он виден на КАЖДОМ шаге потока, а контекст берёт из
+``st.session_state['ui_focus']``, который публикует активная закладка рабочей
+области.
+
+**iter69 — раскладка и поведение ленты.** Панель переехала в ЛЕВУЮ колонку
+(``st.columns(workspace.MAIN_COLUMNS)``, эскиз пользователя) и работает как
+переписка в Cline: лента живёт в контейнере ФИКСИРОВАННОЙ высоты со своим
+скроллом и автоскроллом к низу (история прокручивается вверх), поле ввода стоит
+ПОД лентой и не двигается, а рабочая область справа от ответов ассистента больше
+не ползёт. Служебные панели (фокус, интернет, ключ, подсказки) собраны в
+свёрнутый экспандер НАД лентой: раньше они стояли между лентой и вводом, и
+переписка «плавала». Чистая логика ленты — :mod:`src.apps.workspace`.
 
 Слой намеренно ТОНКИЙ. Вся логика — в :mod:`src.assistant.context` и
 :mod:`src.assistant.views` (чистые функции, покрытые
@@ -37,6 +46,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
+from src.apps import workspace as wsx
 from src.assistant import config as ai_config
 from src.assistant import context as actx
 from src.assistant import files as afiles
@@ -337,6 +347,22 @@ def _chat_submission(session, root: str, project: str):
     return (question or None), images
 
 
+def _supports_feed_container() -> bool:
+    """Умеет ли установленный Streamlit ленту с ФИКСИРОВАННОЙ высотой и автоскроллом.
+
+    ``height`` у контейнера появился в 1.29, ``autoscroll`` — позже (1.50+).
+    Проверяем оба параметра фактически, а не по номеру версии: на более старом
+    Streamlit лента останется частью общего скролла страницы (прежнее
+    поведение), но приложение не упадёт.
+    """
+    try:
+        import inspect
+        params = inspect.signature(st.container).parameters
+        return "height" in params and "autoscroll" in params
+    except (TypeError, ValueError):  # pragma: no cover — экзотические сборки
+        return False
+
+
 def _render_attachments(session, root: str, project: str) -> None:
     with st.expander(f"📎 Вложения: {len(session.attachments)}"):
         up = st.file_uploader("Паспорт, ТДС, выгрузка, скриншот (txt/md/csv/"
@@ -371,7 +397,12 @@ def _render_artifacts(session) -> None:
 # Док целиком
 # ----------------------------------------------------------------------
 def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
-    """Правая колонка: чат архитектора с контекстом ТЕКУЩЕГО шага потока."""
+    """Левая колонка (iter69): чат архитектора с контекстом ТЕКУЩЕЙ закладки.
+
+    Порядок частей задаёт поведение переписки: настройки → ЛЕНТА (свой скролл,
+    автоскролл к низу) → поле ввода → результаты хода. Ввод стоит под лентой и
+    не уезжает, потому что растёт не страница, а прокрутка внутри ленты.
+    """
     root = root or os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))), "project_campaigns")
@@ -381,50 +412,68 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
     focus = dock_focus()
 
     st.subheader("💬 Архитектор кампании")
-    st.caption("Отвечает ЧИСЛАМИ ИЗ ЯДРА: роли, эффективные границы, "
-               "spec_hash и preflight считают инструменты, а не память модели.")
     if runner is None:
         st.info("Проект не собран: движка и базы точек нет — вопросы про "
                 "preflight и прогоны честно останутся без чисел.")
 
-    focus = _render_focus(focus, ctx)
-    session.web_enabled = st.toggle(
-        "🌐 Интернет (:online)", value=bool(session.web_enabled),
-        key="dock_web",
-        help="Всё, что придёт из сети, — уровень знания L2: локальный факт "
-             "цеха его отменяет.")
-    _render_connection()
+    # iter69: служебные панели (фокус, интернет, ключ, подсказки, вложения,
+    # патчи) — НАД лентой и свёрнуты. Раньше они стояли между лентой и полем
+    # ввода, и переписка «плавала»: ответ ассистента отодвигал ввод вниз,
+    # а до истории приходилось прокручивать всю страницу.
+    with st.expander("⚙️ Контекст и настройки хода", expanded=runner is None):
+        st.caption("Отвечает ЧИСЛАМИ ИЗ ЯДРА: роли, эффективные границы, "
+                   "spec_hash и preflight считают инструменты, а не память "
+                   "модели.")
+        focus = _render_focus(focus, ctx)
+        session.web_enabled = st.toggle(
+            "🌐 Интернет (:online)", value=bool(session.web_enabled),
+            key="dock_web",
+            help="Всё, что придёт из сети, — уровень знания L2: локальный факт "
+                 "цеха его отменяет.")
+        _render_connection()
+        st.markdown("**Спросить по месту:**")
+        asked = _render_suggestions(focus, runner is not None)
 
-    st.markdown("**Спросить по месту:**")
-    asked = _render_suggestions(focus, runner is not None)
+    # --- ЛЕНТА: свой скролл, история вверх, свежее внизу (как в Cline) ---
+    typed, images = None, []
+    feed = wsx.feed_items(session.messages)
+    box = st.container(height=wsx.CHAT_FEED_HEIGHT, border=True,
+                       autoscroll=True) if _supports_feed_container() \
+        else st.container()
+    with box:
+        for item in feed:
+            with st.chat_message(item.role):
+                st.markdown(item.content)
+                for sha in item.images:
+                    _show_attachment_image(session, root, project, sha)
+        # Ход ЭТОГО прогона дорисовывается в ту же ленту ниже (см. run_turn).
+        turn_slot = st.container()
+    st.caption(wsx.feed_hint(len(feed), wsx.dialog_count(session.messages)))
 
-    for m in session.messages[-20:]:
-        if m.role in ("user", "assistant"):
-            with st.chat_message(m.role):
-                st.markdown(m.content)
-                _render_message_images(m, session, root, project)
-
+    # Поле ввода — ПОД лентой и не двигается: лента прокручивается внутри себя.
     typed, images = _chat_submission(session, root, project)
     question = typed or asked or st.session_state.pop(K_PENDING, None)
 
     if question or images:
-        with st.chat_message("user"):
-            st.markdown(question or "_(изображение без текста)_")
-            for sha in images:
-                _show_attachment_image(session, root, project, sha)
-        box = st.empty()
-        with st.chat_message("assistant"):
-            with st.spinner("Считаю инструментами ядра…"):
-                res = actx.run_turn(
-                    session, ctx, question or "", focus=focus,
-                    spec_hash=spec_hash_of(ctx), kinds=AGENT_KINDS,
-                    images=images,
-                    on_event=lambda e: box.caption(llm.progress_caption(e)))
-            box.empty()
-            st.markdown(res.text or "—")
-            # Графики/таблицы, посчитанные в ходе, — сразу в ответе: файл,
-            # который надо искать в другой панели, разговору не помогает.
-            _render_outputs(views.turn_outputs(session, res.new_artifacts))
+        with turn_slot:
+            with st.chat_message("user"):
+                st.markdown(question or "_(изображение без текста)_")
+                for sha in images:
+                    _show_attachment_image(session, root, project, sha)
+            progress = st.empty()
+            with st.chat_message("assistant"):
+                with st.spinner("Считаю инструментами ядра…"):
+                    res = actx.run_turn(
+                        session, ctx, question or "", focus=focus,
+                        spec_hash=spec_hash_of(ctx), kinds=AGENT_KINDS,
+                        images=images,
+                        on_event=lambda e: progress.caption(
+                            llm.progress_caption(e)))
+                progress.empty()
+                st.markdown(res.text or "—")
+                # Графики/таблицы, посчитанные в ходе, — сразу в ответе: файл,
+                # который надо искать в другой панели, разговору не помогает.
+                _render_outputs(views.turn_outputs(session, res.new_artifacts))
         for err in res.image_errors:
             st.warning(f"Изображение не дошло до модели — {err}")
         st.caption(views.turn_caption(res))

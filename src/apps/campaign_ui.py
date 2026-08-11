@@ -39,6 +39,7 @@ from ..apps.mixture_process_runner import MixtureProcessRunner
 from ..apps import campaign as cv
 from ..apps import campaign_screening as csx
 from ..apps import campaign_state as cs
+from ..apps import workspace as wsx
 
 from ..design.branches import ROLE_OPTIMIZED, ROLE_PRICE_INPUT
 from ..design.blocking import blocking_diagnostics
@@ -4477,27 +4478,166 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
                              use_container_width=True, hide_index=True)
 
 
-def render_campaign() -> None:
-    """Вкладка «🧬 Кампания»: реальный сетап §17.4 + роли + мультицель §16.3 +
-    рабочий стол §16.4 + смена роли §5 + spawn §8 + undo §7 (мутации — по кнопке)."""
+def _tab_row(keys: Sequence[str], labels: Mapping[str, str], current: str, *,
+             key_prefix: str) -> str:
+    """Ряд закладок (эскиз iter69) → ключ, который выбрал человек.
+
+    Закладки нарисованы КНОПКАМИ в ряд, а не ``segmented_control``/``radio``,
+    по двум причинам. Во-первых, состояние виджета с ключом переживает
+    перерисовку и «залипает»: если закладка стала недоступна (проект пересобран,
+    точки исчезли), виджет продолжал бы возвращать её, споря с логикой
+    доступности. Кнопка же — событие, а истина о выбранной закладке хранится
+    там, где решается: в ``session_state`` рабочей области. Во-вторых,
+    ``segmented_control`` появился в Streamlit 1.40, а в ``requirements.txt``
+    заявлен минимум 1.28 — кнопки работают везде.
+
+    Активная закладка выделена ``type="primary"``; возвращается КЛЮЧ (подписи
+    человеческие и меняются).
+    """
+    opts = [str(k) for k in keys]
+    if not opts:
+        return ""
+    picked = str(current) if str(current) in opts else opts[0]
+    cols = st.columns(len(opts))
+    for i, k in enumerate(opts):
+        if cols[i].button(labels.get(k, k), key=f"{key_prefix}_{k}",
+                          type=("primary" if k == picked else "secondary"),
+                          use_container_width=True):
+            picked = k
+    return picked
 
 
+def _branch_tabs(bids: Sequence[str], labels: Mapping[str, str],
+                 current: str) -> str:
+    """Второй ряд закладок — ВЕТКИ проекта (зелёный ряд на эскизе)."""
+    return _tab_row(bids, labels, current, key_prefix="camp_branch_tab")
+
+
+def render_workspace(ctrl: Optional["cv.CampaignController"], *,
+                     overview_renderer: Optional[Any] = None) -> None:
+    """Закладки рабочей области + содержимое активной закладки (iter69).
+
+    Ряд закладок и подпись состояния рисуются СНАРУЖИ прокручиваемого
+    контейнера — иначе, прокрутив таблицу, человек теряет из виду сами
+    закладки. Содержимое активной закладки уходит в контейнер фиксированной
+    высоты (:data:`workspace.WORKSPACE_HEIGHT`): у него собственный скролл,
+    поэтому ответ ассистента в левой панели больше не двигает рабочую область.
+
+    Логика доступности закладок — чистая (:func:`workspace.tab_states`), здесь
+    только показ и роутинг.
+    """
+    runner = getattr(ctrl, "runner", None) if ctrl is not None else None
+    n_points = len(runner.points) if runner is not None else 0
+    n_branches = len(getattr(runner, "branches", {}) or {}) if runner else 0
+    states = wsx.tab_states(has_project=ctrl is not None, n_points=n_points,
+                            n_branches=n_branches)
+    labels = {s.key: s.title for s in states}
+    ok = [s.key for s in states if s.enabled]
+
+    # Смена фазы проекта (собрали / измерили seed / создали ветку) открывает
+    # следующий шаг сама: иначе человек, нажавший «Построить проект» с закладки
+    # «Обзор», остался бы на обзоре и решил, что кнопка не сработала.
+    decision = wsx.decide_tab(st.session_state.get("ws_tab"),
+                              prev_phase=st.session_state.get("ws_phase"),
+                              has_project=ctrl is not None,
+                              n_points=n_points, n_branches=n_branches)
+    active = decision.key
+    st.session_state["ws_phase"] = decision.phase
+    st.session_state["ws_tab"] = active
+    if decision.notice:
+        # A0.6: переключение закладки не должно быть молчаливым.
+        st.info(decision.notice)
+    picked = _tab_row(ok, labels, active, key_prefix="ws_tab")
+    if picked != active:
+        st.session_state["ws_tab"] = picked
+        st.rerun()
+
+    off = [s for s in states if not s.enabled]
+    if off:
+        st.caption("Пока недоступно: "
+                   + "; ".join(f"{s.title} — {s.why}" for s in off))
+
+    tab = wsx.TABS_BY_KEY.get(active)
+    if tab is not None and tab.blurb:
+        st.caption(tab.blurb)
+
+    box = st.container(height=wsx.WORKSPACE_HEIGHT, border=True) \
+        if _supports_container_height() else st.container()
+    with box:
+        _render_workspace_body(ctrl, active,
+                               overview_renderer=overview_renderer)
+
+
+def _supports_container_height() -> bool:
+    """Умеет ли установленный Streamlit контейнер ФИКСИРОВАННОЙ высоты.
+
+    ``st.container(height=…)`` появился в 1.29; на более раннем Streamlit
+    рабочая область просто останется без собственного скролла (страница
+    поведёт себя как раньше) — это хуже по UX, но работоспособно.
+    """
+    try:
+        import inspect
+        return "height" in inspect.signature(st.container).parameters
+    except (TypeError, ValueError):  # pragma: no cover — экзотические сборки
+        return False
+
+
+def _render_workspace_body(ctrl: Optional["cv.CampaignController"], key: str, *,
+                           overview_renderer: Optional[Any] = None) -> None:
+    """Содержимое активной закладки. Один вход — один шаг потока §17."""
+    if key == "overview":
+        if overview_renderer is not None:
+            overview_renderer()
+        else:
+            st.caption("Обзор ассистента подключается приложением "
+                       "(`streamlit_app`) — здесь он не задан.")
+        return
+    if ctrl is None:
+        st.info("Соберите проект в форме «🆕 Новый проект» (левая панель) или "
+                "создайте демо-проект — кнопка «🧪 Демо» в заголовке "
+                "(синтетический оракул {A,B,C}×{T,P}).")
+        return
+    if key == "start":
+        render_start_panel(ctrl)
+    elif key == "base":
+        publish_ui_focus("base")
+        render_base_panel(ctrl)
+    elif key == "branches":
+        render_branches_panel(ctrl)
+    elif key == "screening":
+        publish_ui_focus("screening")
+        render_screening_analysis(ctrl)
+    elif key == "evolution":
+        publish_ui_focus("evolution")
+        render_schema_evolution(ctrl)
+    else:  # pragma: no cover — resolve_tab не отдаёт неизвестных ключей
+        st.warning(f"Закладка «{key}» не реализована.")
+
+
+def render_campaign(*, overview_renderer: Optional[Any] = None) -> None:
+    """Рабочая область проекта (iter69): шапка + ЗАКЛАДКИ вместо простыни.
+
+    Раньше все шаги потока §17 рисовались друг под другом одной страницей, и
+    рабочая область делила скролл документа с диалогом ассистента: любой ответ
+    уводил экран, а таблицу приходилось искать заново. Теперь шаги разложены по
+    закладкам (:mod:`src.apps.workspace`), видна ровно одна, и она живёт в
+    контейнере фиксированной высоты со СВОИМ скроллом.
+
+    ``overview_renderer`` — функция показа закладки «🤖 Обзор» (чат-обзор
+    кампании из ``streamlit_app``). Передаётся аргументом, чтобы поток не
+    импортировал приложение (иначе получился бы цикл импорта).
+    """
     # UX: демо-кнопки — компактно в ЗАГОЛОВКЕ (popover справа от подзаголовка;
     # для старых Streamlit без st.popover — фолбэк-экспандер), а не отдельным
     # широким блоком посреди страницы.
     hdr = st.columns([5, 1])
-    hdr[0].subheader("🧬 Проект: per-branch роли откликов и эволюция (ТЗ v1.1)")
+    hdr[0].subheader("🧬 Рабочая область проекта")
     _ctrl_now = get_campaign_controller()
     with hdr[1]:
         if hasattr(st, "popover"):
             _demo_box = st.popover("🧪 Демо")
         else:  # pragma: no cover — старые Streamlit без st.popover
             _demo_box = st.expander("🧪 Демо", expanded=_ctrl_now is None)
-    st.caption(
-        "Роль отклика — атрибут пары (ветка × отклик): один и тот же ρ может быть "
-        "ЦЕЛЬЮ в одной ветке и ЦЕНОЙ-ВХОДОМ в другой. Денежный канал ρ читается из "
-        "РЕАЛЬНОЙ атрибуции ядра (И-5/Гр-1): OPTIMIZED ⇒ занулён, PRICE_INPUT ⇒ "
-        "живой. Всё, что меняет состояние, делает только ваша кнопка (A0.6).")
 
     # P0: уведомления мутаций (переживают st.rerun) — показ в начале прогона.
     _show_flashes()
@@ -4531,35 +4671,46 @@ def render_campaign() -> None:
             st.rerun()
 
     ctrl = get_campaign_controller()
-    if ctrl is None:
-        st.info("Соберите проект в форме «🆕 Новый проект» (левая панель) или "
-                "создайте демо-проект — кнопка «🧪 Демо» в заголовке "
-                "(синтетический оракул {A,B,C}×{T,P}).")
-        return
-    runner = ctrl.runner
+    # iter69: рабочая область — ЗАКЛАДКИ в контейнере фиксированной высоты
+    # (диалог с ассистентом скроллится отдельно и страницу больше не уводит).
+    render_workspace(ctrl, overview_renderer=overview_renderer)
 
+
+def render_start_panel(ctrl: "cv.CampaignController") -> None:
+    """Закладка «🌱 Старт»: настройки проекта + стартовый дизайн (seed).
+
+    Пока база пуста, это единственный рабочий шаг (§17.4): предложить план →
+    внести измеренные Y → зафиксировать. После фиксации закладка остаётся
+    справочной: видно сводку настроек движка и что seed уже снят.
+    """
+    runner = ctrl.runner
     # C2: read-only сводка настроек ДЕЙСТВУЮЩЕГО проекта (из движка) — видно,
     # что доли компонентов/границы процесса/отклики подтянулись после загрузки.
     render_project_settings(runner)
-
-    # §17.4 (Ш3b): пока стартовый дизайн НЕ измерен (база пуста) — единственная
-    # активная секция это ручной seed-цикл; ветко-UI ниже требует измеренных данных.
     if len(runner.points) == 0:
         render_seed_entry(ctrl)
         return
+    st.success(f"Стартовый дизайн измерен: общая база = {len(runner.points)} "
+               "точек, суррогаты обучены (И-1). Дальше — закладка «🌿 Ветки».")
+    _blk = base_blocking_caption(runner)
+    if _blk:
+        st.caption(_blk)
 
-    # §17.5 (Ш4): ручное создание веток — доступно после измеренного seed.
-    render_branch_creation(ctrl)
-    # §17.6/§16.2 (Ш6): эволюция схемы в любой момент (штатная операция проекта).
-    render_schema_evolution(ctrl)
 
-    # M3-минималка: интерпретируемый анализ скрининга сразу после измеренного seed
-    # (Scheffé + ARD по составу) — «что дали опыты» до построения веток.
-    render_screening_analysis(ctrl)
+def render_base_panel(ctrl: "cv.CampaignController") -> None:
+    """Закладка «📚 База опытов»: выгрузка, коррекция откликов, ковариаты.
+
+    Всё, что относится к УЖЕ измеренным точкам проекта: Excel-выгрузка общей
+    базы (C3, §17.6.1), исправление опечаток ввода откликов (§17.2.1) и
+    телеметрия прогона (ковариаты, P3.1). Координаты не редактируются нигде —
+    измеренная правда не переписывается (И-1).
+    """
+    runner = ctrl.runner
 
     # C3 (§17.6.1): выгрузка ОБЩЕЙ базы опытов кампании в Excel (+ расход сырья).
 
-    with st.expander("⬇️ Выгрузить общую базу опытов в Excel (C3)"):
+    with st.expander("⬇️ Выгрузить общую базу опытов в Excel (C3)",
+                     expanded=True):
         st.caption(
             "Общая база всех измеренных опытов (И-1): № опыта, источник, состав "
             "(доли) + процесс (реальные единицы) и измеренные отклики. Укажите "
@@ -4665,27 +4816,47 @@ def render_campaign() -> None:
                 except (ValueError, KeyError, IndexError) as exc:
                     st.error(str(exc))
 
-    bids = list(runner.branches)
 
+def render_branches_panel(ctrl: "cv.CampaignController") -> None:
+    """Закладка «🌿 Ветки»: второй ряд закладок (сами ветки) + работа с веткой.
+
+    Ветка — линза контекста (Тр-3.3): роли откликов валидны только внутри неё,
+    поэтому выбор ветки стоит ПЕРВЫМ рядом закладок, а всё остальное (роли,
+    цели, рабочий стол, рецепт x*, undo, spawn) рисуется в этом контексте.
+    Выбор человека хранится в ``camp_branch`` — том же ключе, что читал прежний
+    селектор: и ``ui_focus`` (iter65), и тесты продолжают его видеть.
+    """
+    runner = ctrl.runner
+
+    # §17.5 (Ш4): ручное создание веток — доступно после измеренного seed.
+    render_branch_creation(ctrl)
+
+    bids = list(runner.branches)
     if not bids:
         st.info("Стартовый дизайн измерен, суррогаты обучены (общая база = "
                 f"{len(runner.points)} точек). Создайте ветку в форме "
                 "«➕ Создать ветку вручную» выше (Ш4, §17.5).")
+        publish_ui_focus("branch")
         return
 
-
-    # --- линза ветки (Тр-3.3): роли В КОНТЕКСТЕ выбранной ветки ----------
+    # --- ряд закладок ВЕТОК (эскиз iter69): линза контекста Тр-3.3 --------
+    labels = wsx.branch_labels(runner.branches)
+    bsel = wsx.resolve_branch(st.session_state.get("camp_branch"), bids)
+    picked = _branch_tabs(bids, labels, bsel)
+    if picked != bsel:
+        # Клик по закладке ветки = смена линзы: кладём выбор в тот же ключ,
+        # который читают ui_focus и остальной UI, и перерисовываем контекст.
+        st.session_state["camp_branch"] = picked
+        st.rerun()
+    st.session_state["camp_branch"] = bsel
+    # iter65: самый конкретный контекст — ВЫБРАННАЯ ветка (её линза определяет
+    # и роли, и рабочий стол ниже).
+    publish_ui_focus("branch", branch=bsel)
 
     def _branch_label(bid: str) -> str:
-        """Показать имя ветки (+id) в селекторе; значение опции остаётся id."""
-        br = runner.branches.get(bid)
-        return f"{br.name} ({bid})" if br is not None else str(bid)
+        """Подпись ветки «Имя (id)» — для селекторов родителя/spawn ниже."""
+        return labels.get(str(bid), str(bid))
 
-    bsel = st.selectbox("Ветка (линза контекста — Тр-3.3)", bids,
-                        key="camp_branch", format_func=_branch_label)
-    # iter65: после измеренного seed самый конкретный контекст — ВЫБРАННАЯ
-    # ветка (её линза определяет и роли, и рабочий стол ниже).
-    publish_ui_focus("branch", branch=bsel)
     rep = ctrl.role_report(bsel)
     st.caption(f"Линза ветки: **{rep['branch_name']}** (`{bsel}`). Role-tag "
                "валиден ТОЛЬКО в этом контексте; смена ветки меняет теги.")

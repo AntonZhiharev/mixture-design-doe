@@ -36,7 +36,13 @@
   Streamlit сам пока НЕ поддерживает — работает выбор файла и drag&drop;
   для настоящей вставки понадобился бы сторонний компонент с JS-бандлом,
   и это решение сознательно отложено. Графики и таблицы, посчитанные в
-  песочнице, рисуются ``st.image``/``st.dataframe`` прямо в ответе.
+  песочнице, рисуются ``st.image``/``st.dataframe`` прямо в ответе;
+* **iter70 — числа отдельно от вывода.** Раздел ``## ЧИСЛА`` формата ответа
+  (iter64) рисуется свёрнутым блоком ПОД ответом (:func:`_render_answer` →
+  :func:`views.answer_view`), а не строкой в общем потоке markdown: там он
+  читался как продолжение рассуждения, и измерение с интерпретацией выглядели
+  одинаково весомо. Одинаково раскладываются и свежий ход, и история — иначе
+  сообщение меняло бы вид после перезапуска приложения.
 """
 from __future__ import annotations
 
@@ -265,6 +271,23 @@ def _render_message_images(msg, session, root: str, project: str) -> None:
         _show_attachment_image(session, root, project, sha)
 
 
+def _render_answer(text: str) -> None:
+    """Ответ ассистента: текст, а раздел «ЧИСЛА» — свёрнутым блоком (iter70).
+
+    Раздел формата (iter64) нужен ради трассируемости — каждое число подписано
+    инструментом. Но в общем потоке markdown он читался как продолжение
+    рассуждения: измерение и интерпретация выглядели одинаково весомо, а модель
+    ещё и дублировала значения выше. Здесь числа стоят ПОД ответом и свёрнуты:
+    вывод виден сразу, проверка — на один клик. Разбор чистый
+    (:func:`views.answer_view`), виджет ничего не режет сам.
+    """
+    view = views.answer_view(text)
+    st.markdown(view.text or "—")
+    if view.has_numbers:
+        with st.expander(view.numbers_title):
+            st.markdown(view.numbers)
+
+
 def _render_outputs(outputs: List[views.OutputFile]) -> None:
     """Выхлоп песочницы КАРТИНКОЙ и ТАБЛИЦЕЙ, а не только строкой пути (iter68).
 
@@ -443,7 +466,13 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
     with box:
         for item in feed:
             with st.chat_message(item.role):
-                st.markdown(item.content)
+                # Ответ ассистента и в истории раскладывается так же, как свежий
+                # (числа — свёрнутым блоком): иначе одно и то же сообщение
+                # выглядело бы по-разному до и после перезапуска приложения.
+                if item.role == "assistant":
+                    _render_answer(item.content)
+                else:
+                    st.markdown(item.content)
                 for sha in item.images:
                     _show_attachment_image(session, root, project, sha)
         # Ход ЭТОГО прогона дорисовывается в ту же ленту ниже (см. run_turn).
@@ -470,7 +499,7 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
                         on_event=lambda e: progress.caption(
                             llm.progress_caption(e)))
                 progress.empty()
-                st.markdown(res.text or "—")
+                _render_answer(res.text)
                 # Графики/таблицы, посчитанные в ходе, — сразу в ответе: файл,
                 # который надо искать в другой панели, разговору не помогает.
                 _render_outputs(views.turn_outputs(session, res.new_artifacts))

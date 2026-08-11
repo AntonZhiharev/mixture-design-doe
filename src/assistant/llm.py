@@ -23,7 +23,9 @@
 """
 from __future__ import annotations
 
+import base64
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +50,18 @@ MAX_TOOL_RESULT_CHARS = 20_000
 
 DEFAULT_TIMEOUT = 180
 DEFAULT_TEMPERATURE = 0.2
+
+#: Эндпоинт распознавания речи OpenRouter (iter68). Отдельный от чата: голос
+#: превращается в ТЕКСТ до входа в диалог, поэтому дальше работает весь
+#: существующий конвейер (маршрутизация, инструменты, аудит), а в сессии
+#: остаётся проверяемая фраза, а не непрослушиваемый блоб.
+TRANSCRIBE_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+
+#: Модель распознавания по умолчанию (переопределяется ``DOE_ASSISTANT_STT``).
+DEFAULT_STT_MODEL = "openai/whisper-1"
+
+#: Предел на аудио: у провайдера тайм-аут 60 с, длинную запись он не успеет.
+MAX_AUDIO_BYTES = 20 * 1024 * 1024
 
 _HEADERS_EXTRA = {
     "HTTP-Referer": "https://github.com/AntonZhiharev/mixture-design-doe",
@@ -80,14 +94,31 @@ def is_online(model: str) -> bool:
 # ----------------------------------------------------------------------
 # Транспорт
 # ----------------------------------------------------------------------
-def _http_transport(payload: Dict[str, Any], *, key: str, timeout: int
-                    ) -> Dict[str, Any]:
-    """POST в OpenRouter на stdlib urllib (новых зависимостей нет)."""
+#: Обрывки текста ответа провайдера, по которым видно, что модель не умеет
+#: принимать картинку/звук (формулировки у провайдеров разные).
+_MODALITY_MARKS = ("image", "vision", "multimodal", "input_audio", "audio",
+                   "modality")
+
+
+def _looks_like_modality_error(detail: str) -> bool:
+    """Похоже ли HTTP 400 на «модель не поддерживает такой вход»."""
+    s = str(detail or "").lower()
+    return any(m in s for m in _MODALITY_MARKS)
+
+
+def _http_transport(payload: Dict[str, Any], *, key: str, timeout: int,
+                    url: str = "") -> Dict[str, Any]:
+    """POST в OpenRouter на stdlib urllib (новых зависимостей нет).
+
+    ``url`` позволяет тому же транспорту обслуживать и распознавание речи
+    (:data:`TRANSCRIBE_URL`): заголовки, разбор ошибок и подсказки там ровно
+    те же, дублировать их значило бы разъехаться в текстах отказов.
+    """
     data = json.dumps(payload).encode("utf-8")
     headers = {"Authorization": f"Bearer {key}",
                "Content-Type": "application/json", **_HEADERS_EXTRA}
-    req = urllib.request.Request(OPENROUTER_URL, data=data, method="POST",
-                                 headers=headers)
+    req = urllib.request.Request(url or OPENROUTER_URL, data=data,
+                                 method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -99,6 +130,12 @@ def _http_transport(payload: Dict[str, Any], *, key: str, timeout: int
             404: " Такой модели нет — проверьте имя (и суффикс ':online').",
             429: " Слишком часто: подождите и повторите.",
         }.get(exc.code, "")
+        if exc.code == 400 and _looks_like_modality_error(detail):
+            # Иначе человек видит сырой JSON провайдера и не понимает, что
+            # дело в выбранной модели, а не в его картинке.
+            hint = (" Похоже, выбранная модель не принимает изображения "
+                    "(vision) или аудио: смените модель в панели «Модель и "
+                    "ключ» на мультимодальную.")
         raise LLMError(f"OpenRouter HTTP {exc.code}.{hint} {detail[:400]}") from exc
     except urllib.error.URLError as exc:
         raise LLMError(f"Сетевая ошибка обращения к OpenRouter: {exc}") from exc
@@ -132,6 +169,104 @@ def chat_once(messages: Sequence[Dict[str, Any]], *,
     if not isinstance(body, dict) or not body.get("choices"):
         raise LLMError(f"Неожиданный ответ OpenRouter: {str(body)[:400]}")
     return body
+
+
+# ----------------------------------------------------------------------
+# Мультимодальный вход: картинки (iter68)
+# ----------------------------------------------------------------------
+def user_content(text: str, image_urls: Optional[Sequence[str]] = None) -> Any:
+    """Содержимое user-сообщения: строка или мультимодальный список частей.
+
+    Без картинок возвращается ПРОСТАЯ СТРОКА, а не список из одной части:
+    так текстовый путь остаётся ровно тем, что был до iter68, и ни один
+    провайдер не получает неожиданную форму запроса.
+
+    Порядок частей — сначала текст, потом изображения: так рекомендует
+    OpenRouter (иначе часть провайдеров хуже разбирает промпт).
+    """
+    text = str(text or "")
+    urls = [str(u) for u in (image_urls or []) if str(u or "").strip()]
+    if not urls:
+        return text
+    parts: List[Dict[str, Any]] = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for u in urls:
+        parts.append({"type": "image_url", "image_url": {"url": u}})
+    return parts
+
+
+def has_images(message: Any) -> bool:
+    """Есть ли в сообщении часть-изображение (для пометок в UI и тестов)."""
+    content = (message or {}).get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(p, dict) and p.get("type") == "image_url"
+               for p in content)
+
+
+# ----------------------------------------------------------------------
+# Голос → текст (iter68)
+# ----------------------------------------------------------------------
+def stt_model() -> str:
+    """Модель распознавания речи (``DOE_ASSISTANT_STT`` или дефолт)."""
+    return os.environ.get("DOE_ASSISTANT_STT", "").strip() or DEFAULT_STT_MODEL
+
+
+def transcribe(audio: bytes, *, fmt: str = "wav", model: Optional[str] = None,
+               key: Optional[str] = None, language: str = "",
+               timeout: int = 120,
+               transport: Optional[Callable[..., Dict[str, Any]]] = None
+               ) -> Dict[str, Any]:
+    """Распознать речь через OpenRouter и вернуть ``{text, model, usage}``.
+
+    Почему распознавание ОТДЕЛЬНО, а не аудио прямо в чат: наш рабочий ассистент
+    держится на tool-calling и длинном контексте (Claude), а аудио на вход
+    принимают другие модели. Превращая голос в текст заранее, мы не меняем
+    модель разговора и оставляем в сессии проверяемую фразу — её видно,
+    можно исправить и переспросить.
+
+    Пустой результат — ЯВНАЯ ошибка: молча отправить в диалог пустой вопрос
+    значит показать человеку ответ «не понял», не сказав, что запись не
+    распознана (A0.6).
+    """
+    if not isinstance(audio, (bytes, bytearray)) or not audio:
+        raise LLMError("Пустая аудиозапись: распознавать нечего.")
+    audio = bytes(audio)
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise LLMError(
+            f"Запись слишком длинная: {len(audio) / 1048576:.1f} МБ при лимите "
+            f"{MAX_AUDIO_BYTES / 1048576:.0f} МБ. У провайдера тайм-аут 60 с — "
+            f"скажите короче или разбейте на части.")
+    key = key or api_key()
+    if not key and transport is None:
+        raise LLMError(
+            "Не задан OPENROUTER_API_KEY: распознавание речи идёт через тот же "
+            "ключ, что и чат — укажите его в панели ассистента.")
+
+    payload: Dict[str, Any] = {
+        "model": str(model or stt_model()),
+        "input_audio": {
+            # Провайдер ждёт «сырой» base64 БЕЗ префикса data:… (в отличие от
+            # картинок в чате) — на этом легко ошибиться, поэтому кодируем тут.
+            "data": base64.b64encode(audio).decode("ascii"),
+            "format": str(fmt or "wav").lower().lstrip("."),
+        },
+    }
+    if language.strip():
+        payload["language"] = language.strip()
+
+    fn = transport or _http_transport
+    body = fn(payload, key=key or "", timeout=timeout, url=TRANSCRIBE_URL)
+    if not isinstance(body, dict):
+        raise LLMError(f"Неожиданный ответ распознавания: {str(body)[:400]}")
+    text = str(body.get("text", "") or "").strip()
+    if not text:
+        raise LLMError(
+            "Речь не распознана (пустой текст). Проверьте, что микрофон "
+            "записал звук, и попробуйте сказать ещё раз ближе к микрофону.")
+    return {"text": text, "model": payload["model"],
+            "usage": dict(body.get("usage", {}) or {})}
 
 
 # ----------------------------------------------------------------------

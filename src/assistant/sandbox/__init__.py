@@ -13,10 +13,12 @@
 from __future__ import annotations
 
 from .base import (DEFAULT_PYTEST_TIMEOUT_S, DEFAULT_TIMEOUT_S,
-                   MAX_OUTPUT_CHARS, PytestReport, SandboxBackend,
-                   SandboxError, SandboxPolicy, SandboxResult, clip_output,
-                   denial_note, detect_denial, parse_pytest_output,
-                   parse_test_line, progress_caption, timeout_note)
+                   IMAGE_SUFFIXES, MAX_COLLECTED_BYTES, MAX_COLLECTED_FILES,
+                   MAX_OUTPUT_CHARS, OUTPUT_SUFFIXES, PytestReport,
+                   SandboxBackend, SandboxError, SandboxPolicy, SandboxResult,
+                   TABLE_SUFFIXES, clip_output, denial_note, detect_denial,
+                   output_kind, parse_pytest_output, parse_test_line,
+                   progress_caption, timeout_note)
 from .guard import NETWORK_MARK, WRITE_MARK, guard_source
 from .subprocess_backend import (BACKEND_ENV, BACKENDS, SubprocessSandbox,
                                  get_backend)
@@ -28,4 +30,6 @@ __all__ = [
     "clip_output", "detect_denial", "denial_note", "timeout_note",
     "guard_source", "NETWORK_MARK", "WRITE_MARK", "DEFAULT_TIMEOUT_S",
     "DEFAULT_PYTEST_TIMEOUT_S", "MAX_OUTPUT_CHARS",
+    "output_kind", "IMAGE_SUFFIXES", "TABLE_SUFFIXES", "OUTPUT_SUFFIXES",
+    "MAX_COLLECTED_FILES", "MAX_COLLECTED_BYTES",
 ]

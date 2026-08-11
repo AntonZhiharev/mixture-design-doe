@@ -20,13 +20,21 @@
 * кнопки «Применить»/«Отклонить» зовут :func:`context.human_apply` /
   :func:`context.human_reject` — единственный путь к классу ``write``;
 * долгий ход рисует прогресс (``llm.progress_caption``): пользователь не
-  должен думать, что приложение зависло.
+  должен думать, что приложение зависло;
+* **iter68 — мультимодальный ввод и графический вывод.** Скриншот и голос
+  принимает штатный ``st.chat_input`` (``accept_file`` / ``accept_audio``,
+  Streamlit ≥1.52), поэтому новых зависимостей нет. Ctrl+V из буфера
+  Streamlit сам пока НЕ поддерживает — работает выбор файла и drag&drop;
+  для настоящей вставки понадобился бы сторонний компонент с JS-бандлом,
+  и это решение сознательно отложено. Графики и таблицы, посчитанные в
+  песочнице, рисуются ``st.image``/``st.dataframe`` прямо в ответе.
 """
 from __future__ import annotations
 
 import os
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import streamlit as st
 
 from src.assistant import config as ai_config
@@ -43,6 +51,10 @@ K_PROJECT = "assistant_session_project"
 K_CONSENT = "assistant_consent_registry"
 K_LAST_TURN = "assistant_last_turn"
 K_PENDING = "assistant_pending_question"
+#: Вопрос НЕУДАВШЕГОСЯ хода (iter67): держим отдельно от K_PENDING, потому что
+#: K_PENDING отправляется автоматически на следующем прогоне, а этот ждёт
+#: явного нажатия кнопки — повтор к модели должен быть решением человека.
+K_FAILED = "assistant_failed_question"
 
 
 # ----------------------------------------------------------------------
@@ -153,6 +165,35 @@ def _render_suggestions(focus: UiFocus, has_runner: bool) -> Optional[str]:
     return asked
 
 
+def _render_retry(res: Any, *, fresh: bool = False) -> None:
+    """Отказ хода → всплывающее предупреждение + подсвеченная кнопка повтора.
+
+    Сознательно НЕ авторетрай: скрытые попытки тратят деньги и время человека,
+    а на неверном ключе или пустом счёте крутились бы бесконечно. Причина
+    показывается тостом (`st.toast`) и остаётся в ленте, а повтор — явное
+    нажатие. Вся логика — в :func:`views.retry_prompt` (чистая, iter67).
+
+    Кнопка держится на ``K_LAST_TURN``, поэтому переживает перезапуски скрипта
+    (любое движение виджета в доке), а ``fresh`` отделяет свежий отказ от
+    перерисовки: тост всплывает один раз, а не на каждом прогоне.
+    """
+    prompt = views.retry_prompt(res)
+    if not prompt:
+        st.session_state.pop(K_FAILED, None)
+        return
+    st.session_state[K_FAILED] = prompt.question
+    if fresh:
+        st.toast(prompt.toast, icon=prompt.icon)
+    st.warning(f"{prompt.icon} {prompt.toast}\n\n{prompt.hint}")
+    if st.button(prompt.button_label, key="dock_retry", type="primary",
+                 use_container_width=True,
+                 help=f"Отправить тот же вопрос заново: «{prompt.question}»"):
+        st.session_state[K_PENDING] = prompt.question
+        st.session_state.pop(K_LAST_TURN, None)
+        st.session_state.pop(K_FAILED, None)
+        st.rerun()
+
+
 def _render_patches(ctx: ToolContext, session) -> None:
     """Панель предложений: применить/отклонить может только ЧЕЛОВЕК (iter63)."""
     staged = session.staged_patches()
@@ -194,10 +235,112 @@ def _render_patches(ctx: ToolContext, session) -> None:
                     st.success("Патч отклонён, решение записано в журнал.")
 
 
+def _show_attachment_image(session, root: str, project: str, ident: str) -> None:
+    """Показать приложенную картинку в ленте (файл лежит в проекте)."""
+    att = afiles.find_attachment(session, ident)
+    if att is None:
+        return
+    path = afiles.attachment_path(root, project, att)
+    if path.exists():
+        st.image(str(path), caption=att.name, width=320)
+    else:
+        # Ссылка есть, файла нет: молчать нельзя — иначе непонятно, почему
+        # ассистент «не видит» картинку (A0.6).
+        st.warning(f"Файл изображения «{att.name}» не найден в проекте.")
+
+
+def _render_message_images(msg, session, root: str, project: str) -> None:
+    """Картинки прошлых сообщений: переписка со скриншотами должна читаться."""
+    for sha in list(getattr(msg, "images", []) or []):
+        _show_attachment_image(session, root, project, sha)
+
+
+def _render_outputs(outputs: List[views.OutputFile]) -> None:
+    """Выхлоп песочницы КАРТИНКОЙ и ТАБЛИЦЕЙ, а не только строкой пути (iter68).
+
+    До этого шага график, построенный кодом модели, оставался во временном
+    каталоге и до человека не доходил вообще: «вывод песочницы» выглядел чисто
+    текстовым. Файлы уже перенесены в кампанию
+    (:func:`assistant.tools.sandbox_tools.collect_outputs`), здесь только показ.
+    """
+    for o in outputs:
+        st.caption(o.caption)
+        if o.kind == "image":
+            st.image(o.path, use_container_width=True)
+        elif o.kind == "table":
+            try:
+                df = (pd.read_excel(o.path) if o.path.lower().endswith(".xlsx")
+                      else pd.read_csv(o.path,
+                                       sep="\t" if o.path.lower().endswith(".tsv")
+                                       else ","))
+            except (OSError, ValueError) as exc:
+                # A0.6: таблица не разобралась — говорим об этом и даём файл,
+                # а не показываем пустое место.
+                st.warning(f"Таблицу «{o.name}» не удалось прочитать: {exc}")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        try:
+            with open(o.path, "rb") as fh:
+                st.download_button("⬇️ Скачать", fh.read(), file_name=o.name,
+                                   key=f"dock_dl_{o.name}")
+        except OSError:
+            pass                       # файл исчез — показ уже состоялся
+
+
+def _chat_submission(session, root: str, project: str):
+    """Разобрать ввод чата: текст + картинки + голос → ``(вопрос, [sha256])``.
+
+    Файлы кладутся вложениями сессии (дедуп по sha256 уже есть), голос
+    распознаётся ДО хода: в переписке остаётся текст, который человек видит и
+    может поправить, а не непрослушиваемая запись.
+    """
+    typed = st.chat_input(
+        "Спросите про эту ось, границу или следующий шаг… "
+        "(📎 скриншот, 🎤 голос)",
+        key="dock_input", accept_file="multiple",
+        file_type=["png", "jpg", "jpeg", "webp", "gif", "txt", "md", "csv",
+                   "json", "xlsx", "docx", "pdf"],
+        accept_audio=True)
+    if typed is None:
+        return None, []
+    if isinstance(typed, str):          # старое поведение: только текст
+        return typed, []
+
+    question = str(getattr(typed, "text", "") or "")
+    images: List[str] = []
+    for up in list(getattr(typed, "files", []) or []):
+        try:
+            att = afiles.attach_file(session, root, up.name, up.getvalue(),
+                                     project=project)
+        except ValueError as exc:
+            st.error(f"«{up.name}»: {exc}")
+            continue
+        store.save_session(session, root, project)
+        if afiles.is_image_name(att.name):
+            images.append(att.sha256)
+        else:
+            st.info(f"Документ «{att.name}» приложен к сессии — ассистент "
+                    f"прочитает его инструментом чтения.")
+
+    audio = getattr(typed, "audio", None)
+    if audio is not None:
+        try:
+            heard = llm.transcribe(audio.getvalue(), fmt="wav")
+        except llm.LLMError as exc:
+            st.error(f"Речь не распознана: {exc}")
+        else:
+            st.caption(f"🎤 распознано ({heard['model']}): «{heard['text']}»")
+            # Голос ДОПОЛНЯЕТ набранное, а не затирает: человек мог начать
+            # печатать и договорить словами.
+            question = (question + " " + heard["text"]).strip() if question \
+                else heard["text"]
+    return (question or None), images
+
+
 def _render_attachments(session, root: str, project: str) -> None:
     with st.expander(f"📎 Вложения: {len(session.attachments)}"):
-        up = st.file_uploader("Паспорт, ТДС, выгрузка (txt/md/csv/json/xlsx/"
-                              "docx/pdf)", key="dock_upload")
+        up = st.file_uploader("Паспорт, ТДС, выгрузка, скриншот (txt/md/csv/"
+                              "json/xlsx/docx/pdf/png/jpg)", key="dock_upload")
         if up is not None and st.button("Приложить к сессии", key="dock_attach"):
             try:
                 afiles.attach_file(session, root, up.name, up.getvalue(),
@@ -210,6 +353,18 @@ def _render_attachments(session, root: str, project: str) -> None:
         if session.attachments:
             st.dataframe(views.attachments_dataframe(session),
                          use_container_width=True, hide_index=True)
+
+
+def _render_artifacts(session) -> None:
+    """Графики и таблицы прогонов ЭТОГО проекта (живут после перезапуска)."""
+    shown = views.artifact_outputs(session)
+    with st.expander(f"🖼 Выхлоп песочницы: {len(shown)}"):
+        if not shown:
+            st.caption("Пусто. Здесь появляются графики и таблицы, которые "
+                       "ассистент построил в песочнице (`run_python` с "
+                       "`savefig`/`to_csv`).")
+            return
+        _render_outputs(shown)
 
 
 # ----------------------------------------------------------------------
@@ -247,32 +402,46 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
         if m.role in ("user", "assistant"):
             with st.chat_message(m.role):
                 st.markdown(m.content)
+                _render_message_images(m, session, root, project)
 
-    typed = st.chat_input("Спросите про эту ось, границу или следующий шаг…",
-                          key="dock_input")
+    typed, images = _chat_submission(session, root, project)
     question = typed or asked or st.session_state.pop(K_PENDING, None)
 
-    if question:
+    if question or images:
         with st.chat_message("user"):
-            st.markdown(question)
+            st.markdown(question or "_(изображение без текста)_")
+            for sha in images:
+                _show_attachment_image(session, root, project, sha)
         box = st.empty()
         with st.chat_message("assistant"):
             with st.spinner("Считаю инструментами ядра…"):
                 res = actx.run_turn(
-                    session, ctx, question, focus=focus,
+                    session, ctx, question or "", focus=focus,
                     spec_hash=spec_hash_of(ctx), kinds=AGENT_KINDS,
+                    images=images,
                     on_event=lambda e: box.caption(llm.progress_caption(e)))
             box.empty()
             st.markdown(res.text or "—")
+            # Графики/таблицы, посчитанные в ходе, — сразу в ответе: файл,
+            # который надо искать в другой панели, разговору не помогает.
+            _render_outputs(views.turn_outputs(session, res.new_artifacts))
+        for err in res.image_errors:
+            st.warning(f"Изображение не дошло до модели — {err}")
         st.caption(views.turn_caption(res))
         st.session_state[K_LAST_TURN] = res
         if res.calls:
             with st.expander("🔧 Что было посчитано"):
                 st.dataframe(views.tool_calls_dataframe(res.calls),
                              use_container_width=True, hide_index=True)
+        _render_retry(res, fresh=True)
+    else:
+        # Отказ прошлого хода не должен исчезать при любом движении виджета:
+        # кнопка повтора живёт до успешного ответа или до нового вопроса.
+        _render_retry(st.session_state.get(K_LAST_TURN))
 
     _render_patches(ctx, session)
     _render_attachments(session, root, project)
+    _render_artifacts(session)
 
     with st.expander("📌 Состояние сессии"):
         st.caption(views.session_caption(session))

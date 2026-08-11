@@ -16,9 +16,16 @@ PDF), выгрузка лаборатории (xlsx/csv), протокол (docx
 
 Зависимости уже в проекте: ``openpyxl`` (xlsx), ``python-docx`` (docx),
 ``pypdf`` (pdf) — добавлен в ``requirements.txt`` этим шагом.
+
+iter68 — **изображения**. Скриншот экрана («вот такие границы вижу») и фото
+паспорта — самый быстрый вход технолога, но текста в них нет: OCR мы не ставим,
+читает их САМА модель (OpenRouter ``image_url``, см. :func:`data_url`).
+Поэтому у такого вложения ``text`` пуст ОСОЗНАННО и это отмечено в ``note`` —
+иначе пустой дайджест выглядел бы как «файл не прочитался» (A0.6).
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -58,10 +65,27 @@ _MIME_BY_EXT = {
     ".docx": "application/vnd.openxmlformats-officedocument."
              "wordprocessingml.document",
     ".pdf": "application/pdf",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif",
 }
 
+#: Форматы изображений, которые принимает OpenRouter (`image_url`). Прочие
+#: (bmp/tiff/heic) отклоняем ЯВНО: молча отправленный неподдерживаемый тип
+#: вернулся бы невнятной ошибкой провайдера уже посреди хода.
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+#: Предел на КАРТИНКУ. Отдельный от :data:`MAX_FILE_BYTES`, потому что
+#: изображение уходит в запрос модели целиком (base64 ≈ +33 %): 20-мегабайтный
+#: скриншот — это отказ провайдера и сожжённый ход, а не «медленно».
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+#: Пометка вложения-изображения: у него нет текстового слоя ПО ЗАМЫСЛУ.
+IMAGE_NOTE = ("изображение — текст не извлекается, картинку читает сама модель "
+              "(нужна модель с поддержкой vision)")
+
 #: Расширения, которые умеем читать. Всё прочее — явный отказ со списком.
-SUPPORTED_EXT = sorted(set(_TEXT_EXT) | {".xlsx", ".xlsm", ".docx", ".pdf"})
+SUPPORTED_EXT = sorted(set(_TEXT_EXT) | {".xlsx", ".xlsm", ".docx", ".pdf"}
+                       | IMAGE_EXT)
 
 
 class AttachmentError(ValueError):
@@ -88,6 +112,23 @@ def safe_filename(name: str) -> str:
 
 def guess_mime(name: str) -> str:
     return _MIME_BY_EXT.get(Path(str(name)).suffix.lower(), "application/octet-stream")
+
+
+def is_image_name(name: str) -> bool:
+    """Похоже ли имя файла на изображение (по расширению)."""
+    return Path(str(name or "")).suffix.lower() in IMAGE_EXT
+
+
+def data_url(data: bytes, mime: str) -> str:
+    """Байты картинки → ``data:<mime>;base64,…`` для OpenRouter ``image_url``.
+
+    Провайдер принимает либо публичный URL, либо data-URL; у нас файл лежит
+    локально в проекте, поэтому единственный рабочий путь — base64.
+    """
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise AttachmentError("Пустое содержимое изображения — нечего кодировать.")
+    mime = str(mime or "").strip() or "image/png"
+    return f"data:{mime};base64,{base64.b64encode(bytes(data)).decode('ascii')}"
 
 
 def _decode(data: bytes) -> str:
@@ -213,6 +254,10 @@ def extract_text(name: str, data: bytes) -> Tuple[str, str]:
     что принимаем (тихо приложить бинарник «как текст» = мусор в контексте).
     """
     ext = Path(str(name)).suffix.lower()
+    if ext in IMAGE_EXT:
+        # Текста нет ПО ЗАМЫСЛУ: картинку читает модель, а не мы. Пустая
+        # строка без пояснения выглядела бы как «файл не прочитался».
+        return "", IMAGE_NOTE
     if ext == ".json":
         return _extract_json(data)
     if ext in _TEXT_EXT:
@@ -263,6 +308,14 @@ def attach_file(session: AssistantSession, root: str | Path, name: str,
     data = bytes(data)
     if not data:
         raise AttachmentError(f"Файл '{name}' пуст (0 байт) — нечего читать.")
+    if is_image_name(name) and len(data) > MAX_IMAGE_BYTES:
+        # Отдельный предел: картинка уходит В ЗАПРОС целиком (base64 +33 %),
+        # поэтому «слишком большая» здесь наступает раньше, чем для документа.
+        raise AttachmentError(
+            f"Изображение '{name}' слишком большое: {len(data) / 1048576:.1f} МБ "
+            f"при лимите {MAX_IMAGE_BYTES / 1048576:.0f} МБ. Оно уходит в запрос "
+            f"модели целиком — уменьшите масштаб или обрежьте до нужной части "
+            f"экрана.")
     if len(data) > max_bytes:
         raise AttachmentError(
             f"Файл '{name}' слишком большой: {len(data) / 1048576:.1f} МБ при "
@@ -341,6 +394,34 @@ def attachment_text(session: AssistantSession, root: str | Path, ident: str, *,
             "length": len(chunk), "total_chars": len(text),
             "has_more": bool(start + len(chunk) < len(text)),
             "text": chunk, "note": att.note}
+
+
+def attachment_data_url(session: AssistantSession, root: str | Path, ident: str,
+                        *, project: Optional[str] = None) -> str:
+    """Вложение-изображение → data-URL для запроса модели (iter68).
+
+    Читаем с диска, а НЕ из сессии: base64 в ``session.json`` раздул бы файл
+    переписки и бюджет контекста (оценка токенов считает символы), поэтому в
+    сессии лежит только ссылка на файл, а картинка собирается на момент
+    отправки.
+    """
+    project = str(project or session.project or "")
+    att = find_attachment(session, ident)
+    if att is None:
+        known = ", ".join(a.name for a in session.attachments) or "(нет файлов)"
+        raise AttachmentError(
+            f"Вложение '{ident}' не найдено в сессии. Приложены: {known}.")
+    if not is_image_name(att.name):
+        raise AttachmentError(
+            f"Вложение '{att.name}' не изображение ({att.mime or 'тип неизвестен'}): "
+            f"как картинку его отправить нельзя. Текстовые документы модель "
+            f"читает инструментом read_attachment.")
+    path = attachment_path(root, project, att)
+    if not path.exists():
+        raise AttachmentError(
+            f"Файл изображения '{att.name}' не найден на диске ({path}). "
+            f"Возможно, проект переносили без каталога assistant/files.")
+    return data_url(path.read_bytes(), att.mime or guess_mime(att.name))
 
 
 def remove_attachment(session: AssistantSession, root: str | Path, ident: str,

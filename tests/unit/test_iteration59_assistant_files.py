@@ -182,9 +182,15 @@ def test_cp1251_text_decoded(tmp_path):
 # 3. Отказы (A0.6 — с объяснением)
 # ----------------------------------------------------------------------
 def test_unsupported_format_rejected_with_list(tmp_path):
+    """Неизвестное расширение — отказ со списком принимаемых.
+
+    Пример сменён с ``.png`` на ``.bmp`` (iter68): png/jpeg/webp/gif теперь
+    ПРИНИМАЮТСЯ как изображения для модели, а bmp — нет (OpenRouter его не
+    берёт). Проверяемое правило то же: отказ объясняет себя, а не молчит.
+    """
     s = _session()
     with pytest.raises(af.AttachmentError, match="не поддерживается"):
-        af.attach_file(s, tmp_path, "photo.png", b"\x89PNG\r\n\x1a\n")
+        af.attach_file(s, tmp_path, "photo.bmp", b"BM\x00\x00\x00\x00")
 
 
 def test_empty_file_rejected(tmp_path):

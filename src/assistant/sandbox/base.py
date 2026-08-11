@@ -53,6 +53,46 @@ MAX_OUTPUT_CHARS = 200_000
 #: не должен быть доступен коду, который написала модель.
 SECRET_PATTERNS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
 
+#: Каталог сторожа внутри workdir — служебный, в выхлоп его не собираем.
+#: Значение дублирует ``subprocess_backend.GUARD_DIRNAME`` (одна строка):
+#: импорт бэкенда из базового модуля дал бы круговую зависимость.
+GUARD_DIRNAME_MARK = "_sandbox_guard"
+
+#: Кеш matplotlib внутри рабочего каталога (iter68). Без него библиотека лезет
+#: в ``~/.matplotlib``, сторож законно это запрещает, и УСПЕШНЫЙ прогон
+#: (``returncode=0``, график сохранён) помечался ``denied='write'`` — то есть
+#: инструмент врал про отказ. Кеш в writable-каталоге снимает причину.
+MPL_CACHE_DIRNAME = "_mpl_cache"
+
+#: Служебные каталоги внутри workdir: не выхлоп прогона, а наша инфраструктура.
+SERVICE_DIRNAMES = (GUARD_DIRNAME_MARK, MPL_CACHE_DIRNAME, "__pycache__")
+
+#: Что считаем «показуемым» выхлопом прогона (iter68): картинка рисуется
+#: `st.image`, таблица — `st.dataframe`, html/json — отдельной вкладкой.
+#: Расширение — единственный доступный признак: содержимое писал не мы.
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")
+TABLE_SUFFIXES = (".csv", ".tsv", ".xlsx")
+OUTPUT_SUFFIXES = IMAGE_SUFFIXES + TABLE_SUFFIXES + (".json", ".html", ".md",
+                                                      ".txt")
+
+#: Сколько файлов выхлопа забираем максимум: код в цикле может насыпать сотни
+#: кадров, а кампания — не свалка. Превышение отмечается ЯВНО (A0.6).
+MAX_COLLECTED_FILES = 12
+
+#: Предел на один собираемый файл. Гигабайтный дамп в проекте кампании —
+#: не «выхлоп», а потеря места; о пропуске сообщаем словами.
+MAX_COLLECTED_BYTES = 10 * 1024 * 1024
+
+
+def output_kind(name: str) -> str:
+    """Вид файла выхлопа по расширению: ``image`` / ``table`` / ``text``."""
+    suffix = Path(str(name or "")).suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        return "image"
+    if suffix in TABLE_SUFFIXES:
+        return "table"
+    return "text"
+
 
 class SandboxError(RuntimeError):
     """Песочница не может выполнить запрос — с объяснением причины (A0.6)."""
@@ -458,6 +498,42 @@ class SandboxBackend(ABC):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(text), encoding="utf-8")
         return str(path)
+
+    def snapshot_workdir(self) -> Dict[str, float]:
+        """Слепок рабочего каталога: ``путь → mtime`` (iter68).
+
+        Нужен, чтобы после прогона отличить СОЗДАННОЕ этим запуском от того,
+        что лежало раньше (скрипт, кеши, файлы прошлого вызова).
+        """
+        out: Dict[str, float] = {}
+        base = Path(self.workdir)
+        if not base.exists():
+            return out
+        for p in base.rglob("*"):
+            if p.is_file() and not any(d in p.parts for d in SERVICE_DIRNAMES):
+                try:
+                    out[str(p)] = p.stat().st_mtime
+                except OSError:
+                    continue
+        return out
+
+    def new_files(self, before: Dict[str, float], *,
+                  suffixes: Optional[Sequence[str]] = None) -> List[str]:
+        """Файлы, появившиеся (или изменившиеся) после ``before``.
+
+        Так график, который построил код модели, перестаёт умирать вместе с
+        временным каталогом: инструмент забирает его в кампанию. Сортировка по
+        времени — чтобы порядок показа совпадал с порядком создания.
+        """
+        after = self.snapshot_workdir()
+        picked: List[str] = []
+        for path, mtime in after.items():
+            if suffixes and Path(path).suffix.lower() not in suffixes:
+                continue
+            was = before.get(path)
+            if was is None or mtime > was:
+                picked.append(path)
+        return sorted(picked, key=lambda p: after.get(p, 0.0))
 
     # -- прикладные операции ---------------------------------------------
     def run_python(self, code: str, *, timeout_s: Optional[float] = None,

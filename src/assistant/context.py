@@ -405,13 +405,19 @@ def build_turn_messages(session: AssistantSession, *, question: str = "",
                         has_runner: bool = True, web: Optional[bool] = None,
                         kinds: Optional[Sequence[str]] = None,
                         max_tokens: int = CONTEXT_TOKENS,
-                        extra: str = "") -> List[Dict[str, Any]]:
+                        extra: str = "",
+                        image_urls: Optional[Sequence[str]] = None
+                        ) -> List[Dict[str, Any]]:
     """Сообщения одного хода: промпт архитектора + фокус + вложения + хвост.
 
     Порядок фиксирован: инструкция (ровно одна, iter64) → место пользователя →
     дайджест вложений → усечённый по бюджету хвост диалога (iter58) → новый
     вопрос. Фокус и вложения живут ТОЛЬКО в сборке: в сессию они не пишутся,
     поэтому вчерашнее место пользователя не всплывёт в завтрашнем ходе.
+
+    ``image_urls`` (iter68) — data-URL картинок ЭТОГО хода: они прикрепляются к
+    новому вопросу, а не к истории. Скриншот относится к тому, о чём спросили
+    сейчас, и повторная отправка его в каждом ходе жгла бы бюджет впустую.
     """
     web_on = bool(session.web_enabled if web is None else web)
     prompt = architect_system_prompt(
@@ -432,9 +438,10 @@ def build_turn_messages(session: AssistantSession, *, question: str = "",
         msgs = msgs[:1] + head + msgs[1:]
 
     q = str(question or "").strip()
-    if q:
-        resolved = resolve_question(q, f)
-        msgs.append({"role": "user", "content": resolved})
+    if q or image_urls:
+        resolved = resolve_question(q, f) if q else ""
+        msgs.append({"role": "user",
+                     "content": llm.user_content(resolved, image_urls)})
     return msgs
 
 
@@ -456,6 +463,14 @@ class TurnResult:
     web: bool = False
     stopped_reason: str = ""
     new_patches: List[str] = field(default_factory=list)
+    #: Артефакты, созданные ЭТИМ ходом (iter68): по ним док рисует график и
+    #: таблицу прямо в ответе (:func:`views.turn_outputs`).
+    new_artifacts: List[str] = field(default_factory=list)
+    #: Изображения, приложенные к вопросу (sha256 вложений сессии).
+    images: List[str] = field(default_factory=list)
+    #: Картинки, которые НЕ удалось приложить, с причинами — показываем прямо
+    #: пользователю: иначе «ничего не вижу на скриншоте» необъяснимо (A0.6).
+    image_errors: List[str] = field(default_factory=list)
     ok: bool = True
     error: str = ""
     duration_s: float = 0.0
@@ -469,6 +484,30 @@ class TurnResult:
         return KIND_LABEL.get(self.kind, self.kind)
 
 
+def _image_urls(session: AssistantSession, root: str, project: str,
+                image_ids: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Ссылки на вложения → data-URL для запроса + список НЕудач (iter68).
+
+    Отказ по одной картинке не отменяет ход: остальные уходят, а причина
+    возвращается вызывающему, чтобы он сказал о ней модели и человеку. Молча
+    выкинуть изображение нельзя — ответ «на скриншоте ничего нет» был бы
+    необъясним (A0.6).
+    """
+    from .files import AttachmentError, attachment_data_url
+
+    urls: List[str] = []
+    errors: List[str] = []
+    for ident in image_ids:
+        if not (root and project):
+            errors.append(f"{ident}: сессия не привязана к проекту, файл не найти")
+            continue
+        try:
+            urls.append(attachment_data_url(session, root, ident, project=project))
+        except (AttachmentError, OSError) as exc:
+            errors.append(f"{ident}: {exc}")
+    return urls, errors
+
+
 def run_turn(session: AssistantSession, ctx: Any, question: str, *,
              focus: Any = None, spec_hash: str = "",
              has_runner: Optional[bool] = None, web: Optional[bool] = None,
@@ -477,7 +516,8 @@ def run_turn(session: AssistantSession, ctx: Any, question: str, *,
              max_tokens: int = CONTEXT_TOKENS,
              transport: Optional[Callable[..., Dict[str, Any]]] = None,
              on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-             persist: bool = True, **loop_kw: Any) -> TurnResult:
+             persist: bool = True, images: Optional[Sequence[str]] = None,
+             **loop_kw: Any) -> TurnResult:
     """Провести ход ассистента ПО МЕСТУ и записать его в сессию.
 
     Одна точка для дока, демо и теста. Что здесь происходит и почему:
@@ -490,7 +530,10 @@ def run_turn(session: AssistantSession, ctx: Any, question: str, *,
     * отказ модели/сети НЕ роняет док: ответ заменяется человекочитаемым
       сообщением об ошибке, ход помечается ``ok=False`` (A0.6);
     * ``spec_hash`` берётся ИЗВНЕ (его знает вызывающий, у него есть спека) —
-      контекст не лезет в ядро сам.
+      контекст не лезет в ядро сам;
+    * ``images`` (iter68) — приложенные к ЭТОМУ вопросу изображения (sha256
+      вложений сессии). В сессию пишутся ссылки, в запрос — data-URL: base64
+      в переписке раздул бы и файл проекта, и оценку бюджета контекста.
     """
     from .tools import AGENT_KINDS, tool_specs
     from .tools.registry import dispatcher
@@ -501,14 +544,39 @@ def run_turn(session: AssistantSession, ctx: Any, question: str, *,
         has_runner = getattr(ctx, "runner", None) is not None
     f = normalize_focus(focus)
     q = str(question or "").strip()
-    if not q:
+    image_ids = [str(x) for x in (images or []) if str(x or "").strip()]
+    if not q and not image_ids:
         raise ValueError("Пустой вопрос: ходить к модели не с чем.")
+    if not q:
+        # Картинка без вопроса — это всё-таки вопрос («посмотри»), но модель
+        # не должна угадывать, что от неё хотят: спрашиваем явно.
+        q = "Посмотри на приложенное изображение и скажи, что видишь."
     resolved = resolve_question(q, f)
 
-    session.add_message("user", q)
+    session.add_message("user", q, images=image_ids)
+    root = str(getattr(ctx, "root", "") or "")
+    project = str(getattr(ctx, "project", "") or session.project)
+    image_urls, image_errors = _image_urls(session, root, project, image_ids)
     msgs = build_turn_messages(session, question="", focus=f,
                                spec_hash=spec_hash, has_runner=has_runner,
                                web=web, kinds=kinds, max_tokens=max_tokens)
+    if image_urls:
+        # Хвост истории уже содержит текст вопроса (add_message выше), поэтому
+        # картинки прикрепляем К НЕМУ, а не отдельным сообщением: провайдеры
+        # ждут текст и изображение в одном user-сообщении.
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                m["content"] = llm.user_content(str(m.get("content", "")),
+                                                image_urls)
+                break
+    if image_errors:
+        # A0.6: картинка, которую не удалось приложить, не должна исчезнуть
+        # молча — иначе ответ «на скриншоте ничего не вижу» необъясним.
+        msgs.append({"role": "system",
+                     "content": FILES_MARK + "НЕ УДАЛОСЬ приложить изображения: "
+                     + "; ".join(image_errors) +
+                     ". Скажи об этом пользователю, не описывай картинку по "
+                     "догадке."})
     if resolved != q:
         # Честная пометка: в истории остаётся сказанное человеком, а модель
         # видит, чем именно «эта ось» была на экране.
@@ -517,8 +585,7 @@ def run_turn(session: AssistantSession, ctx: Any, question: str, *,
                                              f"фокусу: «{resolved}»"})
 
     before = {p.id for p in session.patches}
-    root = str(getattr(ctx, "root", "") or "")
-    project = str(getattr(ctx, "project", "") or session.project)
+    before_art = {a.id for a in session.artifacts}
 
     def _audit(rec: Dict[str, Any]) -> None:
         session.add_tool_call(ToolCall(
@@ -534,7 +601,8 @@ def run_turn(session: AssistantSession, ctx: Any, question: str, *,
 
     t0 = time.monotonic()
     res = TurnResult(question=q, resolved=resolved, web=bool(
-        session.web_enabled if web is None else web))
+        session.web_enabled if web is None else web),
+        images=list(image_ids), image_errors=list(image_errors))
     r = route(resolved)
     res.kind, res.tools = r.kind, tuple(r.tools)
     try:
@@ -562,6 +630,8 @@ def run_turn(session: AssistantSession, ctx: Any, question: str, *,
     session.add_message("assistant", res.text, model=res.model, web=res.web,
                         usage=res.usage)
     res.new_patches = [p.id for p in session.patches if p.id not in before]
+    res.new_artifacts = [a.id for a in session.artifacts
+                         if a.id not in before_art]
 
     if persist and root and project:
         from .store import save_session

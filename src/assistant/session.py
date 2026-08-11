@@ -73,6 +73,12 @@ class Message:
     ``:online``): без этой пометки нельзя отличить утверждение из веба от
     утверждения из контекста проекта. ``tool_calls``/``tool_call_id`` — сырые
     поля протокола инструментов (iter60), хранятся как есть.
+
+    ``images`` (iter68) — ССЫЛКИ на приложенные изображения (``sha256``
+    вложений), а НЕ base64. Причина: ``content`` остаётся строкой, поэтому
+    оценка бюджета (:func:`estimate_tokens`) и ``session.json`` не распухают на
+    мегабайт скриншота; сам data-URL собирается на момент отправки
+    (:func:`assistant.files.attachment_data_url`).
     """
     role: str
     content: str
@@ -84,6 +90,7 @@ class Message:
     tool_call_id: str = ""
     name: str = ""
     usage: Dict[str, Any] = field(default_factory=dict)
+    images: List[str] = field(default_factory=list)
 
     def to_state(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"id": self.id, "role": self.role,
@@ -100,6 +107,8 @@ class Message:
             out["name"] = self.name
         if self.usage:
             out["usage"] = dict(self.usage)
+        if self.images:
+            out["images"] = list(self.images)
         return out
 
     @classmethod
@@ -113,10 +122,16 @@ class Message:
                    tool_calls=list(d.get("tool_calls", []) or []),
                    tool_call_id=str(d.get("tool_call_id", "")),
                    name=str(d.get("name", "")),
-                   usage=dict(d.get("usage", {}) or {}))
+                   usage=dict(d.get("usage", {}) or {}),
+                   images=[str(x) for x in (d.get("images", []) or [])])
 
     def chat_message(self) -> Dict[str, Any]:
-        """Вид сообщения для API модели (без внутренних полей сессии)."""
+        """Вид сообщения для API модели (без внутренних полей сессии).
+
+        ``images`` здесь НЕ разворачивается: собрать мультимодальный
+        ``content`` может только тот, у кого есть доступ к файлам проекта
+        (см. :func:`assistant.llm.user_content`). Сессия остаётся JSON-native.
+        """
         out: Dict[str, Any] = {"role": self.role, "content": self.content}
         if self.tool_calls:
             out["tool_calls"] = self.tool_calls

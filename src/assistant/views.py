@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pandas as pd
@@ -60,14 +62,20 @@ def messages_dataframe(session: AssistantSession) -> pd.DataFrame:
 
 
 def attachments_dataframe(session: AssistantSession) -> pd.DataFrame:
-    """Приложенные файлы: имя / тип / размер / символов текста / усечён / хеш."""
+    """Приложенные файлы: имя / тип / размер / символов текста / усечён / хеш.
+
+    У изображения (iter68) в колонке «символов» стоит не 0, а «—»: ноль читался
+    бы как «файл не прочитался», тогда как текста там нет ПО ЗАМЫСЛУ — картинку
+    смотрит сама модель.
+    """
     rows: List[Dict[str, Any]] = []
     for a in session.attachments:
+        is_image = str(a.mime or "").startswith("image/")
         rows.append({
             "файл": a.name,
             "тип": a.mime or "—",
             "размер, КБ": round(a.size / 1024.0, 1) if a.size else 0.0,
-            "символов": int(a.n_chars),
+            "символов": "— (картинка)" if is_image else int(a.n_chars),
             "усечён": "да" if a.truncated else "",
             "sha256": a.sha256[:12],
             "примечание": _short(a.note, 60),
@@ -116,6 +124,87 @@ def artifacts_dataframe(session: AssistantSession) -> pd.DataFrame:
     } for a in session.artifacts]
     return pd.DataFrame(rows, columns=["время", "артефакт", "вид",
                                        "инструмент", "подпись"])
+
+
+@dataclass
+class OutputFile:
+    """Файл, созданный прогоном песочницы, — для показа в UI (iter68).
+
+    ``kind`` решает, ЧЕМ рисовать: ``image`` → картинкой, ``table`` → таблицей,
+    ``text`` → сворачиваемым блоком. Определяется в
+    :func:`assistant.sandbox.output_kind` по расширению — содержимое писал код
+    модели, других признаков у нас нет.
+    """
+    name: str
+    kind: str
+    path: str
+    size: int = 0
+    #: Инструмент, который создал файл (`run_python`) — видно происхождение.
+    tool: str = ""
+
+    @property
+    def caption(self) -> str:
+        label = {"image": "🖼 график", "table": "📊 таблица"}.get(
+            self.kind, "📄 файл")
+        return f"{label} · {self.name} · {self.size / 1024.0:.1f} КБ"
+
+
+#: Виды артефактов, которые UI умеет РИСОВАТЬ (а не только назвать).
+SHOWABLE_KINDS = ("image", "table")
+
+
+def outputs_from_artifacts(artifacts: Sequence[Any]) -> List[OutputFile]:
+    """Артефакты → файлы для показа (график/таблица), в порядке появления.
+
+    Источник — артефакты сессии, а не результаты вызовов: в аудит вызова
+    (`llm.run_tool_loop`) попадает лишь короткая сводка, а полный путь к файлу
+    знает :func:`assistant.tools.sandbox_tools.collect_outputs`, который его же
+    и записал в сессию. Так UI не зависит от формата ответа инструмента.
+
+    Пропавший с диска файл в список НЕ попадает: заголовок «график» без
+    картинки хуже, чем отсутствие заголовка.
+    """
+    out: List[OutputFile] = []
+    for a in artifacts or []:
+        kind = str(getattr(a, "kind", "") or "")
+        path = str(getattr(a, "path", "") or "")
+        if kind not in SHOWABLE_KINDS or not path or not os.path.exists(path):
+            continue
+        out.append(OutputFile(name=str(getattr(a, "name", "")), kind=kind,
+                              path=path, size=_file_size(path),
+                              tool=str(getattr(a, "tool", ""))))
+    return out
+
+
+def turn_outputs(session: AssistantSession, new_artifact_ids: Sequence[str]
+                 ) -> List[OutputFile]:
+    """Файлы, созданные ЭТИМ ходом: то, что док рисует прямо в ответе.
+
+    Нужна, чтобы посчитанная кривая появлялась в разговоре, а не только в
+    отдельной панели артефактов проекта: график, который надо искать, для
+    обсуждения почти бесполезен.
+    """
+    ids = set(str(i) for i in (new_artifact_ids or []))
+    return outputs_from_artifacts([a for a in session.artifacts
+                                   if str(a.id) in ids])
+
+
+def artifact_outputs(session: AssistantSession, *, limit: int = 6
+                     ) -> List[OutputFile]:
+    """Последние показуемые артефакты сессии (график/таблица) для панели.
+
+    Работает и после перезапуска приложения: артефакты живут в проекте, а не в
+    памяти процесса.
+    """
+    shown = outputs_from_artifacts(list(reversed(session.artifacts)))
+    return shown[: max(1, int(limit))]
+
+
+def _file_size(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
 
 
 def tool_calls_dataframe(calls: Sequence[Any]) -> pd.DataFrame:
@@ -282,6 +371,83 @@ def turn_caption(res: Any) -> str:
     if sections:
         parts.append("разделы: " + ", ".join(sections))
     return " · ".join(parts)
+
+
+#: Сколько символов причины показывать во всплывающем предупреждении: тост
+#: живёт секунды, полный текст ошибки остаётся в ленте и в сессии.
+TOAST_CHARS = 220
+
+#: Подсказки по классам отказов. Обрыв связи и лимит частоты лечатся ПОВТОРОМ,
+#: неверный ключ / модель / пустой счёт — нет, и предлагать «попробуйте снова»
+#: в этих случаях значит гонять человека по кругу.
+_RETRY_HINTS = (
+    ("Сетевая ошибка", True,
+     "связь с OpenRouter оборвалась — обычно помогает повтор"),
+    ("10054", True, "соединение разорвано на стороне сети — повторите отправку"),
+    ("HTTP 429", True, "слишком часто: подождите несколько секунд и повторите"),
+    ("HTTP 5", True, "сбой на стороне OpenRouter — повтор обычно проходит"),
+    ("timed out", True, "модель не ответила за отведённое время"),
+    ("HTTP 401", False, "ключ не принят — проверьте OPENROUTER_API_KEY"),
+    ("HTTP 402", False, "на счёте OpenRouter нет средств — повтор не поможет"),
+    ("HTTP 404", False, "такой модели нет — проверьте имя и суффикс ':online'"),
+    ("OPENROUTER_API_KEY", False, "ключ не задан — укажите его в панели «Модель и ключ»"),
+)
+
+
+@dataclass
+class RetryPrompt:
+    """Что показать пользователю после НЕУДАЧНОГО хода (iter67).
+
+    Транспорт ассистента делает одну попытку, и разовый обрыв TLS
+    (``WinError 10054``) превращался в тупик: ответа нет, а повторить вопрос
+    можно только перенабрав его руками. Решение — не молчаливый авторетрай
+    (человек не должен платить деньгами и временем за скрытые попытки), а
+    ЯВНАЯ кнопка: причина видна, повтор — осознанное действие (A0.6).
+
+    * ``show`` — был ли отказ вообще (успешный ход ничего не рисует);
+    * ``question`` — что именно переотправить (слова человека, как сказаны);
+    * ``retryable`` — лечится ли отказ повтором; если нет, кнопка остаётся
+      доступной (запрещать не наше дело), но подпись честно предупреждает.
+    """
+    show: bool = False
+    question: str = ""
+    toast: str = ""
+    icon: str = "⚠️"
+    button_label: str = "🔄 Повторить отправку"
+    retryable: bool = True
+    hint: str = ""
+
+    def __bool__(self) -> bool:            # `if prompt:` читается как «есть отказ»
+        return bool(self.show)
+
+
+def retry_prompt(res: Any) -> RetryPrompt:
+    """Итог хода → данные для тоста и кнопки повтора (чистая, без Streamlit).
+
+    Успешный ход (или его отсутствие) даёт ``show=False``: кнопка не должна
+    висеть после нормального ответа.
+    """
+    if res is None:
+        return RetryPrompt()
+    get = (res.get if isinstance(res, Mapping) else lambda k, d=None:
+           getattr(res, k, d))
+    if get("ok", True):
+        return RetryPrompt()
+
+    error = str(get("error", "") or "").strip()
+    question = str(get("question", "") or "").strip()
+    retryable, hint = True, "повторите отправку того же вопроса"
+    for needle, flag, text in _RETRY_HINTS:
+        if needle.lower() in error.lower():
+            retryable, hint = flag, text
+            break
+
+    toast = f"Ответ не получен: {_short(error, TOAST_CHARS) or 'причина неизвестна'}"
+    return RetryPrompt(show=True, question=question, toast=toast,
+                       icon="⚠️" if retryable else "⛔",
+                       button_label="🔄 Повторить отправку" if retryable
+                       else "🔄 Отправить ещё раз (причина вряд ли уйдёт сама)",
+                       retryable=retryable, hint=hint)
 
 
 def apply_result_caption(result: Mapping[str, Any]) -> str:

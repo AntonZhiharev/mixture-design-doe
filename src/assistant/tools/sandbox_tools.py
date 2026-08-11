@@ -31,8 +31,9 @@ from typing import Any, Dict, Sequence
 
 
 from ..sandbox import (DEFAULT_PYTEST_TIMEOUT_S, DEFAULT_TIMEOUT_S,
-                       SandboxBackend, SandboxError, SandboxPolicy,
-                       get_backend)
+                       MAX_COLLECTED_BYTES, MAX_COLLECTED_FILES,
+                       OUTPUT_SUFFIXES, SandboxBackend, SandboxError,
+                       SandboxPolicy, get_backend, output_kind)
 from ..session import Artifact
 from ..store import artifacts_dir, ensure_dirs
 from .registry import SANDBOX, ToolContext, ToolError, register
@@ -114,6 +115,75 @@ def save_artifact(ctx: ToolContext, name: str, text: str, *, tool: str,
     return str(path)
 
 
+def collect_outputs(ctx: ToolContext, sb: SandboxBackend,
+                    before: Dict[str, float], *, tool: str
+                    ) -> Dict[str, Any]:
+    """Забрать ФАЙЛЫ, созданные прогоном, из workdir в кампанию (iter68).
+
+    Зачем: рабочий каталог песочницы временный и удаляется в
+    :meth:`SandboxBackend.close`, поэтому график, который построил код модели,
+    существовал ровно до конца хода — и «вывод песочницы» выглядел чисто
+    текстовым, хотя `matplotlib` в ней есть. Теперь картинка/таблица переезжает
+    в ``assistant/artifacts/`` кампании, попадает в сессию и рисуется в доке.
+
+    Что здесь СОЗНАТЕЛЬНО ограничено (A0.6 — ограничение видно, а не молчит):
+
+    * берём только известные расширения (``OUTPUT_SUFFIXES``) — бинарный дамп
+      «на всякий случай» кампании не нужен;
+    * не больше :data:`MAX_COLLECTED_FILES` файлов и не больше
+      :data:`MAX_COLLECTED_BYTES` на файл, о пропуске сообщаем словами;
+    * ``*.py`` не собираем: это исходник, который мы же и записали.
+    """
+    out: Dict[str, Any] = {"files": [], "skipped": []}
+    try:
+        produced = sb.new_files(before, suffixes=OUTPUT_SUFFIXES)
+    except OSError as exc:
+        out["skipped"].append(f"каталог прогона не прочитан: {exc}")
+        return out
+    if not produced:
+        return out
+    if not (ctx.root and ctx.project):
+        out["skipped"].append(
+            f"файлов создано {len(produced)}, но сессия не привязана к проекту "
+            f"— сохранять их некуда")
+        return out
+
+    for path in produced[:MAX_COLLECTED_FILES]:
+        src = Path(path)
+        try:
+            size = src.stat().st_size
+        except OSError as exc:
+            out["skipped"].append(f"{src.name}: не прочитан ({exc})")
+            continue
+        if size > MAX_COLLECTED_BYTES:
+            out["skipped"].append(
+                f"{src.name}: {size / 1048576:.1f} МБ больше лимита "
+                f"{MAX_COLLECTED_BYTES / 1048576:.0f} МБ — не сохранён")
+            continue
+        kind = output_kind(src.name)
+        try:
+            ensure_dirs(ctx.root, ctx.project)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            fname = f"{ts}_{_safe_name(src.name)}"
+            dst = artifacts_dir(ctx.root, ctx.project) / fname
+            dst.write_bytes(src.read_bytes())
+        except OSError as exc:
+            out["skipped"].append(f"{src.name}: не сохранён ({exc})")
+            continue
+        if ctx.session is not None:
+            ctx.session.add_artifact(Artifact(
+                name=fname, kind=kind, path=str(dst), tool=tool,
+                caption=f"{kind} · {size} байт · создан прогоном"))
+        out["files"].append({"name": fname, "kind": kind, "size": size,
+                             "path": str(dst), "source_name": src.name})
+
+    if len(produced) > MAX_COLLECTED_FILES:
+        out["skipped"].append(
+            f"создано файлов: {len(produced)}, сохранены первые "
+            f"{MAX_COLLECTED_FILES} — сохраняй меньше файлов за прогон")
+    return out
+
+
 # ----------------------------------------------------------------------
 # Инструменты
 # ----------------------------------------------------------------------
@@ -136,7 +206,13 @@ def sandbox_info(ctx: ToolContext) -> Dict[str, Any]:
         "вывод. Пользуйся, когда нужно ПОСЧИТАТЬ то, для чего нет готового "
         "инструмента (проверить формулу границы, разыграть точки, сверить "
         "числа). Сети нет; писать можно только в рабочий каталог песочницы; "
-        "спеку и файлы проекта менять нельзя — для этого есть патч."),
+        "спеку и файлы проекта менять нельзя — для этого есть патч. "
+        "ГРАФИК И ТАБЛИЦУ показывай ФАЙЛОМ: сохрани в текущий каталог "
+        "(matplotlib: `plt.savefig('name.png')`; таблица: `df.to_csv('name.csv', "
+        "index=False)`) — созданные png/svg/csv/tsv/xlsx/json/html "
+        "автоматически переносятся в кампанию и показываются пользователю "
+        "картинкой и таблицей. matplotlib используй с backend 'Agg' "
+        "(`matplotlib.use('Agg')`), окон в песочнице нет."),
     parameters={"type": "object", "properties": {
         "code": {"type": "string", "description": "код Python"},
         "timeout_s": {"type": "number", "description": "предел времени, сек"}},
@@ -146,6 +222,7 @@ def run_python(ctx: ToolContext, code: str, timeout_s: Any = None
                ) -> Dict[str, Any]:
     sb = backend_for(ctx)
     limit = _check_timeout(timeout_s, sb.policy.timeout_s or DEFAULT_TIMEOUT_S)
+    before = sb.snapshot_workdir()          # чтобы отличить созданное прогоном
     try:
         res = sb.run_python(str(code), timeout_s=limit)
     except SandboxError as exc:
@@ -155,6 +232,18 @@ def run_python(ctx: ToolContext, code: str, timeout_s: Any = None
         ctx, "run_python.txt",
         f"# argv: {' '.join(res.argv)}\n# {res.caption()}\n\n{res.output}",
         tool="run_python", caption=res.caption())
+    # Файлы забираем ДАЖЕ при падении: график часто успевает сохраниться до
+    # ошибки, и он же объясняет, что пошло не так.
+    produced = collect_outputs(ctx, sb, before, tool="run_python")
+    out["outputs"] = produced["files"]
+    if produced["skipped"]:
+        out["outputs_skipped"] = produced["skipped"]
+    if produced["files"]:
+        out["outputs_note"] = (
+            "Эти файлы сохранены в кампанию и УЖЕ ПОКАЗАНЫ пользователю "
+            "(картинки — изображением, csv/xlsx — таблицей). Не описывай их "
+            "содержимое как невидимое и не пересказывай числа таблицы целиком: "
+            "ссылайся по имени файла.")
     return out
 
 

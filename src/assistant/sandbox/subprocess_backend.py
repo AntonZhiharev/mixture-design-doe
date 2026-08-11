@@ -32,9 +32,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .base import (SandboxBackend, SandboxError, SandboxPolicy, SandboxResult,
-                   SECRET_PATTERNS, clip_output, denial_note, detect_denial,
-                   timeout_note)
+from .base import (MPL_CACHE_DIRNAME, SandboxBackend, SandboxError,
+                   SandboxPolicy, SandboxResult, SECRET_PATTERNS, clip_output,
+                   denial_note, detect_denial, timeout_note)
 from .guard import GUARD_FILENAME, POLICY_ENV, guard_source
 
 #: Каталог сторожа внутри рабочего каталога (первый в PYTHONPATH).
@@ -113,6 +113,18 @@ class SubprocessSandbox(SandboxBackend):
         # бы UnicodeEncodeError — отчёты кампании пишутся по-русски.
         env["PYTHONUTF8"] = "1"
         env["DOE_SANDBOX"] = "1"
+        # matplotlib по умолчанию кеширует шрифты в ~/.matplotlib — сторож это
+        # (законно) запрещает, и УСПЕШНЫЙ прогон с сохранённым графиком
+        # помечался denied='write': инструмент сообщал об отказе, которого по
+        # сути не было. Кеш внутри workdir убирает причину, а не симптом.
+        mpl_cache = Path(self.policy.workdir) / MPL_CACHE_DIRNAME
+        try:
+            mpl_cache.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass                     # не смогли — matplotlib просто предупредит
+        env["MPLCONFIGDIR"] = str(mpl_cache)
+        # Окон в песочнице нет: интерактивный backend упал бы на импорте pyplot.
+        env.setdefault("MPLBACKEND", "Agg")
 
         for k, v in (extra or {}).items():
             env[str(k)] = str(v)

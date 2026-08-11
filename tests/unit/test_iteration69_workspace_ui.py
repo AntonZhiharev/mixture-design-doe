@@ -63,12 +63,17 @@ def test_points_gate_opens_base_branches_analysis_and_schema():
 
 
 def test_gate_reason_distinguishes_no_project_from_no_points():
-    """Причина отказа конкретна: «нет проекта» и «seed не измерен» — разные."""
+    """Причина отказа конкретна: «нет проекта» и «план не измерен» — разные.
+
+    iter74: причина формулируется операционно («стартовый план ещё не
+    измерен»), без внутреннего слова «seed» — текст читает технолог.
+    """
     no_proj = {s.key: s.why for s in ws.tab_states(has_project=False)}
     no_pts = {s.key: s.why for s in ws.tab_states(has_project=True,
                                                   n_points=0)}
     assert "проект не собран" in no_proj["base"]
-    assert "seed" in no_pts["base"].lower()
+    assert "стартовый план" in no_pts["base"].lower()
+    assert "не измерен" in no_pts["base"].lower()
 
 
 def test_default_tab_follows_project_state():
@@ -91,7 +96,7 @@ def test_resolve_tab_explains_forced_switch():
     """Закладка стала недоступна → переход на дефолт с ЯВНОЙ причиной."""
     key, why = ws.resolve_tab("base", has_project=True, n_points=0)
     assert key == "start"
-    assert why and "недоступна" in why and "seed" in why.lower()
+    assert why and "недоступна" in why and "стартовый план" in why.lower()
 
 
 def test_resolve_tab_survives_unknown_key():

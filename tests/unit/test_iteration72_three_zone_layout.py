@@ -53,11 +53,14 @@ def test_main_columns_define_three_zones():
 # 2. Разнесение панелей: справка — вправо, утверждение — у ассистента
 # ======================================================================
 def test_info_panels_moved_out_of_dialog_column():
-    """Вложения/выхлоп/состояние сессии больше НЕ под перепиской."""
+    """Вложения/файлы расчётов/состояние переписки больше НЕ под перепиской."""
     dock_src = inspect.getsource(dock.render_assistant_dock)
     info_src = inspect.getsource(dock.render_assistant_info)
+    # iter74: подписи панелей переведены на операционные формулировки
+    # («выхлоп песочницы» → «файлы расчётов ассистента»), поэтому маркером
+    # служит новая формулировка блока состояния.
     for marker in ("_render_attachments(", "_render_artifacts(",
-                   "Состояние сессии"):
+                   "Состояние переписки"):
         assert marker not in dock_src, f"«{marker}» остался в колонке диалога"
         assert marker in info_src, f"«{marker}» не попал в инфо-панель"
 
@@ -101,7 +104,7 @@ def test_app_renders_all_three_zones_together():
     # правая зона: заголовок инфо-панели и кнопка очистки из «Состояния сессии»
     subs = [str(s.value) for s in at.subheader]
     assert any("Инфо" in s for s in subs), "заголовок инфо-панели не найден"
-    assert "dock_clear" in keys, "панель «Состояние сессии» не нарисована"
+    assert "dock_clear" in keys, "панель состояния переписки не нарисована"
 
 
 def test_info_panel_survives_demo_project():

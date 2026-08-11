@@ -223,8 +223,8 @@ def _render_patches(ctx: ToolContext, session) -> None:
     staged = session.staged_patches()
     st.markdown(f"**🧩 Предложенные патчи спеки: {len(staged)}**")
     if not staged:
-        st.caption("Пусто. Патч появляется здесь, когда ассистент предлагает "
-                   "правку геометрии — сам он её не применяет.")
+        st.caption("Пусто. Правка появляется здесь, когда помощник предлагает "
+                   "изменить границу узла — сам он её не применяет.")
         return
     st.dataframe(views.staged_patches_dataframe(session, only_staged=True),
                  use_container_width=True, hide_index=True)
@@ -281,7 +281,7 @@ def _render_project_packages(ctx: ToolContext, session, runner: Any) -> None:
     st.markdown(f"**🏗 Предложенные проекты (пакетом): {len(staged)}**")
     if not staged:
         st.caption("Пусто. Пакет появляется здесь, когда проекта в сессии нет и "
-                   "ассистент собирает его целиком: состав (phr-спека) + "
+                   "помощник собирает его целиком: состав (phr-спека) + "
                    "отклики + процесс-оси с границами. Одной спекой проект не "
                    "заводится — откликов и осей в ней нет по схеме.")
         return
@@ -290,8 +290,8 @@ def _render_project_packages(ctx: ToolContext, session, runner: Any) -> None:
     if runner is not None:
         st.warning("В сессии УЖЕ собран проект: принять пакет проекта нельзя — "
                    "иначе молча пропали бы измеренные точки и ветки. Для правки "
-                   "геометрии нужен пакет спеки, отклики и оси меняются в "
-                   "сетапе при осознанной пересборке.")
+                   "состава нужен пакет спеки; отклики и процесс-оси меняются в "
+                   "форме «🆕 Новый проект» при осознанной пересборке.")
     for p in staged:
         m = p.summary or {}
         st.caption(f"`{p.id}` · {p.label or 'без метки'} · "
@@ -359,8 +359,8 @@ def _render_spec_packages(ctx: ToolContext, session) -> None:
     staged = session.staged_specs()
     st.markdown(f"**🧬 Предложенные спеки (пакетом): {len(staged)}**")
     if not staged:
-        st.caption("Пусто. Пакет появляется здесь, когда ассистент собирает "
-                   "спеку целиком — первичный ввод геометрии или эволюция "
+        st.caption("Пусто. Пакет появляется здесь, когда помощник собирает "
+                   "спеку целиком — первичный ввод состава или его изменение "
                    "(новый узел, удаление, смена роли). Сам он её не применяет.")
         return
     st.dataframe(views.staged_specs_dataframe(session, only_staged=True),
@@ -522,8 +522,8 @@ def _chat_submission(session, root: str, project: str):
         if afiles.is_image_name(att.name):
             images.append(att.sha256)
         else:
-            st.info(f"Документ «{att.name}» приложен к сессии — ассистент "
-                    f"прочитает его инструментом чтения.")
+            st.info(f"Документ «{att.name}» приложен к переписке — помощник "
+                    f"прочитает его по запросу.")
 
     audio = getattr(typed, "audio", None)
     if audio is not None:
@@ -577,10 +577,10 @@ def _render_attachments(session, root: str, project: str) -> None:
 def _render_artifacts(session) -> None:
     """Графики и таблицы прогонов ЭТОГО проекта (живут после перезапуска)."""
     shown = views.artifact_outputs(session)
-    with st.expander(f"🖼 Выхлоп песочницы: {len(shown)}"):
+    with st.expander(f"🖼 Файлы расчётов помощника: {len(shown)}"):
         if not shown:
             st.caption("Пусто. Здесь появляются графики и таблицы, которые "
-                       "ассистент построил в песочнице (`run_python` с "
+                       "помощник построил своим расчётом (`run_python` с "
                        "`savefig`/`to_csv`).")
             return
         _render_outputs(shown, scope="panel")
@@ -604,19 +604,20 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
     ctx = dock_context(root, project, runner, session)
     focus = dock_focus()
 
-    st.subheader("💬 Архитектор кампании")
+    st.subheader("💬 Помощник по проекту")
     if runner is None:
-        st.info("Проект не собран: движка и базы точек нет — вопросы про "
-                "preflight и прогоны честно останутся без чисел.")
+        st.info("Проект не собран: расчётной модели и базы опытов нет — на "
+                "вопросы о проверке плана и расчётах ответить числами пока "
+                "нечем.")
 
     # iter69: служебные панели (фокус, интернет, ключ, подсказки, вложения,
     # патчи) — НАД лентой и свёрнуты. Раньше они стояли между лентой и полем
     # ввода, и переписка «плавала»: ответ ассистента отодвигал ввод вниз,
     # а до истории приходилось прокручивать всю страницу.
-    with st.expander("⚙️ Контекст и настройки хода", expanded=runner is None):
-        st.caption("Отвечает ЧИСЛАМИ ИЗ ЯДРА: роли, эффективные границы, "
-                   "spec_hash и preflight считают инструменты, а не память "
-                   "модели.")
+    with st.expander("⚙️ Контекст вопроса и настройки", expanded=runner is None):
+        st.caption("Помощник отвечает ЧИСЛАМИ ИЗ РАСЧЁТА: роли, действующие "
+                   "границы, отпечаток спеки и проверку плана считает "
+                   "программа, а не сама модель.")
         focus = _render_focus(focus, ctx)
         session.web_enabled = st.toggle(
             "🌐 Интернет (:online)", value=bool(session.web_enabled),
@@ -624,7 +625,7 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
             help="Всё, что придёт из сети, — уровень знания L2: локальный факт "
                  "цеха его отменяет.")
         _render_connection()
-        st.markdown("**Спросить по месту:**")
+        st.markdown("**Спросить про открытую закладку:**")
         asked = _render_suggestions(focus, runner is not None)
 
     # --- ЛЕНТА: свой скролл, история вверх, свежее внизу (как в Cline) ---
@@ -718,11 +719,11 @@ def render_assistant_info(runner: Any = None, *, root: str = "") -> None:
     project = current_project() or "_scratch"
     session = dock_session(root, project)
 
-    st.subheader("📋 Инфо")
+    st.subheader("📋 Инфо-панель проекта")
     _render_attachments(session, root, project)
     _render_artifacts(session)
 
-    with st.expander("📌 Состояние сессии"):
+    with st.expander("📌 Состояние переписки с помощником"):
         st.caption(views.session_caption(session))
         st.caption(views.context_caption(session))
         if st.button("🗑️ Очистить переписку (файлы и патчи останутся)",

@@ -376,8 +376,9 @@ def test_tool_calls_dataframe_accepts_objects_and_dicts():
 
 
 def test_artifacts_and_decisions_dataframes():
+    # iter74: столбец таблицы называется «файл» (слово «артефакт» — внутреннее).
     df = views.artifacts_dataframe(_rich_session())
-    assert df.iloc[0]["артефакт"] == "narrowing.png"
+    assert df.iloc[0]["файл"] == "narrowing.png"
 
     dec = views.decisions_dataframe([{
         "ts": "2026-08-08T10:00:00+00:00", "title": "мел до 100 phr",
@@ -388,9 +389,10 @@ def test_artifacts_and_decisions_dataframes():
 
 
 def test_session_caption_reports_web_and_counts():
+    # iter74: «в стейдже» → «ждёт применения» (подпись читает технолог).
     txt = views.session_caption(_rich_session())
     assert PROJECT in txt and "файлов: 1" in txt
-    assert "патчей в стейдже: 1" in txt and "интернет: включён" in txt
+    assert "патчей ждёт применения: 1" in txt and "интернет: включён" in txt
 
 
 def test_context_caption_reports_truncation():

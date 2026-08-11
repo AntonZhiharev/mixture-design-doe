@@ -244,7 +244,8 @@ def test_turn_messages_do_not_accumulate_focus_between_turns():
     build_turn_messages(s, question="раз", focus={"section": "spec"})
     msgs = build_turn_messages(s, question="два", focus={"section": "seed"})
     focus = [m for m in msgs if str(m["content"]).startswith(FOCUS_MARK)]
-    assert len(focus) == 1 and "Стартовый дизайн" in focus[0]["content"]
+    # iter74: шаг называется «Стартовый план опытов» (без внутреннего «seed»).
+    assert len(focus) == 1 and "Стартовый план опытов" in focus[0]["content"]
 
 
 def test_turn_messages_include_attachment_digest(tmp_path):

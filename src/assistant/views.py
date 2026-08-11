@@ -310,20 +310,20 @@ def spec_apply_caption(result: Mapping[str, Any]) -> str:
             parts.append(f"точек проверено: {pts.get('n_checked', 0)}, "
                          f"выпало: {pts.get('n_lost', 0)}")
     else:
-        parts.append(f"гейты неприменимы ({gates.get('reason', '—')})")
+        parts.append(f"проверки неприменимы ({gates.get('reason', '—')})")
     return " · ".join(parts)
 
 
 def artifacts_dataframe(session: AssistantSession) -> pd.DataFrame:
-    """Артефакты песочницы: время / имя / вид / инструмент / подпись."""
+    """Файлы расчётов помощника: время / имя / вид / инструмент / подпись."""
     rows = [{
         "время": _hhmm(a.ts),
-        "артефакт": a.name,
+        "файл": a.name,
         "вид": a.kind,
         "инструмент": a.tool or "—",
         "подпись": _short(a.caption, 80),
     } for a in session.artifacts]
-    return pd.DataFrame(rows, columns=["время", "артефакт", "вид",
+    return pd.DataFrame(rows, columns=["время", "файл", "вид",
                                        "инструмент", "подпись"])
 
 
@@ -604,7 +604,7 @@ def turn_caption(res: Any) -> str:
         parts.append("🌐 веб включён (уровень знания L2)")
     new_patches = list(get("new_patches", []) or [])
     if new_patches:
-        parts.append(f"новых патчей в стейдже: {len(new_patches)} — "
+        parts.append(f"новых патчей ждёт применения: {len(new_patches)} — "
                      f"применяет ЧЕЛОВЕК кнопкой")
     reason = str(get("stopped_reason", "") or "")
     if reason and reason != "final":
@@ -716,8 +716,8 @@ def apply_result_caption(result: Mapping[str, Any]) -> str:
                      f"выпало: {pts.get('n_lost', 0)}")
     pre = (gates.get("preflight", {}) or {})
     if pre.get("checked"):
-        parts.append("preflight: "
-                     + ("не ухудшился" if pre.get("ok") else "УХУДШИЛСЯ"))
+        parts.append("проверка плана: "
+                     + ("не ухудшилась" if pre.get("ok") else "УХУДШИЛАСЬ"))
     return " · ".join(parts)
 
 
@@ -728,9 +728,9 @@ def session_caption(session: AssistantSession) -> str:
         f"проект: **{session.project or '—'}**",
         f"сообщений: {len(session.messages)}",
         f"файлов: {len(session.attachments)}",
-        f"патчей в стейдже: {staged}",
-        f"пакетов спеки в стейдже: {len(session.staged_specs())}",
-        f"артефактов: {len(session.artifacts)}",
+        f"патчей ждёт применения: {staged}",
+        f"пакетов спеки ждёт применения: {len(session.staged_specs())}",
+        f"файлов расчётов: {len(session.artifacts)}",
         f"вызовов инструментов: {len(session.tool_calls)}",
     ]
     total = int((session.usage or {}).get("total_tokens", 0))

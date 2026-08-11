@@ -709,7 +709,7 @@ def demo_iter62() -> None:
         print(f"\n🔧 Инструмент run_pytest вернул модели: ok={out['ok']} · "
               f"{out['passed']} прошло · {out['failed']} упало · "
               f"артефакт сохранён в кампанию")
-        print("\n🗂 Артефакты сессии (выхлоп песочницы живёт в проекте):")
+        print("\n🗂 Файлы расчётов сессии (сохраняются внутри проекта):")
         show(views.artifacts_dataframe(s))
         store.save_session(s, CAMPAIGN_ROOT)
     finally:

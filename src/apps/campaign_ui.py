@@ -655,10 +655,10 @@ def seed_preflight_caption(report) -> str:
     блокировки (A0.6): решение фиксировать план остаётся за пользователем.
     Чистая (без Streamlit) — тестируется напрямую."""
     if report.passed:
-        return (f"🔎 Preflight: план информативен (rank {report.rank}/"
+        return (f"🔎 Проверка плана: план информативен (rank {report.rank}/"
                 f"{report.rank_ref}, cond ×{report.cond / max(report.cond_ref, 1e-12):.1f} "
-                f"от reference-пула области).")
-    return "⚠️ Preflight: " + "; ".join(report.failures)
+                f"от эталонного набора точек области).")
+    return "⚠️ Проверка плана: " + "; ".join(report.failures)
 
 
 def preflight_details_dataframe(report) -> pd.DataFrame:
@@ -872,7 +872,7 @@ _MONEY_RU = {cv.MONEY_ZEROED: "занулён (ZEROED)", cv.MONEY_ALIVE: "жив
              None: "—"}
 _CHANGE_RU = {"inherited": "унаследовано как есть",
               "overridden_same_role": "тронуто, роль та же",
-              "changed_by_objective": "изменено объективом ветки"}
+              "changed_by_objective": "изменено новой целью ветки"}
 
 # Легенда §4-стопа: причина остановки раунда (двойной критерий §4/§6).
 _STOP_RU: Dict[Optional[str], str] = {
@@ -2965,7 +2965,7 @@ def render_project_settings(runner) -> None:
     with st.expander("📋 Настройки проекта"):
         st.caption(
             f"Отклики: {', '.join(runner.property_names)} · схема v"
-            f"{int(runner.current_schema_version)} · seed раннера = "
+            f"{int(runner.current_schema_version)} · зерно ГСЧ проекта = "
             f"{int(getattr(runner, 'seed', 0))} · общая база: "
             f"{len(runner.points)} точек. Границы ниже — те, по которым "
             "реально работает движок (сохраняются и загружаются с проектом).")
@@ -3023,13 +3023,14 @@ def render_setup_form() -> None:
     if _pending:
         for _k, _v in dict(_pending).items():
             st.session_state[_k] = _v
-    with st.expander("🆕 Новый проект — реальный сетап (§17.4)",
+    with st.expander("🆕 Новый проект — настройка области опытов (§17.4)",
                      expanded=get_campaign_controller() is None):
         st.caption(
-            "Составная область СРАЗУ: симплекс компонентов смеси (Σ=1) × куб "
-            "процесс-параметров (реальные единицы). Отклики (свойства) меряются "
-            "вручную — оракула-симулятора нет (кнопка «Заполнить тестовыми» в "
-            "seed-цикле оставлена для прогонов без лаборатории, A0.6).")
+            "Область задаётся сразу целиком: состав смеси (сумма долей = 1) × "
+            "диапазоны процесс-параметров в реальных единицах. Отклики "
+            "(свойства) измеряются вручную — расчётного симулятора для реального "
+            "проекта нет (кнопка «Заполнить тестовыми значениями» в стартовом "
+            "плане оставлена для проверки хода работы без лаборатории, A0.6).")
         mix_txt = st.text_input("Компоненты смеси (через запятую)",
                                 value="A, B, C", key="setup_mix")
         resp_txt = st.text_input("Отклики / свойства (через запятую)",
@@ -3111,13 +3112,14 @@ def render_setup_form() -> None:
                    "числом не восстанавливаются.")
         label_txt = st.text_input(
             "Метка кампании", value="", key="setup_campaign_label",
-            help="Пишется в origin_tag каждой новой точки (вместе со "
-                 "spec_hash активной phr-спеки и номером партии) — без неё "
-                 "блочный дрейф при staged-расширении не отделить.")
+            help="Записывается в происхождение каждой новой точки (вместе с "
+                 "отпечатком активной phr-спеки и номером партии) — без неё "
+                 "сдвиг между партиями при поэтапном расширении не отделить.")
         pairs_txt = st.text_area(
             "Обязательные 2D-пары", value="", key="setup_preflight_pairs",
-            help="Гейт pair-coverage в preflight. Одна строка = пара, стороны "
-                 "через «|», ось-сумма — имена через запятую. Например:\n"
+            help="Проверка совместного покрытия пар при проверке плана. Одна "
+                 "строка = пара, стороны через «|», ось-сумма — имена через "
+                 "запятую. Например:\n"
                  "UV_CSFCP | TiO2_BLR895\n"
                  "T | PMPlus_8, DL_531")
         # P2.3: лоты сырья, anchor-рецепты и разрешение весов — часть
@@ -3150,20 +3152,20 @@ def render_setup_form() -> None:
         # P3.1: ковариаты базы — телеметрия прогона (M(t)/SME, Die_Pressure,
         # торк, вытяжка, наработка вала): столбцы базы, НЕ отклики модели.
         cov_txt = st.text_input(
-            "Ковариаты базы — телеметрия прогона (опц.)", value="",
+            "Условия прогона — дополнительные показания (опц.)", value="",
             key="setup_covariates",
             help="Имена через запятую (например: SME, Die_Pressure, торк, "
                  "вытяжка, наработка_вала). Это СТОЛБЦЫ общей базы, а не "
-                 "отклики: в модель/суррогаты не входят, желательности не "
-                 "несут, но записываются при каждом замере — постфактум "
-                 "телеметрию прогона не восстановить. Значения вносятся в "
-                 "таблицах seed/добора (пустые ячейки допустимы).")
+                 "отклики: в модели свойств не входят, в целях не участвуют, но "
+                 "записываются при каждом замере — задним числом эти показания "
+                 "не восстановить. Значения вносятся в таблицах стартового "
+                 "плана и рабочего стола (пустые ячейки допустимы).")
 
         seed_v = st.number_input(
 
-            "Seed раннера (зерно ГСЧ проекта)", value=1, step=1, key="setup_seed",
+            "Зерно ГСЧ проекта", value=1, step=1, key="setup_seed",
             help="Зерно генератора случайных чисел движка проекта: фиксирует "
-                 "воспроизводимость стартового дизайна и внутренних рестартов "
+                 "воспроизводимость стартового плана и внутренних перезапусков "
                  "оптимизатора. Одно и то же значение → тот же результат; на "
                  "состав и границы НЕ влияет.")
         if st.button("🏗 Построить проект", key="setup_build"):
@@ -3238,8 +3240,8 @@ def render_setup_form() -> None:
                        if levels_now else "")
                     + (f" {links_caption(runner.process_links)}"
                        if links_now else "")
-                    + " База пуста — предложите и измерьте стартовый дизайн "
-                      "ниже.")
+                    + " База пуста — предложите и измерьте стартовый план "
+                      "опытов ниже.")
 
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
@@ -3260,11 +3262,12 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # iter65: пока база пуста, это ЕДИНСТВЕННАЯ активная секция — значит,
     # пользователь именно здесь, и док ассистента должен спрашивать про seed.
     publish_ui_focus("seed")
-    st.markdown("### 🌱 Стартовый дизайн (seed) — ручной ввод откликов (§17.4)")
+    st.markdown("### 🌱 Стартовый план опытов — ручной ввод откликов (§17.4)")
     st.caption(
-        f"Отклики проекта: {', '.join(props)}. Предложите N точек по составной "
-        "области, внесите измеренные Y по каждому свойству и зафиксируйте — точки "
-        "лягут в ОБЩУЮ базу (origin=seed), суррогаты обучатся (И-1).")
+        f"Отклики проекта: {', '.join(props)}. Предложите N точек по области "
+        "«состав × процесс», внесите измеренные значения по каждому свойству и "
+        "зафиксируйте — точки попадут в ОБЩУЮ базу (источник «стартовый план»), "
+        "модели свойств обучатся (И-1).")
     # Замечание 4: рекомендуемый N скрининга считаем от q компонентов и d
     # процесс-параметров — предлагаем сразу как значение по умолчанию.
     q = len(runner.current_schema.mixture_names)
@@ -3272,8 +3275,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     rec_n = recommended_seed_size(q, d)
     sc = st.columns([1, 1, 1, 1])
     seed_n = sc[0].number_input(
-        "N seed-точек", min_value=2, max_value=200, value=int(rec_n), step=1,
-        key="setup_seed_n",
+        "Точек в стартовом плане", min_value=2, max_value=200,
+        value=int(rec_n), step=1, key="setup_seed_n",
         help=f"Рекомендация для скрининга: N = q·(1+d) + ⌈q·(1+d)/2⌉ = {rec_n} "
              f"(q={q} компонентов, d={d} процесс-параметров) — число членов "
              "кросс-модели «смесь-линейно × процесс-линейно» плюс ~50% запаса на "
@@ -3283,9 +3286,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         "зерно ГСЧ (воспроизводимость)", value=1, step=1,
         key="setup_seed_design",
         help="Зерно генератора случайных чисел для построения стартового "
-             "дизайна. Одно и то же значение → тот же набор из N точек "
+             "плана. Одно и то же значение → тот же набор точек "
              "(воспроизводимо); другое значение → другой случайный вариант. "
-             "К числу «seed-точек» отношения не имеет — это разные «seed».")
+             "На число точек в плане не влияет.")
 
     # P0-багфикс «+/− срабатывает со второго клика»: НЕ передаём value= вместе
     # с key — меняющийся default конфликтует со state виджета, и Streamlit
@@ -3297,15 +3300,15 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     nb_blocks = sc[2].number_input(
         "Партий (блоков)", min_value=1, max_value=20, step=1,
         key="setup_seed_blocks",
-        help="Blocking стартового дизайна: если опыты нельзя поставить одной "
-             "партией / за один день, план ОПТИМАЛЬНО разбивается на блоки "
-             "(interchange по блочному D-критерию) — эффект партии ловится "
-             "блочной моделью и не искажает оценки состава. 1 — без "
-             "блокировки. Доборы веток автоматически получают НОВЫЙ блок "
-             "(каждая партия добора — отдельный блок).")
+        help="Разбиение стартового плана на партии: если опыты нельзя "
+             "поставить одной партией / за один день, план оптимально делится "
+             "на блоки (обмен точками по блочному D-критерию) — влияние партии "
+             "учитывается моделью и не искажает оценки состава. 1 — без "
+             "разбиения. Новые точки веток автоматически попадают в НОВУЮ "
+             "партию.")
     runner.n_blocks_start = max(1, int(nb_blocks))
 
-    if sc[3].button("📐 Предложить seed-дизайн", key="setup_propose_seed"):
+    if sc[3].button("📐 Предложить стартовый план", key="setup_propose_seed"):
         X = np.asarray(ctrl.propose_seed(int(seed_n), seed=int(seed_design)), float)
         st.session_state["setup_seed_X"] = X
         st.session_state.pop("setup_seed_Y", None)
@@ -3360,13 +3363,14 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     delta_phr: Optional[float] = None
     gpp_val: Optional[float] = None
     if spec_w is not None:
-        with st.expander("⚖️ Навеска (phr): разрешение весов, премикс, actual",
-                         expanded=True):
+        with st.expander("⚖️ Навеска (phr → граммы): шаг весов, премикс, "
+                         "фактические доли", expanded=True):
             st.caption(
-                "Слой навески (CAMPAIGN_SPEC_PVC §5): доли плана переводятся в "
-                "phr по fixed-якорю спеки, снапятся к сетке весов и "
-                "фиксируются как ACTUAL — модель должна видеть actual, а не "
-                "nominal. Задайте параметры лаборатории:")
+                "Пересчёт навески (CAMPAIGN_SPEC_PVC §5): доли плана "
+                "переводятся в phr по опорному компоненту спеки, округляются "
+                "до шага весов и фиксируются как ФАКТИЧЕСКИЕ — модель должна "
+                "учиться на том, что реально взвесили, а не на расчётном "
+                "плане. Задайте параметры лаборатории:")
             wc = st.columns(2)
             # P2.3: дефолты слоя навески — из ПАСПОРТА кампании (если задан):
             # разрешение весов записывается при сетапе и переживает load, а
@@ -3393,8 +3397,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                     st.error(str(exc))
                     delta_phr = None
             else:
-                st.caption("Слой навески выключен (шаг весов или загрузка = 0): "
-                           "план фиксируется как NOMINAL.")
+                st.caption("Пересчёт в граммы выключен (шаг весов или загрузка "
+                           "= 0): план фиксируется как расчётный (nominal).")
             if delta_phr is not None:
                 Xs_snap = snap_design_to_grid(spec_w, Xs, delta_phr)
                 moved = float(np.abs(Xs_snap - Xs).max()) if len(Xs) else 0.0
@@ -3403,10 +3407,11 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                     Xs = Xs_snap
                 st.caption(
                     weighing_caption(spec_w, delta_phr)
-                    + (f" План СНАПНУТ к δ-сетке (макс. сдвиг доли "
-                       f"{moved:.2e}) — фиксируется actual."
+                    + (f" План ПРИВЕДЁН к шагу весов (макс. сдвиг доли "
+                       f"{moved:.2e}) — фиксируется фактическая навеска."
                        if moved > 0 else
-                       " План уже стоит на δ-сетке — фиксируется actual."))
+                       " План уже кратен шагу весов — фиксируется фактическая "
+                       "навеска."))
                 nums_w = list(experiment_index(len(runner.points), len(Xs)))
                 sel_w = st.selectbox("Карта навески для опыта №", nums_w,
                                      key="setup_weigh_row")
@@ -3433,8 +3438,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                 "«Почему план не даёт такую точку» — ответ ядра ПО ЭТОЙ точке: "
                 "какие границы действуют на каждый узел и КАКОЕ ограничение их "
                 "задало (заявленный интервал / потолок cap / окно тотала / "
-                "техлимит phr / партнёры по группе). Read-only, ничего не "
-                "блокирует (A0.6).")
+                "техлимит phr / партнёры по группе). Только просмотр, ничего "
+                "не блокирует (A0.6).")
             nums_b = list(experiment_index(len(runner.points), len(Xs)))
             sel_b = st.selectbox("Границы для опыта №", nums_b,
                                  key="setup_bounds_row")
@@ -3448,7 +3453,11 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
             except ValueError as exc:
                 st.error(f"Границы точки не рассчитаны: {exc}")
 
-    if st.button("🧪 Заполнить тестовыми (демо-оракул)", key="setup_fill_demo"):
+    if st.button("🧪 Заполнить тестовыми значениями (симулятор)",
+                 key="setup_fill_demo",
+                 help="Подставляет отклики из тестового симулятора вместо "
+                      "лаборатории — для проверки хода работы, не для реальных "
+                      "данных."):
 
         st.session_state["setup_seed_Y"] = np.vstack(
             [runner._measure(np.asarray(x, float)) for x in Xs])
@@ -3497,9 +3506,10 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         st.session_state.pop("setup_seed_editor", None)
     df = st.session_state["setup_seed_df"]
     cov_names_ui = list(getattr(runner, "covariate_names", []) or [])
-    st.caption("Составные координаты заблокированы; заполняются только столбцы "
-               "«свойство (lab)» (вручную или кнопкой «Заполнить тестовыми»)"
-               + (" и «… (ковариата)» — телеметрия прогона, пустые ячейки "
+    st.caption("Координаты точек заблокированы; заполняются только столбцы "
+               "«свойство (lab)» — вручную или кнопкой «Заполнить тестовыми "
+               "значениями»"
+               + (" и «… (ковариата)» — условия прогона, пустые ячейки "
                   "допустимы (P3.1)" if cov_names_ui else "")
                + ":")
     blk_cols = [c for c in ("Блок", "Партия") if c in df.columns]
@@ -3536,16 +3546,17 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     pf = st.session_state.get("setup_seed_pf")
     if pf is not None:
         st.caption(seed_preflight_caption(pf))
-        with st.expander("🔎 Preflight: детали проверок плана"):
+        with st.expander("🔎 Проверка плана до опытов: подробности"):
             st.caption(
-                "Гейты ОТНОСИТЕЛЬНЫЕ: план сравнивается с равномерным "
-                "reference-пулом ЭТОЙ ЖЕ области (классические абсолютные "
-                "пороги cond<30 / VIF<5 в долях Шеффе неприменимы). Провал — "
-                "сигнал пересмотреть план ДО измерений; фиксация не блокируется.")
+                "Проверки ОТНОСИТЕЛЬНЫЕ: план сравнивается с равномерным "
+                "эталонным набором точек ЭТОЙ ЖЕ области (классические "
+                "абсолютные пороги cond<30 / VIF<5 в долях Шеффе неприменимы). "
+                "Непройденная проверка — сигнал пересмотреть план ДО "
+                "измерений; фиксация плана не блокируется.")
             st.dataframe(preflight_details_dataframe(pf),
                          use_container_width=True, hide_index=True)
     elif st.session_state.get("setup_seed_pf_err"):
-        st.caption("🔎 Preflight недоступен: "
+        st.caption("🔎 Проверка плана недоступна: "
                    + str(st.session_state["setup_seed_pf_err"]))
     # C2: черновик Y из редактора живёт в session_state (setup_seed_Y), чтобы
     # частично внесённые отклики можно было сохранить в проект ДО фиксации
@@ -3570,7 +3581,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
         mime="application/vnd.openxmlformats-officedocument."
              "spreadsheetml.sheet")
 
-    if st.button("💾 Зафиксировать seed (commit_seed)", key="setup_commit_seed"):
+    if st.button("💾 Зафиксировать стартовый план и отклики",
+                 key="setup_commit_seed"):
 
         try:
             Y = np.column_stack([np.asarray(edited[c], float) for c in lab_cols])
@@ -3578,7 +3590,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                 raise ValueError(
                     "Заполните измеренные отклики (столбцы «… (lab)») для ВСЕХ "
                     "точек — вручную в таблице или кнопкой «🧪 Заполнить "
-                    "тестовыми». Пустые ячейки (None) фиксировать нельзя.")
+                    "тестовыми значениями». План с пустыми ячейками "
+                    "зафиксировать нельзя.")
             # P3.1: телеметрия прогона из столбцов «(ковариата)» — NaN
             # пропускаются (не снята); валидация имён/чисел — раннером.
             covs_seed = (covariate_rows_from_editor(edited, cov_names_ui)
@@ -3591,9 +3604,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
             # P0: уведомление через _flash — st.success перед st.rerun не
             # доживал до глаз пользователя (rerun стирает вывод прогона).
             _flash(
-                f"Seed зафиксирован: +{out['added']} точек (origin=seed), общая "
-                f"база = {out['n_base']}, суррогаты обучены. Дальше — создание "
-                "веток (Ш4, §17.5).")
+                f"Стартовый план зафиксирован: +{out['added']} точек (источник "
+                f"«стартовый план»), общая база = {out['n_base']}, модели "
+                "свойств обучены. Дальше — создание веток (Ш4, §17.5).")
             # База стала непустой → сразу перерисовать вкладку, чтобы открылось
             # создание веток (§17.5) без второго клика (иначе ранний return в
             # render_campaign держит seed-секцию до следующего взаимодействия).
@@ -3972,7 +3985,7 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                     st.session_state["camp_new_goals"] = draft_remove_goal(draft, i)
                     st.rerun()
         else:
-            st.caption("Пока ни одной цели — ветке нужен минимум один объектив "
+            st.caption("Пока ни одной цели — ветке нужна минимум одна цель "
                        "(§17.3).")
 
 
@@ -4108,13 +4121,16 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
     props = list(runner.property_names)
     coord_names = setup_coord_names(runner)
     kx, ky = f"camp_wb_X_{bsel}", f"camp_wb_Y_{bsel}"
-    with st.expander("🛠 Рабочий стол ветки (§17.2/§16.4 — ручной добор)",
-                     expanded=True):
+    with st.expander("🛠 Рабочий стол ветки — новые опыты вручную "
+                     "(§17.2/§16.4)", expanded=True):
         st.caption(
-            "Реальный лабораторный цикл (§17.2): предложить N точек (read-only) → "
-            "внести измеренные Y по всем свойствам → долить в ОБЩУЮ базу "
-            "(origin=branch:{id}, И-1) → переобучить суррогаты → x*/d_best → "
-            "§4-стоп. Мерим только по кнопке (A0.6); долив запечатывает undo.")
+            "Реальный лабораторный цикл (§17.2): предложить N точек (только "
+            "расчёт, база не меняется) → внести измеренные отклики по всем "
+            "свойствам → добавить точки в ОБЩУЮ базу (источник — эта ветка, "
+            "И-1) → переобучить модели свойств → пересчитать рецепт x* и d_best "
+            "→ проверка остановки (§4). Расчёт идёт только по нажатию кнопки "
+            "(A0.6); после добавления точек прежние настройки ветки отменить "
+            "уже нельзя.")
         br_now = runner.branches[bsel]
         st.caption(f"Ветка «{br_now.name}»: бюджет {br_now.budget}, потрачено "
                    f"{br_now.spent}, осталось {br_now.remaining()}, "
@@ -4125,7 +4141,7 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         # кнопке (A0.6), результат кешируем в session_state (df + готовые
         # xlsx-байты), чтобы rerun не пересчитывал оптимизацию.
         st.markdown("**📋 Рекомендованный рецепт ветки (x*) — по общим "
-                    "GP-суррогатам**")
+                    "моделям свойств**")
         st.caption(
             "Итог ветки одной строкой: рецепт-состав + процесс в РЕАЛЬНЫХ единицах, "
             "предсказанные свойства целей, общий d_overall и по-целевые d[·]. "
@@ -4165,8 +4181,9 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
             st.caption(binding_report_caption(brep))
             bdf = binding_report_dataframe(brep)
             if not bdf.empty:
-                st.caption("Что связывает оптимум (veto целей + вероятностные "
-                           "ограничения; % — доля точек пула под биндингом):")
+                st.caption("Что ограничивает оптимум (запреты целей + "
+                           "вероятностные ограничения; % — доля точек в наборе "
+                           "кандидатов, где ограничение активно):")
                 st.dataframe(bdf, use_container_width=True, hide_index=True)
 
 
@@ -4174,14 +4191,19 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         ready = ctrl.validate_ready(bsel)
 
         if not ready["ok"]:
-            st.error("Не хватает данных для добора (§17.3):\n" + ready["text"])
+            st.error("Не хватает данных для новых точек (§17.3):\n"
+                     + ready["text"])
 
         wc = st.columns([1, 1, 1])
-        wb_n = wc[0].number_input("N точек", min_value=1, max_value=20, value=3,
-                                  step=1, key=f"camp_wb_n_{bsel}")
-        wb_expl = wc[1].slider("explore", 0.0, 1.0, 0.3, 0.05,
-                               key=f"camp_wb_expl_{bsel}")
-        if wc[2].button("📐 Предложить точки (read-only)",
+        wb_n = wc[0].number_input("Сколько точек предложить", min_value=1,
+                                  max_value=20, value=3, step=1,
+                                  key=f"camp_wb_n_{bsel}")
+        wb_expl = wc[1].slider("Доля точек на разведку области", 0.0, 1.0, 0.3,
+                               0.05, key=f"camp_wb_expl_{bsel}",
+                               help="0 — все точки около текущего оптимума; "
+                                    "1 — все точки на разведку неизученных "
+                                    "участков области.")
+        if wc[2].button("📐 Предложить точки (база не меняется)",
                         key=f"camp_wb_propose_{bsel}", disabled=not ready["ok"]):
             X = np.asarray(ctrl.propose_points(bsel, n_points=int(wb_n),
                                                explore_frac=float(wb_expl),
@@ -4196,7 +4218,8 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
             # NB: без вложенного st.expander — рабочий стол сам живёт в
             # экспандере, а Streamlit запрещает вложенные экспандеры.
             st.success(last["msg"])
-            st.caption("Измеренные отклики долитых точек (по всем P):")
+            st.caption("Измеренные отклики добавленных точек (по всем "
+                       "свойствам):")
             st.dataframe(last["points"], use_container_width=True,
                          hide_index=True)
             st.caption("Сводка источников общей базы:")
@@ -4212,8 +4235,11 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
             st.info("Бюджет ветки исчерпан — предложить нечего.")
             return
 
-        if st.button("🧪 Заполнить тестовыми (демо-оракул)",
-                     key=f"camp_wb_fill_{bsel}"):
+        if st.button("🧪 Заполнить тестовыми значениями (симулятор)",
+                     key=f"camp_wb_fill_{bsel}",
+                     help="Подставляет отклики из тестового симулятора вместо "
+                          "лаборатории — для проверки хода работы, не для "
+                          "реальных данных."):
             st.session_state[ky] = np.vstack(
                 [runner._measure(np.asarray(x, float)) for x in Xs])
 
@@ -4234,15 +4260,16 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         df.insert(0, "№ опыта",
                   list(experiment_index(len(runner.points), len(df))))
         st.caption("Предложенные точки: координаты заблокированы, заполняются "
-                   "только столбцы «свойство (lab)» (вручную или демо-кнопкой)"
-                   + (" и «… (ковариата)» — телеметрия прогона (P3.1)"
+                   "только столбцы «свойство (lab)» — вручную или кнопкой "
+                   "тестовых значений"
+                   + (" и «… (ковариата)» — условия прогона (P3.1)"
                       if wb_cov_names else "") + ":")
         edited = st.data_editor(df, use_container_width=True, height=280,
                                 hide_index=True,
                                 disabled=["№ опыта", *coord_names[:Xs.shape[1]]],
                                 key=f"camp_wb_editor_{bsel}")
 
-        if st.button("💾 Долить измеренные (commit_measured)",
+        if st.button("💾 Добавить измеренные точки в базу",
                      key=f"camp_wb_commit_{bsel}"):
             try:
                 d_before = float(br_now.d_best)
@@ -4252,8 +4279,8 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                     raise ValueError(
                         "Заполните измеренные отклики (столбцы «… (lab)») для "
                         "ВСЕХ предложенных точек — вручную или кнопкой "
-                        "«🧪 Заполнить тестовыми». Пустые ячейки (None) "
-                        "доливать нельзя.")
+                        "«🧪 Заполнить тестовыми значениями». Точки с пустыми "
+                        "ячейками в базу не добавляются.")
                 # P3.1: телеметрия прогона из столбцов «(ковариата)»
                 covs_wb = (covariate_rows_from_editor(edited, wb_cov_names)
                            if wb_cov_names else None)
@@ -4285,14 +4312,15 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                 # остаётся видимой), а rerun сразу обновляет капшены/таблицы
                 # ВЫШЕ по странице (бюджет, d_best, роли, база).
                 st.session_state[f"camp_wb_last_{bsel}"] = {
-                    "msg": (f"Долито {res['added']} точек "
-                            f"(origin=branch:{bsel}); d_best {d_before:.3f} → "
-                            f"{res['d_best']:.3f} (монотонно не убывает); "
+                    "msg": (f"Добавлено {res['added']} точек "
+                            f"(источник — ветка {bsel}); d_best {d_before:.3f} → "
+                            f"{res['d_best']:.3f} (не убывает); "
                             f"общая база = {res['n_base']} точек."),
                     "points": wdf,
                     "origins": oc,
                     "stop": (
-                        f"§4-стоп: **{_STOP_RU.get(dec.reason, dec.reason)}** "
+                        f"Решение об остановке (§4): "
+                        f"**{_STOP_RU.get(dec.reason, dec.reason)}** "
                         f"(Δd={delta_d:+.4f}, d_best={res['d_best']:.3f}, "
                         f"ceil={br_now.satisfy_at:.3f}, "
                         f"econ_red_flag={dec.econ_red_flag})."),
@@ -4416,18 +4444,19 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
     """
     runner = ctrl.runner
     props = list(runner.property_names)
-    with st.expander("📊 Анализ скрининга (M3 — Scheffé + ARD по составу)"):
+    with st.expander("📊 Влияние компонентов на свойства "
+                     "(модель Шеффе + оценка важности)"):
         st.caption(
-            "Интерпретируемая сводка сразу после измеренного стартового дизайна: "
-            "какой компонент на какое свойство влияет (ARD-важность) и насколько "
-            "квадратичная модель Шеффе по составу объясняет данные (R²). Процесс "
-            "здесь не участвует — его роль за общими GP-суррогатами. Считается "
-            "по кнопке (ARD-фиты дорогие).")
+            "Сводка сразу после измеренного стартового плана: какой компонент на "
+            "какое свойство влияет (важность 0…1) и насколько квадратичная "
+            "модель Шеффе по составу объясняет данные (R²). Процесс здесь не "
+            "участвует — его учитывают общие модели свойств (GP). Расчёт идёт "
+            "по кнопке: он длительный.")
 
         # --- сводная матрица влияний (главный итог скрининга) ---
         if st.button("📊 Рассчитать матрицу влияний (компонент × свойство)",
                      key="camp_m3_overview_btn"):
-            with st.spinner("ARD-скрининг по каждому свойству…"):
+            with st.spinner("Оценка важности компонентов по каждому свойству…"):
                 try:
                     st.session_state["camp_m3_matrix"] = csx.influence_matrix(
                         runner, n_restarts=4, seed=0)
@@ -4436,16 +4465,18 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
                     st.error(f"Не удалось построить матрицу влияний: {exc}")
         mat = st.session_state.get("camp_m3_matrix")
         if mat is not None:
-            st.caption("ARD-важность компонентов (0…1; максимум по свойству = 1) "
+            st.caption("Важность компонентов (0…1; максимум по свойству = 1) "
                        "— чем ближе к 1, тем сильнее компонент влияет на свойство:")
             st.dataframe(mat, use_container_width=True)
 
         # --- детальный разбор одного свойства ---
-        st.markdown("**🔬 Детальный разбор свойства (Scheffé-quadratic по составу)**")
+        st.markdown("**🔬 Разбор свойства (квадратичная модель Шеффе по "
+                    "составу)**")
         prop = st.selectbox("Свойство", props, key="camp_m3_prop")
-        if st.button("🔬 Разобрать свойство (Scheffé-fit + ANOVA + ARD)",
+        if st.button("🔬 Разобрать свойство (модель + ANOVA + важность)",
                      key="camp_m3_fit_btn"):
-            with st.spinner(f"Фит Шеффе + ARD для «{prop}»…"):
+            with st.spinner(f"Подгонка модели Шеффе и оценка важности для "
+                            f"«{prop}»…"):
                 try:
                     st.session_state["camp_m3_report"] = csx.screening_report(
                         runner, prop, n_restarts=4, seed=0)
@@ -4463,10 +4494,11 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
             mc[2].metric("RMSE", f"{s['rmse']:.3g}")
             mc[3].metric("q_eff", rep["q_eff"])
             if s.get("underdetermined"):
-                st.warning("n < p: модель недоопределена — R² вводит в "
-                           "заблуждение, добавьте опыты (§17.4).")
+                st.warning("Опытов меньше, чем коэффициентов модели (n < p): "
+                           "R² в этом случае вводит в заблуждение — добавьте "
+                           "опыты (§17.4).")
             st.caption(f"Свойство «{rep['property']}» — коэффициенты Шеффе "
-                       f"(mixture-only, {rep['model']}):")
+                       f"(только состав, {rep['model']}):")
             st.dataframe(pd.DataFrame(rep["coefficients"]),
                          use_container_width=True, hide_index=True)
             st.caption("ANOVA (значимость регрессии в целом, F-тест):")
@@ -4474,7 +4506,7 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
                          use_container_width=True, hide_index=True)
             rank = pd.DataFrame(rep["component_ranking"])
             if not rank.empty and "importance" in rank.columns:
-                st.caption("Важность компонентов (ARD, 0…1):")
+                st.caption("Важность компонентов (0…1):")
                 st.bar_chart(rank.set_index("component")["importance"])
             st.caption(f"Значимых термов (p < {rep['alpha']}): "
                        f"{rep['n_significant']}.")
@@ -4608,7 +4640,7 @@ def _render_workspace_body(ctrl: Optional["cv.CampaignController"], key: str, *,
     if ctrl is None:
         st.info("Соберите проект на закладке «🌱 Старт» (форма «🆕 Новый "
                 "проект») или создайте демо-проект — кнопка «🧪 Демо» в "
-                "заголовке (синтетический оракул {A,B,C}×{T,P}).")
+                "заголовке (тестовый симулятор {A,B,C}×{T,P}).")
         return
     if key == "base":
         publish_ui_focus("base")
@@ -4659,10 +4691,10 @@ def render_campaign(*, overview_renderer: Optional[Any] = None,
     # P0: демо-проект — с явным подтверждением, если кампания уже есть
     # (раньше кнопка молча ЗАТИРАЛА текущую кампанию одним кликом).
     with _demo_box:
-        st.caption("Демо-проект (синтетический оракул {A,B,C}×{T,P}) — готовый "
-                   "проект для знакомства с интерфейсом: общий пул + "
-                   "две контрастные ветки (premium: ρ=PRICE_INPUT, канал живой; "
-                   "rho_focus: ρ=OPTIMIZED, канал занулён).")
+        st.caption("Демо-проект (тестовый симулятор {A,B,C}×{T,P}) — готовый "
+                   "проект для знакомства с интерфейсом: заполненная база "
+                   "опытов + две контрастные ветки (premium: ρ=PRICE_INPUT, "
+                   "канал живой; rho_focus: ρ=OPTIMIZED, канал занулён).")
         if _ctrl_now is not None:
             st.warning("Проект уже есть в сессии: создание демо ЗАМЕНИТ его. "
                        "Несохранённые изменения пропадут — сначала сохраните "
@@ -4674,7 +4706,7 @@ def render_campaign(*, overview_renderer: Optional[Any] = None,
             demo_ok = True
         if st.button("🧬 Создать / сбросить демо-проект", key="camp_create",
                      disabled=not demo_ok):
-            with st.spinner("Сборка демо-проекта (общий пул + 2 ветки)…"):
+            with st.spinner("Сборка демо-проекта (база опытов + 2 ветки)…"):
                 runner = build_demo_campaign_runner()
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
             _flash("Демо-проект создан: ветки **premium** (ρ=PRICE_INPUT, "
@@ -4736,8 +4768,9 @@ def render_start_panel(ctrl: Optional["cv.CampaignController"], *,
     if len(runner.points) == 0:
         render_seed_entry(ctrl)
         return
-    st.success(f"Стартовый дизайн измерен: общая база = {len(runner.points)} "
-               "точек, суррогаты обучены (И-1). Дальше — закладка «🌿 Ветки».")
+    st.success(f"Стартовый план измерен: общая база = {len(runner.points)} "
+               "точек, модели свойств обучены (И-1). Дальше — закладка "
+               "«🌿 Ветки».")
     _blk = base_blocking_caption(runner)
     if _blk:
         st.caption(_blk)
@@ -4787,8 +4820,9 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
         st.caption(
             "Опечатку/ошибку ВВОДА отклика можно исправить: правятся только "
             "значения откликов, состав и «№ опыта» сохраняются (И-1 — история не "
-            "урезается и не переупорядочивается). После сохранения суррогаты "
-            "переобучаются, ветки переоцениваются. Координаты не редактируются.")
+            "урезается и не переупорядочивается). После сохранения модели "
+            "свойств переобучаются, ветки пересчитываются. Координаты не "
+            "редактируются.")
         props_corr = list(runner.property_names)
         edit_df = measured_responses_editor_df(runner)
         edited_corr = st.data_editor(
@@ -4811,8 +4845,8 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
                         n_fixed += 1
                 if n_fixed:
                     _invalidate_branch_caches()
-                    _flash(f"Исправлено опытов: {n_fixed}. Суррогаты "
-                           "переобучены, ветки переоценены (И-1).")
+                    _flash(f"Исправлено опытов: {n_fixed}. Модели свойств "
+                           "переобучены, ветки пересчитаны (И-1).")
                     st.rerun()
                 else:
                     st.info("Изменений не обнаружено — редактировать нечего.")
@@ -4823,19 +4857,21 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
     # значения можно внести/исправить и ПОСЛЕ фиксации точки (телеметрия
     # снимается на прогоне и часто вносится позже откликов лаборатории).
     if list(getattr(runner, "covariate_names", []) or []):
-        with st.expander("📈 Ковариаты базы — телеметрия прогона (P3.1)"):
+        with st.expander("📈 Условия прогона — дополнительные показания "
+                         "(ковариаты, P3.1)"):
             st.caption(
-                "Столбцы базы, НЕ отклики модели: телеметрия (SME, "
-                "Die_Pressure, торк…) в суррогаты не входит и желательности "
-                "не несёт, но объясняет условия прогона за точкой. Пустая "
-                "ячейка = «не снята» (допустимо); суррогаты при сохранении "
-                "НЕ переобучаются — координаты и Y не меняются (И-1).")
+                "Столбцы базы, которые НЕ являются откликами модели: показания "
+                "прогона (SME, Die_Pressure, торк…) в модели свойств не входят "
+                "и в цели не участвуют, но объясняют, при каких условиях "
+                "получена точка. Пустая ячейка = «не снято» (допустимо); при "
+                "сохранении модели НЕ переобучаются — координаты и отклики не "
+                "меняются (И-1).")
             cov_names_base = list(runner.covariate_names)
             cov_df = covariates_editor_df(runner)
             edited_cov = st.data_editor(
                 cov_df, use_container_width=True, hide_index=True,
                 disabled=["№ опыта", "источник"], key="camp_cov_editor")
-            if st.button("💾 Сохранить ковариаты", key="camp_cov_save"):
+            if st.button("💾 Сохранить условия прогона", key="camp_cov_save"):
                 try:
                     n_upd = 0
                     for ridx in range(len(edited_cov)):
@@ -4854,8 +4890,9 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
                             ctrl.set_point_covariates(ridx, changes)
                             n_upd += 1
                     if n_upd:
-                        _flash(f"Ковариаты обновлены у {n_upd} опытов "
-                               "(координаты/Y/суррогаты не тронуты, P3.1).")
+                        _flash(f"Условия прогона обновлены у {n_upd} опытов "
+                               "(координаты, отклики и модели не тронуты, "
+                               "P3.1).")
                         st.rerun()
                     else:
                         st.info("Изменений не обнаружено.")
@@ -4879,7 +4916,7 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
 
     bids = list(runner.branches)
     if not bids:
-        st.info("Стартовый дизайн измерен, суррогаты обучены (общая база = "
+        st.info("Стартовый план измерен, модели свойств обучены (общая база = "
                 f"{len(runner.points)} точек). Создайте ветку в форме "
                 "«➕ Создать ветку вручную» выше (Ш4, §17.5).")
         publish_ui_focus("branch")
@@ -4904,8 +4941,9 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
         return labels.get(str(bid), str(bid))
 
     rep = ctrl.role_report(bsel)
-    st.caption(f"Линза ветки: **{rep['branch_name']}** (`{bsel}`). Role-tag "
-               "валиден ТОЛЬКО в этом контексте; смена ветки меняет теги.")
+    st.caption(f"Выбрана ветка **{rep['branch_name']}** (`{bsel}`). Роли "
+               "откликов действуют ТОЛЬКО внутри этой ветки; при переходе на "
+               "другую ветку роли будут другими.")
     st.dataframe(role_table_dataframe(rep), use_container_width=True)
 
     with st.expander("💰 Почему за ρ есть/нет денег (§16.1)"):
@@ -4933,8 +4971,9 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
             "Ветка — это НАБОР целей: несколько откликов, каждый со своим видом "
             "(min/max/target), диапазоном и весом (снято ограничение «одна ветка — "
             "одна цель»). Цель над откликом делает его роль OPTIMIZED (§16.0); "
-            "удаление ПОСЛЕДНЕЙ цели запрещено — ветке нужен объектив. Правки "
-            "обратимы (undo, §7) и НЕ трогают измеренную правду (И-1).")
+            "удаление ПОСЛЕДНЕЙ цели запрещено — ветке нужна хотя бы одна цель. "
+            "Правки можно отменить (кнопка «Отменить последнюю настройку», §7); "
+            "измеренные данные они не меняют (И-1).")
         st.dataframe(goal_editor_dataframe(runner, bsel), use_container_width=True)
 
         st.markdown("**➕/✏️ Задать или заменить цель над откликом**")
@@ -5068,41 +5107,46 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
 
-    # --- undo (§7) + прогон раунда (запечатывает дно) -------------------
+    # --- отмена настройки (§7) + прогон раунда (закрывает отмену) -------
     cu = st.columns(2)
     if ctrl.can_undo():
-        if cu[0].button("↩️ Undo последней настройки (§7)", key="camp_undo"):
+        if cu[0].button("↩️ Отменить последнюю настройку (§7)", key="camp_undo"):
             u = ctrl.undo()
             _invalidate_branch_caches()
-            _flash(f"Откат «{u['undone']}» ветки {u['branch_id']} "
-                   f"(undo_available={u['undo_available']}).", kind="info")
+            _flash(f"Отменено «{u['undone']}» в ветке {u['branch_id']} "
+                   f"(можно отменить ещё: {u['undo_available']}).", kind="info")
             st.rerun()
     else:
-        cu[0].caption("Undo пуст: дно — последний снятый раунд (И-1).")
-    # P0: авто-раунд зовёт оракул раннера; в РУЧНОЙ кампании (ManualOracle) это
+        cu[0].caption("Отменять нечего: настройки после последнего измерения не "
+                      "менялись (измеренные данные не отменяются, И-1).")
+    # P0: авто-раунд зовёт симулятор движка; в РУЧНОМ проекте (ManualOracle) это
     # записало бы в реальную базу СИНТЕТИЧЕСКИЕ Y — кнопка скрыта (A0.6).
     if is_manual_campaign(runner):
-        cu[1].caption("Авто-прогон раунда недоступен: отклики этого проекта "
+        cu[1].caption("Автоматический раунд недоступен: отклики этого проекта "
                       "вносятся ВРУЧНУЮ — используйте «🛠 Рабочий стол ветки» "
-                      "выше (предложить → внести Y → долить).")
-    elif cu[1].button("▶ Прогнать раунд ветки (демо-оракул; запечатает undo, "
-                      "Тр-7.2/7.3)", key="camp_run_round"):
+                      "выше (предложить точки → внести отклики → добавить в "
+                      "базу).")
+    elif cu[1].button("▶ Прогнать раунд ветки (тестовый симулятор; после этого "
+                      "настройки уже не отменить, Тр-7.2/7.3)",
+                      key="camp_run_round"):
         try:
             ctrl.run_round(bsel, n_points=2, explore_frac=0.2, n_candidates=150)
             _invalidate_branch_caches()
-            _flash("Раунд снят: новые измерения в общей базе, дно undo "
-                   "обновлено.")
+            _flash("Раунд выполнен: новые измерения добавлены в общую базу, "
+                   "прежние настройки отменить уже нельзя.")
             st.rerun()
         except (ValueError, KeyError, RuntimeError) as exc:
             st.error(str(exc))
 
-    # --- spawn ветки (§8) с наследованием ролей -------------------------
-    st.markdown("**🌱 Spawn ветки (§8) — наследование ролей + review-сводка**")
+    # --- дочерняя ветка (§8) с наследованием ролей ----------------------
+    st.markdown("**🌱 Создать дочернюю ветку (§8) — наследование ролей + "
+                "сводка изменений**")
     # NB: локальная переменная НЕ «cs» — иначе затеняется модуль campaign_state.
     spc = st.columns([2, 2, 2])
-    parent = spc[0].selectbox("Родитель", bids, key="camp_spawn_parent",
+    parent = spc[0].selectbox("Исходная ветка", bids, key="camp_spawn_parent",
                               format_func=_branch_label)
-    cname = spc[1].text_input("Имя ребёнка", value="child", key="camp_spawn_name")
+    cname = spc[1].text_input("Имя дочерней ветки", value="child",
+                              key="camp_spawn_name")
     over = spc[2].checkbox("новая цель над ρ (перебьёт роль, Тр-8.1в)",
                            key="camp_spawn_over")
     prho = _rho_of(runner, parent)
@@ -5114,9 +5158,9 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
         rev = ctrl.preview_spawn(parent, new_goals=new_goals)
         st.dataframe(spawn_review_dataframe(rev), use_container_width=True)
         if rev["any_role_changed_by_objective"]:
-            st.warning("Объектив ветки перебил унаследованную роль ρ — канал "
+            st.warning("Новая цель ветки перебила унаследованную роль ρ — канал "
                        "цены будет занулён (И-5).")
-    if st.button("🌱 Создать ветку (spawn)", key="camp_do_spawn"):
+    if st.button("🌱 Создать дочернюю ветку", key="camp_do_spawn"):
         try:
             cid = f"{parent}_child{len(bids)}"
             res = ctrl.spawn_branch(parent, cname, child_id=cid,
@@ -5132,6 +5176,6 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
         except (ValueError, KeyError) as exc:
             st.error(str(exc))
     if st.session_state.get("camp_spawn_last") is not None:
-        st.caption("Review-сводка наследования ролей последнего spawn:")
+        st.caption("Сводка наследования ролей последней дочерней ветки:")
         st.dataframe(spawn_review_dataframe(st.session_state["camp_spawn_last"]),
                      use_container_width=True)

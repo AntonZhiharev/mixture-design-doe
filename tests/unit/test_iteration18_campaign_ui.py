@@ -58,7 +58,8 @@ def test_spawn_review_dataframe_marks_objective_override():
         "premium", new_goals={"rho": DesirabilitySpec("min", low=0.5, high=1.5)})
     df = spawn_review_dataframe(rev)
     rho_row = df[df["отклик"] == "rho"].iloc[0]
-    assert rho_row["изменение"] == "изменено объективом ветки"
+    # iter74: подпись в таблице — «изменено новой целью ветки» (без «объектива»).
+    assert rho_row["изменение"] == "изменено новой целью ветки"
     assert "ZEROED" in rho_row["ден. канал ρ (ребёнок)"]
 
 

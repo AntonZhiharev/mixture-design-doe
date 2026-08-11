@@ -50,9 +50,11 @@ def test_campaign_assistant_reply_uses_campaign_prompt(monkeypatch):
     out = ai.campaign_assistant_reply(overview, [], "что делать дальше?")
     assert out == "ответ"
 
-    # системный промпт — КАМПАНИЯ, а не M1…M8
+    # системный промпт — поток ПРОЕКТА (§17), а не стадии M1…M8.
+    # iter74: слово «кампания» в тексте для пользователя заменено на «проект»
+    # (язык интерфейса), смысл проверки тот же — промпт campaign-native.
     sys_msg = captured["messages"][0]["content"]
-    assert "КАМПАНИЯ" in sys_msg
+    assert "ПРОЕКТ (§17)" in sys_msg
     assert "M1" not in sys_msg or "M1…M8" in sys_msg  # M1…M8 лишь в отрицании
 
     # контекст — campaign-native (mode=campaign, есть ветки/база)

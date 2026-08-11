@@ -620,12 +620,14 @@ class TestJournalAndPersistence:
         sid = _stage(ctx)
         cap = spec_apply_caption(actx.human_apply_spec(ctx, sid))
         assert "впервые" in cap
-        assert "гейты неприменимы" in cap
+        # iter74: подпись говорит «проверки неприменимы» (без слова «гейты»).
+        assert "проверки неприменимы" in cap
 
     def test_session_caption_counts_packages(self):
         ctx = _ctx()
         _stage(ctx)
-        assert "пакетов спеки в стейдже: 1" in session_caption(ctx.session)
+        # iter74: подпись сессии говорит «ждёт применения», а не «в стейдже».
+        assert "пакетов спеки ждёт применения: 1" in session_caption(ctx.session)
 
     def test_dock_panel_renders_and_offers_both_buttons(self, monkeypatch):
         """Панель дока действительно рисуется и предлагает ОБЕ кнопки.

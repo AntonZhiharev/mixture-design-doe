@@ -4,7 +4,7 @@
 лежит в git; единственное, что НЕ хранится в репозитории — локальная регистрация
 MCP-сервера в настройках Cline (она машинно-зависимая). Ниже — как всё поднять.
 
-## 0. Какой сервер актуален (состояние на 09.08.2026)
+## 0. Какой сервер актуален (состояние на 11.08.2026)
 
 | Сервер | Что отдаёт | Статус |
 |---|---|---|
@@ -18,6 +18,13 @@ pipeline-потока) и в кампанийном потоке не нужен
 если вернулись к разбору прогонов `run_iteration7_demo.py` / benchmark.
 Два включённых сервера с похожими именами — источник путаницы, поэтому
 легаси держим выключенным, а не удалённым.
+
+Проверить фактическое состояние (какой файл настроек живой и что в нём):
+```powershell
+.venv\Scripts\python.exe tools\check_mcp_settings.py
+```
+Скрипт печатает ОБА хранилища настроек Cline и возвращает код 1, если канон
+нарушен. **Важно:** в Cline 4.1.x путь к настройкам ДРУГОЙ, чем в 3.x — см. §5.
 
 
 ## 1. Клонирование и окружение
@@ -60,12 +67,35 @@ MCP-сервер `doe-introspect` читает сохранённые прого
 ```
 Должен напечатать `TRACE_ROOT` и список прогонов. Если пусто — сначала шаг 3.
 
-## 5. Регистрация `doe-introspect` в Cline — ЛЕГАСИ (по умолчанию выключен)
-Открой настройки MCP Cline (файл `cline_mcp_settings.json`):
+## 5. Где лежит `cline_mcp_settings.json` (ВАЖНО: путь зависит от версии Cline)
+
+> **Грабли, пойманные 11.08.2026.** Cline **4.1.x** перенёс хранилище настроек
+> MCP из `globalStorage` расширения в домашний каталог и сменил СХЕМУ (поля
+> `command`/`args`/`env` теперь вложены в блок `transport`). При обновлении
+> расширение мигрирует конфиг ОДИН раз; после этого правки старого файла в
+> `globalStorage` **ни на что не влияют** — Cline их больше не читает.
+> Симптом: в чате доступен старый набор инструментов (например,
+> легаси `list_runs` вместо кампанийных `get_spec`/`preflight`), хотя в старом
+> файле всё «правильно». Проверять — по фактически запущенному процессу:
+> `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Select-Object CommandLine`.
+
+Актуальное (авторитетное) хранилище — **Cline 4.1.x и новее**:
+
+- Windows: `%USERPROFILE%\.cline\data\settings\cline_mcp_settings.json`
+- macOS/Linux: `~/.cline/data/settings/cline_mcp_settings.json`
+
+Легаси-хранилище — **Cline 3.x** (оставлено для истории; новыми версиями не читается):
 
 - Windows: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
 - macOS: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
 - Linux: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+
+Не уверен, какой файл живой — правь оба (они не конфликтуют) и сверься
+скриптом из §7. После сохранения нужен **реконнект MCP** (кнопка в панели
+Cline) или перезапуск VS Code: набор инструментов в уже открытой сессии сам
+не обновится.
+
+### Регистрация `doe-introspect` — ЛЕГАСИ (по умолчанию выключен)
 
 Добавь сервер (замени `<REPO>` на абсолютный путь к клонированному репозиторию):
 ```json
@@ -157,9 +187,52 @@ $env:DOE_TRACE_ROOT = "<REPO>\project_demo\trace"  # тот же, что у MCP-
 $env:DOE_CAMPAIGN_ROOT = "<REPO>\project_campaigns"
 .venv\Scripts\python.exe src/mcp/campaign_server.py --selftest
 ```
-Регистрация в `cline_mcp_settings.json` (путь к файлу — см. §5). Это и есть
-рабочая конфигурация текущей машины; легаси-сервер лежит рядом с
-`"disabled": true`:
+Регистрация в `cline_mcp_settings.json` (путь к файлу — см. §5, он зависит от
+версии Cline!). Это и есть рабочая конфигурация текущей машины; легаси-сервер
+лежит рядом с `"disabled": true`.
+
+**Формат Cline 4.1.x** (транспорт вынесен в блок `transport`) — актуальный:
+
+```json
+{
+  "mcpServers": {
+    "doe-campaign": {
+      "transport": {
+        "type": "stdio",
+        "command": "C:\\Users\\anton\\Documents\\DOE\\.venv\\Scripts\\python.exe",
+        "args": ["C:\\Users\\anton\\Documents\\DOE\\src\\mcp\\campaign_server.py"],
+        "env": {
+          "DOE_CAMPAIGN_ROOT": "C:\\Users\\anton\\Documents\\DOE\\project_campaigns",
+          "PYTHONPATH": "C:\\Users\\anton\\Documents\\DOE",
+          "PYTHONIOENCODING": "utf-8"
+        }
+      },
+      "disabled": false,
+      "autoApprove": [],
+      "timeout": 60
+    },
+    "doe-introspect": {
+      "transport": {
+        "type": "stdio",
+        "command": "C:\\Users\\anton\\Documents\\DOE\\.venv\\Scripts\\python.exe",
+        "args": ["C:\\Users\\anton\\Documents\\DOE\\src\\mcp\\introspect_server.py"],
+        "env": {
+          "DOE_TRACE_ROOT": "C:\\Users\\anton\\Documents\\DOE\\project_demo\\trace",
+          "PYTHONPATH": "C:\\Users\\anton\\Documents\\DOE",
+          "PYTHONIOENCODING": "utf-8"
+        }
+      },
+      "disabled": true,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+`PYTHONIOENCODING=utf-8` обязателен на Windows: диагностика серверов пишется
+по-русски, без него stdio-канал ломается на cp1251.
+
+**Формат Cline 3.x** (легаси, плоские поля — если у тебя старое расширение):
 
 ```json
 {
@@ -177,6 +250,15 @@ $env:DOE_CAMPAIGN_ROOT = "<REPO>\project_campaigns"
   }
 }
 ```
+
+Сверить, что Cline видит именно то, что нужно (печатает оба хранилища и
+состояние `disabled` по каждому серверу):
+```powershell
+.venv\Scripts\python.exe tools\check_mcp_settings.py
+```
+Ожидаемый вывод: `doe-campaign` — вкл, `doe-introspect` — ВЫКЛ. Если в
+НОВОМ хранилище `doe-campaign` отсутствует, а легаси включён — ты правил
+не тот файл (см. врезку в §5).
 Каталог проектов по умолчанию — `<repo>/project_campaigns` (тот же, что у
 приложения), переопределяется `DOE_CAMPAIGN_ROOT`. Проекты создаются
 сохранением кампании в интерфейсе; проект без `campaign.json` честно
@@ -192,3 +274,5 @@ $env:DOE_CAMPAIGN_ROOT = "<REPO>\project_campaigns"
 - `docs/FinalCheckList.md` + `docs/FinalCheckList_audit.md` — чек-лист и статус по блокам.
 - `.clinerules` — правила работы и синхронизации с git в каждой сессии.
 - `docs/ASSISTANT_SPEC.md` — слой ассистента (iter58–iter66) и MCP-контракт.
+- `tools/check_mcp_settings.py` — сверка настроек Cline с каноном §0
+  (оба хранилища, обе схемы записи).

@@ -21,8 +21,20 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Iterable
+
+# Диагностика печатается по-русски, поэтому stdout принудительно в UTF-8: иначе
+# при перенаправлении в файл Python берёт кодировку локали (на этой машине
+# cp1251) и падает/портит текст.
+#
+# ВНИМАНИЕ (проверено): если гнать вывод через ПАЙП PowerShell
+# (``... | Select-Object -Last 12``), кириллица всё равно превращается в
+# мохибейк — это декодирование на стороне PowerShell, а не кодировка Python.
+# Лечится в оболочке: ``[Console]::OutputEncoding =
+# [Text.Encoding]::UTF8``. Проще запускать скрипт БЕЗ пайпа — вывод короткий.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ----------------------------------------------------------------------
 # Пути к хранилищам настроек

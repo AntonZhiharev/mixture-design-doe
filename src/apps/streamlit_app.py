@@ -22,7 +22,8 @@ Salvage перенесён на C1–C3 и подключён здесь:
   * C1 — ИИ-ассистент campaign-native (``assistant.campaign_assistant_reply`` +
     ``build_campaign_context``), закладка «🤖 Обзор» рабочей области;
   * C2 — персистентность кампании (``campaign_state.save/load/list/delete``),
-    сайдбар «📁 Кампания» (+ удаление под паролём администратора);
+    панель «📁 Проект» на закладке «🌱 Старт» (iter72: сайдбар упразднён;
+    + удаление под паролём администратора);
   * C3 — выгрузка общей базы/рецепта ветки в Excel живёт внутри ``render_campaign``.
 
 Запуск:
@@ -62,7 +63,7 @@ CAMPAIGN_ROOT = os.path.join(_REPO, "project_campaigns")
 
 
 # ----------------------------------------------------------------------
-# Сайдбар: персистентность проекта (C2, §17.6.1)
+# Панель «📁 Проект»: персистентность (C2, §17.6.1; iter72 — закладка «Старт»)
 # ----------------------------------------------------------------------
 def _seed_draft_from_session() -> Optional[Dict[str, Any]]:
     """Черновик стартового дизайна из session_state → JSON-native словарь.
@@ -97,10 +98,12 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
     """Восстановить черновик seed в session_state (обратное к сбору выше).
 
     Возвращает True, если черновик был и восстановлен. Ключ виджета-редактора
-    Y сбрасывается, чтобы data_editor не наложил старые правки ячеек; сайдбар
-    рендерится ДО редактора, поэтому чистить ключ здесь безопасно. Размер
-    пробы (``seed_batch``) восстанавливается в ключ виджета — сайдбар идёт
-    раньше number_input, менять session_state ещё можно."""
+    Y сбрасывается, чтобы data_editor не наложил старые правки ячеек; панель
+    «📁 Проект» рендерится ДО редактора (обе на закладке «Старт», панель
+    первой), а успех загрузки завершается ``st.rerun`` — чистить ключи здесь
+    безопасно. Размер пробы (``seed_batch``) восстанавливается в ключ виджета
+    аналогично: панель идёт раньше number_input, менять session_state ещё
+    можно."""
     for k in ("setup_seed_X", "setup_seed_Y", "setup_seed_editor",
               "setup_seed_batch", "setup_seed_df", "setup_seed_df_sig"):
         st.session_state.pop(k, None)
@@ -122,40 +125,41 @@ def render_campaign_persistence(root: str) -> None:
     Опирается на C2 (``campaign_state``): одна модель физики на проект,
     суррогаты НЕ сохраняются (переобучаются из измеренных точек при загрузке);
     незафиксированный стартовый дизайн сохраняется черновиком (``draft``).
+
+    iter72: панель живёт на закладке «🌱 Старт» рабочей области (обычные
+    виджеты, не ``st.sidebar``) — сайдбар упразднён, левая колонка целиком
+    отдана ассистенту (эскиз пользователя).
     """
-    st.sidebar.header("📁 Проект")
+    st.markdown("#### 📁 Проект")
+    # Имя проекта живёт как состояние ПРИЛОЖЕНИЯ (пин в main()): виджет ниже
+    # рисуется только на закладке «Старт», и без пина Streamlit удалял бы ключ
+    # на других закладках — а от него зависит сессия ассистента.
     st.session_state.setdefault("campaign_name", "my_project")
-    # Отложенное имя (выставляется при загрузке проекта): применяем ДО
-    # инстанцирования виджета text_input — Streamlit запрещает менять
-    # session_state ключа виджета после его создания в том же прогоне.
-    pending = st.session_state.pop("campaign_name_pending", None)
-    if pending:
-        st.session_state["campaign_name"] = pending
     ctrl = get_campaign_controller()
 
-    name = st.sidebar.text_input("Имя проекта", key="campaign_name")
-    if st.sidebar.button("💾 Сохранить проект", key="save_campaign"):
+    name = st.text_input("Имя проекта", key="campaign_name")
+    if st.button("💾 Сохранить проект", key="save_campaign"):
         if ctrl is None:
-            st.sidebar.error("Проект ещё не собран — соберите его во "
-                             "вкладке «🧬 Проект» или создайте демо-проект.")
+            st.error("Проект ещё не собран — соберите его в форме "
+                     "«🆕 Новый проект» ниже или создайте демо-проект.")
         else:
             try:
                 path = cs.save_campaign(ctrl.runner, root, name,
                                         draft=_seed_draft_from_session())
-                st.sidebar.success(f"Проект сохранён: {Path(path).parent.name}")
+                st.success(f"Проект сохранён: {Path(path).parent.name}")
             except Exception as exc:  # noqa: BLE001
-                st.sidebar.error(f"Не удалось сохранить: {exc}")
+                st.error(f"Не удалось сохранить: {exc}")
 
     camps = cs.list_campaigns(root)
-    sel = st.sidebar.selectbox("Открыть сохранённый проект",
-                               ["— нет —"] + camps, key="campaign_select")
-    if st.sidebar.button("📂 Загрузить проект", key="load_campaign") \
+    sel = st.selectbox("Открыть сохранённый проект",
+                       ["— нет —"] + camps, key="campaign_select")
+    if st.button("📂 Загрузить проект", key="load_campaign") \
             and sel != "— нет —":
         try:
             runner = cs.load_campaign(root, sel)
             draft = cs.load_campaign_draft(root, sel)
         except Exception as exc:  # noqa: BLE001
-            st.sidebar.error(f"Не удалось загрузить '{sel}': {exc}")
+            st.error(f"Не удалось загрузить '{sel}': {exc}")
         else:
             # Успех — st.rerun() ВНЕ try: RerunException наследует Exception,
             # иначе управляющий сигнал перерисовки был бы проглочен except'ом
@@ -177,7 +181,7 @@ def render_campaign_persistence(root: str) -> None:
             st.rerun()
 
     if st.session_state.get("camp_loaded_msg"):
-        st.sidebar.success(st.session_state.pop("camp_loaded_msg"))
+        st.success(st.session_state.pop("camp_loaded_msg"))
 
 
 def render_campaign_deleter(root: str) -> None:
@@ -185,8 +189,9 @@ def render_campaign_deleter(root: str) -> None:
 
     Барьер от случайного удаления (не криптозащита): нужны выбор проекта,
     подтверждение имени и admin-пароль (env ``DOE_ADMIN_PASSWORD``).
+    iter72: живёт на закладке «🌱 Старт» (сайдбар упразднён).
     """
-    with st.sidebar.expander("🗑 Удалить проект (admin)", expanded=False):
+    with st.expander("🗑 Удалить проект (admin)", expanded=False):
         if st.session_state.get("camp_del_msg"):
             st.success(st.session_state.pop("camp_del_msg"))
         camps = cs.list_campaigns(root)
@@ -281,8 +286,8 @@ def render_campaign_assistant() -> None:
         st.json(ai.build_campaign_context(overview or {}))
 
     if overview is None:
-        st.info("Проект ещё не собран — соберите его во вкладке "
-                "«🧬 Проект» (или создайте демо-проект), чтобы ассистент "
+        st.info("Проект ещё не собран — соберите его на закладке "
+                "«🌱 Старт» (или создайте демо-проект), чтобы ассистент "
                 "видел реальное состояние: ветки, роли, денежный канал ρ.")
 
     if not ai.llm_available():
@@ -336,24 +341,42 @@ def main():
                "двигается), справа — постоянная инфо-панель: вложения, выхлоп "
                "песочницы, состояние сессии.")
 
-    render_campaign_persistence(CAMPAIGN_ROOT)   # 📁 сохранить/загрузить проект
-    render_campaign_deleter(CAMPAIGN_ROOT)       # 🗑 удалить проект (под паролём)
+    # iter72: имя проекта — состояние ПРИЛОЖЕНИЯ, а не только виджета.
+    # Виджет «Имя проекта» рисуется лишь на закладке «Старт»; когда открыта
+    # другая закладка, Streamlit удаляет ключи неотрисованных виджетов — а от
+    # `campaign_name` зависят сохранение проекта и СЕССИЯ АССИСТЕНТА
+    # (`assistant_dock.current_project`). Пин (само-присваивание) переводит
+    # ключ в app-state и переживает любые закладки. Отложенное имя
+    # (`campaign_name_pending`, выставляет загрузчик) применяется тоже здесь —
+    # ДО инстанцирования любого виджета с этим ключом.
+    st.session_state.setdefault("campaign_name", "my_project")
+    _pending_name = st.session_state.pop("campaign_name_pending", None)
+    st.session_state["campaign_name"] = (
+        _pending_name if _pending_name else st.session_state["campaign_name"])
 
     # iter72: раскладка по эскизу — ТРИ зоны: ДИАЛОГ слева (ассистент —
     # инструмент взаимодействия с программой), РАБОЧАЯ ОБЛАСТЬ в центре
     # (закладки), ИНФО-ПАНЕЛЬ справа (вложения, выхлоп песочницы, состояние
-    # сессии — нужны постоянно на разных закладках).
+    # сессии — нужны постоянно на разных закладках). Сайдбар упразднён:
+    # персистентность проекта (сохранить/загрузить/удалить) переехала на
+    # закладку «🌱 Старт» через project_renderer (аргументом — чтобы поток
+    # не импортировал приложение, иначе цикл импорта).
     #
     # Порядок рендера обратный порядку колонок: рабочая область рисуется ПЕРВОЙ,
     # потому что именно она публикует `ui_focus` (активная закладка, ветка), из
     # которого диалог берёт контекст «по месту» (iter65). Streamlit это
     # позволяет: содержимое колонки пишется в её контейнер, а не по порядку
     # вызовов на странице.
+    def _project_panel() -> None:
+        render_campaign_persistence(CAMPAIGN_ROOT)   # 📁 сохранить/загрузить
+        render_campaign_deleter(CAMPAIGN_ROOT)       # 🗑 удалить (под паролём)
+
     dock_col, work_col, info_col = st.columns(list(wsx.MAIN_COLUMNS))
     with work_col:
         # Обзор ассистента — закладка рабочей области, а не отдельная вкладка
         # верхнего уровня: иначе «💬 Ассистент (обзор)» уводил с проекта целиком.
-        render_campaign(overview_renderer=render_campaign_assistant)
+        render_campaign(overview_renderer=render_campaign_assistant,
+                        project_renderer=_project_panel)
     ctrl_now = get_campaign_controller()
     runner_now = getattr(ctrl_now, "runner", None) if ctrl_now else None
     with dock_col:

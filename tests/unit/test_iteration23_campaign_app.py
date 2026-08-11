@@ -144,11 +144,14 @@ def test_campaign_save_and_load_roundtrip():
         ctrl = _serializable_ctrl()
         n_pts = len(ctrl.runner.points)
 
-        # инъектируем готовую кампанию в сессию приложения и сохраняем (сайдбар)
+        # инъектируем готовую кампанию в сессию приложения и сохраняем
+        # (iter72: панель «📁 Проект» живёт на закладке «🌱 Старт», а проект
+        # с ветками открывается на «🌿 Ветки» — переходим на «Старт» явно)
         at = AppTest.from_file(APP, default_timeout=300)
         at.session_state["campaign_ctrl"] = ctrl
         at.run()
         assert not at.exception
+        _click(at, "ws_tab_start")
         at.text_input(key="campaign_name").set_value(name).run()
         _click(at, "save_campaign")
         assert not at.exception

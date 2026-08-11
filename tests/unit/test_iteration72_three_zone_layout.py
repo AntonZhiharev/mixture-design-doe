@@ -114,3 +114,31 @@ def test_info_panel_survives_demo_project():
     keys = {w.key for w in at.button}
     assert "dock_clear" in keys
     assert any(w.key == "dock_input" for w in at.chat_input)
+
+
+def test_project_entry_lives_on_start_tab_not_sidebar():
+    """Сетап и персистентность проекта — на закладке «🌱 Старт», сайдбар пуст.
+
+    Концепция iter72: самая левая область целиком у ассистента, у «Проекта»
+    своя первая закладка рабочей области. Пустая сессия открывается сразу на
+    ней — там форма «🆕 Новый проект» (`setup_build`), панель «📁 Проект»
+    (`save_campaign`/`load_campaign`) и удаление (admin).
+    """
+    at = AppTest.from_file(APP, default_timeout=300).run()
+    assert not at.exception
+    # дефолтная закладка пустой сессии — «Старт» (вход в проект)
+    assert at.session_state["ws_tab"] == "start"
+    keys = {w.key for w in at.button}
+    assert "setup_build" in keys, "форма сетапа не на «Старте»"
+    assert "save_campaign" in keys and "load_campaign" in keys, \
+        "панель «📁 Проект» не на «Старте»"
+    # сайдбар упразднён: в нём не осталось ни одного виджета
+    assert not at.sidebar.button, "в сайдбаре остались кнопки"
+    assert not at.sidebar.text_input, "в сайдбаре остались поля ввода"
+    # уйдя на «Обзор», человек теряет форму сетапа с экрана (она не дублируется)
+    tab = [w for w in at.button if w.key == "ws_tab_overview"]
+    tab[0].click().run()
+    assert not at.exception
+    assert "setup_build" not in {w.key for w in at.button}
+    # имя проекта — состояние приложения: переживает уход с закладки «Старт»
+    assert at.session_state["campaign_name"] == "my_project"

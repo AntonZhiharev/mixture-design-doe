@@ -47,10 +47,11 @@ def test_tabs_are_visible_but_disabled_without_project():
     states = ws.tab_states(has_project=False)
     assert [s.key for s in states] == [t.key for t in ws.WORKSPACE_TABS]
     off = {s.key: s.why for s in states if not s.enabled}
-    assert "start" in off and "branches" in off
+    assert "branches" in off
     assert all(w for w in off.values()), "у выключенной закладки нет причины"
-    # обзор доступен всегда: он не требует состояния проекта
-    assert ws.enabled_keys(has_project=False) == ["overview"]
+    # iter72: «Старт» доступен всегда — там сетап и загрузка проекта (вход);
+    # «Обзор» тоже не требует состояния проекта.
+    assert ws.enabled_keys(has_project=False) == ["start", "overview"]
 
 
 def test_points_gate_opens_base_branches_analysis_and_schema():
@@ -71,7 +72,9 @@ def test_gate_reason_distinguishes_no_project_from_no_points():
 
 
 def test_default_tab_follows_project_state():
-    assert ws.default_tab_key(has_project=False) == "overview"
+    # iter72: пустая сессия открывается на «Старте» — там собирают/загружают
+    # проект (раньше форма жила в сайдбаре и дефолтом был «Обзор»)
+    assert ws.default_tab_key(has_project=False) == "start"
     assert ws.default_tab_key(has_project=True, n_points=0) == "start"
     # seed измерен → человека интересует работа с ветками, а не сделанный seed
     assert ws.default_tab_key(has_project=True, n_points=8) == "branches"
@@ -132,7 +135,8 @@ def test_decide_tab_keeps_choice_inside_one_phase():
 def test_decide_tab_first_run_is_silent():
     """Первый прогон (фазы ещё не было) — просто дефолт, без уведомления."""
     d = ws.decide_tab(None, prev_phase=None, has_project=False)
-    assert d.key == "overview" and d.notice == ""
+    # iter72: дефолт пустой сессии — «Старт» (вход в проект), не «Обзор»
+    assert d.key == "start" and d.notice == ""
 
 
 # ======================================================================
@@ -284,9 +288,11 @@ def test_app_renders_tab_row_and_chat_input_together():
     keys = {w.key for w in at.button}
     # ряд закладок рабочей области (по кнопке на закладку)
     assert "ws_tab_overview" in keys
-    # проекта нет → закладки, требующие состояния, не нарисованы, но ЯВНО
-    # перечислены как недоступные (см. подпись «Пока недоступно: …»)
-    assert "ws_tab_start" not in keys
+    # iter72: «Старт» доступен и БЕЗ проекта (там сетап/загрузка — вход);
+    # закладки, требующие точек, не нарисованы, но ЯВНО перечислены как
+    # недоступные (см. подпись «Пока недоступно: …»)
+    assert "ws_tab_start" in keys
+    assert "ws_tab_base" not in keys
     assert any("Пока недоступно" in str(c.value) for c in at.caption)
     # поле ввода диалога — на той же странице, что и рабочая область
     assert at.chat_input, "поле ввода диалога не нарисовано"

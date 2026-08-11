@@ -3006,20 +3006,21 @@ def render_setup_form() -> None:
     ключом, что и демо-кампания (главный поток §17 — один движок). Реального
     оракула нет: стартовые отклики вносит пользователь в ручном seed-цикле ниже.
 
-    UX: форма живёт в ЛЕВОЙ панели (сайдбар) рядом с «📁 Проект» — основная
-    область не загромождается; кнопка «🏗 Построить проект» — ВНУТРИ формы
-    (это её submit: собирает раннер из введённых полей), поэтому не висит
-    отдельной сиротой на странице.
+    UX (iter72): форма живёт на закладке «🌱 Старт» рабочей области, рядом с
+    панелью «📁 Проект» — сайдбар упразднён, левая колонка целиком отдана
+    ассистенту (эскиз пользователя). Кнопка «🏗 Построить проект» — ВНУТРИ
+    формы (это её submit: собирает раннер из введённых полей), поэтому не
+    висит отдельной сиротой на странице.
     """
     # C2: отложенный префилл формы из ЗАГРУЖЕННОГО проекта — применяем ДО
-    # инстанцирования виджетов формы (ключ кладёт загрузчик в сайдбаре;
+    # инстанцирования виджетов формы (ключ кладёт загрузчик панели «📁 Проект»;
     # менять session_state виджета можно только до его создания в прогоне).
     _pending = st.session_state.pop("setup_prefill_pending", None)
     if _pending:
         for _k, _v in dict(_pending).items():
             st.session_state[_k] = _v
-    with st.sidebar.expander("🆕 Новый проект — реальный сетап (§17.4)",
-                             expanded=get_campaign_controller() is None):
+    with st.expander("🆕 Новый проект — реальный сетап (§17.4)",
+                     expanded=get_campaign_controller() is None):
         st.caption(
             "Составная область СРАЗУ: симплекс компонентов смеси (Σ=1) × куб "
             "процесс-параметров (реальные единицы). Отклики (свойства) меряются "
@@ -4514,7 +4515,8 @@ def _branch_tabs(bids: Sequence[str], labels: Mapping[str, str],
 
 
 def render_workspace(ctrl: Optional["cv.CampaignController"], *,
-                     overview_renderer: Optional[Any] = None) -> None:
+                     overview_renderer: Optional[Any] = None,
+                     project_renderer: Optional[Any] = None) -> None:
     """Закладки рабочей области + содержимое активной закладки (iter69).
 
     Ряд закладок и подпись состояния рисуются СНАРУЖИ прокручиваемого
@@ -4565,7 +4567,8 @@ def render_workspace(ctrl: Optional["cv.CampaignController"], *,
         if _supports_container_height() else st.container()
     with box:
         _render_workspace_body(ctrl, active,
-                               overview_renderer=overview_renderer)
+                               overview_renderer=overview_renderer,
+                               project_renderer=project_renderer)
 
 
 def _supports_container_height() -> bool:
@@ -4583,7 +4586,8 @@ def _supports_container_height() -> bool:
 
 
 def _render_workspace_body(ctrl: Optional["cv.CampaignController"], key: str, *,
-                           overview_renderer: Optional[Any] = None) -> None:
+                           overview_renderer: Optional[Any] = None,
+                           project_renderer: Optional[Any] = None) -> None:
     """Содержимое активной закладки. Один вход — один шаг потока §17."""
     if key == "overview":
         if overview_renderer is not None:
@@ -4592,14 +4596,17 @@ def _render_workspace_body(ctrl: Optional["cv.CampaignController"], key: str, *,
             st.caption("Обзор ассистента подключается приложением "
                        "(`streamlit_app`) — здесь он не задан.")
         return
-    if ctrl is None:
-        st.info("Соберите проект в форме «🆕 Новый проект» (левая панель) или "
-                "создайте демо-проект — кнопка «🧪 Демо» в заголовке "
-                "(синтетический оракул {A,B,C}×{T,P}).")
-        return
     if key == "start":
-        render_start_panel(ctrl)
-    elif key == "base":
+        # iter72: «Старт» работает и БЕЗ собранного проекта — здесь он
+        # собирается (сетап) и открывается (панель «📁 Проект»).
+        render_start_panel(ctrl, project_renderer=project_renderer)
+        return
+    if ctrl is None:
+        st.info("Соберите проект на закладке «🌱 Старт» (форма «🆕 Новый "
+                "проект») или создайте демо-проект — кнопка «🧪 Демо» в "
+                "заголовке (синтетический оракул {A,B,C}×{T,P}).")
+        return
+    if key == "base":
         publish_ui_focus("base")
         render_base_panel(ctrl)
     elif key == "branches":
@@ -4614,7 +4621,8 @@ def _render_workspace_body(ctrl: Optional["cv.CampaignController"], key: str, *,
         st.warning(f"Закладка «{key}» не реализована.")
 
 
-def render_campaign(*, overview_renderer: Optional[Any] = None) -> None:
+def render_campaign(*, overview_renderer: Optional[Any] = None,
+                    project_renderer: Optional[Any] = None) -> None:
     """Рабочая область проекта (iter69): шапка + ЗАКЛАДКИ вместо простыни.
 
     Раньше все шаги потока §17 рисовались друг под другом одной страницей, и
@@ -4624,8 +4632,10 @@ def render_campaign(*, overview_renderer: Optional[Any] = None) -> None:
     контейнере фиксированной высоты со СВОИМ скроллом.
 
     ``overview_renderer`` — функция показа закладки «🤖 Обзор» (чат-обзор
-    кампании из ``streamlit_app``). Передаётся аргументом, чтобы поток не
-    импортировал приложение (иначе получился бы цикл импорта).
+    кампании из ``streamlit_app``). ``project_renderer`` — панель «📁 Проект»
+    (сохранить/загрузить/удалить) для закладки «🌱 Старт» (iter72: сайдбар
+    упразднён). Оба передаются аргументами, чтобы поток не импортировал
+    приложение (иначе получился бы цикл импорта).
     """
     # UX: демо-кнопки — компактно в ЗАГОЛОВКЕ (popover справа от подзаголовка;
     # для старых Streamlit без st.popover — фолбэк-экспандер), а не отдельным
@@ -4642,9 +4652,6 @@ def render_campaign(*, overview_renderer: Optional[Any] = None) -> None:
     # P0: уведомления мутаций (переживают st.rerun) — показ в начале прогона.
     _show_flashes()
 
-    # §17.4 (Ш3b): форма реального сетапа проекта — в ЛЕВОЙ панели (сайдбар).
-    render_setup_form()
-
     # P0: демо-проект — с явным подтверждением, если кампания уже есть
     # (раньше кнопка молча ЗАТИРАЛА текущую кампанию одним кликом).
     with _demo_box:
@@ -4655,7 +4662,7 @@ def render_campaign(*, overview_renderer: Optional[Any] = None) -> None:
         if _ctrl_now is not None:
             st.warning("Проект уже есть в сессии: создание демо ЗАМЕНИТ его. "
                        "Несохранённые изменения пропадут — сначала сохраните "
-                       "проект в сайдбаре («📁 Проект»).")
+                       "проект (панель «📁 Проект» на закладке «🌱 Старт»).")
             demo_ok = st.checkbox(
                 "Понимаю: заменить текущий проект демо-проектом",
                 key="camp_create_confirm")
@@ -4673,16 +4680,35 @@ def render_campaign(*, overview_renderer: Optional[Any] = None) -> None:
     ctrl = get_campaign_controller()
     # iter69: рабочая область — ЗАКЛАДКИ в контейнере фиксированной высоты
     # (диалог с ассистентом скроллится отдельно и страницу больше не уводит).
-    render_workspace(ctrl, overview_renderer=overview_renderer)
+    render_workspace(ctrl, overview_renderer=overview_renderer,
+                     project_renderer=project_renderer)
 
 
-def render_start_panel(ctrl: "cv.CampaignController") -> None:
-    """Закладка «🌱 Старт»: настройки проекта + стартовый дизайн (seed).
+def render_start_panel(ctrl: Optional["cv.CampaignController"], *,
+                       project_renderer: Optional[Any] = None) -> None:
+    """Закладка «🌱 Старт»: проект (сетап/сохранить/загрузить) + seed.
 
-    Пока база пуста, это единственный рабочий шаг (§17.4): предложить план →
-    внести измеренные Y → зафиксировать. После фиксации закладка остаётся
-    справочной: видно сводку настроек движка и что seed уже снят.
+    iter72: это ВХОД в проект — закладка доступна всегда (сайдбар упразднён,
+    эскиз пользователя). Сверху панель «📁 Проект» (``project_renderer`` из
+    ``streamlit_app`` — сохранить/загрузить/удалить; аргументом, чтобы поток
+    не импортировал приложение), затем форма сетапа «🆕 Новый проект».
+
+    Пока база пуста, seed-цикл — единственный рабочий шаг (§17.4): предложить
+    план → внести измеренные Y → зафиксировать. После фиксации закладка
+    остаётся справочной: видно сводку настроек движка и что seed уже снят.
     """
+    if project_renderer is not None:
+        project_renderer()          # 📁 Проект: сохранить/загрузить/удалить
+    render_setup_form()             # 🆕 Новый проект — реальный сетап (§17.4)
+    # Кнопка «🏗 Построить проект» живёт ВНУТРИ формы выше и могла только что
+    # положить контроллер в session_state — перечитываем, иначе seed-секция
+    # появлялась бы лишь со СЛЕДУЮЩЕГО прогона (переданный ctrl снят до формы).
+    ctrl = get_campaign_controller()
+    if ctrl is None:
+        st.info("Проекта в сессии нет: соберите его формой «🆕 Новый проект» "
+                "выше, загрузите сохранённый (панель «📁 Проект») или "
+                "создайте демо-проект — кнопка «🧪 Демо» в заголовке.")
+        return
     runner = ctrl.runner
     # C2: read-only сводка настроек ДЕЙСТВУЮЩЕГО проекта (из движка) — видно,
     # что доли компонентов/границы процесса/отклики подтянулись после загрузки.

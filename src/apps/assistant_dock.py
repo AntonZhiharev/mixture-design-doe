@@ -68,6 +68,7 @@ from src.assistant import llm, store, views
 from src.assistant.consent import ConsentRegistry
 from src.assistant.context import UiFocus
 from src.assistant.tools import AGENT_KINDS, ToolContext, ToolError
+from src.core import project_ref as pref
 
 #: Ключи session_state дока (все с префиксом — чтобы не столкнуться с потоком).
 K_SESSION = "assistant_session"
@@ -80,15 +81,47 @@ K_PENDING = "assistant_pending_question"
 #: явного нажатия кнопки — повтор к модели должен быть решением человека.
 K_FAILED = "assistant_failed_question"
 #: iter76: уведомление о ПЕРЕКЛЮЧЕНИИ переписки при смене имени проекта.
-#: Без него смена имени выглядела как потеря диалога (файл на диске цел).
+#: Начиная с iter77 смена ИМЕНИ переписку уже не переключает (ключ — ссылка),
+#: поэтому сообщение появляется только при смене САМОГО проекта (загрузили
+#: другой, создали новый) — то есть когда диалог и правда другой.
 K_SWITCH_MSG = "assistant_project_switch_msg"
+
+#: iter77: ССЫЛКА текущего проекта в состоянии приложения. Ключ связи проекта
+#: и переписки: имя каталога может совпадать у разных проектов и меняться,
+#: ссылка — нет.
+K_REF = "campaign_ref"
 
 
 # ----------------------------------------------------------------------
 # Состояние дока
 # ----------------------------------------------------------------------
-def current_project() -> str:
-    """Имя текущего проекта (то же поле, что у сохранения кампании)."""
+def current_project_ref() -> str:
+    """ССЫЛКА текущего проекта (iter77) — истинный ключ связи с перепиской.
+
+    Живёт в ``st.session_state['campaign_ref']`` как состояние ПРИЛОЖЕНИЯ
+    (выставляет ``streamlit_app.main``: дефолтный проект получает ссылку ещё до
+    сборки). Пустая строка = приложение стартует и ссылку ещё не проставили.
+    """
+    return str(st.session_state.get(K_REF, "") or "").strip()
+
+
+def current_project(root: str = "") -> str:
+    """Каталог текущего проекта: по ССЫЛКЕ, а не по имени из поля ввода.
+
+    Это и есть багфикс iter77. Раньше здесь читалось поле «Имя проекта»
+    (``campaign_name``), поэтому правка имени переключала переписку на другой
+    каталог. Теперь имя — подпись, а адрес берётся из идентичности проекта.
+
+    Совместимость: если ссылки в состоянии нет (например, док вызван в обход
+    ``main`` — так делают старые тесты AppTest), поведение прежнее — каталог
+    по имени. Молчаливого «пусто» здесь быть не должно: без каталога
+    переписке некуда лечь.
+    """
+    ref = current_project_ref()
+    if ref and root:
+        ident = pref.find_by_ref(root, ref)
+        if ident is not None:
+            return ident.dirname
     return str(st.session_state.get("campaign_name", "") or "").strip()
 
 
@@ -104,10 +137,11 @@ def dock_focus() -> UiFocus:
 def dock_session(root: str, project: str):
     """Сессия ассистента текущего проекта (перечитывается при смене проекта).
 
-    iter76: смена имени проекта переключает и ПЕРЕПИСКУ — раньше это
-    происходило молча, и человек, поменяв имя перед сохранением, видел
-    «пропавший» диалог (на диске он цел, в каталоге прежнего имени).
-    Теперь факт переключения показывается явно (:data:`K_SWITCH_MSG`).
+    iter77: переписка адресуется ССЫЛКОЙ проекта, поэтому ПЕРЕИМЕНОВАНИЕ её
+    больше не переключает (``project`` — каталог, полученный из идентичности,
+    а не строка из поля ввода). Сообщение :data:`K_SWITCH_MSG` остаётся, но
+    теперь означает то, что и должно: сменился САМ проект (загрузили другой,
+    создали новый) — значит и диалог другой.
     """
     prev = st.session_state.get(K_PROJECT)
     if prev != project or K_SESSION not in st.session_state:
@@ -116,12 +150,13 @@ def dock_session(root: str, project: str):
         st.session_state[K_PROJECT] = project
         if prev is not None and prev != project:
             st.session_state[K_SWITCH_MSG] = (
-                f"Имя проекта изменилось: «{prev or '_scratch'}» → "
-                f"«{project or '_scratch'}». Переписка переключена на новый "
-                f"проект; прежний диалог ЦЕЛ — он сохранён в "
+                f"Открыт другой проект: «{prev or '_scratch'}» → "
+                f"«{project or '_scratch'}», переписка переключена на него. "
+                f"Прежний диалог ЦЕЛ — он сохранён в "
                 f"`project_campaigns/{prev or '_scratch'}/assistant/` и "
-                f"вернётся, если вписать прежнее имя в поле «Имя проекта» "
-                f"на закладке «🌱 Старт».")
+                f"вернётся вместе со своим проектом. Переименование проекта "
+                f"переписку НЕ переключает: она привязана к ссылке проекта, "
+                f"а не к имени.")
     return st.session_state[K_SESSION]
 
 
@@ -691,7 +726,7 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
     root = root or os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))), "project_campaigns")
-    project = current_project() or "_scratch"
+    project = current_project(root) or "_scratch"
     session = dock_session(root, project)
     ctx = dock_context(root, project, runner, session)
     focus = dock_focus()
@@ -815,7 +850,7 @@ def render_assistant_info(runner: Any = None, *, root: str = "") -> None:
     root = root or os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))), "project_campaigns")
-    project = current_project() or "_scratch"
+    project = current_project(root) or "_scratch"
     session = dock_session(root, project)
 
     st.subheader("📋 Инфо-панель проекта")

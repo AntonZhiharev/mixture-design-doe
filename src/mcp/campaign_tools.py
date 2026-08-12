@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.assistant.store import (append_log, load_session, session_path)
+from src.core import project_ref as pref
 from src.assistant.tools import (PROPOSE, READONLY, SANDBOX, TOOLS, WRITE,
                                  ToolContext, ToolError, dispatch, tool_names)
 from src.assistant.tools.registry import ToolDef
@@ -102,8 +103,14 @@ def list_projects(root: Optional[str] = None) -> List[Dict[str, Any]]:
         has_session = (p / "assistant" / "session.json").exists()
         if not (has_campaign or has_session):
             continue
+        # iter77: ссылка проекта — то, чем он опознаётся; имя (label) может
+        # меняться и совпадать у разных проектов, поэтому в ответе есть и то,
+        # и другое, а «project» остаётся именем КАТАЛОГА (адресом).
+        ident = pref.read_identity(base, p.name)
         out.append({"project": p.name, "has_campaign": has_campaign,
                     "has_session": has_session,
+                    "ref": ident.ref if ident is not None else "",
+                    "label": ident.label if ident is not None else p.name,
                     "path": str(p)})
     return out
 
@@ -113,19 +120,32 @@ def project_names(root: Optional[str] = None) -> List[str]:
 
 
 def resolve_project(project: str = "", root: Optional[str] = None) -> str:
-    """Имя проекта: пустое разрешается ТОЛЬКО при единственном кандидате.
+    """Проект → имя КАТАЛОГА; пустое значение разрешается при единственном.
 
-    Угадывать «наверное, он имел в виду вот этот» нельзя: ответ про чужую
-    кампанию выглядит так же уверенно, как правильный.
+    Принимается имя каталога, ССЫЛКА проекта (``prj_…``, iter77) или его имя
+    (``label``). Угадывать «наверное, он имел в виду вот этот» нельзя: ответ
+    про чужую кампанию выглядит так же уверенно, как правильный, — поэтому
+    неоднозначное имя отклоняется, а не разрешается «первым похожим».
     """
     name = str(project or "").strip()
     known = project_names(root)
     if name:
+        # iter77: ссылку принимаем как ключ, а имя (label) — как подсказку;
+        # обе формы приводим к имени КАТАЛОГА, которым дальше адресуются файлы.
+        if name not in known:
+            try:
+                ident = pref.resolve(campaign_root(root), name)
+            except ValueError as exc:        # одноимённые проекты
+                raise ToolError(str(exc)) from None
+            if ident is not None and ident.dirname in known:
+                return ident.dirname
         if name not in known:
             raise ToolError(
                 f"Проекта '{name}' нет в каталоге кампаний "
                 f"{campaign_root(root)}. Доступны: {known or '—'}. "
-                f"Проверьте DOE_CAMPAIGN_ROOT сервера doe-campaign.")
+                f"Можно назвать проект ссылкой (prj_…) или его именем — "
+                f"см. list_projects. Проверьте DOE_CAMPAIGN_ROOT сервера "
+                f"doe-campaign.")
         return name
     if not known:
         raise ToolError(

@@ -50,6 +50,7 @@ from src.apps import assistant as ai  # noqa: E402
 from src.apps import campaign as cv  # noqa: E402
 from src.apps import campaign_state as cs  # noqa: E402
 from src.apps import workspace as wsx  # noqa: E402
+from src.apps import assistant_dock as dock  # noqa: E402
 from src.apps.assistant_dock import (render_assistant_dock,  # noqa: E402
                                       render_assistant_info)
 from src.apps.campaign_ui import (render_campaign,  # noqa: E402
@@ -139,7 +140,13 @@ def _load_setup_draft_into_form(root: str, sel: str) -> None:
         return
     st.session_state.pop("campaign_ctrl", None)
     st.session_state["setup_prefill_pending"] = setup_draft
-    st.session_state["campaign_name_pending"] = sel
+    # iter77: переключаем и ССЫЛКУ (переписка/вложения пойдут за проектом),
+    # а в поле имени кладём его ИМЯ, а не имя каталога.
+    _ident = cs.pref.read_identity(root, sel)
+    if _ident is not None:
+        st.session_state["campaign_ref_pending"] = _ident.ref
+    st.session_state["campaign_name_pending"] = (
+        _ident.label if _ident is not None else sel)
     st.session_state["camp_loaded_msg"] = (
         f"Черновик настроек '{sel}' загружен ({len(setup_draft)} полей "
         f"формы). Проект ещё НЕ собран: проверьте форму «🆕 Новый проект» "
@@ -161,20 +168,69 @@ def render_campaign_persistence(root: str) -> None:
     st.markdown("#### 📁 Проект")
     # Имя проекта живёт как состояние ПРИЛОЖЕНИЯ (пин в main()): виджет ниже
     # рисуется только на закладке «Старт», и без пина Streamlit удалял бы ключ
-    # на других закладках — а от него зависит сессия ассистента.
-    st.session_state.setdefault("campaign_name", "my_project")
+    # на других закладках.
+    st.session_state.setdefault("campaign_name", cs.pref.DEFAULT_LABEL)
     ctrl = get_campaign_controller()
 
-    # iter73: подпись говорит, ЧТО это за имя. Поле заполнено по умолчанию
-    # («my_project») и читалось как «проект открыт», хотя проекта могло не быть
-    # вовсе — из-за этого человек нажимал «Применить» у ассистента, не понимая,
-    # что применять некуда. Состояние проекта показывает статус-строка выше.
+    # iter77: ССЫЛКА проекта — то, чем он опознаётся. Показываем её рядом с
+    # именем: без этого «переименование не влияет на переписку» остаётся
+    # словами, а человек не видит, с каким проектом работает.
+    ref = dock.current_project_ref()
+    ident = cs.pref.find_by_ref(root, ref) if ref else None
+    if ident is not None:
+        st.caption(f"Ссылка проекта: `{ident.ref}` · папка "
+                   f"`{ident.dirname}` · переписка и вложения привязаны к "
+                   f"ССЫЛКЕ, поэтому переименование их не переключает."
+                   + (f" Прежние имена: {', '.join(ident.label_history)}."
+                      if ident.label_history else ""))
+
+    # iter73/iter77: подпись говорит, ЧТО это за имя. Раньше имя было ещё и
+    # адресом на диске, поэтому его правка молча уводила переписку в другой
+    # каталог; теперь это ПОДПИСЬ проекта, а кнопка ниже применяет её.
     name = st.text_input(
-        "Имя проекта (для сохранения/загрузки)", key="campaign_name",
-        help="Это имя ПАПКИ проекта на диске и переписки с помощником, а не "
-             "признак открытого проекта: собран проект или нет — сказано "
-             "строкой в начале закладки.")
-    if st.button("💾 Сохранить проект", key="save_campaign"):
+        "Имя проекта (подпись; переименование не меняет папку и переписку)",
+        key="campaign_name",
+        help="Имя — только для человека: проект опознаётся ссылкой (см. "
+             "строку выше). Собран проект или нет — сказано строкой в начале "
+             "закладки.")
+    if ident is not None and st.button("✏️ Переименовать проект",
+                                       key="rename_campaign"):
+        try:
+            renamed = cs.pref.rename_label(root, ident.ref, name)
+        except ValueError as exc:
+            st.error(f"Переименование отклонено: {exc}")
+        else:
+            st.success(f"Проект переименован: «{renamed.label}». Папка "
+                       f"(`{renamed.dirname}`), переписка, вложения и журналы "
+                       f"остались на месте — они привязаны к ссылке "
+                       f"`{renamed.ref}`.")
+    # iter77: у «Сохранить» два разных смысла, и их надо различать явно.
+    #   * имя в поле СОВПАДАЕТ с именем текущего проекта → пишем в него (по
+    #     ссылке): это обычное сохранение;
+    #   * имя ДРУГОЕ → «сохранить как»: адресуем проект с таким именем, а если
+    #     его нет — создаём НОВЫЙ (с новой ссылкой) и переключаемся на него.
+    # Переименование БЕЗ создания копии — отдельная кнопка выше. Молча
+    # выбирать между этими двумя действиями нельзя: одно меняет подпись, другое
+    # плодит проект с собственной перепиской.
+    _save = st.button("💾 Сохранить проект", key="save_campaign")
+    if _save and (ident is None or name.strip() != ident.label):
+        # «Сохранить как»: ищем проект с таким именем, иначе создаём новый.
+        try:
+            _found = cs.pref.resolve(root, name)
+        except ValueError as exc:            # два проекта с этим именем
+            st.error(f"{exc} Загрузите нужный проект в списке ниже — тогда "
+                     f"сохранение пойдёт именно в него.")
+            _save = False
+        else:
+            ident = _found or cs.pref.create_project(root, name)
+            st.session_state[dock.K_REF] = ident.ref
+            st.info(f"Сохранение идёт в проект «{ident.label}» (папка "
+                    f"`{ident.dirname}`, ссылка `{ident.ref}`)"
+                    + (" — он создан только что, поэтому переписка у него "
+                       "своя, пустая." if _found is None else "")
+                    + " Чтобы сменить только подпись текущего проекта, "
+                      "нажмите «✏️ Переименовать проект».")
+    if _save:
         if ctrl is None:
             # iter76: до сборки сохраняем ЧЕРНОВИК НАСТРОЕК (поля формы
             # «🆕 Новый проект»). Раньше здесь стоял отказ — и вместе с
@@ -183,7 +239,12 @@ def render_campaign_persistence(root: str) -> None:
             # терялась при закрытии вкладки.
             try:
                 fields = cs.setup_draft_fields(st.session_state)
-                path = cs.save_setup_draft(root, name, fields)
+                # iter77: сохраняем В ТЕКУЩИЙ проект (по ссылке), а не в
+                # каталог с именем из поля. Иначе правка имени плодила бы
+                # новый каталог, а переписка оставалась в прежнем.
+                path = (cs.save_setup_draft_by_ref(root, ident.ref, fields)
+                        if ident is not None
+                        else cs.save_setup_draft(root, name, fields))
                 st.success(
                     f"Черновик настроек сохранён: {Path(path).parent.name} "
                     f"({len(fields)} полей формы). Проект ещё НЕ собран — "
@@ -194,17 +255,41 @@ def render_campaign_persistence(root: str) -> None:
                 st.error(f"Не удалось сохранить черновик: {exc}")
         else:
             try:
-                path = cs.save_campaign(ctrl.runner, root, name,
-                                        draft=_seed_draft_from_session())
+                path = (cs.save_campaign_by_ref(
+                            ctrl.runner, root, ident.ref,
+                            draft=_seed_draft_from_session())
+                        if ident is not None
+                        else cs.save_campaign(ctrl.runner, root, name,
+                                              draft=_seed_draft_from_session()))
                 st.success(f"Проект сохранён: {Path(path).parent.name}")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Не удалось сохранить: {exc}")
 
-    camps = cs.list_campaigns(root)
+    # iter77: в списке — ИМЯ проекта (человеку), выбор — по КАТАЛОГУ (адресу).
+    # Одноимённые проекты теперь возможны, поэтому подпись показывает и папку:
+    # иначе две строки «Кромка» были бы неразличимы.
+    idents = cs.list_projects(root)
+    _by_dir = {i.dirname: i for i in idents}
+
+    def _project_option(dirname: str) -> str:
+        if dirname == "— нет —":
+            return dirname
+        it = _by_dir.get(dirname)
+        if it is None:
+            return dirname
+        tail = "" if it.label == it.dirname else f" · папка «{it.dirname}»"
+        return f"{it.label}{tail}"
+
     sel = st.selectbox("Открыть сохранённый проект",
-                       ["— нет —"] + camps, key="campaign_select")
+                       ["— нет —"] + [i.dirname for i in idents],
+                       format_func=_project_option, key="campaign_select")
     if st.button("📂 Загрузить проект", key="load_campaign") \
             and sel != "— нет —":
+        # Ссылка выбранного проекта уходит в состояние приложения: с этого
+        # момента переписка, вложения и журналы берутся по ней.
+        _sel_ident = _by_dir.get(sel) or cs.pref.read_identity(root, sel)
+        if _sel_ident is not None and _sel_ident.has_ref:
+            st.session_state["campaign_ref_pending"] = _sel_ident.ref
         # iter76: проект-ЧЕРНОВИК (собранного campaign.json ещё нет) —
         # возвращаем поля формы «🆕 Новый проект» тем же механизмом
         # отложенного префилла, что у загрузки собранного проекта.
@@ -230,7 +315,10 @@ def render_campaign_persistence(root: str) -> None:
             # ДО инстанцирования виджетов формы следующего прогона.
             st.session_state["setup_prefill_pending"] = \
                 setup_prefill_from_runner(runner)
-            st.session_state["campaign_name_pending"] = sel
+            # iter77: в поле имени — ИМЯ проекта (label), а не имя каталога:
+            # они теперь могут различаться (проект переименовали).
+            st.session_state["campaign_name_pending"] = (
+                _sel_ident.label if _sel_ident is not None else sel)
             st.session_state["camp_loaded_msg"] = (
                 f"Проект '{sel}' загружен (общая база: "
                 f"{len(runner.points)} точек, веток: {len(runner.branches)}"
@@ -252,15 +340,25 @@ def render_campaign_deleter(root: str) -> None:
     with st.expander("🗑 Удалить проект (admin)", expanded=False):
         if st.session_state.get("camp_del_msg"):
             st.success(st.session_state.pop("camp_del_msg"))
-        camps = cs.list_campaigns(root)
-        if not camps:
+        idents = cs.list_projects(root)
+        if not idents:
             st.caption("Сохранённых проектов нет.")
             return
         st.caption("Удаление безвозвратно. Это барьер от случайного удаления "
                    "(не криптозащита): нужен пароль администратора "
-                   "(переменная окружения `DOE_ADMIN_PASSWORD`).")
-        target = st.selectbox("Проект для удаления", camps, key="camp_del_select")
-        confirm = st.text_input("Подтвердите: впишите имя проекта точно",
+                   "(переменная окружения `DOE_ADMIN_PASSWORD`). Удаление — "
+                   "единственный способ прекратить жизнь проекта, включая "
+                   "не стартовавший: сам он не исчезает.")
+        _labels = {i.dirname: (f"{i.label} · папка «{i.dirname}»"
+                               if i.label != i.dirname else i.dirname)
+                   for i in idents}
+        target = st.selectbox("Проект для удаления",
+                              [i.dirname for i in idents],
+                              format_func=lambda d: _labels.get(d, d),
+                              key="camp_del_select")
+        # Подтверждаем ПАПКОЙ: имя может совпадать у двух проектов, и «впишите
+        # имя точно» тогда не отличало бы один от другого.
+        confirm = st.text_input("Подтвердите: впишите имя ПАПКИ проекта точно",
                                 key="camp_del_confirm")
         pwd = st.text_input("Пароль администратора", type="password",
                             key="camp_del_pwd")
@@ -279,9 +377,16 @@ def render_campaign_deleter(root: str) -> None:
                     if not ok:
                         st.error(f"Проект '{target}' не найден.")
                     else:
-                        # если удалён загруженный сейчас проект — сбросить сессию
-                        if st.session_state.get("campaign_name") == target:
+                        # iter77: сравниваем по КАТАЛОГУ текущего проекта (имя
+                        # для этого не годится: оно могло быть переименовано и
+                        # может совпадать у двух проектов). Ссылку тоже
+                        # сбрасываем — иначе состояние ссылалось бы на
+                        # удалённый проект, и main() открыл бы его заново.
+                        if dock.current_project(root) == target:
                             st.session_state.pop("campaign_ctrl", None)
+                            st.session_state.pop(dock.K_REF, None)
+                            st.session_state.pop(dock.K_SESSION, None)
+                            st.session_state.pop(dock.K_PROJECT, None)
                         st.session_state["camp_del_msg"] = \
                             f"Проект '{target}' удалён."
                         st.rerun()
@@ -400,15 +505,36 @@ def main():
                "инфо-панель: вложения, файлы расчётов помощника, состояние "
                "переписки.")
 
+    # iter77: ИДЕНТИЧНОСТЬ проекта — ссылка, а не имя. Порядок здесь важен:
+    #   1) выдать ссылки проектам, созданным до iter77 (безопасно: ничего не
+    #      переносится, только дописывается project.json);
+    #   2) если проект в сессии ещё не выбран — открыть ДЕФОЛТНЫЙ («my_project»)
+    #      и сразу назначить ему ссылку, чтобы к нему можно было подвязать
+    #      переписку, вложения и черновик формы ДО сборки движка. Не
+    #      стартовавший проект открывается снова как дефолтный с ТОЙ ЖЕ
+    #      ссылкой — прекратить его существование может только админское
+    #      удаление.
+    cs.pref.migrate_root(CAMPAIGN_ROOT)
+    _pending_ref = st.session_state.pop("campaign_ref_pending", None)
+    if _pending_ref:
+        st.session_state[dock.K_REF] = str(_pending_ref)
+    if not st.session_state.get(dock.K_REF):
+        _ident = cs.pref.ensure_default_project(CAMPAIGN_ROOT)
+        st.session_state[dock.K_REF] = _ident.ref
+        st.session_state.setdefault("campaign_name", _ident.label)
+
     # iter72: имя проекта — состояние ПРИЛОЖЕНИЯ, а не только виджета.
     # Виджет «Имя проекта» рисуется лишь на закладке «Старт»; когда открыта
     # другая закладка, Streamlit удаляет ключи неотрисованных виджетов — а от
-    # `campaign_name` зависят сохранение проекта и СЕССИЯ АССИСТЕНТА
-    # (`assistant_dock.current_project`). Пин (само-присваивание) переводит
-    # ключ в app-state и переживает любые закладки. Отложенное имя
+    # `campaign_name` зависит подпись проекта. Пин (само-присваивание)
+    # переводит ключ в app-state и переживает любые закладки. Отложенное имя
     # (`campaign_name_pending`, выставляет загрузчик) применяется тоже здесь —
     # ДО инстанцирования любого виджета с этим ключом.
-    st.session_state.setdefault("campaign_name", "my_project")
+    #
+    # ВАЖНО (iter77): от этого ключа больше НЕ зависит сессия ассистента —
+    # переписка адресуется ссылкой (`assistant_dock.current_project_ref`),
+    # поэтому правка имени в поле диалог не переключает.
+    st.session_state.setdefault("campaign_name", cs.pref.DEFAULT_LABEL)
     _pending_name = st.session_state.pop("campaign_name_pending", None)
     st.session_state["campaign_name"] = (
         _pending_name if _pending_name else st.session_state["campaign_name"])

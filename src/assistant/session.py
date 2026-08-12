@@ -478,12 +478,20 @@ class ToolCall:
 class AssistantSession:
     """Диалог ассистента с памятью, привязанный к проекту.
 
-    ``project`` — имя проекта кампании (каталог в ``project_campaigns``);
+    ``ref`` (iter77) — ССЫЛКА на проект (``core.project_ref``), истинный ключ
+    связи «проект ↔ переписка». До iter77 связь держалась на ``project``, то
+    есть на ИМЕНИ: правка имени в поле формы переключала переписку на другой
+    каталог, а переименовать проект было нельзя вовсе. Теперь имя — подпись,
+    а адресация идёт по ``ref``.
+
+    ``project`` — имя КАТАЛОГА проекта в ``project_campaigns`` (остаётся: по
+    нему строятся пути, и старые сессии без ``ref`` читаются как раньше);
     ``model`` / ``web_enabled`` — политика подключения, живущая вместе с
     проектом (после перезапуска приложения не надо вспоминать, была ли
     включена сеть при этом разборе).
     """
     project: str = ""
+    ref: str = ""
     model: str = ""
     web_enabled: bool = False
     created_at: str = field(default_factory=_now)
@@ -801,6 +809,11 @@ class AssistantSession:
             "specs": [s.to_state() for s in self.specs],
             "projects": [p.to_state() for p in self.projects],
             "setups": [s.to_state() for s in self.setups],
+            # iter77: ССЫЛКА на проект пишется, только когда она есть, —
+            # иначе сессии, записанные до перехода на ссылку, изменили бы
+            # состояние на диске от одного лишь чтения (round-trip должен
+            # быть побайтно стабилен, см. ASSISTANT_SPEC §3.1).
+            **({"ref": self.ref} if self.ref else {}),
             "tool_calls": [c.to_state() for c in self.tool_calls],
         }
 
@@ -813,6 +826,9 @@ class AssistantSession:
                 f"Неизвестный формат сессии ассистента: {fmt!r} "
                 f"(ожидался {FORMAT_VERSION!r}).")
         s = cls(project=str(state.get("project", "")),
+                # iter77: сессия до перехода на ссылку — ref пуст, и это не
+                # ошибка: ссылку досоздаст store.load_session по каталогу.
+                ref=str(state.get("ref", "")),
                 model=str(state.get("model", "")),
                 web_enabled=bool(state.get("web_enabled", False)),
                 created_at=str(state.get("created_at", "")) or _now(),
@@ -843,11 +859,17 @@ class AssistantSession:
         return s
 
 
-def new_session(project: str, *, model: str = "",
-                web_enabled: bool = False) -> AssistantSession:
-    """Пустая сессия проекта (используется, когда на диске её ещё нет)."""
+def new_session(project: str, *, model: str = "", web_enabled: bool = False,
+                ref: str = "") -> AssistantSession:
+    """Пустая сессия проекта (используется, когда на диске её ещё нет).
+
+    ``ref`` (iter77) — ссылка на проект: её проставляет :mod:`.store`, который
+    знает каталог. Аргумент необязателен, чтобы вызовы из ядра и тестов, где
+    каталога проекта нет вовсе, работали как прежде.
+    """
     return AssistantSession(project=str(project or ""), model=str(model or ""),
-                            web_enabled=bool(web_enabled))
+                            web_enabled=bool(web_enabled),
+                            ref=str(ref or ""))
 
 
 def messages_from_pairs(pairs: Iterable[Dict[str, str]]) -> List[Message]:

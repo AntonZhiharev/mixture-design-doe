@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from ..core import project_ref as pref
 from ..core.schema import DataPoint, ProjectSchema
 from ..core.schema_evolution import SchemaHistory
 from ..design.branches import Branch, ROLE_PRICE_INPUT
@@ -466,10 +467,78 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
 # Файловая персистентность: save / load / list / delete
 # ----------------------------------------------------------------------
 def _validate_name(name: str) -> str:
-    name = (name or "").strip()
-    if not name or name in (".", "..") or any(s in name for s in ("/", "\\")):
-        raise ValueError(f"Недопустимое имя проекта: {name!r}")
-    return name
+    """Имя КАТАЛОГА проекта; правило — одно, в ядре идентичности (iter77)."""
+    try:
+        return pref.validate_dirname(name)
+    except ValueError:
+        raise ValueError(f"Недопустимое имя проекта: {(name or '').strip()!r}") \
+            from None
+
+
+# ----------------------------------------------------------------------
+# iter77: доступ ПО ССЫЛКЕ (ref) — имя больше не ключ
+# ----------------------------------------------------------------------
+def save_campaign_by_ref(runner: MixtureProcessRunner, root: str | Path,
+                         ref: str, *, draft: Optional[Dict[str, Any]] = None
+                         ) -> str:
+    """Сохранить проект ПО ССЫЛКЕ: каталог берётся из идентичности."""
+    return save_campaign(runner, root, pref.require_identity(root, ref).dirname,
+                         draft=draft)
+
+
+def load_campaign_by_ref(root: str | Path, ref: str, *, oracle: Any = None,
+                         price_fn_registry: Optional[Dict[str, Callable]] = None
+                         ) -> MixtureProcessRunner:
+    """Загрузить проект ПО ССЫЛКЕ (переименование на это не влияет)."""
+    return load_campaign(root, pref.require_identity(root, ref).dirname,
+                         oracle=oracle, price_fn_registry=price_fn_registry)
+
+
+def campaign_exists_by_ref(root: str | Path, ref: str) -> bool:
+    """Есть ли у проекта СОБРАННЫЙ движок; неизвестная ссылка → ``False``.
+
+    Отсутствие ссылки — не исключение: это штатный ответ «такого проекта нет»
+    для UI, который спрашивает про выбранную строку списка.
+    """
+    ident = pref.find_by_ref(root, ref)
+    return bool(ident) and campaign_exists(root, ident.dirname)
+
+
+def save_setup_draft_by_ref(root: str | Path, ref: str,
+                            fields: Dict[str, Any]) -> str:
+    """Сохранить черновик формы НЕсобранного проекта по ссылке.
+
+    Именно этот путь позволяет вязать данные к проекту ДО старта: ссылка у
+    него уже есть (``project_ref.ensure_default_project``), а движка ещё нет.
+    """
+    return save_setup_draft(root, pref.require_identity(root, ref).dirname,
+                            fields)
+
+
+def load_setup_draft_by_ref(root: str | Path, ref: str
+                            ) -> Optional[Dict[str, Any]]:
+    return load_setup_draft(root, pref.require_identity(root, ref).dirname)
+
+
+def load_campaign_draft_by_ref(root: str | Path, ref: str
+                               ) -> Optional[Dict[str, Any]]:
+    return load_campaign_draft(root, pref.require_identity(root, ref).dirname)
+
+
+def delete_campaign_by_ref(root: str | Path, ref: str) -> bool:
+    """Удалить проект ПО ССЫЛКЕ (админское действие — единственный способ
+    прекратить жизнь проекта, в том числе не стартовавшего)."""
+    return delete_campaign(root, pref.require_identity(root, ref).dirname)
+
+
+def list_projects(root: str | Path) -> List["pref.ProjectIdentity"]:
+    """Проекты каталога как ИДЕНТИЧНОСТИ (ссылка + имя + каталог).
+
+    Замена ``list_campaigns`` для нового UI: список должен показывать имя, а
+    выбирать проект — ссылкой. ``list_campaigns`` оставлен как есть (имена
+    каталогов), чтобы не ломать существующие вызовы и тесты.
+    """
+    return pref.list_identities(root)
 
 
 def save_campaign(runner: MixtureProcessRunner, root: str | Path,
@@ -483,6 +552,11 @@ def save_campaign(runner: MixtureProcessRunner, root: str | Path,
     name = _validate_name(name)
     target = Path(root) / name
     target.mkdir(parents=True, exist_ok=True)
+    # iter77: у сохранённого проекта ссылка есть ВСЕГДА. Здесь это уместно:
+    # сохранение — явное действие человека, и именно с него проект начинает
+    # существовать на диске (для несобранного ту же роль играет
+    # save_setup_draft / ensure_default_project).
+    pref.ensure_identity(root, name, label=name)
     path = target / _STATE_FILE
     state = runner_to_state(runner, draft=draft)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2),
@@ -530,13 +604,13 @@ def list_campaigns(root: str | Path) -> List[str]:
     Проект — каталог с ``campaign.json`` (собранный) ИЛИ с ``setup_draft.json``
     (iter76: черновик настроек, проект ещё не собран). Черновик должен быть
     виден в списке загрузки — иначе сохранённая до сборки форма недостижима.
+
+    iter77: проектом считается и каталог, у которого пока есть только
+    ИДЕНТИЧНОСТЬ (``project.json``) или одна переписка ассистента: к
+    не стартовавшему проекту уже можно подвязать диалог и вложения, и он
+    обязан быть виден — иначе всё это недостижимо до сборки.
     """
-    root = Path(root)
-    if not root.exists():
-        return []
-    return sorted(p.name for p in root.iterdir()
-                  if p.is_dir() and ((p / _STATE_FILE).exists()
-                                     or (p / _SETUP_DRAFT_FILE).exists()))
+    return [i.dirname for i in pref.list_identities(root)]
 
 
 def campaign_exists(root: str | Path, name: str) -> bool:
@@ -579,6 +653,9 @@ def save_setup_draft(root: str | Path, name: str,
                          "заполненных полей — сохранять нечего.")
     target = Path(root) / name
     target.mkdir(parents=True, exist_ok=True)
+    # iter77: черновик — это «проект до старта», и ссылка у него должна быть
+    # (к ней привязаны переписка и вложения, собранные во время настройки).
+    pref.ensure_identity(root, name, label=name)
     path = target / _SETUP_DRAFT_FILE
     path.write_text(json.dumps(dict(fields), ensure_ascii=False, indent=2),
                     encoding="utf-8")
@@ -610,9 +687,12 @@ def delete_campaign(root: str | Path, name: str) -> bool:
         return False
     # iter76: проектом считается и черновик настроек (setup_draft.json) —
     # несобранный, но сохранённый проект тоже должен удаляться штатно.
-    if not ((target / _STATE_FILE).exists()
-            or (target / _SETUP_DRAFT_FILE).exists()):
-        raise ValueError(f"'{name}' не похож на проект (нет {_STATE_FILE} и "
-                         f"{_SETUP_DRAFT_FILE}) — удаление отклонено.")
+    # iter77: и проект, у которого пока есть ТОЛЬКО идентичность (project.json)
+    # или одна переписка: не стартовавший проект живёт до удаления админом, а
+    # значит должен этим удалением и убираться — иначе его нельзя убрать вовсе.
+    if not pref.has_project_content(root, name):
+        raise ValueError(f"'{name}' не похож на проект (нет {_STATE_FILE}, "
+                         f"{_SETUP_DRAFT_FILE}, {pref.IDENTITY_FILE} и "
+                         f"переписки) — удаление отклонено.")
     shutil.rmtree(target)
     return True

@@ -3106,9 +3106,13 @@ def render_setup_form() -> None:
     # C2: отложенный префилл формы из ЗАГРУЖЕННОГО проекта — применяем ДО
     # инстанцирования виджетов формы (ключ кладёт загрузчик панели «📁 Проект»;
     # менять session_state виджета можно только до его создания в прогоне).
+    # iter81: и ТОЛЬКО те ключи, которым присваивать РАЗРЕШЕНО. Черновик,
+    # сохранённый до iter81, несёт на диске ключ пустого загрузчика спеки
+    # (setup_phr_file: null) — без фильтра загрузка такого проекта роняла всё
+    # приложение StreamlitValueAssignmentNotAllowedError.
     _pending = st.session_state.pop("setup_prefill_pending", None)
     if _pending:
-        for _k, _v in dict(_pending).items():
+        for _k, _v in cs.settable_setup_fields(_pending).items():
             st.session_state[_k] = _v
     with st.expander("🆕 Новый проект — настройка области опытов (§17.4)",
                      expanded=get_campaign_controller() is None):

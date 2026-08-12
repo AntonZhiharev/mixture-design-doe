@@ -50,18 +50,48 @@ _STATE_FILE = "campaign.json"
 #: замкнутый круг «собрать не могу (ошибка), сохранить не могу (не собран)».
 _SETUP_DRAFT_FILE = "setup_draft.json"
 
-#: Ключи формы сетапа, которые НЕ идут в черновик: объекты конкретного прогона
-#: (PhrSpec-объект, numpy-план seed, состояние data_editor) и КНОПКИ (их bool
-#: живёт в session_state, но Streamlit запрещает класть его обратно —
-#: StreamlitValueAssignmentNotAllowedError при префилле) — они либо не
-#: JSON-сериализуемы, либо восстанавливаются из других полей.
+#: Ключи формы сетапа, которые НЕ идут в черновик: объекты конкретного ПРОГОНА
+#: (PhrSpec-объект, numpy-план seed, состояние data_editor, кэш диагностики) —
+#: они либо не JSON-сериализуемы, либо восстанавливаются из других полей, либо
+#: относятся к текущему плану, а не к настройкам проекта.
 _SETUP_DRAFT_SKIP = frozenset({
     "setup_seed_X", "setup_seed_Y", "setup_seed_df", "setup_seed_df_sig",
-    "setup_seed_editor", "setup_phr_spec_obj", "setup_phr_tree",
-    # кнопки формы сетапа (st.button / st.download_button)
-    "setup_build", "setup_propose_seed", "setup_commit_seed",
-    "setup_fill_demo", "setup_seed_dl",
+    "setup_phr_spec_obj", "setup_phr_tree",
+    # iter81: кэш preflight стартового плана — состояние ПРОГОНА. Сам объект
+    # не сериализуется, а текст ошибки без объекта показывал бы на экране
+    # диагностику прошлой сессии как свежую (§2 — факт ≠ интерпретация).
+    "setup_seed_pf", "setup_seed_pf_sig", "setup_seed_pf_err",
+    # iter81: номера опытов в selectbox'ах карты навески и границ точки —
+    # адрес строки ТЕКУЩЕГО плана. После загрузки план другой (или его нет), и
+    # восстановленный номер либо ничего не значит, либо выпадает из options.
+    "setup_weigh_row", "setup_bounds_row",
 })
+
+#: iter81: ключи формы сетапа, значение которых Streamlit ЗАПРЕЩАЕТ задавать
+#: через ``session_state`` (у виджета ``writes_allowed=False``): ``st.button``,
+#: ``st.download_button``, ``st.file_uploader``, ``st.data_editor``. Такой ключ
+#: нельзя ни писать в черновик, ни возвращать префиллом — первый же рендер
+#: падает ``StreamlitValueAssignmentNotAllowedError`` (живая сессия 12.08.2026:
+#: загрузка проекта роняла приложение из-за ``setup_phr_file`` = None, который
+#: положил в состояние пустой загрузчик JSON-спеки).
+#:
+#: Набор — ОДИН источник истины для записи черновика и для применения префилла;
+#: тест iter81 сканирует ``campaign_ui``/``streamlit_app`` и требует, чтобы
+#: каждый ключ ``setup_*`` неприсваиваемого виджета был здесь (иначе новый
+#: виджет протёк бы тем же путём).
+SETUP_UNSETTABLE_KEYS = frozenset({
+    "setup_build", "setup_propose_seed", "setup_commit_seed",
+    "setup_fill_demo", "setup_seed_dl", "setup_seed_editor",
+    "setup_phr_file", "setup_phr_add_group", "setup_phr_add_single",
+    "setup_phr_clear",
+})
+
+#: Те же неприсваиваемые виджеты с ДИНАМИЧЕСКИМ хвостом ключа (uid узла спеки,
+#: версия схемы): кнопки ▲/▼/🗑 блока и таблица долей группы. Префикс
+#: ``setup_phr_kids_`` покрывает и кэш DataFrame ``setup_phr_kids_df_*`` —
+#: восстанавливать таблицу скаляром всё равно нельзя.
+SETUP_UNSETTABLE_PREFIXES = ("setup_phr_up_", "setup_phr_dn_",
+                             "setup_phr_del_", "setup_phr_kids_")
 
 
 # ----------------------------------------------------------------------
@@ -621,18 +651,53 @@ def campaign_exists(root: str | Path, name: str) -> bool:
 # ----------------------------------------------------------------------
 # iter76: черновик настроек НЕсобранного проекта (поля формы сетапа)
 # ----------------------------------------------------------------------
+def is_settable_setup_key(key: str) -> bool:
+    """iter81: можно ли ПРИСВОИТЬ этому ключу значение через ``session_state``.
+
+    ``False`` для ключей неприсваиваемых виджетов (:data:`SETUP_UNSETTABLE_KEYS`,
+    :data:`SETUP_UNSETTABLE_PREFIXES`): у ``st.button`` / ``st.download_button`` /
+    ``st.file_uploader`` / ``st.data_editor`` Streamlit поднимает
+    ``StreamlitValueAssignmentNotAllowedError``. Чистая — один барьер и для
+    записи черновика, и для применения префилла.
+    """
+    k = str(key)
+    if k in SETUP_UNSETTABLE_KEYS:
+        return False
+    return not k.startswith(SETUP_UNSETTABLE_PREFIXES)
+
+
+def settable_setup_fields(fields: Any) -> Dict[str, Any]:
+    """Отфильтровать префилл формы до ключей, которым МОЖНО присвоить значение.
+
+    Барьер на стороне ПРИМЕНЕНИЯ: черновики, сохранённые до iter81, уже несут
+    на диске ключ неприсваиваемого виджета (``setup_phr_file: null`` от пустого
+    загрузчика JSON-спеки) — при загрузке такого проекта форма падала
+    ``StreamlitValueAssignmentNotAllowedError``. Чистить старые файлы не нужно:
+    ключ отбрасывается при применении. Ключи вне ``setup_*`` не трогаем — их
+    смысл задаёт вызывающая сторона (:func:`is_settable_setup_key` покрывает
+    только форму сетапа).
+    """
+    return {str(k): v for k, v in dict(fields or {}).items()
+            if is_settable_setup_key(k)}
+
+
 def setup_draft_fields(state: Any) -> Dict[str, Any]:
     """Снимок полей формы «🆕 Новый проект» из ``session_state`` (чистая).
 
     Берутся все ключи ``setup_*`` со СКАЛЯРНЫМИ значениями (str/int/float/
     bool/None) — ровно то, что человек ввёл в форму и что можно честно
     вернуть через ``setup_prefill_pending``. Объекты прогона (numpy-план,
-    PhrSpec, состояние редактора) исключены явно (:data:`_SETUP_DRAFT_SKIP`).
+    PhrSpec, состояние редактора) исключены явно (:data:`_SETUP_DRAFT_SKIP`),
+    как и ключи виджетов, которым Streamlit запрещает присваивать значение
+    (:func:`is_settable_setup_key`) — иначе черновик сохранял бы то, что при
+    загрузке роняет форму.
     """
     out: Dict[str, Any] = {}
     for k, v in dict(state or {}).items():
         key = str(k)
         if not key.startswith("setup_") or key in _SETUP_DRAFT_SKIP:
+            continue
+        if not is_settable_setup_key(key):
             continue
         if v is None or isinstance(v, (str, int, float, bool)):
             out[key] = v

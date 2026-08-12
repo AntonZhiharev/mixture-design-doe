@@ -1,0 +1,220 @@
+{
+  "spec_version": 2,
+  "group_order": [
+    "FILLER",
+    "SOFT",
+    "ACR",
+    "LUB"
+  ],
+  "nodes": [
+    {
+      "name": "RESIN",
+      "role": "GROUP_TOTAL_FIXED",
+      "value": 100.0,
+      "members": [
+        "PVC_67",
+        "PVC_71"
+      ]
+    },
+    {
+      "name": "PVC_67",
+      "role": "SHARE_CLOSURE",
+      "group": "RESIN"
+    },
+    {
+      "name": "PVC_71",
+      "role": "SHARE_FREE",
+      "group": "RESIN",
+      "share_range": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "name": "DINP",
+      "role": "ABSOLUTE",
+      "range": [
+        4.0,
+        14.0
+      ]
+    },
+    {
+      "name": "FILLER",
+      "role": "GROUP_TOTAL",
+      "range": [
+        2.0,
+        100.0
+      ],
+      "members": [
+        "Chalk_1T",
+        "Chalk_95T"
+      ]
+    },
+    {
+      "name": "Chalk_1T",
+      "role": "SHARE_CLOSURE",
+      "group": "FILLER",
+      "max_phr": 100.0
+    },
+    {
+      "name": "Chalk_95T",
+      "role": "SHARE_FREE",
+      "group": "FILLER",
+      "share_range": [
+        0.3,
+        1.0
+      ]
+    },
+    {
+      "name": "SOFT",
+      "role": "GROUP_TOTAL",
+      "range": [
+        3.0,
+        15.0
+      ],
+      "members": [
+        "CPE_135A",
+        "PBNK_3355"
+      ]
+    },
+    {
+      "name": "CPE_135A",
+      "role": "SHARE_CLOSURE",
+      "group": "SOFT",
+      "min_phr": 3.0
+    },
+    {
+      "name": "PBNK_3355",
+      "role": "SHARE_FREE",
+      "group": "SOFT",
+      "share_range": [
+        0.0,
+        0.7
+      ],
+      "max_phr": 8.0
+    },
+    {
+      "name": "ACR",
+      "role": "GROUP_TOTAL",
+      "range": [
+        0.2,
+        2.0
+      ],
+      "members": [
+        "PMPlus_8",
+        "DL_531"
+      ]
+    },
+    {
+      "name": "PMPlus_8",
+      "role": "SHARE_CLOSURE",
+      "group": "ACR"
+    },
+    {
+      "name": "DL_531",
+      "role": "SHARE_FREE",
+      "group": "ACR",
+      "share_range": [
+        0.25,
+        0.6
+      ]
+    },
+    {
+      "name": "LUB",
+      "role": "GROUP_TOTAL",
+      "range": [
+        0.4,
+        1.2
+      ],
+      "members": [
+        "DL_60",
+        "AKLUB_K_435",
+        "OPE"
+      ]
+    },
+    {
+      "name": "DL_60",
+      "role": "SHARE_SIMPLEX",
+      "group": "LUB",
+      "share_range": [
+        0.3,
+        0.7
+      ]
+    },
+    {
+      "name": "AKLUB_K_435",
+      "role": "SHARE_SIMPLEX",
+      "group": "LUB",
+      "share_range": [
+        0.1,
+        0.6
+      ]
+    },
+    {
+      "name": "OPE",
+      "role": "SHARE_SIMPLEX",
+      "group": "LUB",
+      "share_range": [
+        0.1,
+        0.6
+      ]
+    },
+    {
+      "name": "PF711",
+      "role": "ABSOLUTE",
+      "range": [
+        2.5,
+        5.0
+      ]
+    },
+    {
+      "name": "PF711LB",
+      "role": "ABSOLUTE",
+      "range": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "name": "SBM_55",
+      "role": "ABSOLUTE",
+      "range": [
+        0.15,
+        0.7
+      ]
+    },
+    {
+      "name": "TiO2_BLR895",
+      "role": "ABSOLUTE",
+      "range": [
+        0.3,
+        8.0
+      ],
+      "scale": "log"
+    },
+    {
+      "name": "UV_CSFCP",
+      "role": "ABSOLUTE_CAPPED",
+      "range": [
+        0.05,
+        0.3
+      ],
+      "scale": "log",
+      "cap_to": [
+        "DINP",
+        "ESO"
+      ],
+      "cap_ratio": 0.03
+    },
+    {
+      "name": "ESO",
+      "role": "FIXED",
+      "value": 2.5
+    },
+    {
+      "name": "SA_1860",
+      "role": "FIXED",
+      "value": 0.1
+    }
+  ]
+}

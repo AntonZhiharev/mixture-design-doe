@@ -41,6 +41,10 @@ from ..core.schema_evolution import (KNOWN_CONSTANT, evolve_schema,
 from ..design.branches import (ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
                                 ROLE_PRIORITY)
 from ..optimize.desirability import Desirability, DesirabilitySpec
+# iter75: единый источник СЕРИАЛИЗУЕМОЙ ценовой ноги (price_fn несёт price_spec,
+# поэтому наследованная веткой цена переживает save/load). Импорт безопасен:
+# campaign_state тянет mixture_process_runner, но НЕ campaign — цикла нет.
+from . import campaign_state as cs
 
 
 # ----------------------------------------------------------------------
@@ -850,6 +854,27 @@ class CampaignController:
         return out
 
     # -- §17.5 (Ш4) РУЧНОЕ создание ветки: мультицель + роли + ценовая нога --
+    def _default_rho_goal_spec(self, rho: str) -> DesirabilitySpec:
+        """iter75: дефолтная цель ``min`` по ρ, когда проект объявил её целевой.
+
+        Диапазон берём из ИЗМЕРЕННЫХ значений ρ в общей базе (``[min, max]``
+        измеренного столбца): desirability нужна монотонная шкала, и честный
+        масштаб — тот, что уже увиден в опытах. Если ρ ещё не измерена (база
+        пуста или ρ введена позже, §13.7 MISSING), диапазон объявить неоткуда —
+        отдаём ``[0, 1]`` как ЯВНО условный: пользователь правит low/high в
+        редакторе целей, а `validate_branch_ready` всё равно не пустит ветку в
+        пересчёт без измерений (READINESS_UNMEASURED_GOAL).
+        """
+        lo, hi = 0.0, 1.0
+        idx = getattr(self.runner, "prop_index", {}).get(rho)
+        Y = getattr(self.runner, "Y", None)
+        if idx is not None and Y is not None and len(Y):
+            col = np.asarray(Y, float)[:, int(idx)]
+            col = col[np.isfinite(col)]
+            if col.size and float(col.max()) > float(col.min()):
+                lo, hi = float(col.min()), float(col.max())
+        return DesirabilitySpec("min", low=lo, high=hi, weight=1.0)
+
     def create_branch(self, name: str,
                       goals: Dict[str, DesirabilitySpec], *,
                       branch_id: Optional[str] = None,
@@ -882,6 +907,23 @@ class CampaignController:
         if unknown:
             raise KeyError(f"Цели ссылаются на неизвестные свойства {sorted(unknown)} "
                            f"(есть: {list(self.runner.property_names)}).")
+        # iter75: экономика — атрибут ПРОЕКТА (ρ + цены сырья), ветка её
+        # НАСЛЕДУЕТ. Если ветке не передали свою ногу, а проект экономику
+        # объявил — собираем ногу из проектных ρ/цен: одно и то же сырьё не
+        # может стоить разное в разных ветках одной кампании. cost_spec ветка
+        # задаёт сама (порог себестоимости — её намерение, не факт проекта);
+        # без порога наследование невозможно — это НЕ ошибка, ветка просто
+        # остаётся технической (ceil цены не объявлен).
+        inherited_price = False
+        if price_fn is None and cost_spec is not None \
+                and getattr(self.runner, "economics_enabled", False) \
+                and getattr(self.runner, "rho_property", ""):
+            prices = self.runner.project_price_vector()
+            if prices:
+                price_fn = cs.linear_price_fn(prices)
+                rho_property = rho_property or self.runner.rho_property
+                inherited_price = True
+
         has_price = price_fn is not None
         if has_price:
             if cost_spec is None or not rho_property:
@@ -892,6 +934,21 @@ class CampaignController:
                 raise KeyError(
                     f"ρ-свойство '{rho_property}' не среди свойств оракула "
                     f"{list(self.runner.property_names)}.")
+
+        # iter75: если проект объявил ρ ЦЕЛЕВЫМ параметром (rho_default_role =
+        # OPTIMIZED) и вызывающий не задал цель по ρ сам — добавляем её здесь,
+        # ДО add_branch: роль выводится ядром из goal, значит цель обязана быть
+        # в намерении ветки с рождения (иначе первый _rescore посчитал бы ρ
+        # входом цены, и денежный канал не занулился бы, И-5). Спека цели по ρ —
+        # min по измеренному разбросу: конкретные low/high задаёт пользователь
+        # в редакторе целей, здесь нужен корректный ПО ЗНАКУ дефолт.
+        goals = dict(goals)
+        rho_goal_auto = False
+        if has_price and str(getattr(self.runner, "rho_default_role", "")) \
+                == ROLE_OPTIMIZED and rho_property not in goals:
+            goals[str(rho_property)] = self._default_rho_goal_spec(
+                str(rho_property))
+            rho_goal_auto = True
 
         # iter31: группы сэмплирования — часть намерения ветки (None →
         # наследовать проектные); валидация имён — в add_branch (A0.6).
@@ -920,6 +977,12 @@ class CampaignController:
             "branch_name": br.name,
             "n_goals": len(br.goal or {}),
             "has_price_leg": has_price,
+            # iter75: откуда взялась цена (проектная экономика или своя нога
+            # ветки) и добавлена ли цель по ρ автоматически — UI обязан это
+            # показать, иначе пользователь не поймёт, почему у ветки есть цена,
+            # которую он не вводил (A0.6).
+            "price_leg_inherited": bool(inherited_price),
+            "rho_goal_auto": bool(rho_goal_auto),
             "rho_property": (str(rho_property) if has_price else None),
             "price_channel_suppressed":
                 bool(self.runner.price_channel_suppressed(br.id)),

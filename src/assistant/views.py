@@ -472,6 +472,36 @@ def tool_calls_dataframe(calls: Sequence[Any]) -> pd.DataFrame:
                                        "итог", "с", "результат"])
 
 
+#: iter80. Вид записи журнала на языке интерфейса. Записи рождаются в разных
+#: местах (кнопки утверждения пакетов и патчей, ручная фиксация решения), и без
+#: этого столбца таблица выглядит однородной: «проект принят» и «правка границы
+#: отклонена» читались бы как одно и то же событие.
+DECISION_KINDS: Dict[str, str] = {
+    "apply_project": "проект принят",
+    "reject_project": "проект отклонён",
+    "apply_spec": "состав принят",
+    "reject_spec": "состав отклонён",
+    "apply_patch": "граница изменена",
+    "reject_patch": "правка границы отклонена",
+    "apply_setup": "поля формы заполнены",
+    "reject_setup": "правка полей отклонена",
+    "decision": "решение человека",
+}
+
+
+def decision_kind_label(kind: Any) -> str:
+    """Вид записи журнала словами. Незнакомый вид показывается КАК ЕСТЬ.
+
+    Подменять неизвестное значение общим «решение» нельзя: новый вид записи
+    появится в журнале раньше, чем в этом словаре, и человек должен увидеть
+    расхождение, а не сглаженную формулировку.
+    """
+    key = str(kind or "").strip()
+    if not key:
+        return "решение"
+    return DECISION_KINDS.get(key, key)
+
+
 def decisions_dataframe(records: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
     """Журнал решений компании (ADR) → таблица.
 
@@ -482,14 +512,76 @@ def decisions_dataframe(records: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
     for r in records or []:
         rows.append({
             "дата": str(r.get("ts", ""))[:10],
+            "вид": decision_kind_label(r.get("kind", "")),
             "решение": _short(r.get("title") or r.get("decision", ""), 70),
             "узлы": ", ".join(r.get("nodes", []) or []) or "—",
             "кто": r.get("author", "—"),
             "spec_hash": str(r.get("spec_hash", ""))[:12] or "—",
             "обоснование": _short(r.get("rationale", ""), 90),
         })
-    return pd.DataFrame(rows, columns=["дата", "решение", "узлы", "кто",
+    return pd.DataFrame(rows, columns=["дата", "вид", "решение", "узлы", "кто",
                                        "spec_hash", "обоснование"])
+
+
+def local_facts_dataframe(records: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    """L1-факты цеха → таблица (iter80).
+
+    Уровень знания показан столбцом намеренно: L1 ОТМЕНЯЕТ литературу, и при
+    споре с источником из сети человек должен видеть, что в журнале лежит факт
+    высшего приоритета, а не ещё одно мнение. Источник факта — тоже столбец:
+    «сказал сменный мастер» и «протокол лаборатории №17» имеют разную цену.
+    """
+    rows: List[Dict[str, Any]] = []
+    for r in records or []:
+        rows.append({
+            "дата": str(r.get("ts", ""))[:10],
+            "область": _short(r.get("scope", ""), 24) or "—",
+            "факт": _short(r.get("statement", ""), 90),
+            "кто": r.get("author", "—"),
+            "откуда": _short(r.get("source", ""), 50) or "—",
+            "уровень": str(r.get("level", "") or "L1"),
+        })
+    return pd.DataFrame(rows, columns=["дата", "область", "факт", "кто",
+                                       "откуда", "уровень"])
+
+
+def decisions_caption(records: Sequence[Mapping[str, Any]]) -> str:
+    """Подпись журнала решений: сколько чего в нём лежит.
+
+    Отказы считаются ОТДЕЛЬНО от применений: «приняли 3, отклонили 5» — это
+    другая история проекта, чем «приняли 3», и по одному числу записей её не
+    видно.
+    """
+    recs = list(records or [])
+    if not recs:
+        return "записей нет"
+    applied = sum(1 for r in recs if str(r.get("kind", "")).startswith("apply"))
+    rejected = sum(1 for r in recs
+                   if str(r.get("kind", "")).startswith("reject"))
+    manual = len(recs) - applied - rejected
+    parts = [f"всего: {len(recs)}", f"принято: {applied}",
+             f"отклонено: {rejected}", f"записано вручную: {manual}"]
+    last = str(recs[-1].get("ts", ""))[:10]
+    if last:
+        parts.append(f"последняя: {last}")
+    return " · ".join(parts)
+
+
+def facts_caption(records: Sequence[Mapping[str, Any]]) -> str:
+    """Подпись журнала фактов цеха: сколько и по каким областям."""
+    recs = list(records or [])
+    if not recs:
+        return "фактов нет"
+    scopes = sorted({str(r.get("scope", "")).strip() for r in recs
+                     if str(r.get("scope", "")).strip()})
+    parts = [f"всего: {len(recs)}"]
+    if scopes:
+        parts.append("области: " + ", ".join(scopes[:6])
+                     + ("…" if len(scopes) > 6 else ""))
+    last = str(recs[-1].get("ts", ""))[:10]
+    if last:
+        parts.append(f"последний: {last}")
+    return " · ".join(parts)
 
 
 def consents_dataframe(consents: Sequence[Any]) -> pd.DataFrame:

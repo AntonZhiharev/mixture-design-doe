@@ -701,6 +701,118 @@ def _render_attachments(session, root: str, project: str) -> None:
                          width="stretch", hide_index=True)
 
 
+def _render_decisions(ctx: ToolContext, root: str, project: str) -> None:
+    """Панель ЖУРНАЛА РЕШЕНИЙ проекта (iter80): показ + ручная запись.
+
+    Закрывает отказ, с которого начался шаг: человек принял пакет проекта,
+    запись легла в ``decision_log.jsonl`` — и НИГДЕ на экране не появилась.
+    Панели «🏗 Предложенные проекты», «🧬 Предложенные спеки», «🧩 Предложенные
+    патчи» показывают ОЖИДАЮЩИЕ утверждения предложения и после применения
+    пустеют штатно; журнал же — история принятых решений, и живёт он в файле
+    проекта, а не в переписке.
+
+    Ручная запись здесь потому, что до iter80 её не было вовсе: инструмент
+    ``record_decision`` существовал, а нажать было нечего — решение «мел до
+    100 phr, потому что так делает цех» технолог зафиксировать не мог. Модели
+    этот инструмент по-прежнему недоступен (iter63): она предлагает
+    формулировку, записывает человек.
+    """
+    recs = store.read_log(root, project, "decisions") if project else []
+    with st.expander(f"📚 Журнал решений: {len(recs)}"):
+        st.caption(views.decisions_caption(recs))
+        if recs:
+            st.dataframe(views.decisions_dataframe(recs),
+                         width="stretch", hide_index=True)
+        else:
+            st.caption("Пусто. Сюда попадает КАЖДОЕ принятое и отклонённое "
+                       "предложение помощника (проект, состав, границы узла) — "
+                       "и решения, которые вы записываете сами. Через полгода "
+                       "спор «почему тогда так решили» разрешает этот журнал, "
+                       "а не память участников.")
+        st.markdown("**✍️ Зафиксировать решение**")
+        title = st.text_input("Решение одной строкой", key="dock_dec_title",
+                              placeholder="мел до 100 phr для белых компаундов")
+        why = st.text_area("Почему так решили", key="dock_dec_why", height=80,
+                           placeholder="на чём основано: опыт цеха, протокол, "
+                                       "паспорт, расчёт")
+        nodes = st.multiselect("Каких компонентов касается (необязательно)",
+                               options=node_names(ctx), key="dock_dec_nodes")
+        who = st.text_input("Кто решил", key="dock_dec_author",
+                            placeholder="фамилия или роль")
+        if st.button("✍️ Записать решение в журнал", key="dock_dec_save"):
+            if not title.strip() or not why.strip():
+                st.error("Решение без обоснования в журнал не пишется: через "
+                         "полгода «почему» будет важнее «что».")
+            else:
+                try:
+                    out = actx.human_record_decision(
+                        ctx, title.strip(), why.strip(), nodes=list(nodes),
+                        author=who.strip() or "человек (UI)")
+                except ToolError as exc:
+                    st.error(str(exc))
+                else:
+                    rec = out.get("decision", {}) or {}
+                    if rec.get("persisted"):
+                        st.success("Решение записано в журнал проекта.")
+                        st.rerun()
+                    else:
+                        # Молчаливой потери быть не должно: говорим прямо.
+                        st.warning("Решение НЕ сохранено на диск: "
+                                   + str(rec.get("note", "проект не выбран")))
+
+
+def _render_local_facts(ctx: ToolContext, root: str, project: str) -> None:
+    """Панель ФАКТОВ ЦЕХА (L1) — высший уровень знания (iter80).
+
+    L1 отменяет литературу и справочники, поэтому автор факта — человек и
+    только человек: факт, записанный моделью, отменял бы источники от своего
+    имени (ASSISTANT_SPEC §370). Помощник читает эти записи (`get_local_facts`)
+    и обязан считать их приоритетнее найденного в сети.
+    """
+    recs = store.read_log(root, project, "local_facts") if project else []
+    with st.expander(f"🏭 Факты производства (L1): {len(recs)}"):
+        st.caption(views.facts_caption(recs))
+        if recs:
+            st.dataframe(views.local_facts_dataframe(recs),
+                         width="stretch", hide_index=True)
+        else:
+            st.caption("Пусто. Здесь живёт знание вашего производства: "
+                       "«смеситель типа A — не выше 120 °C», «плотность "
+                       "компаунда измеряется, а не считается». Помощник "
+                       "ставит эти записи ВЫШЕ литературы и справочников.")
+        st.markdown("**✍️ Записать факт производства**")
+        stmt = st.text_area("Сам факт одной фразой", key="dock_fact_stmt",
+                            height=80,
+                            placeholder="смеситель типа A — не выше 120 °C")
+        scope = st.text_input("К чему относится", key="dock_fact_scope",
+                              placeholder="компонент, свойство, участок, "
+                                          "оборудование")
+        src_txt = st.text_input("Откуда известно", key="dock_fact_src",
+                                placeholder="кто сказал / протокол / номер опыта")
+        who = st.text_input("Кто утверждает", key="dock_fact_author",
+                            placeholder="фамилия или роль")
+        if st.button("✍️ Записать факт в журнал", key="dock_fact_save"):
+            if not stmt.strip():
+                st.error("Пустой факт записать нельзя.")
+            else:
+                try:
+                    out = actx.human_add_local_fact(
+                        ctx, stmt.strip(), scope=scope.strip(),
+                        source=src_txt.strip(),
+                        author=who.strip() or "технолог")
+                except ToolError as exc:
+                    st.error(str(exc))
+                else:
+                    rec = out.get("fact", {}) or {}
+                    if rec.get("persisted"):
+                        st.success("Факт записан. Помощник будет считать его "
+                                   "важнее литературы и найденного в сети.")
+                        st.rerun()
+                    else:
+                        st.warning("Факт НЕ сохранён на диск: "
+                                   + str(rec.get("note", "проект не выбран")))
+
+
 def _render_artifacts(session) -> None:
     """Графики и таблицы прогонов ЭТОГО проекта (живут после перезапуска)."""
     shown = views.artifact_outputs(session)
@@ -756,7 +868,11 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
             help="Всё, что придёт из сети, — уровень знания L2: локальный факт "
                  "цеха его отменяет.")
         _render_connection()
-        st.markdown("**Спросить про открытую закладку:**")
+        # iter78: пока шаг не определён (приложение только открыли), «про
+        # открытую закладку» — неправда: закладки в фокусе ещё нет, а кнопки
+        # под этой подписью отвечают на вопросы первого входа.
+        st.markdown("**С чего начать:**" if not focus.section_key
+                    else "**Спросить про открытую закладку:**")
         asked = _render_suggestions(focus, runner is not None)
 
     # --- ЛЕНТА: свой скролл, история вверх, свежее внизу (как в Cline) ---
@@ -840,9 +956,17 @@ def render_assistant_info(runner: Any = None, *, root: str = "") -> None:
 
     По эскизу пользователя крайняя правая зона — то, что нужно ПОСТОЯННО на
     разных закладках рабочей области и большей частью связано с ассистентом:
-    📎 вложения сессии, 🖼 выхлоп песочницы, 📌 состояние сессии. Раньше эти
-    панели жили в левой колонке ПОД перепиской — до них приходилось скроллить
-    сквозь весь диалог, а видны они были только когда диалог короткий.
+    📎 вложения сессии, 🖼 файлы расчётов, 📚 журнал решений, 🏭 факты
+    производства, 📌 состояние сессии. Раньше эти панели жили в левой колонке
+    ПОД перепиской — до них приходилось скроллить сквозь весь диалог, а видны
+    они были только когда диалог короткий.
+
+    **iter80 — журналы проекта.** «📚 Журнал решений» и «🏭 Факты производства»
+    добавлены здесь, а не в левой колонке, намеренно: слева живёт то, что ЖДЁТ
+    утверждения (и после нажатия кнопки панель пустеет), а журнал — ИСТОРИЯ
+    принятого и отклонённого, она читается из файла проекта и нужна на любом
+    шаге. Отсутствие показа и читалось как «решения никуда не пишутся», хотя
+    записывались они с iter63.
 
     Сессия и проект берутся тем же путём, что у дока (:func:`dock_session`):
     обе колонки показывают ОДНО состояние, а не две копии.
@@ -852,10 +976,19 @@ def render_assistant_info(runner: Any = None, *, root: str = "") -> None:
             os.path.abspath(__file__)))), "project_campaigns")
     project = current_project(root) or "_scratch"
     session = dock_session(root, project)
+    # iter80: журналы решений и фактов — те же инструменты, что у дока, поэтому
+    # контекст собирается ОДНИМ путём: реестр подтверждений и спека должны быть
+    # общими с левой колонкой, иначе токен кнопки относился бы к другому сеансу.
+    ctx = dock_context(root, project, runner, session)
 
     st.subheader("📋 Инфо-панель проекта")
     _render_attachments(session, root, project)
     _render_artifacts(session)
+    # Журнал — ПОСЛЕ файлов и ПЕРЕД состоянием переписки: это история проекта,
+    # а не служебное состояние сеанса. Нужен он на любой закладке, поэтому
+    # живёт в постоянной правой зоне, а не под лентой диалога (iter72).
+    _render_decisions(ctx, root, project)
+    _render_local_facts(ctx, root, project)
 
     with st.expander("📌 Состояние переписки с помощником"):
         st.caption(views.session_caption(session))

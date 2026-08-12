@@ -151,9 +151,17 @@ UNKNOWN_SECTION = FocusSection(
     key="", title="— шаг не определён",
     doing=("место в интерфейсе неизвестно: не строй догадок о шаге — "
            "спроси, какая закладка открыта, если это важно для ответа"),
-    asks=(("Можно строить план?",
-           "Можно уже строить план? Что показала проверка плана?"),
-          ("Что в базе?", "Сколько точек в базе и что они покрывают?")))
+    # iter78: шаг не определён — значит человек ТОЛЬКО ЧТО открыл приложение.
+    # Прежние подсказки («Можно строить план?», «Что в базе?») спрашивали о
+    # состоянии кампании, которой на этом месте ещё нет: на чистом проекте
+    # ответ был бы «не проверено, база пуста» — верный, но бесполезный. Здесь
+    # уместны два вопроса первого входа: с чего начать и что программа умеет.
+    asks=(("С чего начать",
+           "С чего начать работу в этом проекте? Что уже задано и какой "
+           "следующий шаг сделать?"),
+          ("Краткое описание функционала",
+           "Краткое описание функционала: что умеет эта программа и из каких "
+           "шагов состоит работа в ней?")))
 
 
 def section(key: Any) -> FocusSection:
@@ -764,6 +772,52 @@ def human_reject_setup(ctx: Any, setup_id: str, reason: str, *,
     return dispatch(ctx, "reject_setup_fields",
                     {"setup_id": setup_id, "human_token": token,
                      "reason": reason, "author": author},
+                    allowed_kinds=[WRITE])
+
+
+def human_record_decision(ctx: Any, title: str, rationale: str, *,
+                          nodes: Optional[Sequence[str]] = None,
+                          author: str = "", ttl_s: Optional[float] = None
+                          ) -> Dict[str, Any]:
+    """Записать РЕШЕНИЕ КОМПАНИИ от имени человека — кнопка UI (iter80).
+
+    До iter80 инструмент ``record_decision`` существовал, но вызвать его было
+    неоткуда: кнопки в интерфейсе не было, а модели класс ``write`` недоступен
+    по построению (iter63). Журнал решений заполнялся ТОЛЬКО побочно — из кнопок
+    утверждения пакетов и патчей, поэтому решение «мел до 100 phr, потому что
+    так делает цех» записать было нечем.
+
+    Токен выдаётся здесь же и гасится инструментом: подтверждение относится к
+    ЭТОМУ заголовку, а не к «человек вообще согласен писать в журнал».
+    """
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_decision_token
+
+    token = issue_decision_token(ctx, title, ttl_s=ttl_s)
+    return dispatch(ctx, "record_decision",
+                    {"title": title, "rationale": rationale,
+                     "nodes": list(nodes or []), "author": author,
+                     "human_token": token},
+                    allowed_kinds=[WRITE])
+
+
+def human_add_local_fact(ctx: Any, statement: str, *, scope: str = "",
+                         source: str = "", author: str = "",
+                         ttl_s: Optional[float] = None) -> Dict[str, Any]:
+    """Записать L1-факт цеха от имени человека — кнопка UI (iter80).
+
+    L1 отменяет литературу (ASSISTANT_SPEC §370), поэтому автор факта — человек
+    и только человек: факт, записанный моделью, отменял бы справочники от своего
+    имени. Модель может предложить формулировку в ответе — записывает её тот,
+    кто нажимает кнопку.
+    """
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_fact_token
+
+    token = issue_fact_token(ctx, statement, ttl_s=ttl_s)
+    return dispatch(ctx, "add_local_fact",
+                    {"statement": statement, "scope": scope, "source": source,
+                     "author": author, "human_token": token},
                     allowed_kinds=[WRITE])
 
 

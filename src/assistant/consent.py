@@ -42,8 +42,12 @@ from typing import Any, Callable, Dict, List, Optional
 #: процесс-оси, то есть РОЖДЕНИЕ проекта, а не правка существующего. Снова
 #: отдельное действие: согласие на замену геометрии не есть согласие завести
 #: проект с другими откликами и осями.
+#: ``apply_setup`` (iter76) — применение ТОЧЕЧНОЙ ПРАВКИ ПОЛЕЙ формы сетапа
+#: несобранного проекта: до сборки данные живут в полях формы, и согласие на
+#: пакет проекта целиком не есть согласие на правку отдельного поля.
 ACTIONS = ("apply_patch", "reject_patch", "record_decision", "add_local_fact",
-           "apply_spec", "reject_spec", "apply_project", "reject_project")
+           "apply_spec", "reject_spec", "apply_project", "reject_project",
+           "apply_setup", "reject_setup")
 
 #: Срок жизни подтверждения по умолчанию, сек.
 DEFAULT_TTL_S = 600.0

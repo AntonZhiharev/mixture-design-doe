@@ -33,7 +33,7 @@ import numpy as np
 
 from ..core.schema import DataPoint, ProjectSchema
 from ..core.schema_evolution import SchemaHistory
-from ..design.branches import Branch
+from ..design.branches import Branch, ROLE_PRICE_INPUT
 from ..design.linked_axes import ProcessLink
 from ..design.phr_sampler import PhrSpec
 from ..optimize.desirability import ChanceConstraint, DesirabilitySpec
@@ -42,6 +42,25 @@ from .mixture_process_runner import MixtureProcessRunner
 
 FORMAT_VERSION = "campaign-v1"
 _STATE_FILE = "campaign.json"
+
+#: iter76: ЧЕРНОВИК НАСТРОЕК несобранного проекта — значения полей формы
+#: «🆕 Новый проект». До этого файла сохранить можно было только СОБРАННЫЙ
+#: проект (campaign.json), и заполненная форма терялась при закрытии вкладки —
+#: замкнутый круг «собрать не могу (ошибка), сохранить не могу (не собран)».
+_SETUP_DRAFT_FILE = "setup_draft.json"
+
+#: Ключи формы сетапа, которые НЕ идут в черновик: объекты конкретного прогона
+#: (PhrSpec-объект, numpy-план seed, состояние data_editor) и КНОПКИ (их bool
+#: живёт в session_state, но Streamlit запрещает класть его обратно —
+#: StreamlitValueAssignmentNotAllowedError при префилле) — они либо не
+#: JSON-сериализуемы, либо восстанавливаются из других полей.
+_SETUP_DRAFT_SKIP = frozenset({
+    "setup_seed_X", "setup_seed_Y", "setup_seed_df", "setup_seed_df_sig",
+    "setup_seed_editor", "setup_phr_spec_obj", "setup_phr_tree",
+    # кнопки формы сетапа (st.button / st.download_button)
+    "setup_build", "setup_propose_seed", "setup_commit_seed",
+    "setup_fill_demo", "setup_seed_dl",
+})
 
 
 # ----------------------------------------------------------------------
@@ -263,6 +282,21 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             # столбцы после load молча пропадали бы из таблиц (A0.6).
             "covariate_names": [str(n) for n in
                                 (getattr(runner, "covariate_names", []) or [])],
+            # iter75: ЭКОНОМИКА ПРОЕКТА (ρ-отклик + цены сырья + единицы +
+            # роль ρ по умолчанию). Проектный уровень, не ветка: без
+            # сериализации save/load молча вернул бы кампанию без
+            # себестоимости, а ветки — к ручному вводу цен (A0.6).
+            "economics_enabled": bool(getattr(runner, "economics_enabled",
+                                              False)),
+            "rho_property": str(getattr(runner, "rho_property", "") or ""),
+            "rho_unit": str(getattr(runner, "rho_unit", "") or ""),
+            "currency_unit": str(getattr(runner, "currency_unit", "") or ""),
+            "mass_unit": str(getattr(runner, "mass_unit", "") or ""),
+            "component_prices": {str(k): float(v) for k, v in
+                                 (getattr(runner, "component_prices", {})
+                                  or {}).items()},
+            "rho_default_role": str(getattr(runner, "rho_default_role", "")
+                                    or ""),
             "region_moves": [_region_move_to_dict(m)
                              for m in getattr(runner, "_region_moves", []) or []],
             "drop_policy": str(getattr(runner, "_drop_policy", "exclude")),
@@ -386,6 +420,39 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     cov_names = r.get("covariate_names", []) or []
     if cov_names:
         runner.set_covariate_names(cov_names)
+    # iter75: экономика проекта — ШТАТНЫМ сеттером (валидация ρ против откликов
+    # и цен против компонентов). Старый сейв без ключа: ключа нет ⇒ экономика
+    # ВЫКЛЮЧЕНА, а не «включена без ρ» — чужой проект не мутируем догадкой
+    # (A0.6). Дефолт конструктора True рассчитан на НОВЫЙ проект, где форма
+    # сетапа сразу задаёт ρ.
+    if "economics_enabled" not in r:
+        runner.set_project_economics(enabled=False)
+    elif not bool(r.get("economics_enabled")):
+        runner.set_project_economics(enabled=False)
+    elif str(r.get("rho_property", "") or ""):
+        runner.set_project_economics(
+            enabled=True,
+            rho_property=str(r.get("rho_property")),
+            prices={str(k): float(v) for k, v in
+                    (r.get("component_prices", {}) or {}).items()},
+            rho_unit=str(r.get("rho_unit", "") or ""),
+            currency_unit=str(r.get("currency_unit", "") or ""),
+            mass_unit=str(r.get("mass_unit", "") or ""),
+            rho_default_role=str(r.get("rho_default_role")
+                                 or ROLE_PRICE_INPUT))
+    else:
+        # «Включена, но НЕ НАСТРОЕНА»: пользователь ещё не назвал ρ (проект
+        # сохранён до заполнения блока экономики). Через сеттер это не провести
+        # — он справедливо требует ρ; поэтому восстанавливаем ровно то же
+        # состояние, что даёт конструктор, не выдавая его за настроенную ногу.
+        runner.economics_enabled = True
+        runner.rho_property = ""
+        runner.component_prices = {}
+        runner.rho_unit = str(r.get("rho_unit", "") or "")
+        runner.currency_unit = str(r.get("currency_unit", "") or "")
+        runner.mass_unit = str(r.get("mass_unit", "") or "")
+        runner.rho_default_role = str(r.get("rho_default_role")
+                                      or ROLE_PRICE_INPUT)
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))
 
@@ -420,6 +487,13 @@ def save_campaign(runner: MixtureProcessRunner, root: str | Path,
     state = runner_to_state(runner, draft=draft)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2),
                     encoding="utf-8")
+    # iter76: черновик настроек относился к НЕсобранному проекту; после
+    # сохранения собранного он устарел (источник истины — campaign.json,
+    # форма префиллится из раннера). Оставить его — значит однажды загрузить
+    # старые поля поверх новых.
+    stale = target / _SETUP_DRAFT_FILE
+    if stale.exists():
+        stale.unlink()
     return str(path)
 
 
@@ -451,12 +525,73 @@ def load_campaign_draft(root: str | Path, name: str) -> Optional[Dict[str, Any]]
 
 
 def list_campaigns(root: str | Path) -> List[str]:
-    """Имена сохранённых кампаний в ``root`` (каталоги с ``campaign.json``)."""
+    """Имена сохранённых проектов в ``root``.
+
+    Проект — каталог с ``campaign.json`` (собранный) ИЛИ с ``setup_draft.json``
+    (iter76: черновик настроек, проект ещё не собран). Черновик должен быть
+    виден в списке загрузки — иначе сохранённая до сборки форма недостижима.
+    """
     root = Path(root)
     if not root.exists():
         return []
     return sorted(p.name for p in root.iterdir()
-                  if p.is_dir() and (p / _STATE_FILE).exists())
+                  if p.is_dir() and ((p / _STATE_FILE).exists()
+                                     or (p / _SETUP_DRAFT_FILE).exists()))
+
+
+def campaign_exists(root: str | Path, name: str) -> bool:
+    """Есть ли у проекта СОБРАННОЕ состояние (``campaign.json``)."""
+    return (Path(root) / _validate_name(name) / _STATE_FILE).exists()
+
+
+# ----------------------------------------------------------------------
+# iter76: черновик настроек НЕсобранного проекта (поля формы сетапа)
+# ----------------------------------------------------------------------
+def setup_draft_fields(state: Any) -> Dict[str, Any]:
+    """Снимок полей формы «🆕 Новый проект» из ``session_state`` (чистая).
+
+    Берутся все ключи ``setup_*`` со СКАЛЯРНЫМИ значениями (str/int/float/
+    bool/None) — ровно то, что человек ввёл в форму и что можно честно
+    вернуть через ``setup_prefill_pending``. Объекты прогона (numpy-план,
+    PhrSpec, состояние редактора) исключены явно (:data:`_SETUP_DRAFT_SKIP`).
+    """
+    out: Dict[str, Any] = {}
+    for k, v in dict(state or {}).items():
+        key = str(k)
+        if not key.startswith("setup_") or key in _SETUP_DRAFT_SKIP:
+            continue
+        if v is None or isinstance(v, (str, int, float, bool)):
+            out[key] = v
+    return out
+
+
+def save_setup_draft(root: str | Path, name: str,
+                     fields: Dict[str, Any]) -> str:
+    """Сохранить черновик настроек в ``root/<name>/setup_draft.json``.
+
+    Черновик — это «ссылка» несобранного проекта: каталог появляется с
+    момента ввода имени, а не с момента сборки, поэтому рядом уже могут жить
+    переписка ассистента (``assistant/``) и, позже, ``campaign.json``.
+    """
+    name = _validate_name(name)
+    if not fields:
+        raise ValueError("Черновик пуст: в форме «🆕 Новый проект» нет "
+                         "заполненных полей — сохранять нечего.")
+    target = Path(root) / name
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / _SETUP_DRAFT_FILE
+    path.write_text(json.dumps(dict(fields), ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return str(path)
+
+
+def load_setup_draft(root: str | Path, name: str) -> Optional[Dict[str, Any]]:
+    """Черновик настроек проекта или ``None`` (черновика нет — не ошибка)."""
+    path = Path(root) / _validate_name(name) / _SETUP_DRAFT_FILE
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return dict(data) if isinstance(data, dict) else None
 
 
 def delete_campaign(root: str | Path, name: str) -> bool:
@@ -473,8 +608,11 @@ def delete_campaign(root: str | Path, name: str) -> bool:
         raise ValueError(f"Проект вне каталога проектов: {target}")
     if not target.exists():
         return False
-    if not (target / _STATE_FILE).exists():
-        raise ValueError(f"'{name}' не похож на проект (нет {_STATE_FILE}) — "
-                         f"удаление отклонено.")
+    # iter76: проектом считается и черновик настроек (setup_draft.json) —
+    # несобранный, но сохранённый проект тоже должен удаляться штатно.
+    if not ((target / _STATE_FILE).exists()
+            or (target / _SETUP_DRAFT_FILE).exists()):
+        raise ValueError(f"'{name}' не похож на проект (нет {_STATE_FILE} и "
+                         f"{_SETUP_DRAFT_FILE}) — удаление отклонено.")
     shutil.rmtree(target)
     return True

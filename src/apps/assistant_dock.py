@@ -79,6 +79,9 @@ K_PENDING = "assistant_pending_question"
 #: K_PENDING отправляется автоматически на следующем прогоне, а этот ждёт
 #: явного нажатия кнопки — повтор к модели должен быть решением человека.
 K_FAILED = "assistant_failed_question"
+#: iter76: уведомление о ПЕРЕКЛЮЧЕНИИ переписки при смене имени проекта.
+#: Без него смена имени выглядела как потеря диалога (файл на диске цел).
+K_SWITCH_MSG = "assistant_project_switch_msg"
 
 
 # ----------------------------------------------------------------------
@@ -99,11 +102,26 @@ def dock_focus() -> UiFocus:
 
 
 def dock_session(root: str, project: str):
-    """Сессия ассистента текущего проекта (перечитывается при смене проекта)."""
-    if st.session_state.get(K_PROJECT) != project or K_SESSION not in st.session_state:
+    """Сессия ассистента текущего проекта (перечитывается при смене проекта).
+
+    iter76: смена имени проекта переключает и ПЕРЕПИСКУ — раньше это
+    происходило молча, и человек, поменяв имя перед сохранением, видел
+    «пропавший» диалог (на диске он цел, в каталоге прежнего имени).
+    Теперь факт переключения показывается явно (:data:`K_SWITCH_MSG`).
+    """
+    prev = st.session_state.get(K_PROJECT)
+    if prev != project or K_SESSION not in st.session_state:
         st.session_state[K_SESSION] = store.load_session(root, project) \
             if project else store.load_session(root, "_scratch")
         st.session_state[K_PROJECT] = project
+        if prev is not None and prev != project:
+            st.session_state[K_SWITCH_MSG] = (
+                f"Имя проекта изменилось: «{prev or '_scratch'}» → "
+                f"«{project or '_scratch'}». Переписка переключена на новый "
+                f"проект; прежний диалог ЦЕЛ — он сохранён в "
+                f"`project_campaigns/{prev or '_scratch'}/assistant/` и "
+                f"вернётся, если вписать прежнее имя в поле «Имя проекта» "
+                f"на закладке «🌱 Старт».")
     return st.session_state[K_SESSION]
 
 
@@ -115,13 +133,27 @@ def consent_registry() -> ConsentRegistry:
     return reg
 
 
+def _setup_fields_snapshot() -> Dict[str, Any]:
+    """iter76: снимок полей формы «🆕 Новый проект» для инструментов.
+
+    До сборки проекта данные живут ТОЛЬКО в полях формы — без снимка помощник
+    их не видел и не мог вносить точечные правки (замкнутый круг несобранного
+    проекта). Логика отбора ключей — чистая ``campaign_state.setup_draft_fields``.
+    """
+    from src.apps import campaign_state as cs
+    return cs.setup_draft_fields(st.session_state)
+
+
 def dock_context(root: str, project: str, runner: Any, session: Any
                  ) -> ToolContext:
     """Контекст инструментов дока: движок + спека + сессия + подтверждения."""
     spec = getattr(runner, "phr_spec", None) if runner is not None else None
     return ToolContext(runner=runner, session=session, root=root,
                        project=project, spec=spec,
-                       extra={"consent": consent_registry()})
+                       extra={"consent": consent_registry(),
+                              # iter76: помощник видит поля формы сетапа
+                              # (get_setup_fields / propose_setup_fields).
+                              "setup_fields": _setup_fields_snapshot()})
 
 
 def spec_hash_of(ctx: ToolContext) -> str:
@@ -262,6 +294,66 @@ def _render_patches(ctx: ToolContext, session) -> None:
                 else:
                     actx.persist_session(ctx)
                     st.success("Патч отклонён, решение записано в журнал.")
+
+
+def _render_setup_edits(ctx: ToolContext, session, runner: Any) -> None:
+    """Панель ПРАВОК ПОЛЕЙ формы сетапа (iter76): применяет человек.
+
+    Пока проект не собран, данные живут в полях формы «🆕 Новый проект» —
+    помощник предлагает их точечную правку (``propose_setup_fields``), а
+    принятие переносит значения в поля тем же механизмом отложенного
+    префилла, что и загрузка проекта.
+    """
+    staged = session.staged_setups()
+    if not staged:
+        return                     # пустая панель не рисуется: шаг редкий
+    st.markdown(f"**📝 Предложенные правки полей формы: {len(staged)}**")
+    if runner is not None:
+        st.warning("Проект уже собран: правки полей формы к нему не "
+                   "применяются — они относились к черновику до сборки.")
+    for s in staged:
+        st.caption(f"`{s.id}` · {s.label or 'без метки'} · полей: "
+                   f"{len(s.fields)}" + (f" · {s.rationale}" if s.rationale
+                                         else ""))
+        st.dataframe(pd.DataFrame(
+            [{"поле": k, "новое значение": str(v)}
+             for k, v in s.fields.items()]),
+            use_container_width=True, hide_index=True)
+        c = st.columns(2)
+        if c[0].button("✅ Применить правку", key=f"dock_apply_setup_{s.id}",
+                       disabled=runner is not None,
+                       help=("Значения лягут в поля формы «🆕 Новый проект»; "
+                             "проект соберёт кнопка «🏗 Построить проект»")
+                            if runner is None else
+                            "Проект уже собран — правка полей неприменима"):
+            try:
+                out = actx.human_apply_setup(ctx, s.id, author="человек (UI)")
+            except ToolError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["setup_prefill_pending"] = dict(
+                    out.get("setup_prefill", {}) or {})
+                st.session_state["camp_project_pkg_msg"] = out.get(
+                    "next_step", "")
+                actx.persist_session(ctx)
+                st.success(out.get("next_step", "Правка применена."))
+                st.rerun()
+        reason = st.text_input("причина отказа",
+                               key=f"dock_setup_reason_{s.id}",
+                               label_visibility="collapsed",
+                               placeholder="почему не берём эту правку")
+        if c[1].button("⛔ Отклонить правку", key=f"dock_reject_setup_{s.id}"):
+            if not reason.strip():
+                st.error("Отказ тоже идёт в журнал решений — назовите причину.")
+            else:
+                try:
+                    actx.human_reject_setup(ctx, s.id, reason.strip(),
+                                            author="человек (UI)")
+                except ToolError as exc:
+                    st.error(str(exc))
+                else:
+                    actx.persist_session(ctx)
+                    st.success("Правка отклонена, решение записано в журнал.")
 
 
 def _render_project_packages(ctx: ToolContext, session, runner: Any) -> None:
@@ -605,6 +697,10 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
     focus = dock_focus()
 
     st.subheader("💬 Помощник по проекту")
+    # iter76: смена имени проекта переключает переписку — говорим об этом
+    # явно, иначе диалог «пропадает» без объяснения (файл на диске цел).
+    if st.session_state.get(K_SWITCH_MSG):
+        st.warning(st.session_state.pop(K_SWITCH_MSG))
     if runner is None:
         st.info("Проект не собран: расчётной модели и базы опытов нет — на "
                 "вопросы о проверке плана и расчётах ответить числами пока "
@@ -697,6 +793,9 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
     # Панели УТВЕРЖДЕНИЯ (проект/спеки/патчи) остаются в зоне ассистента:
     # применить или отклонить предложение — часть работы с ним (iter72).
     _render_project_packages(ctx, session, runner)
+    # iter76: правки полей формы — между пакетами проекта и спеки: они
+    # относятся к тому же несобранному состоянию, что и пакет проекта.
+    _render_setup_edits(ctx, session, runner)
     _render_spec_packages(ctx, session)
     _render_patches(ctx, session)
 

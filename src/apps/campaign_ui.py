@@ -268,6 +268,75 @@ COST_MODEL_LABEL = "Модель себестоимости изделия (пл
 CURRENCY_UNIT = "₽"
 MASS_UNIT = "кг"
 
+# iter75: экономика — блок СТАРТОВОЙ страницы (плотность ρ входит в экономику
+# проекта по умолчанию, решение сессии 12.08.2026). Ярлыки — единый источник для
+# формы сетапа, read-only показа в форме ветки и тестов формулировок.
+PROJECT_ECON_LABEL = "💰 Экономика проекта — себестоимость изделия через плотность ρ"
+RHO_DEFAULT_NAME = "rho"
+RHO_ROLE_PRICE_LABEL = "вход себестоимости (ρ питает цену изделия)"
+RHO_ROLE_TARGET_LABEL = "целевой параметр (ρ оптимизируется как цель)"
+RHO_ROLE_LABELS = [RHO_ROLE_PRICE_LABEL, RHO_ROLE_TARGET_LABEL]
+
+
+def rho_role_from_label(label: str) -> str:
+    """Ярлык радиокнопки роли ρ → роль ядра (``ROLE_PRICE_INPUT``/``OPTIMIZED``)."""
+    return (ROLE_OPTIMIZED if str(label) == RHO_ROLE_TARGET_LABEL
+            else ROLE_PRICE_INPUT)
+
+
+def rho_role_to_label(role: str) -> str:
+    """Роль ядра → ярлык радиокнопки (обратная проекция для префилла)."""
+    return (RHO_ROLE_TARGET_LABEL if str(role) == ROLE_OPTIMIZED
+            else RHO_ROLE_PRICE_LABEL)
+
+
+def ensure_rho_in_responses(responses: Sequence[str],
+                            rho_name: str) -> List[str]:
+    """iter75: дописать ρ в список откликов, если её там нет.
+
+    По §3 плотность — ПОЛНОЦЕННЫЙ отклик: её измеряют, а не считают. Поэтому при
+    включённой экономике ρ обязана стоять среди откликов проекта — иначе ценовую
+    ногу не собрать (``set_project_economics`` откажет). Добавляем в КОНЕЦ, чтобы
+    не сдвигать порядок уже введённых столбцов «(lab)». Чистая функция.
+    """
+    out = [str(s) for s in responses]
+    rho = str(rho_name or "").strip()
+    if rho and rho not in out:
+        out.append(rho)
+    return out
+
+
+def parse_component_prices(text: str,
+                           mixture_names: Sequence[str]) -> Dict[str, float]:
+    """iter75: строка цен «через запятую» → ``{компонент: цена}``.
+
+    Порядок значений = порядок компонентов. Число значений обязано совпасть с
+    числом компонентов: недобор молча оставил бы часть сырья бесплатным (A0.6).
+    Чистая функция (без Streamlit) — тестируется напрямую.
+    """
+    comps = [str(c) for c in mixture_names]
+    vals = _parse_floats(text)
+    if vals is None or len(vals) != len(comps):
+        raise ValueError(
+            f"Нужно {len(comps)} цен компонентов {comps} через запятую "
+            f"(в том же порядке). Пустых значений быть не может: нуль по "
+            f"умолчанию занизил бы себестоимость молча.")
+    return {c: float(v) for c, v in zip(comps, vals)}
+
+
+def item_cost_formula_caption(currency: str, mass: str, rho_unit: str) -> str:
+    """Подпись формулы себестоимости с ЕДИНЫМИ единицами массы (решение сессии).
+
+    Цена состава в ``валюта/масса``, ρ в ``масса/изделие`` — одна и та же масса,
+    поэтому произведение сразу даёт ``валюта/изделие`` без коэффициентов.
+    """
+    cur = str(currency or CURRENCY_UNIT)
+    ms = str(mass or MASS_UNIT)
+    ru = str(rho_unit or f"{ms}/изд")
+    return (f"Себестоимость изделия = цена состава [{cur}/{ms}] × плотность ρ "
+            f"[{ru}] = [{cur}/изд]. Единица массы в цене и в ρ — ОДНА И ТА ЖЕ, "
+            f"поэтому пересчёт прямой, без переводных коэффициентов.")
+
 
 def recommended_seed_size(q: int, d: int) -> int:
     """§17.4 (замечание 4): рекомендуемый размер стартового (скрининг) дизайна.
@@ -2891,6 +2960,24 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
     # префилла повторная сборка проекта молча стёрла бы объявление.
     out["setup_covariates"] = covariate_names_to_text(
         getattr(runner, "covariate_names", []) or [])
+    # iter75: экономика проекта (ρ, цены сырья, единицы, роль ρ) — без префилла
+    # повторная сборка проекта из формы молча стёрла бы себестоимость.
+    econ_on = bool(getattr(runner, "economics_enabled", False))
+    out["setup_econ_on"] = econ_on
+    if econ_on:
+        out["setup_econ_rho"] = str(getattr(runner, "rho_property", "")
+                                    or RHO_DEFAULT_NAME)
+        out["setup_econ_cur"] = str(getattr(runner, "currency_unit", "")
+                                    or CURRENCY_UNIT)
+        out["setup_econ_mass"] = str(getattr(runner, "mass_unit", "")
+                                     or MASS_UNIT)
+        out["setup_econ_rho_unit"] = str(getattr(runner, "rho_unit", "") or "")
+        out["setup_econ_rho_role"] = rho_role_to_label(
+            str(getattr(runner, "rho_default_role", "") or ""))
+        prices = dict(getattr(runner, "component_prices", {}) or {})
+        if prices:
+            out["setup_econ_prices"] = ", ".join(
+                f"{float(prices.get(nm, 0.0)):g}" for nm in mix)
 
     # iter41.3: активная phr-спека → режим «phr-спека (JSON)» с каноническим
     # JSON to_dicts (round-trip: parse_phr_spec_json(json).spec_hash() == hash).
@@ -3104,6 +3191,76 @@ def render_setup_form() -> None:
                  "ось не может одновременно быть в связке и на дискретных "
                  "уровнях.")
 
+        # iter75: ЭКОНОМИКА ПРОЕКТА — плотность ρ входит в экономику проекта ПО
+        # УМОЛЧАНИЮ (решение сессии 12.08.2026), поэтому объявляется ЗДЕСЬ, на
+        # стартовой странице, а не выбирается заново в каждой ветке: закупочная
+        # цена сырья — факт проекта. Отключается ЯВНО галкой; ρ так же явно
+        # переводится в ЦЕЛЕВОЙ параметр (роли §5 — ядро умеет switch_role).
+        st.markdown(f"**{PROJECT_ECON_LABEL}**")
+        econ_on = st.checkbox(
+            "Учитывать себестоимость изделия (плотность ρ + цены сырья)",
+            value=True, key="setup_econ_on",
+            help="Включено по умолчанию: себестоимость — штатная часть проекта. "
+                 "Снятие галочки ЯВНО выключает экономику: ветки будут чисто "
+                 "техническими, денежный стоп (§4) не применяется.")
+        econ_rho = RHO_DEFAULT_NAME
+        econ_prices_txt = ""
+        econ_rho_unit = ""
+        econ_cur = CURRENCY_UNIT
+        econ_mass = MASS_UNIT
+        econ_role_label = RHO_ROLE_PRICE_LABEL
+        if econ_on:
+            uc = st.columns([2, 1, 1])
+            econ_rho = uc[0].text_input(
+                "Отклик плотности ρ", value=RHO_DEFAULT_NAME,
+                key="setup_econ_rho",
+                help="Плотность — ПОЛНОЦЕННЫЙ отклик (§3): её измеряют в "
+                     "лаборатории, как глянец или прочность. Если этого имени "
+                     "нет в списке откликов выше, оно будет добавлено "
+                     "автоматически — и появится столбцом в стартовом плане.")
+            econ_cur = uc[1].text_input(
+                "Валюта", value=CURRENCY_UNIT, key="setup_econ_cur",
+                help="Обозначение денежной единицы (₽, $, €…) — идёт в подписи "
+                     "цен, экономики и в Excel-выгрузку.")
+            econ_mass = uc[2].text_input(
+                "Единица массы", value=MASS_UNIT, key="setup_econ_mass",
+                help="ОДНА единица массы и для цены сырья, и для плотности ρ: "
+                     "тогда пересчёт в себестоимость прямой, без переводных "
+                     "коэффициентов.")
+            st.caption(item_cost_formula_caption(econ_cur, econ_mass, ""))
+            pc2 = st.columns([3, 2])
+            econ_prices_txt = pc2[0].text_input(
+                f"Цены компонентов {mix_live}, {econ_cur}/{econ_mass} "
+                "(через запятую)",
+                value=", ".join(["0"] * len(mix_live)) if mix_live else "",
+                key="setup_econ_prices",
+                help="В том же порядке, что компоненты выше. Значение нужно для "
+                     "КАЖДОГО компонента: пропуск, доопределённый нулём, тихо "
+                     "занижает себестоимость и уводит оптимум к дорогому сырью.")
+            econ_rho_unit = pc2[1].text_input(
+                f"Единица ρ", value=f"{econ_mass}/изд", key="setup_econ_rho_unit",
+                help="Как подписана плотность в таблицах ввода: масса изделия в "
+                     "той же единице массы (например «кг/изд»). На арифметику не "
+                     "влияет — только на подписи.")
+            # A0.6: «включено, но все цены нулевые» — себестоимость тождественно
+            # ноль, желательность цены всегда 1, экономика не работает. Молчать
+            # об этом нельзя: пользователь будет считать, что цена учтена.
+            _pv = _parse_floats(econ_prices_txt)
+            if _pv is not None and _pv and not any(v > 0 for v in _pv):
+                st.warning(
+                    "Все цены сырья нулевые: себестоимость выйдет тождественно "
+                    "нулевой, и денежный критерий работать не будет. Введите "
+                    "реальные цены или снимите галочку выше.")
+            econ_role_label = st.radio(
+                "Роль ρ по умолчанию в новых ветках", RHO_ROLE_LABELS,
+                index=0, key="setup_econ_rho_role",
+                help="«Вход себестоимости» — ρ уточняется ради точной цены "
+                     "(денежный канал разведки ЖИВОЙ). «Целевой параметр» — ρ "
+                     "становится целью ветки (например, минимизировать массу "
+                     "изделия); денежный канал при этом зануляется, чтобы одна "
+                     "и та же польза не считалась дважды. Роль каждой ветки "
+                     "можно поменять позже в её карточке.")
+
         # iter41.2: паспорт кампании — записать ДО первого замера
 
         # (CAMPAIGN_SPEC_PVC §3: задним числом не восстанавливается).
@@ -3119,7 +3276,9 @@ def render_setup_form() -> None:
             "Обязательные 2D-пары", value="", key="setup_preflight_pairs",
             help="Проверка совместного покрытия пар при проверке плана. Одна "
                  "строка = пара, стороны через «|», ось-сумма — имена через "
-                 "запятую. Например:\n"
+                 "запятую. В режиме phr-спеки можно указывать имя ГРУППЫ "
+                 "(например, FILLER) — она развернётся в сумму членов "
+                 "(iter76). Например:\n"
                  "UV_CSFCP | TiO2_BLR895\n"
                  "T | PMPlus_8, DL_531")
         # P2.3: лоты сырья, anchor-рецепты и разрешение весов — часть
@@ -3189,6 +3348,11 @@ def render_setup_form() -> None:
                 # iter41.1: имена компонентов — из спеки (поле игнорируется),
                 # иначе рассинхрон имён и молчаливый откат на бокс-сэмплер.
                 mix = setup_mixture_names(mix, phr_spec_live)
+                # iter75: ρ обязана быть ОТКЛИКОМ (§3) — дописываем её ДО сборки
+                # раннера, иначе столбца «ρ (lab)» не будет в стартовом плане, а
+                # добавление отклика потом оставит MISSING у снятых точек (§13.7).
+                if econ_on:
+                    resp = ensure_rho_in_responses(resp, econ_rho)
 
                 runner = build_setup_runner(
                     mixture_names=mix, process_names=proc,
@@ -3226,6 +3390,18 @@ def render_setup_form() -> None:
                 # P3.1: ковариаты базы — валидация имён (дубли, коллизии с
                 # откликами/осями) ШТАТНЫМ set_covariate_names (A0.6).
                 runner.set_covariate_names(parse_covariate_names(cov_txt))
+                # iter75: экономика проекта — ШТАТНЫМ сеттером (валидация ρ
+                # против откликов и полноты цен). Выключено ⇒ явное enabled=False,
+                # а не молчаливый пропуск: ветки станут техническими осознанно.
+                if econ_on:
+                    runner.set_project_economics(
+                        enabled=True, rho_property=econ_rho,
+                        prices=parse_component_prices(econ_prices_txt, mix),
+                        rho_unit=econ_rho_unit, currency_unit=econ_cur,
+                        mass_unit=econ_mass,
+                        rho_default_role=rho_role_from_label(econ_role_label))
+                else:
+                    runner.set_project_economics(enabled=False)
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
 
                 for k in ("setup_seed_X", "setup_seed_Y",
@@ -3240,6 +3416,14 @@ def render_setup_form() -> None:
                        if levels_now else "")
                     + (f" {links_caption(runner.process_links)}"
                        if links_now else "")
+                    # iter75: экономика видна в подтверждении — пользователь
+                    # должен убедиться, что ρ попала в отклики и роль та.
+                    + (f" Экономика: ρ = «{runner.rho_property}» "
+                       f"({rho_role_to_label(runner.rho_default_role)}), "
+                       f"цены в {runner.currency_unit}/{runner.mass_unit}."
+                       if runner.economics_enabled and runner.rho_property
+                       else " Экономика проекта выключена (ветки будут "
+                            "техническими).")
                     + " База пуста — предложите и измерьте стартовый план "
                       "опытов ниже.")
 
@@ -3989,21 +4173,58 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                        "(§17.3).")
 
 
-        # --- модель себестоимости изделия (опц.) — замечания 6, 7 ---
-        st.markdown(f"**💰 {COST_MODEL_LABEL} (опц., §3/§15.6)**")
-        st.caption(
-            f"Себестоимость изделия = цена состава ({CURRENCY_UNIT}/{MASS_UNIT}) × "
-            "плотность ρ. Плотность ρ — отдельный отклик (роль «вход "
-            "себестоимости»): чем точнее ρ, тем точнее себестоимость. Задайте цены "
-            "компонентов и верхний приемлемый порог себестоимости.")
-        use_price = st.checkbox(
-            "Учитывать себестоимость изделия (ρ-отклик + цены компонентов)",
-            key="camp_nb_use_price")
+        # --- модель себестоимости изделия — замечания 6, 7; iter75 ---
+        # iter75: ρ и цены сырья — ПРОЕКТНЫЕ (стартовая страница). Здесь ветка их
+        # только НАСЛЕДУЕТ и задаёт своё намерение: порог себестоимости и роль ρ.
+        # Ручной ввод цен в ветке оставлен ТОЛЬКО как фолбэк для проектов, где
+        # экономика выключена/не настроена (старые сейвы) — иначе одно и то же
+        # сырьё стоило бы разное в разных ветках одной кампании.
+        econ_ok = bool(getattr(runner, "economics_enabled", False)) and \
+            bool(getattr(runner, "rho_property", ""))
+        st.markdown(f"**💰 {COST_MODEL_LABEL} (§3/§15.6)**")
         rho_prop = None
         prices_txt = ""
         cost_hi = 300.0
-        cur_unit = CURRENCY_UNIT
-        if use_price:
+        cur_unit = str(getattr(runner, "currency_unit", "") or CURRENCY_UNIT)
+        mass_unit_now = str(getattr(runner, "mass_unit", "") or MASS_UNIT)
+        if econ_ok:
+            rho_prop = str(runner.rho_property)
+            st.caption(item_cost_formula_caption(
+                cur_unit, mass_unit_now,
+                str(getattr(runner, "rho_unit", "") or "")))
+            prices_now = dict(getattr(runner, "component_prices", {}) or {})
+            st.caption(
+                f"Наследуется из экономики ПРОЕКТА (стартовая страница): "
+                f"ρ = «{rho_prop}», роль по умолчанию — "
+                f"{rho_role_to_label(str(getattr(runner, 'rho_default_role', '')))}"
+                f"; цены {cur_unit}/{mass_unit_now}: "
+                + ", ".join(f"{nm} = {float(prices_now.get(nm, 0.0)):g}"
+                            for nm in mix_names)
+                + ". Цены сырья — факт проекта, в ветке они не переопределяются.")
+            use_price = st.checkbox(
+                "Включить себестоимость в цели этой ветки", value=True,
+                key="camp_nb_use_price",
+                help="Снятие галочки делает ЭТУ ветку чисто технической "
+                     "(себестоимость не входит в её желательность), проектную "
+                     "экономику это не отключает.")
+            if use_price:
+                cost_hi = st.number_input(
+                    f"Верхний порог себестоимости, {cur_unit}/изд (выше → d=0)",
+                    min_value=0.0, value=300.0, step=10.0,
+                    key="camp_nb_cost_hi",
+                    help="Порог — намерение ВЕТКИ (сколько готовы платить за "
+                         "изделие в этом продукте), поэтому задаётся здесь, а "
+                         "не в проекте.")
+        else:
+            st.caption(
+                "Экономика проекта не настроена (стартовая страница → блок "
+                f"«{PROJECT_ECON_LABEL}»). Здесь можно задать ценовую ногу "
+                "только для этой ветки — но лучше настроить проектную, иначе "
+                "цены сырья разойдутся между ветками.")
+            use_price = st.checkbox(
+                "Учитывать себестоимость изделия (ρ-отклик + цены компонентов)",
+                key="camp_nb_use_price")
+        if use_price and not econ_ok:
             uc = st.columns([1, 2])
             cur_unit = uc[0].text_input(
                 "Валюта", value=CURRENCY_UNIT, key="camp_nb_cur",
@@ -4075,14 +4296,19 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                 goals = draft_goal_specs(draft)
                 price_fn = cost_spec = None
                 if use_price:
-                    prices = _parse_floats(prices_txt)
-                    if prices is None or len(prices) != len(mix_names):
-                        raise ValueError(
-                            f"Нужно {len(mix_names)} цен компонентов "
-                            f"{mix_names} (через запятую).")
-                    price_fn = make_linear_price_fn(prices)
                     cost_spec = DesirabilitySpec("min", low=0.0,
                                                  high=float(cost_hi), weight=0.5)
+                    # iter75: при настроенной проектной экономике price_fn НЕ
+                    # собираем здесь — его подставит create_branch из проектных
+                    # цен (одна цена сырья на кампанию). Форма ветки даёт только
+                    # порог себестоимости.
+                    if not econ_ok:
+                        prices = _parse_floats(prices_txt)
+                        if prices is None or len(prices) != len(mix_names):
+                            raise ValueError(
+                                f"Нужно {len(mix_names)} цен компонентов "
+                                f"{mix_names} (через запятую).")
+                        price_fn = make_linear_price_fn(prices)
                 out = ctrl.create_branch(
                     str(name), goals, budget=int(budget),
                     satisfy_at=float(satisfy), price_fn=price_fn,
@@ -4098,7 +4324,14 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                     f"Ветка «{out['branch_name']}» (`{out['branch_id']}`) создана: "
                     f"{out['n_goals']} цел., ценовая нога = {out['has_price_leg']}"
                     + (f" (ρ={out['rho_property']}, канал занулён="
-                       f"{out['price_channel_suppressed']})"
+                       f"{out['price_channel_suppressed']}"
+                       # iter75: откуда цена и не добавлена ли цель по ρ сама —
+                       # иначе пользователь не поймёт, что за цель он не вводил.
+                       + (", цены наследованы из проекта"
+                          if out.get("price_leg_inherited") else "")
+                       + (", цель по ρ добавлена по проектной политике"
+                          if out.get("rho_goal_auto") else "")
+                       + ")"
                        if out['has_price_leg'] else "")
                     + f"; d_best={out['d_best']:.3f}.")
                 st.rerun()

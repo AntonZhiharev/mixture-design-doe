@@ -734,6 +734,39 @@ def human_reject_project(ctx: Any, project_id: str, reason: str, *,
                     allowed_kinds=[WRITE])
 
 
+def human_apply_setup(ctx: Any, setup_id: str, *, note: str = "",
+                      author: str = "", ttl_s: Optional[float] = None
+                      ) -> Dict[str, Any]:
+    """Применить ПРАВКУ ПОЛЕЙ формы сетапа от имени человека (iter76).
+
+    Кнопка «Применить» панели правок полей: результат — ``setup_prefill``
+    (значения для ``setup_prefill_pending``), проект по-прежнему собирает
+    штатная кнопка «🏗 Построить проект».
+    """
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_apply_setup_token
+
+    token = issue_apply_setup_token(ctx, setup_id, ttl_s=ttl_s, note=note)
+    return dispatch(ctx, "apply_setup_fields",
+                    {"setup_id": setup_id, "human_token": token,
+                     "note": note, "author": author},
+                    allowed_kinds=[WRITE])
+
+
+def human_reject_setup(ctx: Any, setup_id: str, reason: str, *,
+                       author: str = "", ttl_s: Optional[float] = None
+                       ) -> Dict[str, Any]:
+    """Отклонить правку полей сетапа от имени человека — с записью в журнал."""
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_reject_setup_token
+
+    token = issue_reject_setup_token(ctx, setup_id, ttl_s=ttl_s)
+    return dispatch(ctx, "reject_setup_fields",
+                    {"setup_id": setup_id, "human_token": token,
+                     "reason": reason, "author": author},
+                    allowed_kinds=[WRITE])
+
+
 def persist_session(ctx: Any) -> bool:
     """Сохранить сессию проекта на диск; вернуть, состоялась ли запись.
 

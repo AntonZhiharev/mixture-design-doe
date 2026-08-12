@@ -256,6 +256,14 @@ def architect_system_prompt(*, project: str = "", spec_hash: str = "",
                    "(состав + отклики + процесс-оси) и предложи "
                    "`propose_project`; пакет СПЕКИ сейчас применять НЕКУДА, "
                    "человек нажмёт кнопку и не получит результата.")
+        # iter76: до сборки данные живут в ПОЛЯХ формы «🆕 Новый проект» —
+        # без этих двух строк модель их не видела и на просьбу «поправь верх
+        # частоты» отвечала пакетом проекта с нуля, затирая ручной ввод.
+        ctx.append("  • поля формы «🆕 Новый проект» уже могут быть заполнены "
+                   "(человеком или принятым пакетом): смотри их через "
+                   "`get_setup_fields`. Точечное изменение заполненных полей "
+                   "предлагай `propose_setup_fields` ({ключ_поля: значение}) — "
+                   "не пересобирай пакет проекта целиком ради одной правки.")
     if n_attachments:
         ctx.append(f"  • вложений в сессии: {n_attachments} — читай их "
                    f"`read_attachment`, не пересказывай по имени файла.")
@@ -316,7 +324,8 @@ class Scenario:
 #: ПАКЕТУ спеки (iter71) — там же, по той же причине.
 HUMAN_ONLY = ("apply_patch", "reject_patch", "record_decision",
               "add_local_fact", "apply_spec", "reject_spec",
-              "apply_project", "reject_project")
+              "apply_project", "reject_project",
+              "apply_setup_fields", "reject_setup_fields")
 
 
 GOLDEN_SCENARIOS: Tuple[Scenario, ...] = (

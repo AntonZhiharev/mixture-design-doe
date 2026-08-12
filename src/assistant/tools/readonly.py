@@ -692,6 +692,44 @@ def has_project(ctx: ToolContext) -> bool:
 
 
 @register(
+    "get_setup_fields",
+    description=(
+        "ТЕКУЩИЕ ЗНАЧЕНИЯ ПОЛЕЙ формы «🆕 Новый проект» (сетап) — снимок "
+        "того, что человек уже ввёл, ДО сборки проекта. Зови ПЕРЕД тем, как "
+        "предлагать первичный ввод или правку: если поля уже заполнены, "
+        "предлагай ТОЧЕЧНУЮ правку (propose_setup_fields), а не пакет "
+        "проекта с нуля. Ключи полей — те же, что принимает "
+        "propose_setup_fields."),
+    parameters={"type": "object", "properties": {}})
+def get_setup_fields(ctx: ToolContext) -> Dict[str, Any]:
+    """Снимок полей формы сетапа из контекста (кладёт UI-слой, iter76).
+
+    Инструменты чистые и Streamlit не видят, поэтому снимок ``setup_*``-полей
+    передаёт док через ``ctx.extra['setup_fields']``. Отсутствие снимка — не
+    ошибка: MCP-сервер и демо работают без формы.
+    """
+    fields = dict((ctx.extra or {}).get("setup_fields") or {})
+    out: Dict[str, Any] = {
+        "n": len(fields), "fields": _f(fields),
+        "project_present": has_project(ctx),
+    }
+    if has_project(ctx):
+        out["note"] = ("Проект уже СОБРАН: поля формы — лишь черновик "
+                       "пересборки, состояние движка смотри в "
+                       "campaign_overview/get_spec.")
+    elif not fields:
+        out["note"] = ("Форма пуста или снимок недоступен (вызов вне UI). "
+                       "Если проекта нет и полей нет — это первичный ввод: "
+                       "собирай пакет проекта (propose_project).")
+    else:
+        out["note"] = ("Проект НЕ собран, но поля формы уже заполнены. "
+                       "Точечные изменения предлагай через "
+                       "propose_setup_fields — пакет проекта целиком "
+                       "затёр бы ручной ввод человека.")
+    return out
+
+
+@register(
     "project_schema",
     description=(
         "СХЕМА ПАКЕТА ПРОЕКТА из ядра: какие блоки нужны, чтобы РОДИТЬ проект "

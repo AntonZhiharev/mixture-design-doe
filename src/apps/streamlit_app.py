@@ -119,6 +119,34 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
     return True
 
 
+def _load_setup_draft_into_form(root: str, sel: str) -> None:
+    """iter76: загрузка проекта-ЧЕРНОВИКА — поля формы вместо раннера.
+
+    Собранного ``campaign.json`` у такого проекта нет; черновик настроек
+    (``setup_draft.json``) возвращается в форму «🆕 Новый проект» тем же
+    отложенным механизмом ``setup_prefill_pending``, что и префилл из
+    загруженного раннера. Успех завершается ``st.rerun()`` (вне ``try`` —
+    RerunException наследует Exception и был бы проглочен).
+    """
+    try:
+        setup_draft = cs.load_setup_draft(root, sel)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Не удалось загрузить черновик '{sel}': {exc}")
+        return
+    if not setup_draft:
+        st.error(f"'{sel}': нет ни собранного проекта, ни черновика "
+                 f"настроек — загружать нечего.")
+        return
+    st.session_state.pop("campaign_ctrl", None)
+    st.session_state["setup_prefill_pending"] = setup_draft
+    st.session_state["campaign_name_pending"] = sel
+    st.session_state["camp_loaded_msg"] = (
+        f"Черновик настроек '{sel}' загружен ({len(setup_draft)} полей "
+        f"формы). Проект ещё НЕ собран: проверьте форму «🆕 Новый проект» "
+        f"и нажмите «🏗 Построить проект».")
+    st.rerun()
+
+
 def render_campaign_persistence(root: str) -> None:
     """📁 Сохранить/загрузить проект целиком (схема + база точек + ветки).
 
@@ -148,8 +176,22 @@ def render_campaign_persistence(root: str) -> None:
              "строкой в начале закладки.")
     if st.button("💾 Сохранить проект", key="save_campaign"):
         if ctrl is None:
-            st.error("Проект ещё не собран — соберите его в форме "
-                     "«🆕 Новый проект» ниже или создайте демо-проект.")
+            # iter76: до сборки сохраняем ЧЕРНОВИК НАСТРОЕК (поля формы
+            # «🆕 Новый проект»). Раньше здесь стоял отказ — и вместе с
+            # ошибкой сборки это давало замкнутый круг: «собрать не могу
+            # (ошибка), сохранить не могу (не собран)», заполненная форма
+            # терялась при закрытии вкладки.
+            try:
+                fields = cs.setup_draft_fields(st.session_state)
+                path = cs.save_setup_draft(root, name, fields)
+                st.success(
+                    f"Черновик настроек сохранён: {Path(path).parent.name} "
+                    f"({len(fields)} полей формы). Проект ещё НЕ собран — "
+                    f"черновик вернёт поля формы «🆕 Новый проект» при "
+                    f"загрузке; соберите проект кнопкой «🏗 Построить "
+                    f"проект», когда настройки готовы.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Не удалось сохранить черновик: {exc}")
         else:
             try:
                 path = cs.save_campaign(ctrl.runner, root, name,
@@ -163,6 +205,14 @@ def render_campaign_persistence(root: str) -> None:
                        ["— нет —"] + camps, key="campaign_select")
     if st.button("📂 Загрузить проект", key="load_campaign") \
             and sel != "— нет —":
+        # iter76: проект-ЧЕРНОВИК (собранного campaign.json ещё нет) —
+        # возвращаем поля формы «🆕 Новый проект» тем же механизмом
+        # отложенного префилла, что у загрузки собранного проекта.
+        # Без st.stop(): обрыв прогона здесь оставил бы колонки ассистента
+        # неотрисованными.
+        if not cs.campaign_exists(root, sel):
+            _load_setup_draft_into_form(root, sel)
+            return
         try:
             runner = cs.load_campaign(root, sel)
             draft = cs.load_campaign_draft(root, sel)

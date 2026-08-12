@@ -395,6 +395,55 @@ class StagedProject:
 
 
 @dataclass
+class StagedSetup:
+    """Предложенная ТОЧЕЧНАЯ ПРАВКА ПОЛЕЙ ФОРМЫ сетапа (iter76).
+
+    Закрывает замкнутый круг несобранного проекта: до сборки данные живут в
+    ПОЛЯХ формы «🆕 Новый проект», и ассистент их не видел и не мог править —
+    единственным его инструментом был пакет ПРОЕКТА целиком, который к тому же
+    отклонялся, пока в полях уже что-то стоит. Здесь предлагается правка
+    ОТДЕЛЬНЫХ полей (``fields`` — ``{ключ_виджета: значение}``); применяет
+    человек кнопкой, результат — ``setup_prefill_pending`` (тот же механизм,
+    что у загрузки проекта). Раннера правка НЕ касается: собранный проект
+    правится пакетами спеки/патчами.
+    """
+    fields: Dict[str, Any] = field(default_factory=dict)
+    label: str = ""
+    rationale: str = ""
+    level: str = ""
+    source: str = ""
+    confidence: str = ""
+    status: str = PATCH_STAGED
+    applied_ts: str = ""
+    reason: str = ""
+    ts: str = field(default_factory=_now)
+    id: str = field(default_factory=lambda: _new_id("setup"))
+
+    def to_state(self) -> Dict[str, Any]:
+        return {"id": self.id, "fields": dict(self.fields),
+                "label": self.label, "rationale": self.rationale,
+                "level": self.level, "source": self.source,
+                "confidence": self.confidence, "status": self.status,
+                "applied_ts": self.applied_ts, "reason": self.reason,
+                "ts": self.ts}
+
+    @classmethod
+    def from_state(cls, d: Dict[str, Any]) -> "StagedSetup":
+        d = dict(d or {})
+        return cls(fields=dict(d.get("fields", {}) or {}),
+                   label=str(d.get("label", "")),
+                   rationale=str(d.get("rationale", "")),
+                   level=str(d.get("level", "")),
+                   source=str(d.get("source", "")),
+                   confidence=str(d.get("confidence", "")),
+                   status=str(d.get("status", PATCH_STAGED)),
+                   applied_ts=str(d.get("applied_ts", "")),
+                   reason=str(d.get("reason", "")),
+                   ts=str(d.get("ts", "")) or _now(),
+                   id=str(d.get("id", "")) or _new_id("setup"))
+
+
+@dataclass
 class ToolCall:
     """Запись аудита вызова инструмента (дублируется в ``tool_calls.jsonl``)."""
     tool: str
@@ -445,6 +494,7 @@ class AssistantSession:
     patches: List[StagedPatch] = field(default_factory=list)
     specs: List[StagedSpec] = field(default_factory=list)
     projects: List[StagedProject] = field(default_factory=list)
+    setups: List[StagedSetup] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
 
@@ -671,6 +721,49 @@ class AssistantSession:
     def staged_projects(self) -> List[StagedProject]:
         return [p for p in self.projects if p.status == PATCH_STAGED]
 
+    # -- правки полей формы сетапа (iter76) -------------------------------
+    def stage_setup(self, setup: StagedSetup) -> StagedSetup:
+        """Положить ПРАВКУ ПОЛЕЙ ФОРМЫ сетапа в стейдж (применяет человек).
+
+        Пустая правка не принимается: «поправить ничего» — не предложение.
+        """
+        if not setup.fields:
+            raise ValueError(
+                "Правка полей сетапа пуста: нечего предлагать. Укажите "
+                "{ключ_поля: значение} — ключи см. в снимке setup_snapshot.")
+        setup.status = PATCH_STAGED
+        self.setups.append(setup)
+        self.updated_at = _now()
+        return setup
+
+    def setup_by_id(self, setup_id: str) -> Optional[StagedSetup]:
+        for s in self.setups:
+            if s.id == setup_id:
+                return s
+        return None
+
+    def set_setup_status(self, setup_id: str, status: str, *,
+                         reason: str = "") -> StagedSetup:
+        """Перевести правку полей в терминальный статус (протокол патчей)."""
+        if status not in PATCH_STATUSES:
+            raise ValueError(f"Неизвестный статус правки сетапа {status!r}: "
+                             f"допустимы {PATCH_STATUSES}.")
+        s = self.setup_by_id(setup_id)
+        if s is None:
+            raise KeyError(f"Правка сетапа '{setup_id}' не найдена в сессии.")
+        if s.status != PATCH_STAGED:
+            raise ValueError(
+                f"Правка сетапа '{setup_id}' уже в статусе '{s.status}' — "
+                f"повторный переход запрещён (предложите новую правку).")
+        s.status = status
+        s.reason = reason
+        s.applied_ts = _now()
+        self.updated_at = _now()
+        return s
+
+    def staged_setups(self) -> List[StagedSetup]:
+        return [s for s in self.setups if s.status == PATCH_STAGED]
+
     # -- аудит вызовов --------------------------------------------------
     def add_tool_call(self, call: ToolCall) -> ToolCall:
         self.tool_calls.append(call)
@@ -689,8 +782,8 @@ class AssistantSession:
 
     def is_empty(self) -> bool:
         return not (self.messages or self.attachments or self.patches
-                    or self.specs or self.projects or self.artifacts
-                    or self.tool_calls)
+                    or self.specs or self.projects or self.setups
+                    or self.artifacts or self.tool_calls)
 
     def to_state(self) -> Dict[str, Any]:
         return {
@@ -707,6 +800,7 @@ class AssistantSession:
             "patches": [p.to_state() for p in self.patches],
             "specs": [s.to_state() for s in self.specs],
             "projects": [p.to_state() for p in self.projects],
+            "setups": [s.to_state() for s in self.setups],
             "tool_calls": [c.to_state() for c in self.tool_calls],
         }
 
@@ -741,6 +835,9 @@ class AssistantSession:
         # записанные до них, ключа 'projects' не имеют и должны открываться.
         s.projects = [StagedProject.from_state(d) for d in
                       (state.get("projects", []) or [])]
+        # iter76: правки полей формы сетапа — тот же принцип совместимости.
+        s.setups = [StagedSetup.from_state(d) for d in
+                    (state.get("setups", []) or [])]
         s.tool_calls = [ToolCall.from_state(d) for d in
                         (state.get("tool_calls", []) or [])]
         return s

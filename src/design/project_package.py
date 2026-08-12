@@ -350,6 +350,15 @@ def parse_project_package(package: Any) -> ProjectPackage:
     covariates = parse_covariates(d.get("covariates"))
     passport = parse_passport(d.get("passport"))
     _check_name_clashes(spec, responses, process, covariates)
+    # iter76: пары preflight паспорта валидируются ЗДЕСЬ, против спеки и осей
+    # пакета — а не при нажатии «🏗 Построить проект». Раньше пара по имени
+    # группы (FILLER | Chalk_95T) проходила dry-run и стейдж, а падала только
+    # на кнопке сборки: человек утверждал пакет, который не собирается.
+    # Группы разворачиваются в сумму членов сразу — форма получает канон.
+    if passport.get("preflight_pairs"):
+        passport["preflight_pairs"] = normalize_preflight_pairs(
+            passport["preflight_pairs"], spec,
+            process_names=[str(p["name"]) for p in process])
 
     try:
         seed = int(d.get("seed", 1) or 1)
@@ -362,6 +371,59 @@ def parse_project_package(package: Any) -> ProjectPackage:
         covariates=covariates, passport=passport, seed=seed,
         label=str(d.get("label", "") or ""), note=str(d.get("note", "") or ""),
         raw=d)
+
+
+def normalize_preflight_pairs(pairs: Any, spec: PhrSpec, *,
+                              process_names: Sequence[str] = ()
+                              ) -> List[List[List[str]]]:
+    """iter76: пары preflight паспорта → канон ``[[левые], [правые]]``.
+
+    Правила те же, что у ядра (``set_preflight_pairs``): сторона пары — имя
+    координаты (компонент спеки или процесс-ось пакета), имя УЗЛА-ГРУППЫ
+    спеки (``FILLER``, ``SOFT`` — ядро само развернёт её в сумму членов при
+    сборке) либо СПИСОК имён (ось-сумма). Имя группы НЕ разворачивается
+    здесь: канон пакета остаётся человекочитаемым. Неизвестное имя —
+    :class:`PackageError` с перечислением, что допустимо: отказ должен
+    случиться на dry-run пакета, а не на кнопке «🏗 Построить проект».
+    """
+    comps = set(spec.component_names)
+    procs = {str(p) for p in process_names}
+    groups = (spec.group_members()
+              if hasattr(spec, "group_members") else {})
+
+    def _side(value: Any, where: str) -> List[str]:
+        names = [value] if isinstance(value, str) else \
+            [str(x) for x in (value or [])]
+        if not names:
+            raise PackageError(f"{where}: пустая сторона пары недопустима.")
+        out: List[str] = []
+        for nm in names:
+            if nm in comps or nm in procs or nm in groups:
+                out.append(nm)
+            else:
+                raise PackageError(
+                    f"{where}: имя '{nm}' не является ни компонентом спеки, "
+                    f"ни процесс-осью пакета"
+                    + (f", ни группой спеки {sorted(groups)}"
+                       if groups else "")
+                    + ". Ось-сумма задаётся списком имён компонентов.")
+        return out
+
+    out: List[List[List[str]]] = []
+    for i, item in enumerate(list(pairs or []), 1):
+        where = f"passport.preflight_pairs[{i}]"
+        if isinstance(item, Mapping):
+            left = item.get("left", item.get("a"))
+            right = item.get("right", item.get("b"))
+        elif isinstance(item, Sequence) and not isinstance(item, str) \
+                and len(item) == 2:
+            left, right = item[0], item[1]
+        else:
+            raise PackageError(
+                f"{where}: пара должна быть [левое, правое] или "
+                f"{{'left': …, 'right': …}}, получено {item!r}.")
+        out.append([_side(left, where), _side(right, where)])
+    return out
 
 
 def _check_name_clashes(spec: PhrSpec, responses: List[Dict[str, str]],

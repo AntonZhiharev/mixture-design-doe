@@ -253,6 +253,28 @@ class MixtureProcessRunner:
         # значения живут per-point в ``origin_tag["covariates"]`` (переживают
         # миграцию схемы и сериализацию точек без отдельного канала).
         self.covariate_names: List[str] = []
+        # iter75: ЭКОНОМИКА ПРОЕКТА — плотность ρ и цены компонентов (§3/§15.6).
+        # Канон §3: ρ — ПОЛНОЦЕННОЕ GP-свойство проекта, а закупочная цена
+        # компонента — факт проекта, НЕ намерения ветки: одно и то же сырьё не
+        # может стоить разное в разных ветках одной кампании. Поэтому ρ и цены
+        # живут ЗДЕСЬ (проектный уровень), а V/c_exp/H остаются атрибутами
+        # ветки (REBUILD_SPEC §2). Ветка лишь наследует эту ногу и решает,
+        # ρ у неё «вход себестоимости» (PRICE_INPUT) или ЦЕЛЬ (OPTIMIZED).
+        #
+        # ЕДИНИЦЫ (решение сессии 12.08.2026): масса цены и масса ρ — ОДНА И ТА
+        # ЖЕ единица. price_изд = price_состав [вал/масса] · ρ [масса/изд]
+        # ⇒ [вал/изд] без переводных коэффициентов (см. price_per_item).
+        # economics_enabled=True по умолчанию: себестоимость входит в проект
+        # ПО УМОЛЧАНИЮ, отключается ЯВНО (A0.6 — не молча).
+        self.economics_enabled: bool = True
+        self.rho_property: str = ""
+        self.rho_unit: str = ""
+        self.currency_unit: str = ""
+        self.mass_unit: str = ""
+        self.component_prices: Dict[str, float] = {}
+        # Роль ρ по умолчанию для НОВЫХ веток: PRICE_INPUT (ρ питает цену) или
+        # OPTIMIZED (ρ — целевой параметр, денежный канал зануляется, И-5).
+        self.rho_default_role: str = ROLE_PRICE_INPUT
 
 
     # ------------------------------------------------------------------
@@ -1223,10 +1245,38 @@ class MixtureProcessRunner:
         относительно reference-пула). Имена валидируются против ПОЛНОЙ
         схемы (пару можно задать до раскрытия оси append'ом); в preflight
         пары с осями вне ТЕКУЩЕЙ фазы просто выпадают из проверки (как
-        группы в стратификации). Пустой список / None — выключить."""
+        группы в стратификации). Пустой список / None — выключить.
+
+        iter76: имя УЗЛА-ГРУППЫ активной phr-спеки (``FILLER``, ``SOFT``)
+        принимается и разворачивается в сумму её членов: тотал группы —
+        это ровно сумма листьев, то есть валидная ось-сумма. Раньше такое
+        имя давало «Ось пары не найдена среди координат полной схемы»,
+        хотя спека с этой группой уже стояла на раннере (замкнутый круг:
+        пакет проекта с парой по группе не собирался кнопкой)."""
         known = set(self._full_mix.names if self._full_mix is not None else [])
         if self._full_proc is not None:
             known |= set(self._full_proc.names)
+        spec = getattr(self, "phr_spec", None)
+        groups: Dict[str, List[str]] = (
+            spec.group_members() if spec is not None
+            and hasattr(spec, "group_members") else {})
+
+        def _expand(names: List[str], pair: Any) -> List[str]:
+            out: List[str] = []
+            for nm in names:
+                if nm in known:
+                    out.append(nm)
+                elif nm in groups:
+                    # группа спеки → сумма её членов (компоненты схемы)
+                    out.extend(str(m) for m in groups[nm])
+                else:
+                    raise KeyError(
+                        f"Ось пары '{nm}' не найдена среди координат полной "
+                        f"схемы {sorted(known)}"
+                        + (f" и групп phr-спеки {sorted(groups)}"
+                           if groups else "") + ".")
+            return out
+
         norm: List[Tuple[List[str], List[str]]] = []
         for pair in (pairs or []):
             if len(pair) != 2:
@@ -1236,13 +1286,130 @@ class MixtureProcessRunner:
             bx = [b] if isinstance(b, str) else [str(x) for x in b]
             if not ax or not bx:
                 raise ValueError(f"Пустая ось в паре {pair!r} недопустима.")
-            for nm in ax + bx:
-                if nm not in known:
-                    raise KeyError(
-                        f"Ось пары '{nm}' не найдена среди координат полной "
-                        f"схемы {sorted(known)}.")
-            norm.append((ax, bx))
+            norm.append((_expand(ax, pair), _expand(bx, pair)))
         self.preflight_pairs = norm
+
+    # ------------------------------------------------------------------
+    # iter75: ЭКОНОМИКА ПРОЕКТА — плотность ρ + цены компонентов (§3/§15.6)
+    # ------------------------------------------------------------------
+    def set_project_economics(self, *, enabled: bool = True,
+                              rho_property: str = "",
+                              prices: Optional[Mapping[str, float]] = None,
+                              rho_unit: str = "",
+                              currency_unit: str = "",
+                              mass_unit: str = "",
+                              rho_default_role: str = ROLE_PRICE_INPUT) -> None:
+        """iter75: задать ЭКОНОМИКУ ПРОЕКТА — ρ-отклик и цены компонентов.
+
+        Экономика — свойство ПРОЕКТА, не ветки (см. комментарий в ``__init__``):
+        плотность ρ по §3 — полноценное GP-свойство, а закупочная цена сырья не
+        может различаться между ветками одной кампании. Ветки наследуют эту ногу
+        (``CampaignController.create_branch``), задавая лишь порог себестоимости
+        и экономику раунда (V/c_exp/H — атрибуты ветки, REBUILD_SPEC §2).
+
+        ``rho_property`` обязан быть среди ``property_names`` — ρ измеряется как
+        обычный отклик (в §3 она GP-свойство, а не расчётная величина).
+        ``prices`` — ``{компонент: цена за единицу массы}``; словарь обязан
+        покрывать ВСЕ mixture-компоненты полной схемы, иначе отказ (A0.6:
+        молчаливый нуль в цене даёт заниженную себестоимость).
+
+        ЕДИНИЦЫ: ``mass_unit`` — единая масса для цены И для ρ (решение сессии
+        12.08.2026), поэтому ``price_состав``·ρ сразу даёт валюту за изделие без
+        переводных коэффициентов. ``rho_unit`` — как ρ подписана в таблицах
+        (например «кг/изд»); на арифметику не влияет, только на подписи.
+
+        ``rho_default_role`` — роль ρ у НОВЫХ веток: ``ROLE_PRICE_INPUT`` (ρ
+        питает себестоимость) или ``ROLE_OPTIMIZED`` (ρ — целевой параметр;
+        денежный канал ρ зануляется, И-5). Смена роли у уже созданной ветки —
+        штатный ``CampaignController.switch_role``.
+
+        ``enabled=False`` — ЯВНО выключить экономику проекта: ρ/цены/единицы
+        обнуляются, новые ветки собираются чисто техническими. Уже настроенные
+        ветки НЕ трогаются (их ценовая нога — часть их истории; убирать её
+        задним числом молча нельзя, A0.6).
+        """
+        if not enabled:
+            self.economics_enabled = False
+            self.rho_property = ""
+            self.component_prices = {}
+            self.rho_unit = ""
+            self.currency_unit = ""
+            self.mass_unit = ""
+            self.rho_default_role = ROLE_PRICE_INPUT
+            return
+
+        rho = str(rho_property or "").strip()
+        if not rho:
+            raise ValueError(
+                "Экономика проекта включена, но отклик плотности ρ не задан. "
+                "Укажите ρ (она измеряется как обычный отклик, §3) или "
+                "выключите экономику явно (enabled=False).")
+        if rho not in self.property_names:
+            raise KeyError(
+                f"ρ-свойство '{rho}' не среди откликов проекта "
+                f"{list(self.property_names)}: по §3 ρ — ПОЛНОЦЕННЫЙ отклик, "
+                f"её нужно объявить в списке откликов и измерять.")
+        if rho_default_role not in (ROLE_PRICE_INPUT, ROLE_OPTIMIZED):
+            raise ValueError(
+                f"Роль ρ по умолчанию должна быть '{ROLE_PRICE_INPUT}' (вход "
+                f"себестоимости) или '{ROLE_OPTIMIZED}' (целевой параметр), "
+                f"дано {rho_default_role!r}.")
+        self._set_component_prices(prices)
+
+        self.economics_enabled = True
+        self.rho_property = rho
+        self.rho_unit = str(rho_unit or "")
+        self.currency_unit = str(currency_unit or "")
+        self.mass_unit = str(mass_unit or "")
+        self.rho_default_role = str(rho_default_role)
+
+    def _set_component_prices(self,
+                              prices: Optional[Mapping[str, float]]) -> None:
+        """Проверить и записать цены сырья по компонентам ПОЛНОЙ схемы.
+
+        Требуем ПОЛНОЕ покрытие компонентов: пропущенная цена, доопределённая
+        нулём, тихо занижает себестоимость и уводит оптимум к дорогому сырью
+        (A0.6). Нулевая цена допустима, но только явно указанная.
+        """
+        comps = list(self._full_mix.names if self._full_mix is not None else [])
+        src = dict(prices or {})
+        unknown = sorted(set(src) - set(comps))
+        if unknown:
+            raise KeyError(
+                f"Цены заданы для {unknown}, которых нет среди компонентов "
+                f"смеси {comps}.")
+        missing = [c for c in comps if c not in src]
+        if missing:
+            raise ValueError(
+                f"Не заданы цены компонентов {missing}. Нуль по умолчанию "
+                f"занизил бы себестоимость молча (A0.6): укажите цену каждого "
+                f"компонента (0 — только если сырьё действительно бесплатно).")
+        clean: Dict[str, float] = {}
+        for c in comps:
+            try:
+                v = float(src[c])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Цена компонента '{c}' не число: {src[c]!r}.") from exc
+            if not np.isfinite(v) or v < 0.0:
+                raise ValueError(
+                    f"Цена компонента '{c}' должна быть конечной и "
+                    f"неотрицательной, дано {v!r}.")
+            clean[c] = v
+        self.component_prices = clean
+
+    def project_price_vector(self) -> List[float]:
+        """Цены компонентов ТЕКУЩЕЙ фазы в порядке её mixture-осей.
+
+        Ценовая нога линейна по долям (``price_состав = Σ доля_i·цена_i``),
+        поэтому вектор обязан идти В ПОРЯДКЕ mixture-осей текущей схемы, а не
+        полной: при поэтапном раскрытии состава (§16.6) фаза короче проекта.
+        Экономика выключена ⇒ пустой список.
+        """
+        if not self.economics_enabled or not self.component_prices:
+            return []
+        return [float(self.component_prices.get(nm, 0.0))
+                for nm in self.current_schema.mixture_names]
 
     # ------------------------------------------------------------------
     # P2.3 (UI_REVISION_SPEC): ПАСПОРТ КАМПАНИИ — лоты сырья,

@@ -36,7 +36,7 @@ import numpy as np
 
 from ..consent import DEFAULT_REGISTRY, ConsentError, ConsentRegistry
 from ..session import (PATCH_APPLIED, PATCH_REJECTED, StagedPatch,
-                       StagedProject, StagedSpec)
+                       StagedProject, StagedSetup, StagedSpec)
 from ..store import append_log
 from .readonly import (_f, active_spec, build_patched_spec,
                        build_spec_from_package, has_project, normalize_patch,
@@ -917,6 +917,189 @@ def reject_project(ctx: ToolContext, project_id: str, human_token: str,
             "decision": decision}
 
 
+# ----------------------------------------------------------------------
+# Правка ПОЛЕЙ ФОРМЫ сетапа (iter76): предложить → принять человеком
+# ----------------------------------------------------------------------
+#: Скалярные типы значений полей формы — то, что честно переносится в виджеты.
+_SETUP_SCALARS = (str, int, float, bool)
+
+
+@register(
+    "propose_setup_fields",
+    description=(
+        "ПРЕДЛОЖИТЬ ТОЧЕЧНУЮ ПРАВКУ ПОЛЕЙ формы «🆕 Новый проект» ДО сборки "
+        "проекта: {ключ_поля: новое_значение} — только изменяемые "
+        "поля, остальные не трогаются. Ключи и текущие значения бери из "
+        "get_setup_fields (например 'setup_resp' — отклики через запятую, "
+        "'setup_preflight_pairs' — пары построчно «A | B», 'setup_phr_json' — "
+        "phr-спека JSON). Правка кладётся в СТЕЙДЖ; применяет человек "
+        "кнопкой, значения попадут в поля формы, а проект соберёт кнопка "
+        "«🏗 Построить проект». Для СОБРАННОГО проекта не годится — там "
+        "propose_patch/propose_spec."),
+    parameters={"type": "object", "properties": {
+        "fields": {"type": "object",
+                   "description": "{ключ_поля_формы: новое значение} — "
+                                  "только скаляры (строка/число/булево)"},
+        "rationale": {"type": "string",
+                      "description": "почему такая правка: физика, паспорт, "
+                                     "слова технолога"},
+        "label": {"type": "string",
+                  "description": "короткая метка правки (например «верх "
+                                 "mixer_freq 50→60 Hz»)"},
+        "level": {"type": "string", "description": "L1 | L2 | L3"},
+        "source": {"type": "string", "description": "источник сведений"},
+        "confidence": {"type": "string", "description": "high | med | low"}},
+        "required": ["fields", "rationale"]},
+    kind=PROPOSE)
+def propose_setup_fields(ctx: ToolContext, fields: Any, rationale: str,
+                         label: str = "", level: str = "", source: str = "",
+                         confidence: str = "") -> Dict[str, Any]:
+    """Правка полей формы → стейдж сессии (применяет человек кнопкой).
+
+    Гейтов ядра здесь нет намеренно: поля формы — черновик, их валидирует
+    штатная кнопка «🏗 Построить проект» (те же парсеры и сеттеры, что при
+    ручном вводе). Зато есть проверка ФОРМЫ правки: ключи ``setup_*`` и
+    скалярные значения — иначе применённая правка молча не легла бы в виджеты.
+    """
+    session = ctx.require_session()
+    if ctx.runner is not None:
+        return {"staged": False, "ok": False,
+                "error": "Проект в сессии уже СОБРАН: поля формы сетапа — "
+                         "черновик пересборки, точечная правка полей к нему "
+                         "не применяется. Геометрию правь пакетом спеки "
+                         "(propose_spec) или патчем (propose_patch).",
+                "hint": "Правка не положена в стейдж."}
+    if not isinstance(fields, dict) or not fields:
+        return {"staged": False, "ok": False,
+                "error": "Ожидается непустой объект {ключ_поля: значение}.",
+                "hint": "Ключи полей смотри в get_setup_fields."}
+    bad_keys = [k for k in fields if not str(k).startswith("setup_")]
+    if bad_keys:
+        return {"staged": False, "ok": False,
+                "error": f"Ключи {bad_keys} не похожи на поля формы сетапа: "
+                         f"все ключи начинаются с 'setup_' "
+                         f"(см. get_setup_fields).",
+                "hint": "Правка не положена в стейдж."}
+    bad_vals = {str(k): type(v).__name__ for k, v in fields.items()
+                if v is not None and not isinstance(v, _SETUP_SCALARS)}
+    if bad_vals:
+        return {"staged": False, "ok": False,
+                "error": f"Значения полей должны быть скалярами (строка/"
+                         f"число/булево), получено: {bad_vals}. Списки "
+                         f"кодируются строкой поля (например, имена через "
+                         f"запятую, пары построчно).",
+                "hint": "Правка не положена в стейдж."}
+
+    current = dict((ctx.extra or {}).get("setup_fields") or {})
+    staged = session.stage_setup(StagedSetup(
+        fields={str(k): v for k, v in fields.items()},
+        label=str(label or ""), rationale=str(rationale or ""),
+        level=str(level or ""), source=str(source or ""),
+        confidence=str(confidence or "")))
+    return _f({
+        "staged": True, "ok": True, "setup_id": staged.id,
+        "fields": dict(staged.fields),
+        "current_values": {k: current.get(k) for k in staged.fields},
+        "note": ("Правка НЕ применена: она в стейдже (панель «📝 Предложенные "
+                 "правки полей»). Применяет человек кнопкой; значения лягут в "
+                 "поля формы «🆕 Новый проект», проект соберёт кнопка "
+                 "«🏗 Построить проект». Скажи пользователю, какие поля и "
+                 "почему меняются."),
+    })
+
+
+@register(
+    "apply_setup_fields",
+    description=(
+        "ПРИМЕНИТЬ правку полей формы сетапа из стейджа: значения переносятся "
+        "в поля формы «🆕 Новый проект». Требует разовый токен подтверждения "
+        "человека — кнопка в интерфейсе. Отклоняется, если проект уже собран."),
+    parameters={"type": "object", "properties": {
+        "setup_id": {"type": "string", "description": "id правки из стейджа"},
+        "human_token": {"type": "string", "description": "разовый токен"},
+        "note": {"type": "string", "description": "комментарий человека"},
+        "author": {"type": "string", "description": "кто решил"}},
+        "required": ["setup_id", "human_token"]},
+    kind=WRITE)
+def apply_setup_fields(ctx: ToolContext, setup_id: str, human_token: str,
+                       note: str = "", author: str = "") -> Dict[str, Any]:
+    """Принятие правки полей человеком → ``setup_prefill`` для формы.
+
+    Раннер здесь НЕ трогается (его нет по определению шага); результат —
+    словарь значений полей, который UI кладёт в ``setup_prefill_pending``,
+    плюс запись в журнал решений (решение человека должно быть видно потом).
+    """
+    session = ctx.require_session()
+    staged = session.setup_by_id(str(setup_id))
+    if staged is None:
+        raise ToolError(
+            f"Правки сетапа '{setup_id}' нет в сессии. В стейдже: "
+            f"{[s.id for s in session.staged_setups()] or 'пусто'}.")
+    if staged.status != "staged":
+        raise ToolError(
+            f"Правка '{setup_id}' уже в статусе '{staged.status}': повторное "
+            f"применение запрещено — предложите новую правку.")
+    if ctx.runner is not None:
+        raise ToolError(
+            "Проект в сессии уже собран: правка полей формы к нему не "
+            "применяется. Правка остаётся в стейдже.")
+    _consume(ctx, human_token, action="apply_setup", target=str(setup_id))
+
+    session.set_setup_status(staged.id, PATCH_APPLIED, reason=str(note or ""))
+    decision = _log(ctx, "decisions", {
+        "ts": _now(),
+        "title": (staged.label
+                  or f"правка полей сетапа: {sorted(staged.fields)}"),
+        "nodes": [], "author": str(author or "человек"),
+        "spec_hash": "", "rationale": staged.rationale,
+        "level": staged.level, "source": staged.source,
+        "confidence": staged.confidence, "setup_id": staged.id,
+        "fields": sorted(staged.fields), "note": str(note or ""),
+        "kind": "apply_setup"})
+    return _f({
+        "ok": True, "setup_id": staged.id, "status": PATCH_APPLIED,
+        "setup_prefill": dict(staged.fields), "decision": decision,
+        "next_step": (f"Поля {sorted(staged.fields)} формы «🆕 Новый проект» "
+                      f"обновлены из правки. Проверьте их и нажмите "
+                      f"«🏗 Построить проект» — сборка проекта остаётся "
+                      f"за вами."),
+        "persist_hint": ("Черновик формы можно сохранить кнопкой "
+                         "«💾 Сохранить проект» (панель «📁 Проект») — "
+                         "он переживёт перезапуск и до сборки."),
+    })
+
+
+@register(
+    "reject_setup_fields",
+    description=(
+        "Отклонить правку полей сетапа из стейджа (решение человека, требует "
+        "токен). Отказ идёт в журнал решений."),
+    parameters={"type": "object", "properties": {
+        "setup_id": {"type": "string", "description": "id правки из стейджа"},
+        "human_token": {"type": "string", "description": "разовый токен"},
+        "reason": {"type": "string", "description": "почему отклонена"},
+        "author": {"type": "string", "description": "кто решил"}},
+        "required": ["setup_id", "human_token", "reason"]},
+    kind=WRITE)
+def reject_setup_fields(ctx: ToolContext, setup_id: str, human_token: str,
+                        reason: str, author: str = "") -> Dict[str, Any]:
+    session = ctx.require_session()
+    staged = session.setup_by_id(str(setup_id))
+    if staged is None:
+        raise ToolError(f"Правки сетапа '{setup_id}' нет в сессии.")
+    _consume(ctx, human_token, action="reject_setup", target=str(setup_id))
+    session.set_setup_status(staged.id, PATCH_REJECTED, reason=str(reason))
+    decision = _log(ctx, "decisions", {
+        "ts": _now(),
+        "title": f"ОТКЛОНЕНО: правка сетапа {staged.label or staged.id}",
+        "nodes": [], "author": str(author or "человек"),
+        "spec_hash": "", "rationale": str(reason),
+        "setup_id": staged.id, "fields": sorted(staged.fields),
+        "kind": "reject_setup"})
+    return {"ok": True, "setup_id": staged.id, "status": PATCH_REJECTED,
+            "decision": decision}
+
+
 @register(
     "record_decision",
     description=(
@@ -1056,6 +1239,25 @@ def issue_reject_project_token(ctx: ToolContext, project_id: str, *,
                                ttl_s: Optional[float] = None) -> str:
     """Токен на отклонение пакета проекта (кнопка «Отклонить проект»)."""
     return registry_for(ctx).issue("reject_project", str(project_id),
+                                   ttl_s=ttl_s).token
+
+
+def issue_apply_setup_token(ctx: ToolContext, setup_id: str, *,
+                            ttl_s: Optional[float] = None,
+                            note: str = "") -> str:
+    """Токен на применение ПРАВКИ ПОЛЕЙ сетапа (кнопка «Применить», iter76).
+
+    ``context_hash`` пуст намеренно: правка относится к ЧЕРНОВИКУ формы, у
+    которого отпечатка геометрии нет по определению шага (проект не собран).
+    """
+    return registry_for(ctx).issue("apply_setup", str(setup_id),
+                                   ttl_s=ttl_s, note=note).token
+
+
+def issue_reject_setup_token(ctx: ToolContext, setup_id: str, *,
+                             ttl_s: Optional[float] = None) -> str:
+    """Токен на отклонение правки полей сетапа (кнопка «Отклонить»)."""
+    return registry_for(ctx).issue("reject_setup", str(setup_id),
                                    ttl_s=ttl_s).token
 
 

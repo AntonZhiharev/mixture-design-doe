@@ -122,6 +122,84 @@ def branch_price_config(runner, branch_id: str) -> Optional[Dict[str, str]]:
             "cost_name": str(cfg.get("cost_name", "price"))}
 
 
+def branch_price_vector(runner, branch_id: str) -> Optional[List[float]]:
+    """Вектор цен, по которому ветка СЕЙЧАС считает себестоимость (или ``None``).
+
+    iter82: ветка наследует проектные цены ОДИН РАЗ, при рождении
+    (``create_branch`` кладёт замыкание ``linear_price_fn`` в ``_branch_cost``) —
+    это СНИМОК, а не ссылка на ``runner.component_prices``. Поэтому после правки
+    проектных цен ветка продолжает считать по старым, и молчать об этом нельзя
+    (A0.6). Читаем цены из сериализуемого дескриптора ``price_spec``; функция
+    цены без дескриптора (или нелинейная) ⇒ ``None`` — «не знаю», а не нули.
+    """
+    cfg = (getattr(runner, "_branch_cost", {}) or {}).get(branch_id)
+    if not cfg:
+        return None
+    spec = getattr(cfg.get("price_fn"), "price_spec", None)
+    if not isinstance(spec, dict) or spec.get("kind") != "linear":
+        return None
+    return [float(v) for v in (spec.get("prices") or [])]
+
+
+def project_economics_report(runner) -> Dict[str, Any]:
+    """iter82: состояние ЭКОНОМИКИ ПРОЕКТА + расхождение цен по ветками (read-only).
+
+    Отвечает на вопрос «по каким ценам сейчас считается себестоимость»: цены
+    проекта (``component_prices``), цены КАЖДОЙ ветки с ценовой ногой и флаг
+    ``stale`` — ветка считает по УСТАРЕВШЕМУ снимку (её вектор ≠ проектному).
+    Без этого правка цен на живом проекте была бы молчаливой: новые ветки
+    считали бы по новым ценам, старые — по старым, и никто бы этого не увидел.
+
+    JSON-сериализуемо (для UI и MCP); ЯДРО не трогается.
+    """
+    enabled = bool(getattr(runner, "economics_enabled", False))
+    rho = str(getattr(runner, "rho_property", "") or "")
+    prices = {str(k): float(v)
+              for k, v in (getattr(runner, "component_prices", {}) or {}).items()}
+    mix_names = [str(n) for n in runner.current_schema.mixture_names]
+    proj_vec = (list(runner.project_price_vector())
+                if hasattr(runner, "project_price_vector") else [])
+    branches: List[Dict[str, Any]] = []
+    for bid in (getattr(runner, "branches", {}) or {}):
+        pcfg = branch_price_config(runner, bid)
+        if pcfg is None:
+            continue
+        vec = branch_price_vector(runner, bid)
+        # «Устарела» — только когда ОБА вектора известны и различаются: у
+        # нелинейной/непрозрачной цены (vec is None) сравнивать нечего.
+        stale = bool(vec is not None and proj_vec
+                     and [round(v, 12) for v in vec]
+                     != [round(v, 12) for v in proj_vec])
+        branches.append({
+            "branch_id": str(bid),
+            "branch_name": str(getattr(runner.branches[bid], "name", bid)),
+            "rho_property": pcfg["rho_property"],
+            "cost_name": pcfg["cost_name"],
+            "prices": vec,
+            "stale": stale,
+            "money_channel": (MONEY_ZEROED
+                              if runner.price_channel_suppressed(bid)
+                              else MONEY_ALIVE),
+        })
+    return {
+        "enabled": enabled,
+        "configured": bool(enabled and rho and prices),
+        "rho_property": rho,
+        "rho_unit": str(getattr(runner, "rho_unit", "") or ""),
+        "currency_unit": str(getattr(runner, "currency_unit", "") or ""),
+        "mass_unit": str(getattr(runner, "mass_unit", "") or ""),
+        "rho_default_role": str(getattr(runner, "rho_default_role", "") or ""),
+        "mixture_names": mix_names,
+        "prices": prices,
+        "price_vector": [float(v) for v in proj_vec],
+        # A0.6: «включено, но всё по нулю» — себестоимость тождественный нуль.
+        "all_zero": bool(proj_vec) and not any(v > 0.0 for v in proj_vec),
+        "branches": branches,
+        "n_stale_branches": sum(1 for b in branches if b["stale"]),
+        "n_points": len(getattr(runner, "points", []) or []),
+    }
+
+
 def _money_channel(response: str, rho_property: Optional[str],
                    suppressed: bool) -> Optional[str]:
     """Статус денежного канала ρ-отклика (И-5): ``zeroed``/``alive``/``None``.
@@ -487,6 +565,111 @@ class CampaignController:
 
     def overview(self, **kw) -> Dict[str, Any]:
         return campaign_overview(self.runner, **kw)
+
+    def economics_report(self) -> Dict[str, Any]:
+        """iter82: состояние экономики проекта + устаревшие цены веток (read-only)."""
+        return project_economics_report(self.runner)
+
+    # -- iter82: ПРАВКА ЦЕН НА ЖИВОМ ПРОЕКТЕ --------------------------
+    def set_project_prices(self, prices: Dict[str, float], *,
+                           apply_to_branches: bool = False,
+                           branch_ids: Optional[List[str]] = None
+                           ) -> Dict[str, Any]:
+        """Изменить ЦЕНЫ СЫРЬЯ уже собранного проекта, не пересобирая его.
+
+        Закупочная цена — факт, который меняется по ходу кампании (новый лот,
+        новый поставщик), поэтому правка цен обязана быть штатной операцией
+        ЖИВОГО проекта: до iter82 единственным путём была кнопка «🏗 Построить
+        проект», а она создаёт НОВЫЙ раннер с ПУСТОЙ базой — то есть смена цены
+        стоила всех измеренных опытов.
+
+        Что делает и чего НЕ делает:
+
+          * зовёт штатный :meth:`MixtureProcessRunner.set_project_economics`
+            (вся валидация там: ρ среди откликов, полнота цен, знак) — меняются
+            ТОЛЬКО ``component_prices``; ρ, единицы и роль ρ по умолчанию
+            сохраняются как есть;
+          * общая база (``runner.points``/``X``/``Y``) и схема НЕ трогаются:
+            измеренная правда от цены сырья не зависит (И-1);
+          * ``apply_to_branches`` переносит новые цены на УЖЕ созданные ветки
+            (перезапись их ``_branch_cost`` через :meth:`set_branch_cost`) и
+            переоценивает ``d_best`` каждой затронутой ветки. По умолчанию
+            ВЫКЛЮЧЕНО: ценовая нога ветки — часть её истории, менять её задним
+            числом молча нельзя (A0.6). Без переноса новые цены действуют только
+            на ветки, созданные ПОСЛЕ правки, и отчёт помечает расхождение
+            (``stale``).
+
+        ``branch_ids`` — подмножество веток для переноса (``None`` = все с
+        ценовой ногой). Предусловие: экономика проекта настроена (включена и ρ
+        объявлена) — иначе цены некуда прикладывать, и это явный отказ, а не
+        тихое включение экономики «за пользователя».
+
+        Возвращает отчёт: цены до/после и что стало с ветками. Undo-стек НЕ
+        используется: это правка ФАКТА проекта, а не обратимой интерпретации
+        ветки (§7 про интерпретацию), поэтому стек обнуляется — иначе откат
+        роли восстановил бы вместе с ней старую цену.
+        """
+        r = self.runner
+        if not bool(getattr(r, "economics_enabled", False)) \
+                or not str(getattr(r, "rho_property", "") or ""):
+            raise ValueError(
+                "Экономика проекта не настроена (нет ρ-отклика): менять цены "
+                "не к чему. Сначала объявите плотность ρ и включите "
+                "себестоимость (set_project_economics / форма сетапа).")
+        before = dict(getattr(r, "component_prices", {}) or {})
+        n_points_before = len(getattr(r, "points", []) or [])
+
+        # Штатный сеттер: он же и валидатор (полнота цен, неизвестные имена).
+        r.set_project_economics(
+            enabled=True, rho_property=str(r.rho_property), prices=dict(prices),
+            rho_unit=str(getattr(r, "rho_unit", "") or ""),
+            currency_unit=str(getattr(r, "currency_unit", "") or ""),
+            mass_unit=str(getattr(r, "mass_unit", "") or ""),
+            rho_default_role=str(getattr(r, "rho_default_role", "")
+                                 or ROLE_PRICE_INPUT))
+
+        updated: List[Dict[str, Any]] = []
+        if apply_to_branches:
+            vec = r.project_price_vector()
+            targets = ([str(b) for b in branch_ids] if branch_ids is not None
+                       else list(getattr(r, "branches", {}) or {}))
+            unknown = [b for b in targets if b not in (r.branches or {})]
+            if unknown:
+                raise KeyError(f"Нет веток {sorted(unknown)}.")
+            for bid in targets:
+                cfg = (getattr(r, "_branch_cost", {}) or {}).get(bid)
+                if not cfg:
+                    continue          # ветка техническая — цены ей не нужны
+                d_before = float(r.branches[bid].d_best)
+                r.set_branch_cost(bid, cs.linear_price_fn(vec),
+                                  cfg["cost_spec"],
+                                  rho_property=str(cfg["rho_property"]),
+                                  cost_name=str(cfg["cost_name"]))
+                self._rescore(bid)
+                updated.append({
+                    "branch_id": str(bid),
+                    "branch_name": str(getattr(r.branches[bid], "name", bid)),
+                    "d_best_before": d_before,
+                    "d_best_after": float(r.branches[bid].d_best),
+                })
+
+        # И-1/П-11: правка цены — не измерение, история не меняется.
+        assert len(getattr(r, "points", []) or []) == n_points_before
+        # Снимки undo несут СТАРУЮ ценовую ногу ветки: оставленный стек вернул бы
+        # её вместе с откатом роли (скрытая потеря новой цены, A0.6).
+        self._undo.clear()
+        report = project_economics_report(r)
+        return {
+            "op": "set_project_prices",
+            "prices_before": before,
+            "prices_after": dict(r.component_prices),
+            "applied_to_branches": bool(apply_to_branches),
+            "branches_updated": updated,
+            "n_stale_branches": int(report["n_stale_branches"]),
+            "n_points": int(report["n_points"]),
+            "all_zero": bool(report["all_zero"]),
+            "undo_available": bool(self._undo),
+        }
 
     # -- §17.3 (Ш2) валидация готовности ветки к пересчёту (read-only) --
     def validate_ready(self, branch_id: str) -> Dict[str, Any]:

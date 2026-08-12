@@ -3043,6 +3043,174 @@ def project_settings_dataframe(runner) -> pd.DataFrame:
 
 
 
+def project_economics_dataframe(runner) -> pd.DataFrame:
+    """iter82: цены сырья ДЕЙСТВУЮЩЕГО проекта — компонент / цена.
+
+    Читает движок (``component_prices``), а не поля формы: после загрузки
+    проекта именно здесь видно, по каким ценам считается себестоимость. До
+    iter82 экономики в панели «📋 Настройки проекта» не было вовсе — цены
+    существовали только в форме сетапа, и на живом проекте их было не увидеть.
+
+    Чистая (без Streamlit) — тестируется напрямую.
+    """
+    rep = cv.project_economics_report(runner)
+    cur = rep["currency_unit"] or CURRENCY_UNIT
+    mass = rep["mass_unit"] or MASS_UNIT
+    rows: List[Dict[str, Any]] = []
+    for nm in rep["mixture_names"]:
+        rows.append({"компонент": str(nm),
+                     f"цена, {cur}/{mass}": float(rep["prices"].get(nm, 0.0))})
+    return pd.DataFrame(rows)
+
+
+def branch_prices_dataframe(runner) -> pd.DataFrame:
+    """iter82: по каким ценам считает КАЖДАЯ ветка с ценовой ногой.
+
+    Ветка наследует цены проекта ОДИН РАЗ, при рождении (снимок в
+    ``_branch_cost``), поэтому после правки цен возможен разнобой: колонка
+    «цены» показывает вектор ветки, «актуальность» — совпадает ли он с
+    проектным. Молчать об этом нельзя (A0.6). Чистая (без Streamlit).
+    """
+    rep = cv.project_economics_report(runner)
+    rows: List[Dict[str, Any]] = []
+    for b in rep["branches"]:
+        rows.append({
+            "ветка": b["branch_name"],
+            "id": b["branch_id"],
+            "ρ": b["rho_property"],
+            "цены": (", ".join(f"{v:g}" for v in b["prices"])
+                     if b["prices"] is not None
+                     else "не линейная (не читается)"),
+            "актуальность": ("устарели" if b["stale"] else "как в проекте"),
+            "ден. канал ρ": _MONEY_RU.get(b["money_channel"], "—"),
+        })
+    return pd.DataFrame(rows)
+
+
+def price_edit_message(out: Mapping[str, Any], *, currency: str = CURRENCY_UNIT,
+                       mass: str = MASS_UNIT) -> str:
+    """iter82: человеческий отчёт о правке цен (что изменилось и что с ветками).
+
+    Чистая функция (без Streamlit): ``out`` — результат
+    :meth:`CampaignController.set_project_prices`. Показывает ИМЕННО изменённые
+    позиции (старое → новое), судьбу веток и, если перенос не делали, сколько
+    веток осталось на старых ценах — иначе правка выглядела бы «применилось
+    везде», хотя это не так (A0.6).
+    """
+    before = dict(out.get("prices_before") or {})
+    after = dict(out.get("prices_after") or {})
+    changed = [f"{k}: {float(before.get(k, 0.0)):g} → {float(after[k]):g}"
+               for k in after
+               if float(before.get(k, float("nan"))) != float(after[k])]
+    parts = ["Цены сырья обновлены"
+             + (f" ({currency}/{mass}): " + "; ".join(changed) if changed
+                else ": значения не изменились")]
+    upd = list(out.get("branches_updated") or [])
+    if out.get("applied_to_branches"):
+        if upd:
+            parts.append(
+                "Ветки переведены на новые цены: "
+                + "; ".join(f"{u['branch_name']} (d_best "
+                            f"{u['d_best_before']:.3f} → "
+                            f"{u['d_best_after']:.3f})" for u in upd))
+        else:
+            parts.append("Веток с ценовой ногой нет — переносить было нечего.")
+    elif int(out.get("n_stale_branches") or 0):
+        parts.append(
+            f"Уже созданные ветки ({out['n_stale_branches']} шт.) продолжают "
+            "считать по СТАРЫМ ценам: новые цены подхватят только новые ветки.")
+    if out.get("all_zero"):
+        parts.append("Внимание: все цены нулевые — себестоимость тождественно "
+                     "нулевая.")
+    parts.append(f"База опытов не изменилась: {int(out.get('n_points') or 0)} "
+                 "точек.")
+    return " ".join(parts)
+
+
+def render_project_economics(runner) -> None:
+    """iter82: блок «💰 Экономика проекта» на ЖИВОМ проекте — показ и ПРАВКА цен.
+
+    Зачем: закупочная цена меняется по ходу кампании (новый лот, новый
+    поставщик), а до iter82 единственным путём была кнопка «🏗 Построить
+    проект» — она собирает НОВЫЙ раннер с ПУСТОЙ базой, то есть смена цены
+    стоила всех измеренных опытов. Здесь цены правятся ШТАТНЫМ
+    :meth:`CampaignController.set_project_prices`: база опытов не трогается.
+
+    A0.6: перенос новых цен на УЖЕ созданные ветки — отдельная галочка с
+    предупреждением (переписывает их ценовую ногу и меняет d_best), а не
+    молчаливый побочный эффект.
+    """
+    rep = cv.project_economics_report(runner)
+    st.caption(f"{PROJECT_ECON_LABEL}:")
+    if not rep["enabled"]:
+        st.caption("Экономика проекта ВЫКЛЮЧЕНА: ветки чисто технические, "
+                   "денежный критерий остановки не применяется. Включить можно "
+                   "только пересборкой проекта (форма «🆕 Новый проект»).")
+        return
+    if not rep["configured"]:
+        st.caption("Экономика включена, но не настроена (нет ρ-отклика или "
+                   "цен): себестоимость не считается. Задайте ρ и цены в форме "
+                   "«🆕 Новый проект» — на пустом проекте это ничего не стоит.")
+        return
+    cur = rep["currency_unit"] or CURRENCY_UNIT
+    mass = rep["mass_unit"] or MASS_UNIT
+    st.caption(
+        f"ρ = «{rep['rho_property']}» "
+        f"({rho_role_to_label(rep['rho_default_role'])}), цены в {cur}/{mass}. "
+        + item_cost_formula_caption(cur, mass, rep["rho_unit"]))
+    if rep["all_zero"]:
+        st.warning("Все цены сырья нулевые: себестоимость тождественно "
+                   "нулевая, денежный критерий не работает.")
+    st.dataframe(project_economics_dataframe(runner),
+                 width="stretch", hide_index=True)
+    if rep["branches"]:
+        st.dataframe(branch_prices_dataframe(runner),
+                     width="stretch", hide_index=True)
+    if rep["n_stale_branches"]:
+        st.warning(
+            f"Ветки считают себестоимость по УСТАРЕВШИМ ценам: "
+            f"{rep['n_stale_branches']} шт. Ветка наследует цены один раз, при "
+            f"создании — чтобы перевести её на текущие, отметьте перенос ниже "
+            f"и примените цены заново.")
+
+    with st.form("proj_prices_form"):
+        st.caption(
+            f"Правка цен ДЕЙСТВУЮЩЕГО проекта: база опытов "
+            f"({rep['n_points']} точек) и схема не затрагиваются — измеренные "
+            f"свойства от цены сырья не зависят.")
+        txt = st.text_input(
+            f"Цены компонентов {rep['mixture_names']}, {cur}/{mass} "
+            "(через запятую)",
+            value=", ".join(f"{float(rep['prices'].get(nm, 0.0)):g}"
+                            for nm in rep["mixture_names"]),
+            key="proj_prices_txt",
+            help="В том же порядке, что компоненты. Значение нужно для КАЖДОГО "
+                 "компонента: пропуск, доопределённый нулём, тихо занижает "
+                 "себестоимость и уводит оптимум к дорогому сырью.")
+        to_branches = st.checkbox(
+            "Перенести новые цены на уже созданные ветки",
+            value=False, key="proj_prices_to_branches",
+            help="Ценовая нога ветки — часть её истории, поэтому по умолчанию "
+                 "ветки НЕ переписываются: новые цены подхватят только ветки, "
+                 "созданные после правки. С галочкой ветки переводятся на "
+                 "текущие цены и их d_best пересчитывается (измеренные отклики "
+                 "при этом не меняются, И-1).")
+        if st.form_submit_button("💾 Применить цены"):
+            ctrl = get_campaign_controller()
+            if ctrl is None:      # pragma: no cover — панель живёт при проекте
+                st.error("Проекта в сессии нет: применять цены некуда.")
+                return
+            try:
+                prices = parse_component_prices(txt, rep["mixture_names"])
+                out = ctrl.set_project_prices(
+                    prices, apply_to_branches=bool(to_branches))
+            except (ValueError, KeyError) as exc:
+                st.error(str(exc))
+            else:
+                _flash(price_edit_message(out, currency=cur, mass=mass))
+                st.rerun()
+
+
 def render_project_settings(runner) -> None:
     """📋 Панель «настройки проекта» (читает движок, не форму).
 
@@ -3069,6 +3237,9 @@ def render_project_settings(runner) -> None:
         st.caption(links_caption(getattr(runner, "process_links", []) or []))
         st.dataframe(project_settings_dataframe(runner),
                      width="stretch", hide_index=True)
+        # iter82: ЭКОНОМИКА — единственное место, где цены живого проекта видны
+        # и правятся без пересборки (пересборка обнулила бы базу опытов).
+        render_project_economics(runner)
         # iter41.3: паспорт кампании — phr-спека / метка / пары (read-only).
 
         st.caption("🪪 Паспорт кампании (CAMPAIGN_SPEC_PVC §3):")

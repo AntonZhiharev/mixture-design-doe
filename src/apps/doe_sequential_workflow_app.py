@@ -1051,7 +1051,7 @@ if s.workflow_stage == 1:
                     st.warning(f"⚠️ {msg}")
 
             with st.expander("📊 Derived proportion bounds (accounting for other components)", expanded=True):
-                st.dataframe(summary_df, use_container_width=True)
+                st.dataframe(summary_df, width="stretch")
                 st.caption(
                     "**Proportion min/max** = achievable proportion range for each component "
                     "when it is at its extreme value and all other components are at the opposite extreme.  "
@@ -1234,7 +1234,7 @@ elif s.workflow_stage == 2:
             display_df.insert(2, "Point Type", pt_types)
             st.dataframe(display_df.style.format(
                 {c: "{:.4f}" for c in s.factor_names}
-            ), use_container_width=True)
+            ), width="stretch")
             # Explain point type breakdown
             from collections import Counter
             pt_counts = Counter(pt_types)
@@ -1243,7 +1243,7 @@ elif s.workflow_stage == 2:
         else:
             st.dataframe(design_df.style.format(
                 {c: "{:.4f}" for c in s.factor_names}
-            ), use_container_width=True)
+            ), width="stretch")
 
         # Show sum check for mixture
         if s.design_kind == "mixture":
@@ -1266,7 +1266,7 @@ elif s.workflow_stage == 2:
                     st.dataframe(parts_view.style.format(
                         {c: "{:.3f}" for c in parts_view.columns
                          if c not in ("Run", s.response_name)}
-                    ), use_container_width=True)
+                    ), width="stretch")
                     buf_parts = io.BytesIO()
                     with pd.ExcelWriter(buf_parts, engine="openpyxl") as _w:
                         parts_view.to_excel(_w, sheet_name="Parts Design", index=False)
@@ -1307,7 +1307,7 @@ elif s.workflow_stage == 2:
                              caxis=dict(title=s.factor_names[2])),
                 height=420,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         col_back, col_fwd = st.columns(2)
         with col_back:
@@ -1353,7 +1353,7 @@ elif s.workflow_stage == 3:
                 "Run": st.column_config.NumberColumn("Run", disabled=True),
                 **{c: st.column_config.NumberColumn(c, disabled=True) for c in s.factor_names},
             },
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
         )
         if st.button("💾 Save Manual Responses", type="primary"):
             resp = edited[s.response_name].values.astype(float)
@@ -1441,14 +1441,14 @@ elif s.workflow_stage == 4:
     with st.expander("📋 ANOVA Table", expanded=False):
         st.dataframe(results["anova_df"].style.format({
             "SS": "{:.4f}", "MS": "{:.4f}", "F": "{:.3f}", "p-Value": "{:.4f}",
-        }, na_rep=""), use_container_width=True)
+        }, na_rep=""), width="stretch")
 
     # ── Charts ────────────────────────────────────────────────────────────────
     chart_col1, chart_col2 = st.columns(2)
     with chart_col1:
-        st.plotly_chart(half_normal_plot(results["coeff_df"]), use_container_width=True)
+        st.plotly_chart(half_normal_plot(results["coeff_df"]), width="stretch")
     with chart_col2:
-        st.plotly_chart(pareto_chart(results["coeff_df"]), use_container_width=True)
+        st.plotly_chart(pareto_chart(results["coeff_df"]), width="stretch")
 
     # ── Aliasing detection ────────────────────────────────────────────────────
     aliasing_df = detect_aliasing(design, s.model_type, s.design_kind, s.factor_names)
@@ -1457,7 +1457,7 @@ elif s.workflow_stage == 4:
         st.warning(f"⚠️ **{len(aliasing_df)} aliased term pair(s) detected** "
                    f"(|correlation| ≥ 0.75). See table below.")
         with st.expander("🔗 Aliasing Structure", expanded=True):
-            st.dataframe(aliasing_df, use_container_width=True)
+            st.dataframe(aliasing_df, width="stretch")
             if s.design_kind == "factorial":
                 st.info(
                     "**Tip:** If you selected terms from aliased pairs, run the "
@@ -1511,7 +1511,7 @@ elif s.workflow_stage == 4:
             "LogWorth":      st.column_config.NumberColumn("LogWorth",disabled=True, format="%.2f"),
             "Significant (α=0.05)": st.column_config.CheckboxColumn("Sig?", disabled=True),
         },
-        hide_index=True, use_container_width=True, num_rows="fixed",
+        hide_index=True, width="stretch", num_rows="fixed",
     )
 
     # Get selected term indices (map back to full model matrix columns)
@@ -1540,7 +1540,7 @@ elif s.workflow_stage == 4:
     # ── Residuals for current full model ──────────────────────────────────────
     with st.expander("📉 Model Diagnostics (full model)"):
         st.plotly_chart(residual_plots(responses, results["y_pred"]),
-                        use_container_width=True)
+                        width="stretch")
 
     # ── Navigation ───────────────────────────────────────────────────────────
     st.markdown("---")
@@ -1641,7 +1641,7 @@ elif s.workflow_stage == 5:
         st.subheader(f"📋 Additional Experimental Runs ({len(fo_df)} new runs)")
         st.dataframe(fo_df.style.format(
             {c: "{:.4f}" for c in s.factor_names}
-        ), use_container_width=True)
+        ), width="stretch")
 
         buf_fo = io.BytesIO()
         with pd.ExcelWriter(buf_fo, engine="openpyxl") as writer:
@@ -1676,7 +1676,7 @@ elif s.workflow_stage == 5:
                     "Run": st.column_config.NumberColumn("Run", disabled=True),
                     **{c: st.column_config.NumberColumn(c, disabled=True) for c in s.factor_names},
                 },
-                hide_index=True, use_container_width=True,
+                hide_index=True, width="stretch",
             )
 
             if st.button("💾 Save Manual Responses", type="primary", key="save_fo_manual"):
@@ -1819,7 +1819,7 @@ elif s.workflow_stage == 6:
             "p-Value":      st.column_config.NumberColumn("p-Value",   disabled=True, format="%.5f"),
             "Significant":  st.column_config.CheckboxColumn("Sig?",    disabled=True),
         },
-        hide_index=True, use_container_width=True, num_rows="fixed",
+        hide_index=True, width="stretch", num_rows="fixed",
     )
 
     selected_indices = [i for i, row in edited6.iterrows() if row["Include"]]
@@ -1866,13 +1866,13 @@ elif s.workflow_stage == 6:
     # ── Coefficients table ─────────────────────────────────────────────────
     st.subheader("🔢 Final Model Coefficients")
     styled_coeff = _coeff_df_styled(final["coeff_df"])
-    st.dataframe(styled_coeff, use_container_width=True)
+    st.dataframe(styled_coeff, width="stretch")
 
     # ── ANOVA table ────────────────────────────────────────────────────────
     with st.expander("📋 ANOVA Table (Final Model)", expanded=True):
         st.dataframe(final["anova_df"].style.format({
             "SS": "{:.4f}", "MS": "{:.4f}", "F": "{:.3f}", "p-Value": "{:.4f}",
-        }, na_rep=""), use_container_width=True)
+        }, na_rep=""), width="stretch")
 
     # ── Model equation ─────────────────────────────────────────────────────
     st.subheader("📐 Model Equation")
@@ -1942,7 +1942,7 @@ elif s.workflow_stage == 6:
             })
             st.dataframe(lof_df.style.format({
                 "SS": "{:.4f}", "MS": "{:.4f}", "F": "{:.3f}", "p-Value": "{:.4f}",
-            }, na_rep=""), use_container_width=True)
+            }, na_rep=""), width="stretch")
 
             if p_lof > 0.10:
                 st.success(f"✅ Lack-of-Fit p = {p_lof:.4f} — **no significant LOF** (model fits well).")
@@ -1957,7 +1957,7 @@ elif s.workflow_stage == 6:
 
     # ── Full diagnostic plots ──────────────────────────────────────────────
     st.subheader("📉 Full Residual Diagnostics")
-    st.plotly_chart(residual_plots(responses, y_pred), use_container_width=True)
+    st.plotly_chart(residual_plots(responses, y_pred), width="stretch")
 
     # ── Response surface (mixture: ternary contour) ─────────────────────────
     if s.design_kind == "mixture" and s.n_factors == 3:
@@ -1983,7 +1983,7 @@ elif s.workflow_stage == 6:
             xaxis_title=s.factor_names[0], yaxis_title=s.factor_names[1],
             height=450,
         )
-        st.plotly_chart(fig_tern, use_container_width=True)
+        st.plotly_chart(fig_tern, width="stretch")
 
     elif s.design_kind == "factorial" and s.n_factors >= 2:
         st.subheader("🌈 Response Surface (first two factors, others at centre)")
@@ -2019,7 +2019,7 @@ elif s.workflow_stage == 6:
             ),
             height=480,
         )
-        st.plotly_chart(fig_rs, use_container_width=True)
+        st.plotly_chart(fig_rs, width="stretch")
 
     # ── Export ─────────────────────────────────────────────────────────────
     st.subheader("📥 Download Final Results")
@@ -2046,7 +2046,7 @@ elif s.workflow_stage == 6:
         buf_report.getvalue(),
         file_name="final_model_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("**Individual sheet downloads:**")

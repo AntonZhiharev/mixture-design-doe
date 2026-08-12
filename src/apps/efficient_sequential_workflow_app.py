@@ -575,7 +575,7 @@ if s.eff_stage == 1:
         "Cumulative": [str(n_p1_new), str(n_p1_new + n_p2_new), str(n_p1_new + n_p2_new + n_p3_new), str(n_jmp_new)],
         "Stop if R2 >=":  [str(r2_target), str(r2_target), "—", "—"],
     })
-    st.dataframe(budget_df, use_container_width=True, hide_index=True)
+    st.dataframe(budget_df, width="stretch", hide_index=True)
 
     st.info(
         f"💡 **Potential savings**: If your model reaches R² ≥ {r2_target:.2f} after Phase 1 "
@@ -642,7 +642,7 @@ elif s.eff_stage == 2:
     # Annotate point types for mixture design
     st.dataframe(
         df1.style.format({c: "{:.4f}" for c in s.component_names}),
-        use_container_width=True
+        width="stretch"
     )
 
     # Sum check
@@ -668,7 +668,7 @@ elif s.eff_stage == 2:
                          caxis=dict(title=s.component_names[2])),
             height=400,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # Downloads
     dl1, dl2 = st.columns(2)
@@ -716,7 +716,7 @@ elif s.eff_stage == 3:
                 "Blend_Order":st.column_config.NumberColumn("Order",       disabled=True),
                 "Response":   st.column_config.NumberColumn("Response",    disabled=True),
             },
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
         )
         if st.button("💾 Save Phase 1 Responses", type="primary"):
             resp_col = s.response_name if s.response_name in edited.columns else "Response"
@@ -811,7 +811,7 @@ elif s.eff_stage == 4:
         st.dataframe(cdf.style.format({
             "Coefficient": "{:.4f}", "Std Error": "{:.4f}",
             "t-Stat": "{:.3f}", "CI Lower 95%": "{:.4f}", "CI Upper 95%": "{:.4f}",
-        }), use_container_width=True)
+        }), width="stretch")
 
         # Significant terms
         n_sig = int(fit["coeff_df"]["Significant"].sum())
@@ -821,16 +821,16 @@ elif s.eff_stage == 4:
         # Pareto + residual side-by-side
         col_p, col_r = st.columns(2)
         with col_p:
-            st.plotly_chart(pareto_fig(fit["coeff_df"]), use_container_width=True)
+            st.plotly_chart(pareto_fig(fit["coeff_df"]), width="stretch")
         with col_r:
             st.plotly_chart(residual_plots_fig(responses, fit["y_pred"]),
-                            use_container_width=True)
+                            width="stretch")
 
         # ── ANOVA ─────────────────────────────────────────────────────
         with st.expander("📋 ANOVA Table"):
             st.dataframe(fit["anova_df"].style.format(
                 {"SS": "{:.4f}", "MS": "{:.4f}", "F": "{:.3f}", "p-Value": "{:.4f}"},
-                na_rep=""), use_container_width=True)
+                na_rep=""), width="stretch")
 
         # ── Navigation ────────────────────────────────────────────────
         st.markdown("---")
@@ -878,7 +878,7 @@ elif s.eff_stage == 5:
     st.subheader("📋 Phase 2 Augmentation Runs")
     st.dataframe(
         df2.style.format({c: "{:.4f}" for c in s.component_names}),
-        use_container_width=True
+        width="stretch"
     )
     st.info(f"  **{len(df2)} new runs** in Phase 2  "
             f"(cumulative total: {existing_count + len(df2)})")
@@ -925,7 +925,7 @@ elif s.eff_stage == 6:
                 "Blend_Order":st.column_config.NumberColumn("Order",    disabled=True),
                 "Response":   st.column_config.NumberColumn("Response", disabled=True),
             },
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
         )
         if st.button("💾 Save Phase 2 Responses", type="primary"):
             resp2 = edited2[s.response_name].values.astype(float)
@@ -1011,7 +1011,7 @@ elif s.eff_stage == 7:
         st.dataframe(cdf2.style.format({
             "Coefficient": "{:.4f}", "Std Error": "{:.4f}",
             "t-Stat": "{:.3f}", "CI Lower 95%": "{:.4f}", "CI Upper 95%": "{:.4f}",
-        }), use_container_width=True)
+        }), width="stretch")
 
         n_sig2 = int(fit2["coeff_df"]["Significant"].sum())
         sig2 = fit2["coeff_df"][fit2["coeff_df"]["Significant"]]["Term"].tolist()
@@ -1019,15 +1019,15 @@ elif s.eff_stage == 7:
 
         col_p, col_r = st.columns(2)
         with col_p:
-            st.plotly_chart(pareto_fig(fit2["coeff_df"]), use_container_width=True)
+            st.plotly_chart(pareto_fig(fit2["coeff_df"]), width="stretch")
         with col_r:
             st.plotly_chart(residual_plots_fig(responses, fit2["y_pred"]),
-                            use_container_width=True)
+                            width="stretch")
 
         with st.expander("📋 ANOVA Table"):
             st.dataframe(fit2["anova_df"].style.format(
                 {"SS": "{:.4f}", "MS": "{:.4f}", "F": "{:.3f}", "p-Value": "{:.4f}"},
-                na_rep=""), use_container_width=True)
+                na_rep=""), width="stretch")
 
         st.markdown("---")
         nc1, nc2, nc3 = st.columns(3)
@@ -1074,7 +1074,7 @@ elif s.eff_stage == 8:
     st.subheader("📋 Phase 3 Augmentation Runs")
     st.dataframe(
         df3.style.format({c: "{:.4f}" for c in s.component_names}),
-        use_container_width=True
+        width="stretch"
     )
     st.info(f"  **{len(df3)} new runs** in Phase 3  "
             f"(cumulative total: {existing_count + len(df3)})")
@@ -1120,7 +1120,7 @@ elif s.eff_stage == 9:
                 "Blend_Order":st.column_config.NumberColumn("Order",    disabled=True),
                 "Response":   st.column_config.NumberColumn("Response", disabled=True),
             },
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
         )
         if st.button("💾 Save Phase 3 Responses", type="primary"):
             resp3 = edited3[s.response_name].values.astype(float)
@@ -1232,7 +1232,7 @@ elif s.eff_stage == 10:
     st.dataframe(cdf_final.style.format({
         "Coefficient": "{:.4f}", "Std Error": "{:.4f}",
         "t-Stat": "{:.3f}", "CI Lower 95%": "{:.4f}", "CI Upper 95%": "{:.4f}",
-    }), use_container_width=True)
+    }), width="stretch")
 
     # ── Model equation ────────────────────────────────────────────────────────
     st.subheader("📐 Model Equation")
@@ -1249,16 +1249,16 @@ elif s.eff_stage == 10:
     with st.expander("📋 ANOVA Table"):
         st.dataframe(fit_final["anova_df"].style.format(
             {"SS": "{:.4f}", "MS": "{:.4f}", "F": "{:.3f}", "p-Value": "{:.4f}"},
-            na_rep=""), use_container_width=True)
+            na_rep=""), width="stretch")
 
     # ── Residual diagnostics ──────────────────────────────────────────────────
     st.subheader("📉 Residual Diagnostics")
     st.plotly_chart(residual_plots_fig(responses, fit_final["y_pred"]),
-                    use_container_width=True)
+                    width="stretch")
 
     # ── Pareto chart ──────────────────────────────────────────────────────────
     st.subheader("📊 Effect Significance (Pareto)")
-    st.plotly_chart(pareto_fig(fit_final["coeff_df"]), use_container_width=True)
+    st.plotly_chart(pareto_fig(fit_final["coeff_df"]), width="stretch")
 
     # ── Normality test ────────────────────────────────────────────────────────
     residuals = fit_final["residuals"]
@@ -1293,7 +1293,7 @@ elif s.eff_stage == 10:
         {"Phase": "JMP Fixed (reference)",  "Runs": n_jmp,  "Note": ""},
         {"Phase": f"Savings",              "Runs": savings, "Note": f"{pct:.0f}% reduction"},
     ]
-    st.dataframe(pd.DataFrame(budget_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(budget_rows), width="stretch", hide_index=True)
 
     # ── Download full results ─────────────────────────────────────────────────
     st.subheader("📥 Download Final Results")
@@ -1317,7 +1317,7 @@ elif s.eff_stage == 10:
         buf_final.getvalue(),
         file_name="efficient_sequential_final_model.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
     )
 
     dl_c1, dl_c2 = st.columns(2)

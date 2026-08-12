@@ -89,6 +89,9 @@ project_campaigns/
 *.log
 _ui_run.log
 _ui_run.err.log
+# Ротированные копии логов (_ui_run.err.log.20260812_120313.bak и т.п.)
+_ui_run.*
+*.bak
 
 
 

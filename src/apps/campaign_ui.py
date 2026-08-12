@@ -2564,7 +2564,7 @@ def _render_phr_group_block(blk: Dict[str, Any], uid: str,
         st.session_state[dkey] = phr_children_dataframe(
             blk, schema_version=schema_version)
     edited = st.data_editor(st.session_state[dkey], num_rows="dynamic",
-                            use_container_width=True, hide_index=True,
+                            width="stretch", hide_index=True,
                             key=f"{key_prefix}_phr_kids_{uid}_v"
                                 f"{int(schema_version)}")
     try:
@@ -2672,13 +2672,13 @@ def _render_phr_tree_input(key_prefix: str) -> Optional[PhrSpec]:
 
     ac = st.columns([2, 2, 1])
     if ac[0].button("➕ Группа", key=f"{key_prefix}_phr_add_group",
-                    use_container_width=True):
+                    width="stretch"):
         tree.append(phr_group_block(f"группа{len(tree) + 1}"))
         st.session_state[tkey] = tree
         st.rerun()
     if ac[1].button("➕ Компонент вне групп",
                     key=f"{key_prefix}_phr_add_single",
-                    use_container_width=True):
+                    width="stretch"):
         tree.append(phr_single_block(f"компонент{len(tree) + 1}"))
         st.session_state[tkey] = tree
         st.rerun()
@@ -2786,7 +2786,7 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
                        f"{', '.join(spec.component_names)} · z-осей: "
                        f"{spec.dim_z}.")
             st.dataframe(phr_spec_summary_dataframe(spec),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
             # iter50/P1.3: политика геометрии (роли уже в таблице выше) —
             # порядок групп, лог-оси и техлимиты входят в spec_hash, но были
             # не видны: две «одинаковые» спеки давали разные планы.
@@ -2795,7 +2795,7 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
                        "mixture-блока схемы (fraction_bounds):")
 
             st.dataframe(phr_spec_fraction_dataframe(spec),
-                         use_container_width=True)
+                         width="stretch")
             st.code(spec.spec_hash(), language=None)
             st.caption("spec_hash активной спеки: зафиксируйте хеш и лоты "
                        "сырья ДО первого замера (CAMPAIGN_SPEC_PVC §3) — "
@@ -2851,7 +2851,7 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
              "доля L": np.round(lo_arr, 4), "доля U": np.round(hi_arr, 4)},
             index=list(names)[:q])
         st.caption("Рассчитанные диапазоны долей для алгоритма:")
-        st.dataframe(tbl, use_container_width=True)
+        st.dataframe(tbl, width="stretch")
         return lo_arr.tolist(), hi_arr.tolist()
 
 
@@ -3068,12 +3068,12 @@ def render_project_settings(runner) -> None:
         # P3.3: связанные оси — то же правило видимости, что у уровней.
         st.caption(links_caption(getattr(runner, "process_links", []) or []))
         st.dataframe(project_settings_dataframe(runner),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
         # iter41.3: паспорт кампании — phr-спека / метка / пары (read-only).
 
         st.caption("🪪 Паспорт кампании (CAMPAIGN_SPEC_PVC §3):")
         st.dataframe(campaign_passport_dataframe(runner),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
         spec = getattr(runner, "phr_spec", None)
         if spec is not None:
             st.code(spec.spec_hash(), language=None)
@@ -3083,7 +3083,7 @@ def render_project_settings(runner) -> None:
             # роли/техлимиты/шкалы/порядок групп, а не только хеш.
             st.caption(phr_spec_policy_caption(spec))
             st.dataframe(phr_spec_summary_dataframe(spec),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
 
 
@@ -3603,7 +3603,7 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                 wdf_one = recipe_weighing_dataframe(
                     spec_w, Xs[i_sel, :spec_w.q], delta_phr,
                     grams_per_phr=gpp_val)
-                st.dataframe(wdf_one, use_container_width=True,
+                st.dataframe(wdf_one, width="stretch",
                              hide_index=True)
                 bad = [v for v in wdf_one["нарушение"] if str(v).strip()]
                 if bad:
@@ -3631,7 +3631,7 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                 bdf_pt = point_bounds_dataframe(
                     spec_w, Xs[nums_b.index(sel_b), :spec_w.q],
                     delta_phr=delta_phr)
-                st.dataframe(bdf_pt, use_container_width=True,
+                st.dataframe(bdf_pt, width="stretch",
                              hide_index=True)
                 st.caption(point_bounds_caption(bdf_pt))
             except ValueError as exc:
@@ -3697,7 +3697,7 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                   "допустимы (P3.1)" if cov_names_ui else "")
                + ":")
     blk_cols = [c for c in ("Блок", "Партия") if c in df.columns]
-    edited = st.data_editor(df, use_container_width=True, height=320,
+    edited = st.data_editor(df, width="stretch", height=320,
                             hide_index=True,
                             disabled=["№ опыта", *blk_cols,
                                       *coord_names[:Xs.shape[1]],
@@ -3738,7 +3738,7 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                 "Непройденная проверка — сигнал пересмотреть план ДО "
                 "измерений; фиксация плана не блокируется.")
             st.dataframe(preflight_details_dataframe(pf),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
     elif st.session_state.get("setup_seed_pf_err"):
         st.caption("🔎 Проверка плана недоступна: "
                    + str(st.session_state["setup_seed_pf_err"]))
@@ -4402,7 +4402,7 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         cached_rec = st.session_state.get(rkey)
         if cached_rec is not None:
             df_rec, xls_bytes, brep = cached_rec
-            st.dataframe(df_rec, use_container_width=True, hide_index=True)
+            st.dataframe(df_rec, width="stretch", hide_index=True)
             st.download_button(
                 "⬇️ Скачать рецепт ветки в Excel (.xlsx)", data=xls_bytes,
                 file_name=f"branch_{bsel}_recipe.xlsx",
@@ -4417,7 +4417,7 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                 st.caption("Что ограничивает оптимум (запреты целей + "
                            "вероятностные ограничения; % — доля точек в наборе "
                            "кандидатов, где ограничение активно):")
-                st.dataframe(bdf, use_container_width=True, hide_index=True)
+                st.dataframe(bdf, width="stretch", hide_index=True)
 
 
         # §17.3 (Ш2) гейт: перед предложением/пересчётом — проверка полноты данных
@@ -4453,10 +4453,10 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
             st.success(last["msg"])
             st.caption("Измеренные отклики добавленных точек (по всем "
                        "свойствам):")
-            st.dataframe(last["points"], use_container_width=True,
+            st.dataframe(last["points"], width="stretch",
                          hide_index=True)
             st.caption("Сводка источников общей базы:")
-            st.dataframe(last["origins"], use_container_width=True,
+            st.dataframe(last["origins"], width="stretch",
                          hide_index=True)
             st.caption(last["stop"])
 
@@ -4497,7 +4497,7 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                    "тестовых значений"
                    + (" и «… (ковариата)» — условия прогона (P3.1)"
                       if wb_cov_names else "") + ":")
-        edited = st.data_editor(df, use_container_width=True, height=280,
+        edited = st.data_editor(df, width="stretch", height=280,
                                 hide_index=True,
                                 disabled=["№ опыта", *coord_names[:Xs.shape[1]]],
                                 key=f"camp_wb_editor_{bsel}")
@@ -4700,7 +4700,7 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
         if mat is not None:
             st.caption("Важность компонентов (0…1; максимум по свойству = 1) "
                        "— чем ближе к 1, тем сильнее компонент влияет на свойство:")
-            st.dataframe(mat, use_container_width=True)
+            st.dataframe(mat, width="stretch")
 
         # --- детальный разбор одного свойства ---
         st.markdown("**🔬 Разбор свойства (квадратичная модель Шеффе по "
@@ -4733,10 +4733,10 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
             st.caption(f"Свойство «{rep['property']}» — коэффициенты Шеффе "
                        f"(только состав, {rep['model']}):")
             st.dataframe(pd.DataFrame(rep["coefficients"]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
             st.caption("ANOVA (значимость регрессии в целом, F-тест):")
             st.dataframe(pd.DataFrame(rep["anova"]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
             rank = pd.DataFrame(rep["component_ranking"])
             if not rank.empty and "importance" in rank.columns:
                 st.caption("Важность компонентов (0…1):")
@@ -4745,7 +4745,7 @@ def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
                        f"{rep['n_significant']}.")
             if rep["n_significant"]:
                 st.dataframe(pd.DataFrame(rep["significant_terms"]),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
 
 
 def _tab_row(keys: Sequence[str], labels: Mapping[str, str], current: str, *,
@@ -4772,7 +4772,7 @@ def _tab_row(keys: Sequence[str], labels: Mapping[str, str], current: str, *,
     for i, k in enumerate(opts):
         if cols[i].button(labels.get(k, k), key=f"{key_prefix}_{k}",
                           type=("primary" if k == picked else "secondary"),
-                          use_container_width=True):
+                          width="stretch"):
             picked = k
     return picked
 
@@ -5036,7 +5036,7 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
                  f"({MASS_UNIT}) = доля компонента × размер партии.")
         batch_kg = float(batch) if batch > 0 else None
         base_df = campaign_base_dataframe(runner, batch_kg=batch_kg)
-        st.dataframe(base_df, use_container_width=True, hide_index=True)
+        st.dataframe(base_df, width="stretch", hide_index=True)
         _blk_txt = base_blocking_caption(runner)
         if _blk_txt:
             st.caption(_blk_txt)
@@ -5059,7 +5059,7 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
         props_corr = list(runner.property_names)
         edit_df = measured_responses_editor_df(runner)
         edited_corr = st.data_editor(
-            edit_df, use_container_width=True, hide_index=True,
+            edit_df, width="stretch", hide_index=True,
             disabled=["№ опыта", "источник"], key="camp_correct_editor")
         if st.button("💾 Сохранить исправления откликов", key="camp_correct_save"):
             try:
@@ -5102,7 +5102,7 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
             cov_names_base = list(runner.covariate_names)
             cov_df = covariates_editor_df(runner)
             edited_cov = st.data_editor(
-                cov_df, use_container_width=True, hide_index=True,
+                cov_df, width="stretch", hide_index=True,
                 disabled=["№ опыта", "источник"], key="camp_cov_editor")
             if st.button("💾 Сохранить условия прогона", key="camp_cov_save"):
                 try:
@@ -5177,7 +5177,7 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
     st.caption(f"Выбрана ветка **{rep['branch_name']}** (`{bsel}`). Роли "
                "откликов действуют ТОЛЬКО внутри этой ветки; при переходе на "
                "другую ветку роли будут другими.")
-    st.dataframe(role_table_dataframe(rep), use_container_width=True)
+    st.dataframe(role_table_dataframe(rep), width="stretch")
 
     with st.expander("💰 Почему за ρ есть/нет денег (§16.1)"):
         # P0: MC-оценка (n_mc=128) раньше считалась на КАЖДЫЙ rerun страницы
@@ -5207,7 +5207,7 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
             "удаление ПОСЛЕДНЕЙ цели запрещено — ветке нужна хотя бы одна цель. "
             "Правки можно отменить (кнопка «Отменить последнюю настройку», §7); "
             "измеренные данные они не меняют (И-1).")
-        st.dataframe(goal_editor_dataframe(runner, bsel), use_container_width=True)
+        st.dataframe(goal_editor_dataframe(runner, bsel), width="stretch")
 
         st.markdown("**➕/✏️ Задать или заменить цель над откликом**")
         gc = st.columns([2, 2, 2, 2, 2])
@@ -5389,7 +5389,7 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
     if st.button("👁 Предпросмотр наследования (без создания)",
                  key="camp_spawn_preview"):
         rev = ctrl.preview_spawn(parent, new_goals=new_goals)
-        st.dataframe(spawn_review_dataframe(rev), use_container_width=True)
+        st.dataframe(spawn_review_dataframe(rev), width="stretch")
         if rev["any_role_changed_by_objective"]:
             st.warning("Новая цель ветки перебила унаследованную роль ρ — канал "
                        "цены будет занулён (И-5).")
@@ -5411,4 +5411,4 @@ def render_branches_panel(ctrl: "cv.CampaignController") -> None:
     if st.session_state.get("camp_spawn_last") is not None:
         st.caption("Сводка наследования ролей последней дочерней ветки:")
         st.dataframe(spawn_review_dataframe(st.session_state["camp_spawn_last"]),
-                     use_container_width=True)
+                     width="stretch")

@@ -159,7 +159,7 @@ def main():
                 })
         
         df = pd.DataFrame(data)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
         
         # Metrics
         col1, col2, col3 = st.columns(3)
@@ -246,7 +246,7 @@ def main():
                     significant_interactions.append(term)
             
             df = pd.DataFrame(data)
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
         else:
             st.warning("No 2-way interactions detected")
             significant_interactions = []

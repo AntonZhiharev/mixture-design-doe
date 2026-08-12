@@ -675,7 +675,7 @@ def main():
                         iteration_colors
                     )
                     if fig:
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
                 
                 elif viz_type == "3D Simplex":
                     fig = plot_design_points_3d(
@@ -684,7 +684,7 @@ def main():
                         iteration_colors,
                         "All Design Points by Iteration"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                 
                 elif viz_type == "Data Table":
                     df = pd.DataFrame(
@@ -695,7 +695,7 @@ def main():
                     df['Iteration'] = iteration_colors
                     df['Sum_Check'] = df[[f'Component_{i+1}' for i in range(n_components)]].sum(axis=1)
                     
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df, width="stretch")
                     
                     # Download data
                     csv = df.to_csv(index=False)
@@ -715,7 +715,7 @@ def main():
         
         if st.session_state.reconstructor is not None and st.session_state.reconstructor.iteration_history:
             fig = plot_response_analysis(st.session_state.reconstructor)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             
             # Show coefficient summary with true coefficients
             st.subheader("🔢 Current Model Coefficients")
@@ -764,7 +764,7 @@ def main():
                                                        np.abs(current_model.coef_) * 100)
                         })
                         
-                        st.dataframe(coeff_df, use_container_width=True)
+                        st.dataframe(coeff_df, width="stretch")
                         
                         # Add a note about the approach
                         st.info("ℹ️ **Note:** Coefficients are computed using the same procedure as in Stage Analysis for consistency.")
@@ -775,7 +775,7 @@ def main():
                     st.error(f"Could not compute model coefficients: {str(e)}")
                     # Fallback to original method
                     coeff_summary = reconstructor.get_coefficient_summary()
-                    st.dataframe(coeff_summary, use_container_width=True)
+                    st.dataframe(coeff_summary, width="stretch")
             else:
                 st.info("No experiment data available yet.")
             
@@ -890,7 +890,7 @@ def main():
                     )
                     stage_df['Response'] = stage_responses
                     stage_df['Point_Type'] = f"New in {selected_stage}"
-                    st.dataframe(stage_df, use_container_width=True)
+                    st.dataframe(stage_df, width="stretch")
                 else:
                     st.info("No new points added in this stage")
                 
@@ -910,7 +910,7 @@ def main():
                     iteration_labels.extend([batch_label] * len(design_batch))
                 
                 cumulative_df['Stage'] = iteration_labels[:len(cumulative_design)]
-                st.dataframe(cumulative_df, use_container_width=True)
+                st.dataframe(cumulative_df, width="stretch")
                 
                 # 2. RECOVERED PARAMETERS AT THIS STAGE
                 st.subheader("🔧 Recovered Parameters")
@@ -1006,7 +1006,7 @@ def main():
                             lambda x: f"{x:.4f}" if not np.isnan(x) and x >= 0.001 else "<0.001" if not np.isnan(x) else "N/A"
                         )
                         
-                        st.dataframe(display_coeffs, use_container_width=True)
+                        st.dataframe(display_coeffs, width="stretch")
                         
                         # Add significance codes explanation
                         st.caption("**Significance codes:** *** p<0.001, ** p<0.01, * p<0.05, . p<0.1")
@@ -1050,7 +1050,7 @@ def main():
                             anova_df[col] = anova_df[col].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x)
                         anova_df['F_Value'] = anova_df['F_Value'].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) and x != 0 else x)
                         
-                        st.dataframe(anova_df, use_container_width=True)
+                        st.dataframe(anova_df, width="stretch")
                         
                         # Partial F-tests for parameter groups
                         if reconstructor.config.model_type == "quadratic" and n_components > 1:
@@ -1084,7 +1084,7 @@ def main():
                                 }
                                 
                                 partial_f_df = pd.DataFrame(partial_f_data)
-                                st.dataframe(partial_f_df, use_container_width=True)
+                                st.dataframe(partial_f_df, width="stretch")
                                 
                             except Exception as e:
                                 st.warning(f"Could not compute partial F-tests: {str(e)}")
@@ -1118,7 +1118,7 @@ def main():
                                 })
                             
                             comparison_df = pd.DataFrame(comparison_data)
-                            st.dataframe(comparison_df, use_container_width=True)
+                            st.dataframe(comparison_df, width="stretch")
                         
                     except Exception as e:
                         st.error(f"Could not compute coefficients for this stage: {str(e)}")
@@ -1155,7 +1155,7 @@ def main():
                             'Squared_Error': errors**2
                         })
                         
-                        st.dataframe(error_df, use_container_width=True)
+                        st.dataframe(error_df, width="stretch")
                         
                         # Error statistics
                         col1, col2, col3, col4 = st.columns(4)
@@ -1201,7 +1201,7 @@ def main():
                             height=500
                         )
                         
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
                         
                     except Exception as e:
                         st.error(f"Could not generate prediction analysis: {str(e)}")

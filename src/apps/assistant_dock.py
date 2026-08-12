@@ -213,7 +213,7 @@ def _render_suggestions(focus: UiFocus, has_runner: bool) -> Optional[str]:
     sugs = actx.suggested_questions(focus, has_runner=has_runner)
     for i, s in enumerate(sugs):
         if st.button(s.label, key=f"dock_sug_{focus.section_key}_{i}",
-                     disabled=not s.enabled, use_container_width=True,
+                     disabled=not s.enabled, width="stretch",
                      help=(s.question if s.enabled else s.why)):
             asked = s.question
         if not s.enabled and s.why:
@@ -242,7 +242,7 @@ def _render_retry(res: Any, *, fresh: bool = False) -> None:
         st.toast(prompt.toast, icon=prompt.icon)
     st.warning(f"{prompt.icon} {prompt.toast}\n\n{prompt.hint}")
     if st.button(prompt.button_label, key="dock_retry", type="primary",
-                 use_container_width=True,
+                 width="stretch",
                  help=f"Отправить тот же вопрос заново: «{prompt.question}»"):
         st.session_state[K_PENDING] = prompt.question
         st.session_state.pop(K_LAST_TURN, None)
@@ -259,7 +259,7 @@ def _render_patches(ctx: ToolContext, session) -> None:
                    "изменить границу узла — сам он её не применяет.")
         return
     st.dataframe(views.staged_patches_dataframe(session, only_staged=True),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     for p in staged:
         st.caption(f"`{p.id}` · {p.node}.{p.field_name}: {p.from_value} → "
                    f"{p.to_value}"
@@ -318,7 +318,7 @@ def _render_setup_edits(ctx: ToolContext, session, runner: Any) -> None:
         st.dataframe(pd.DataFrame(
             [{"поле": k, "новое значение": str(v)}
              for k, v in s.fields.items()]),
-            use_container_width=True, hide_index=True)
+            width="stretch", hide_index=True)
         c = st.columns(2)
         if c[0].button("✅ Применить правку", key=f"dock_apply_setup_{s.id}",
                        disabled=runner is not None,
@@ -378,7 +378,7 @@ def _render_project_packages(ctx: ToolContext, session, runner: Any) -> None:
                    "заводится — откликов и осей в ней нет по схеме.")
         return
     st.dataframe(views.staged_projects_dataframe(session, only_staged=True),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     if runner is not None:
         st.warning("В сессии УЖЕ собран проект: принять пакет проекта нельзя — "
                    "иначе молча пропали бы измеренные точки и ветки. Для правки "
@@ -393,7 +393,7 @@ def _render_project_packages(ctx: ToolContext, session, runner: Any) -> None:
                    f"hash {str(m.get('spec_hash', ''))[:12]}…")
         # Блоки таблицей — «что именно загружается» без чтения JSON глазами.
         st.dataframe(views.project_blocks_dataframe(m),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
         with st.expander(f"JSON пакета проекта {p.id}", expanded=False):
             st.json(p.payload())
         c = st.columns(2)
@@ -456,7 +456,7 @@ def _render_spec_packages(ctx: ToolContext, session) -> None:
                    "(новый узел, удаление, смена роли). Сам он её не применяет.")
         return
     st.dataframe(views.staged_specs_dataframe(session, only_staged=True),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     for s in staged:
         d = s.summary or {}
         head = (f"`{s.id}` · {s.label or 'без метки'} · "
@@ -559,7 +559,7 @@ def _render_outputs(outputs: List[views.OutputFile], *, scope: str) -> None:
     for i, o in enumerate(outputs):
         st.caption(o.caption)
         if o.kind == "image":
-            st.image(o.path, use_container_width=True)
+            st.image(o.path, width="stretch")
         elif o.kind == "table":
             try:
                 df = (pd.read_excel(o.path) if o.path.lower().endswith(".xlsx")
@@ -571,7 +571,7 @@ def _render_outputs(outputs: List[views.OutputFile], *, scope: str) -> None:
                 # а не показываем пустое место.
                 st.warning(f"Таблицу «{o.name}» не удалось прочитать: {exc}")
             else:
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.dataframe(df, width="stretch", hide_index=True)
         try:
             with open(o.path, "rb") as fh:
                 # Ключ уникален по МЕСТУ показа и позиции в списке: имени файла
@@ -663,7 +663,7 @@ def _render_attachments(session, root: str, project: str) -> None:
                 st.success(f"Файл «{up.name}» приложен.")
         if session.attachments:
             st.dataframe(views.attachments_dataframe(session),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
 
 def _render_artifacts(session) -> None:
@@ -778,7 +778,7 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
         if res.calls:
             with st.expander("🔧 Что было посчитано"):
                 st.dataframe(views.tool_calls_dataframe(res.calls),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
         _render_retry(res, fresh=True)
     else:
         # Отказ прошлого хода не должен исчезать при любом движении виджета:

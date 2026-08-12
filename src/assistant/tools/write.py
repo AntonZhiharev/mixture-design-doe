@@ -830,12 +830,26 @@ def apply_project(ctx: ToolContext, project_id: str, human_token: str,
         raise ToolError(
             f"ГЕЙТ ВАЛИДАЦИИ: пакет проекта не разбирается ядром ({exc}). "
             f"Проект НЕ создан, состояние прежнее.") from exc
+    # iter79: ПРЕФИЛЛ считается ДО гашения токена. Раньше порядок был обратный,
+    # и сбой проекции пакета в поля формы (например, связка осей строкой в
+    # паспорте) сжигал разовый токен: пакет оставался в стейдже, а повторное
+    # «Применить» требовало нового подтверждения. Ошибка проекции — это отказ
+    # ГЕЙТА, а не внутренняя поломка: она должна дойти до человека как ToolError
+    # (UI покажет её через st.error), а не уронить страницу целиком.
+    try:
+        prefill = package_to_setup_prefill(pkg)
+    except PackageError as exc:
+        raise ToolError(
+            f"ГЕЙТ ВАЛИДАЦИИ: пакет проекта не переносится в поля формы "
+            f"({exc}). Проект НЕ создан, состояние прежнее, подтверждение не "
+            f"израсходовано — исправьте пакет и предложите заново."
+        ) from exc
+
     # Токен привязан к отпечатку СПЕКИ пакета: подменить пакет между нажатием
     # кнопки и вызовом нельзя.
     _consume(ctx, human_token, action="apply_project", target=str(project_id),
              context_hash=pkg.spec_hash)
 
-    prefill = package_to_setup_prefill(pkg)
     manifest = package_manifest(pkg)
     session.set_project_status(staged.id, PATCH_APPLIED, reason=str(note or ""))
     decision = _log(ctx, "decisions", _project_decision_record(

@@ -301,10 +301,18 @@ class TestSetupPrefill:
     def test_links_and_pairs_text_parse_back(self):
         """Паспортные связки/пары идут в форму в её же синтаксисе."""
         from src.apps import campaign_ui as ui
+        # iter79: полоса связки теперь проверяется ЯДРОМ уже на разборе пакета
+        # (`normalize_process_links` → `linked_axes.normalize_links`), поэтому
+        # данные обязаны быть реализуемыми. Прежняя запись (T_plast − rotor_rpm
+        # ≥ 10) физически невозможна: разность этих осей лежит в [-735, -215], и
+        # на кнопке «🏗 Построить проект» ядро отвергало её той же ошибкой —
+        # тест проходил лишь потому, что до iter79 связки не валидировались.
+        # Смысл проверки прежний: связка идёт в форму её же синтаксисом, а
+        # открытая сторона полосы пишется «*».
         pkg = pp.parse_project_package({**PACKAGE, "passport": {
             "preflight_pairs": [{"left": ["DINP"], "right": ["SOFT"]}],
-            "process_links": [{"name": "dT", "minuend": "T_plast",
-                               "subtrahend": "rotor_rpm", "lo": 10, "hi": None}],
+            "process_links": [{"name": "dT", "minuend": "rotor_rpm",
+                               "subtrahend": "T_plast", "lo": 250, "hi": None}],
             "material_lots": {"DINP": "лот-7"},
             "anchor_recipes": {"серийный": {"DINP": 8.0}},
         }})
@@ -312,7 +320,7 @@ class TestSetupPrefill:
         assert ui.parse_preflight_pairs(pre["setup_preflight_pairs"]) == [
             (["DINP"], ["SOFT"])]
         link = ui.parse_process_links(pre["setup_process_links"])[0]
-        assert link["minuend"] == "T_plast" and link["lo"] == 10.0
+        assert link["minuend"] == "rotor_rpm" and link["lo"] == 250.0
         assert link["hi"] is None                  # открытая сторона — «*»
         assert ui.parse_material_lots(pre["setup_material_lots"]) == {
             "DINP": "лот-7"}

@@ -359,6 +359,14 @@ def parse_project_package(package: Any) -> ProjectPackage:
         passport["preflight_pairs"] = normalize_preflight_pairs(
             passport["preflight_pairs"], spec,
             process_names=[str(p["name"]) for p in process])
+    # iter79: СВЯЗКИ осей паспорта — той же болезнью, что пары preflight до
+    # iter76: `parse_passport` проверял только ИМЕНА ключей, поэтому строка
+    # вместо объекта («dT: A - B : 10, 60») проходила dry-run и стейдж, а
+    # падала на кнопке «✅ Принять проект» уже внутри префилла формы. Разбор
+    # и смысловая проверка — здесь, против осей ПАКЕТА.
+    if passport.get("process_links"):
+        passport["process_links"] = normalize_process_links(
+            passport["process_links"], process)
 
     try:
         seed = int(d.get("seed", 1) or 1)
@@ -424,6 +432,132 @@ def normalize_preflight_pairs(pairs: Any, spec: PhrSpec, *,
                 f"{{'left': …, 'right': …}}, получено {item!r}.")
         out.append([_side(left, where), _side(right, where)])
     return out
+
+
+def normalize_process_links(links: Any, process: Sequence[Mapping[str, Any]]
+                            ) -> List[Dict[str, Any]]:
+    """iter79: связки осей паспорта → канон ``{name, minuend, subtrahend, lo, hi}``.
+
+    Принимаются ДВЕ формы записи, потому что обе встречаются у модели:
+
+      * объект ``{"name": …, "minuend": …, "subtrahend": …, "lo": …, "hi": …}``
+        (синонимы ``left``/``right``, ``min``/``max``);
+      * СТРОКА формы приложения ``"dT_head: T_adapter - T_plast : 10, 60"`` —
+        ровно то, что человек видит в поле «связанные оси», и то, на чём
+        падало применение пакета.
+
+    Открытая сторона полосы — ``None``/``"*"``. Смысловые правила (ось
+    существует, полоса пересекает достижимый диапазон, ось не в двух связках)
+    проверяет ЯДРО :func:`design.linked_axes.normalize_links` — единый источник
+    правил, тот же, что у ``runner.set_process_links``. Его отказ переводится в
+    :class:`PackageError`, чтобы он случился на dry-run пакета, а не на кнопке.
+    """
+    from .linked_axes import normalize_links
+
+    raw_items = list(links or [])
+    parsed: List[Dict[str, Any]] = []
+    for i, item in enumerate(raw_items, 1):
+        where = f"passport.process_links[{i}]"
+        if isinstance(item, str):
+            parsed.append(_link_from_text(item, where))
+            continue
+        d = _as_mapping(item, where)
+        name = str(d.get("name", "") or "").strip()
+        a = str(d.get("minuend", d.get("left", "")) or "").strip()
+        b = str(d.get("subtrahend", d.get("right", "")) or "").strip()
+        if not (name and a and b):
+            raise PackageError(
+                f"{where}: нужны 'name', 'minuend', 'subtrahend' (производная "
+                f"ось = minuend − subtrahend). Можно и строкой формы: "
+                f"\"dT_head: T_adapter - T_plast : 10, 60\".")
+        parsed.append({"name": name, "minuend": a, "subtrahend": b,
+                       "lo": _link_bound(d.get("lo", d.get("min")), where),
+                       "hi": _link_bound(d.get("hi", d.get("max")), where)})
+
+    names = [str(p["name"]) for p in process]
+    lower = [float(p["range"][0]) for p in process]
+    upper = [float(p["range"][1]) for p in process]
+    try:
+        checked = normalize_links(parsed, names=names, lower=lower, upper=upper)
+    except (ValueError, KeyError) as exc:
+        raise PackageError(
+            f"passport.process_links: {exc}. Связка задаётся против ОСЕЙ ПАКЕТА "
+            f"{names} в реальных единицах; проект не тронут.") from exc
+    return [{"name": lk.name, "minuend": lk.minuend,
+             "subtrahend": lk.subtrahend,
+             "lo": (None if lk.lo == float("-inf") else float(lk.lo)),
+             "hi": (None if lk.hi == float("inf") else float(lk.hi))}
+            for lk in checked]
+
+
+def _link_from_text(text: str, where: str) -> Dict[str, Any]:
+    """Строка формы ``имя: осьA - осьB : lo, hi`` → словарь связки.
+
+    Синтаксис — тот же, что у ``campaign_ui.parse_process_links`` (там он
+    разбирает поле формы). Здесь он повторяется сознательно: слой ``design``
+    не имеет права импортировать слой ``apps`` (иначе ядро потянет Streamlit).
+    """
+    raw = str(text)
+    # iter79: живой синоним «имя = осьA - осьB : lo, hi». Модель пишет так,
+    # потому что это выглядит как определение величины; ход терять на знаке
+    # равенства дорого, а двусмысленности нет — «=» стоит на месте первого
+    # разделителя. Заменяем ТОЛЬКО первое вхождение и только если двоеточий
+    # меньше двух: иначе «=» внутри имени полосы ничего не значит.
+    if raw.count(":") < 2 and "=" in raw:
+        raw = raw.replace("=", ":", 1)
+    parts = raw.split(":")
+    if len(parts) == 2 and "-" in parts[1]:
+        # Частый случай: «dT_head = T_adapter - T_plast» — названа разность, но
+        # НЕ названа полоса. Причина отказа тут не в синтаксисе: связка без
+        # полосы ничего не ограничивает, а придумывать пределы железа за
+        # технолога нельзя (A0.6). Говорим именно это.
+        raise PackageError(
+            f"{where}: у связки «{str(text).strip()}» не задана ПОЛОСА "
+            f"реализуемости. Разность названа, но пределы железа — нет: "
+            f"допишите «: lo, hi» в реальных единицах (открытая сторона «*», "
+            f"например «: 10, *»). Хотя бы одна граница обязана быть конечной, "
+            f"иначе связка ничего не ограничивает. Пределы назовите вы — "
+            f"выдумывать их за технолога нельзя.")
+    if len(parts) != 3:
+        raise PackageError(
+            f"{where}: строка «{str(text).strip()}» должна иметь вид "
+            f"«имя: осьA - осьB : lo, hi» — два разделителя «:», полоса в "
+            f"реальных единицах, открытая сторона «*». Надёжнее объектом: "
+            f"{{'name': …, 'minuend': …, 'subtrahend': …, 'lo': …, 'hi': …}}.")
+    name = parts[0].strip()
+    sides = parts[1].split("-")
+    if len(sides) != 2 or not sides[0].strip() or not sides[1].strip():
+        raise PackageError(
+            f"{where}: разность «{parts[1].strip()}» должна иметь вид "
+            f"«осьA - осьB» (ровно один «-»; имена осей с дефисом этим "
+            f"каналом задать нельзя — используйте объект JSON).")
+    toks = [t.strip() for t in parts[2].split(",")]
+    if len(toks) != 2:
+        raise PackageError(
+            f"{where}: полоса «{parts[2].strip()}» — два значения через "
+            f"запятую («lo, hi»; открытая сторона — «*»).")
+    if not name:
+        raise PackageError(f"{where}: пустое имя производной величины.")
+    return {"name": name, "minuend": sides[0].strip(),
+            "subtrahend": sides[1].strip(),
+            "lo": _link_bound(toks[0], where),
+            "hi": _link_bound(toks[1], where)}
+
+
+def _link_bound(value: Any, where: str) -> Optional[float]:
+    """Граница полосы связки: ``None``/``"*"``/``""`` — сторона открыта."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        if s in ("", "*"):
+            return None
+        value = s
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise PackageError(f"{where}: граница {value!r} не число и не «*»."
+                           ) from exc
 
 
 def _check_name_clashes(spec: PhrSpec, responses: List[Dict[str, str]],
@@ -630,10 +764,37 @@ def project_package_schema(*, include_example: bool = True) -> Dict[str, Any]:
                 "обязателен": False,
                 "единицы": "в модель и желательности НЕ входят",
             },
+            # iter79: раньше здесь стояло только «объект с ключами [...]», и
+            # формат ЗНАЧЕНИЙ модель восстанавливала по памяти — промахивалась
+            # синтаксисом связки («dT = A - B») и теряла ход на гейте. Формат
+            # значений каждого ключа паспорта описан явно, как у блока process.
             "passport": {
                 "что": "политика кампании ДО первого замера",
                 "обязателен": False,
                 "формат": "объект с ключами " + str(list(PASSPORT_KEYS)),
+                "значения": {
+                    "campaign_label": "строка — метка кампании",
+                    "preflight_pairs": "список пар: {'left': [имена], "
+                                       "'right': [имена]} либо [левое, правое]; "
+                                       "имя компонента, узла-группы спеки или "
+                                       "процесс-оси пакета",
+                    "material_lots": "объект {компонент: 'лот'}",
+                    "anchor_recipes": "объект {имя: {компонент: phr}}",
+                    "weighing_step_g": "число — шаг весов, г",
+                    "grams_per_phr": "число — граммов на 1 phr",
+                    "process_links": "список связок ОСЕЙ: {'name': …, "
+                                     "'minuend': ось, 'subtrahend': ось, "
+                                     "'lo': число|null, 'hi': число|null} — "
+                                     "производная величина = minuend − "
+                                     "subtrahend в РЕАЛЬНЫХ единицах. Открытая "
+                                     "сторона полосы — null (или '*' в "
+                                     "текстовой записи). Допустима и строка "
+                                     "формы \"имя: осьA - осьB : lo, hi\" "
+                                     "(ровно два разделителя ':'); запись через "
+                                     "'=' форматом НЕ является. Полоса обязана "
+                                     "пересекать достижимый диапазон разности "
+                                     "по границам осей, иначе область пуста.",
+                },
             },
             "seed": {"что": "зерно ГСЧ движка проекта", "обязателен": False,
                      "единицы": "целое; на состав и границы не влияет"},
@@ -772,17 +933,23 @@ def _links_text(links: Any) -> str:
     ``subtrahend`` (принимаем и синонимы ``left``/``right``). Открытая сторона
     полосы пишется ``*``: полоса в этом канале обязательна, «нет ограничения» —
     это ``*``, а не пропуск.
+
+    iter79: связка может прийти и СТРОКОЙ формы («dT: A - B : 10, 60») — тогда
+    она разбирается тем же :func:`_link_from_text`, что и на валидации пакета.
+    Раньше строка здесь роняла применение уже принятого пакета.
     """
     lines: List[str] = []
-    for item in list(links or []):
-        d = _as_mapping(item, "passport.process_links[]")
+    for i, item in enumerate(list(links or []), 1):
+        where = f"passport.process_links[{i}]"
+        d = _link_from_text(item, where) if isinstance(item, str) \
+            else _as_mapping(item, where)
         name = str(d.get("name", "") or "")
         a = str(d.get("minuend", d.get("left", "")) or "")
         b = str(d.get("subtrahend", d.get("right", "")) or "")
         if not (name and a and b):
             raise PackageError(
-                "passport.process_links[]: нужны 'name', 'minuend', "
-                "'subtrahend' (производная ось = minuend − subtrahend).")
+                f"{where}: нужны 'name', 'minuend', 'subtrahend' (производная "
+                f"ось = minuend − subtrahend).")
         lo = _bound_text(d.get("lo", d.get("min")))
         hi = _bound_text(d.get("hi", d.get("max")))
         lines.append(f"{name}: {a} - {b} : {lo}, {hi}")

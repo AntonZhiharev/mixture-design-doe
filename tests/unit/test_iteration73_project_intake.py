@@ -296,7 +296,12 @@ class TestSetupPrefill:
         pre = pp.package_to_setup_prefill(pp.parse_project_package(PACKAGE))
         assert pre["setup_campaign_label"] == "PVC-кромка-2026"
         assert pre["setup_pass_weigh_step"] == 0.1
-        assert pre["setup_pass_weigh_gpp"] == 10.0
+        # iter83 (ОСОЗНАННАЯ смена контракта поля): `setup_pass_weigh_gpp`
+        # показывает ВЕС ЗАМЕСА в кг. Паспорт пакета хранит масштаб ядра
+        # (grams_per_phr = 10), перевод идёт по верху Σphr спеки пакета
+        # (107…137 phr по листьям): 10 · 137 / 1000 = 1.37 кг. Обратный
+        # перевод точен — batch_grams_per_phr(spec, 1.37) снова даёт 10.
+        assert pre["setup_pass_weigh_gpp"] == pytest.approx(1.37)
 
     def test_links_and_pairs_text_parse_back(self):
         """Паспортные связки/пары идут в форму в её же синтаксисе."""

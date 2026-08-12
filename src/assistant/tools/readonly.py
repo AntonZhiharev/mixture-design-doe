@@ -325,6 +325,20 @@ def get_spec(ctx: ToolContext, include_nodes: bool = True) -> Dict[str, Any]:
         "group_order": list(getattr(spec, "group_order", []) or []),
         "component_names": list(spec.component_names),
         "phr_intervals": intervals,
+        # ⚠️ ИЗВЕСТНЫЙ БАГ (найден iter83, 12.08.2026; НЕ исправлен здесь
+        # осознанно — правка меняет числа, которые ассистент уже цитировал в
+        # живых сессиях, поэтому идёт отдельным шагом).
+        #
+        # Суммируются ВСЕ узлы `phr_intervals()`, включая узлы-ТОТАЛЫ групп, а
+        # тотал группы = сумма своих детей ⇒ группы считаются ДВАЖДЫ и верх
+        # Σphr завышен. На референсной спеке `pvc_edge_v1` (усечённой, с
+        # группой SOFT = PBNK + CPE) выходит 114.85…162.80 вместо верного
+        # 109.85…147.80 — расхождение ровно на интервал тотала SOFT.
+        #
+        # Правильно — суммировать ЛИСТЬЯ (`spec.component_names`), как это
+        # делает `apps.campaign_ui.batch_sigma_phr` (там же тесты:
+        # tests/unit/test_iteration83_batch_weighing.py::TestSigmaPhr).
+        # Подробности и числа — docs/UI_REVISION_SPEC.md §iter83 п.1.
         "sigma_phr_static": [float(sum(v[0] for v in intervals.values())),
                              float(sum(v[1] for v in intervals.values()))],
         "log_axes": [d["name"] for d in nodes if d.get("scale") == "log"],

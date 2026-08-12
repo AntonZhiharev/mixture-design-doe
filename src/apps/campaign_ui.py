@@ -1645,6 +1645,223 @@ def weighing_delta_phr(step_g: float, grams_per_phr: float) -> float:
     return step / gpp
 
 
+#: iter83: минимум шагов весов на навеску, ниже которого дозировка «грубая».
+#: 20 шагов ⇒ относительная погрешность ≥ 5% — тот же порог, что у правила
+#: премикса (:func:`premix_required`, threshold=0.05), только в другой
+#: проекции: премикс смотрит на РАБОЧИЙ ДИАПАЗОН оси, а этот порог — на саму
+#: НАВЕСКУ. Ось может иметь широкий диапазон (премикс не нужен) и при этом
+#: мизерную нижнюю дозу, которую весы не берут — это разные отказы.
+BATCH_MIN_STEPS = 20
+
+#: Вердикты хелпера навески (от худшего к лучшему): порядок задаёт приоритет
+#: показа в предупреждении при сборке проекта.
+BATCH_VERDICT_IMPOSSIBLE = "невозможно"
+BATCH_VERDICT_COARSE = "грубо"
+BATCH_VERDICT_PREMIX = "премикс"
+BATCH_VERDICT_OK = "ок"
+BATCH_VERDICT_ZERO = "низ 0"
+BATCH_VERDICT_ORDER = (BATCH_VERDICT_IMPOSSIBLE, BATCH_VERDICT_COARSE,
+                       BATCH_VERDICT_PREMIX, BATCH_VERDICT_ZERO,
+                       BATCH_VERDICT_OK)
+
+
+def batch_sigma_phr(spec: PhrSpec) -> Tuple[float, float]:
+    """iter83: статический интервал Σphr спеки по ЛИСТЬЯМ (``lo``, ``hi``).
+
+    Суммируются именно ЛИСТЬЯ (``component_names``), а не все узлы
+    ``phr_intervals()``: узел-тотал группы равен сумме своих детей, и сложение
+    всех узлов подряд считало бы группы дважды. Число нужно и хелперу
+    навески, и подписям UI, и тестам — поэтому отдельная функция.
+    Чистая (без Streamlit)."""
+    iv = spec.phr_intervals()
+    names = list(spec.component_names)
+    return (float(sum(iv[nm][0] for nm in names)),
+            float(sum(iv[nm][1] for nm in names)))
+
+
+def batch_grams_per_phr(spec: PhrSpec, batch_kg: float) -> float:
+    """iter83: ``г на 1 phr`` из ВЕСА ЗАМЕСА — то, что просит ядро.
+
+    Пользователь вводит вес одного замеса рецепта (кг) — величину, которую в
+    цехе действительно знают. Ядру (:meth:`MixtureProcessRunner.
+    set_weighing_resolution`) нужен масштаб ``г/phr``: он один на кампанию,
+    иначе ``δ_phr`` не определён. Перевод идёт по ВЕРХУ Σphr спеки::
+
+        г/phr = вес_замеса_г / Σphr_max
+
+    Почему по верху: Σphr от рецепта к рецепту плавает (границы узлов
+    независимы), а масштаб обязан быть ОДИН. Верх Σphr даёт наименьший
+    ``г/phr`` ⇒ наибольшую ``δ_phr`` ⇒ самую осторожную оценку разрешения:
+    если навеска берётся при таком масштабе, она берётся на всём плане.
+    Занижать ``δ`` опаснее — это молча обещало бы точность, которой нет.
+
+    Чистая (без Streamlit). ``batch_kg > 0``.
+    """
+    kg = float(batch_kg)
+    if kg <= 0:
+        raise ValueError("Вес одного замеса рецепта должен быть > 0 кг "
+                         "(иначе перевод навески в граммы не определён).")
+    _, sigma_hi = batch_sigma_phr(spec)
+    if sigma_hi <= 0:
+        raise ValueError("Суммарный phr компонентов спеки не положителен — "
+                         "перевод веса замеса в «г на 1 phr» не определён.")
+    return kg * 1000.0 / sigma_hi
+
+
+def batch_kg_from_grams_per_phr(spec: Optional[PhrSpec],
+                                grams_per_phr: Any) -> float:
+    """iter83: ОБРАТНЫЙ перевод «г на 1 phr» → вес замеса, кг.
+
+    Нужен префиллу формы: раннер хранит масштаб ядра, а поле показывает вес
+    замеса. Точное обращение :func:`batch_grams_per_phr` (тот же верх Σphr),
+    поэтому «собрать проект → загрузить → собрать снова» не сдвигает паспорт.
+
+    ``0.0`` («не задано») возвращается, когда переводить нечем или нечего: нет
+    спеки (Σphr неизвестна), масштаб не задан/не число, вырожденная спека.
+    Выдумывать вес замеса в этих случаях нельзя — в поле попало бы
+    правдоподобное, но неверное число. Чистая (без Streamlit)."""
+    if spec is None:
+        return 0.0
+    try:
+        gpp = float(grams_per_phr)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(gpp) or gpp <= 0:
+        return 0.0
+    _, sigma_hi = batch_sigma_phr(spec)
+    if sigma_hi <= 0:
+        return 0.0
+    return gpp * sigma_hi / 1000.0
+
+
+def batch_weighing_report(spec: PhrSpec, batch_kg: float, step_g: float, *,
+                          min_steps: int = BATCH_MIN_STEPS) -> pd.DataFrame:
+    """iter83: ДОСТИЖИМ ЛИ ОТВЕС при этом весе замеса и этих весах.
+
+    Маршрут расчёта — тот, которым думает технолог (решение 12.08.2026):
+    массовые части спеки → массовые ДОЛИ (:meth:`PhrSpec.fraction_bounds`) →
+    граммы через вес замеса → сравнение с ценой деления весов::
+
+        навеска_min_г = доля_L · вес_замеса_г
+
+    ``г/phr`` в этой цепочке не участвует: он нужен ядру для ``δ_phr``, но
+    вводить его человеку незачем — и оценка навески ЧЕРЕЗ него систематически
+    завышает мелкость варьируемых осей (Σphr_max недостижим: у групп сумма
+    долей = 1, у capped-осей работает потолок).
+
+    Доли берутся по БОКСУ ``fraction_bounds`` (без сэмплирования): бокс
+    СОДЕРЖИТ образ decode, то есть его низ ≤ фактического минимума доли ⇒
+    расчётная навеска ≤ фактической. Ошибка в безопасную сторону: хелпер
+    может перестраховаться, но не пропустит невзвешиваемый компонент.
+
+    Вердикты: ``невозможно`` (навеска меньше цены деления), ``грубо``
+    (меньше ``min_steps`` шагов), ``премикс`` (:func:`premix_required` по
+    РАБОЧЕМУ ДИАПАЗОНУ оси), ``низ 0`` (доля_L = 0 — компонент может
+    отсутствовать, отвес не нормируется), ``ок`` (прямая навеска).
+
+    A0.6: это ДИАГНОСТИКА. Ничего не блокируется и не подгоняется — решение
+    (премикс, другой замес, другие весы) за технологом.
+
+    Чистая (без Streamlit) — тестируется напрямую.
+    """
+    kg = float(batch_kg)
+    step = float(step_g)
+    if kg <= 0:
+        raise ValueError("Вес одного замеса рецепта должен быть > 0 кг.")
+    if step <= 0:
+        raise ValueError("Цена деления весов должна быть > 0 г.")
+    batch_g = kg * 1000.0
+    iv = spec.phr_intervals()
+    lo_x, hi_x = spec.fraction_bounds()
+    delta = step / batch_grams_per_phr(spec, kg)
+    rows: List[Dict[str, Any]] = []
+    for j, nm in enumerate(spec.component_names):
+        x_lo = float(lo_x[j])
+        grams = x_lo * batch_g
+        p_lo, p_hi = float(iv[nm][0]), float(iv[nm][1])
+        wide = p_hi > p_lo + 1e-9
+        steps: Optional[float]
+        err: Optional[float]
+        if x_lo <= 0.0:
+            # Низ диапазона = 0: компонент МОЖЕТ отсутствовать. Отвес по нулю
+            # не нормируется (шагов ∞, погрешность ∞) — это не отказ весов, и
+            # вердикт «невозможно» здесь был бы ложной тревогой.
+            verdict = BATCH_VERDICT_ZERO
+            steps = err = None
+        else:
+            steps = grams / step
+            err = 100.0 * step / grams
+            if grams < step:
+                verdict = BATCH_VERDICT_IMPOSSIBLE
+            elif steps < float(min_steps):
+                verdict = BATCH_VERDICT_COARSE
+            elif wide and premix_required(delta, p_lo, p_hi):
+                verdict = BATCH_VERDICT_PREMIX
+            else:
+                verdict = BATCH_VERDICT_OK
+        rows.append({
+            "компонент": nm,
+            "доля L": round(x_lo, 6),
+            "доля U": round(float(hi_x[j]), 6),
+            "навеска min, г": round(grams, 4),
+            "шагов весов": None if steps is None else round(steps, 1),
+            "погрешность, %": None if err is None else round(err, 3),
+            "phr lo": round(p_lo, 4),
+            "phr hi": round(p_hi, 4),
+            "вердикт": verdict,
+        })
+    return pd.DataFrame(rows)
+
+
+def batch_weighing_problems(df: pd.DataFrame) -> Dict[str, List[str]]:
+    """iter83: проблемные компоненты по вердиктам — ``{вердикт: [имена]}``.
+
+    Только «плохие» вердикты (``невозможно`` / ``грубо`` / ``премикс``);
+    пустой словарь = отвес достижим везде. Отдельная функция, чтобы подпись,
+    предупреждение при сборке проекта и тесты читали ОДИН источник.
+    Чистая (без Streamlit)."""
+    out: Dict[str, List[str]] = {}
+    if df is None or df.empty:
+        return out
+    for verdict in (BATCH_VERDICT_IMPOSSIBLE, BATCH_VERDICT_COARSE,
+                    BATCH_VERDICT_PREMIX):
+        names = [str(v) for v in df.loc[df["вердикт"] == verdict, "компонент"]]
+        if names:
+            out[verdict] = names
+    return out
+
+
+def batch_weighing_caption(spec: PhrSpec, batch_kg: float, step_g: float, *,
+                           min_steps: int = BATCH_MIN_STEPS) -> str:
+    """iter83: подпись под таблицей навески — масштаб, Σphr и проблемные оси.
+
+    Проблемы называются ИМЕНАМИ (не «3 компонента»): технолог должен видеть,
+    что именно не взвешивается, иначе предупреждение — шум, а не действие.
+    Чистая (без Streamlit)."""
+    df = batch_weighing_report(spec, batch_kg, step_g, min_steps=min_steps)
+    s_lo, s_hi = batch_sigma_phr(spec)
+    gpp = batch_grams_per_phr(spec, batch_kg)
+    delta = float(step_g) / gpp
+    parts = [f"Замес {float(batch_kg):g} кг при цене деления "
+             f"{float(step_g):g} г: Σphr спеки {s_lo:.4g}…{s_hi:.4g} ⇒ "
+             f"масштаб {gpp:.4g} г на 1 phr (по верху Σphr — осторожная "
+             f"оценка), δ = {delta:.4g} phr."]
+    problems = batch_weighing_problems(df)
+    for verdict, text in (
+            (BATCH_VERDICT_IMPOSSIBLE,
+             "НЕ взвешиваются (навеска меньше цены деления)"),
+            (BATCH_VERDICT_COARSE,
+             f"взвешиваются грубо (меньше {int(min_steps)} шагов весов)"),
+            (BATCH_VERDICT_PREMIX, "требуют премикса")):
+        if verdict in problems:
+            parts.append(f"⚠️ {text}: {', '.join(problems[verdict])}.")
+    if not problems:
+        parts.append("Все компоненты берутся прямой навеской.")
+    parts.append("Диагностика: ничего не блокируется (A0.6) — решение "
+                 "(премикс, другой замес, другие весы) за вами.")
+    return " ".join(parts)
+
+
 def recipe_weighing_dataframe(spec: PhrSpec, x_fractions: Sequence[float],
                               delta_phr: float, *,
                               grams_per_phr: Optional[float] = None
@@ -2945,8 +3162,14 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
         getattr(runner, "anchor_recipes", {}) or {})
     out["setup_pass_weigh_step"] = float(
         getattr(runner, "weighing_step_g", 0.0) or 0.0)
-    out["setup_pass_weigh_gpp"] = float(
-        getattr(runner, "grams_per_phr", 0.0) or 0.0)
+    # iter83: раннер хранит масштаб «г на 1 phr», а ПОЛЕ формы — вес замеса
+    # (кг). Возвращаем обратный перевод по спеке проекта, иначе после загрузки
+    # в поле «вес замеса» лежало бы число другой размерности (169 «кг» вместо
+    # 25). Без спеки Σphr неизвестна — оставляем 0 («не задано»), а не
+    # правдоподобную выдумку.
+    out["setup_pass_weigh_gpp"] = batch_kg_from_grams_per_phr(
+        getattr(runner, "phr_spec", None),
+        getattr(runner, "grams_per_phr", 0.0))
     # iter52/P2.1-UI: дискретные уровни process-осей — политика кампании,
     # которую после загрузки обязана показывать и ФОРМА (иначе повторная
     # сборка проекта молча вернула бы непрерывные оси).
@@ -3471,18 +3694,26 @@ def render_setup_form() -> None:
                  "«имя: комп=phr, комп=phr, …» (например, «anchor_main: "
                  "PVC_67=70, PVC_71=30, DINP=10»). Против anchor'а сверяется "
                  "round-trip спеки и дрейф между фазами.")
+        # iter83: пара «весы + замес». Раньше вторым полем просили «г на 1 phr»
+        # — величину, которой в цехе не оперируют: чтобы её назвать, надо
+        # сначала перебрать варианты рецептов и посмотреть, при каком вводе
+        # базового компонента выходит нужный масштаб. Спрашиваем то, что
+        # известно (вес замеса), а «г/phr» для ядра считаем сами
+        # (batch_grams_per_phr) — он остаётся ВНУТРЕННИМ масштабом δ.
         pwc = st.columns(2)
         pass_step = pwc[0].number_input(
-            "Шаг весов, г (паспорт)", min_value=0.0, value=0.0, step=0.01,
-            format="%.4f", key="setup_pass_weigh_step",
-            help="Дискретность лабораторных весов — дефолт слоя навески "
-                 "(iter42). 0 у ОБОИХ полей = не задано; заполнено ОДНО из "
-                 "двух — явная ошибка (δ не определим).")
-        pass_gpp = pwc[1].number_input(
-            "г на 1 phr (паспорт)", min_value=0.0, value=0.0, step=0.5,
-            format="%.4f", key="setup_pass_weigh_gpp",
-            help="Загрузка смесителя: сколько граммов приходится на 1 phr. "
-                 "Вместе с шагом весов даёт δ_phr = шаг / (г на 1 phr).")
+            "Цена деления весов, г (паспорт)", min_value=0.0, value=0.0,
+            step=0.01, format="%.4f", key="setup_pass_weigh_step",
+            help="Дискретность лабораторных весов, на которых развешивают "
+                 "компоненты. 0 у ОБОИХ полей = не задано; заполнено ОДНО из "
+                 "двух — явная ошибка (разрешение навески не определимо).")
+        pass_batch = pwc[1].number_input(
+            "Вес одного замеса рецепта, кг (паспорт)", min_value=0.0,
+            value=0.0, step=0.5, format="%.4f", key="setup_pass_weigh_gpp",
+            help="Полная масса одного замеса. Из неё и цены деления весов "
+                 "считается достижимость навески КАЖДОГО компонента: "
+                 "массовые доли спеки × вес замеса = граммы. При сборке "
+                 "проекта покажем, что не взвешивается и где нужен премикс.")
         # P3.1: ковариаты базы — телеметрия прогона (M(t)/SME, Die_Pressure,
         # торк, вытяжка, наработка вала): столбцы базы, НЕ отклики модели.
         cov_txt = st.text_input(
@@ -3552,8 +3783,22 @@ def render_setup_form() -> None:
                 # парсеры (номер строки), имена валидируют ШТАТНЫЕ сеттеры.
                 runner.set_material_lots(parse_material_lots(lots_txt))
                 runner.set_anchor_recipes(parse_anchor_recipes(anchors_txt))
-                runner.set_weighing_resolution(float(pass_step),
-                                               float(pass_gpp))
+                # iter83: человек ввёл ВЕС ЗАМЕСА (кг), ядру нужен масштаб
+                # «г на 1 phr» — считаем его сами по спеке. Без активной спеки
+                # Σphr неизвестна, и перевод невозможен: это явный отказ, а не
+                # молчаливый пропуск половины паспорта (A0.6).
+                batch_kg = float(pass_batch)
+                step_g = float(pass_step)
+                if batch_kg > 0 and phr_spec_live is None:
+                    raise ValueError(
+                        "Вес замеса задан, но phr-спеки нет: перевести "
+                        "массовые доли в граммы нечем (нужна геометрия "
+                        "рецепта). Либо включите режим «phr-спека (JSON)», "
+                        "либо обнулите оба поля весов.")
+                runner.set_weighing_resolution(
+                    step_g,
+                    0.0 if batch_kg <= 0
+                    else batch_grams_per_phr(phr_spec_live, batch_kg))
                 # iter52/P2.1-UI: дискретные уровни — ПОСЛЕ сборки схемы
                 # (валидация имён/границ — штатным set_process_levels, A0.6).
                 levels_now = parse_process_levels(levels_txt)
@@ -3601,6 +3846,23 @@ def render_setup_form() -> None:
                             "техническими).")
                     + " База пуста — предложите и измерьте стартовый план "
                       "опытов ниже.")
+                # iter83: ДОСТИЖИМОСТЬ ОТВЕСА — проверяем СРАЗУ при сборке, а
+                # не когда план уже предложен: если самый малый компонент
+                # весами не берётся, это меняет решение о премиксе и, возможно,
+                # о самом весе замеса. Показываем и таблицу, и подпись с
+                # именами; сборку НЕ отменяем — она уже состоялась (A0.6).
+                if phr_spec_live is not None and batch_kg > 0 and step_g > 0:
+                    wdf = batch_weighing_report(phr_spec_live, batch_kg,
+                                                step_g)
+                    problems = batch_weighing_problems(wdf)
+                    txt = batch_weighing_caption(phr_spec_live, batch_kg,
+                                                 step_g)
+                    (st.warning if problems else st.info)(txt)
+                    with st.expander(
+                            "⚖️ Достижимость навески по компонентам "
+                            "(вес замеса × цена деления весов)",
+                            expanded=bool(problems)):
+                        st.dataframe(wdf, width="stretch", hide_index=True)
 
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))

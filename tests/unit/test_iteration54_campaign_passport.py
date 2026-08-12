@@ -337,7 +337,37 @@ class TestPassportAndPrefill:
         assert ui.parse_material_lots(out["setup_material_lots"]) == LOTS
         assert ui.parse_anchor_recipes(out["setup_anchor_recipes"]) == ANCHORS
         assert out["setup_pass_weigh_step"] == pytest.approx(0.1)
-        assert out["setup_pass_weigh_gpp"] == pytest.approx(5.0)
+        # iter83 (ОСОЗНАННАЯ смена контракта поля): ключ
+        # `setup_pass_weigh_gpp` теперь показывает ВЕС ЗАМЕСА в кг, а не
+        # масштаб «г на 1 phr». У этого раннера phr-спеки нет, значит Σphr
+        # неизвестна и перевод невозможен — честный 0 («не задано») вместо
+        # правдоподобного, но неверного числа. Сам паспорт в раннере при этом
+        # НЕ теряется (проверка ниже) — теряется только префилл поля, которое
+        # без спеки всё равно неприменимо: слой навески работает только со
+        # спекой.
+        assert out["setup_pass_weigh_gpp"] == 0.0
+        r = _passport_runner()
+        assert r.grams_per_phr == pytest.approx(5.0)     # ядро помнит масштаб
+
+    def test_prefill_batch_kg_round_trips_with_spec(self):
+        """iter83: со спекой поле «вес замеса» переживает круг без сдвига.
+
+        Собрали проект весом замеса N кг → раннер хранит г/phr → префилл формы
+        обязан вернуть те же N кг, иначе повторная сборка молча изменила бы
+        паспорт.
+        """
+        from src.design.phr_sampler import PhrSpec
+        spec = PhrSpec.from_dicts([
+            {"name": "A", "role": "FIXED", "value": 100.0},
+            {"name": "B", "role": "ABSOLUTE", "range": [4.0, 14.0]},
+            {"name": "C", "role": "ABSOLUTE", "range": [1.0, 6.0]},
+        ])
+        r = _runner()
+        r.set_phr_spec(spec)
+        batch_kg = 25.0
+        r.set_weighing_resolution(0.1, ui.batch_grams_per_phr(spec, batch_kg))
+        out = ui.setup_prefill_from_runner(r)
+        assert out["setup_pass_weigh_gpp"] == pytest.approx(batch_kg)
 
     def test_prefill_empty_without_passport(self):
         out = ui.setup_prefill_from_runner(_runner())

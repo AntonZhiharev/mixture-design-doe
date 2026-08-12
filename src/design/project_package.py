@@ -871,7 +871,14 @@ def package_to_setup_prefill(pkg: ProjectPackage) -> Dict[str, Any]:
     if "weighing_step_g" in p:
         out["setup_pass_weigh_step"] = float(p.get("weighing_step_g") or 0.0)
     if "grams_per_phr" in p:
-        out["setup_pass_weigh_gpp"] = float(p.get("grams_per_phr") or 0.0)
+        # iter83: поле формы показывает ВЕС ЗАМЕСА (кг), а паспорт пакета
+        # хранит масштаб ядра «г на 1 phr». Переводим по спеке пакета (тот же
+        # верх Σphr, что и в UI), иначе в поле «вес замеса» попало бы число
+        # другой размерности. Импорт локальный: project_package — слой ядра и
+        # на UI-модуль по кругу зависеть не должен.
+        from ..apps.campaign_ui import batch_kg_from_grams_per_phr
+        out["setup_pass_weigh_gpp"] = batch_kg_from_grams_per_phr(
+            pkg.spec, p.get("grams_per_phr") or 0.0)
     if p.get("preflight_pairs"):
         out["setup_preflight_pairs"] = _pairs_text(p["preflight_pairs"])
     if p.get("material_lots"):

@@ -239,12 +239,18 @@ def test_feed_hint_admits_truncation():
     assert "последние 4 из 60" in hint and "сохранена" in hint
 
 
-def test_panel_heights_are_fixed_and_independent():
-    """Фиксированные высоты — суть решения: без них общий скролл возвращается."""
-    assert isinstance(ws.WORKSPACE_HEIGHT, int) and ws.WORKSPACE_HEIGHT > 400
+def test_chat_feed_height_is_fixed():
+    """Лента диалога — окно с фиксированной высотой: ввод под ней не уезжает.
+
+    iter88 снял окно с РАБОЧЕЙ ОБЛАСТИ (запрос технолога: центр должен быть
+    обычной страницей с одним скроллом), поэтому прежняя проверка «лента ниже
+    рабочей области» смысла больше не имеет — сравнивать не с чем. Контракт
+    высоты центра проверяет ``test_iteration88_workspace_page_scroll``.
+    """
     assert isinstance(ws.CHAT_FEED_HEIGHT, int) and ws.CHAT_FEED_HEIGHT > 300
-    # лента ниже рабочей области: под ней ещё стоит поле ввода
-    assert ws.CHAT_FEED_HEIGHT < ws.WORKSPACE_HEIGHT
+    # ориентир iter69 сохранён как константа — по нему считается окно, если
+    # WORKSPACE_SCROLL вернут в True
+    assert isinstance(ws.WORKSPACE_HEIGHT, int) and ws.WORKSPACE_HEIGHT > 400
 
 
 def test_dialog_count_ignores_service_messages():

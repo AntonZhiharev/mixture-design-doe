@@ -580,7 +580,9 @@ iter58–64 — 318; UI-регресс кампании (iter19/20/23/26/52) —
    спорило бы с логикой доступности, а истина о закладке живёт в `ws_tab`.
    Выбор ветки по-прежнему в `camp_branch` — `ui_focus` и старые тесты его видят.
 4. **Независимые скроллы.** Содержимое активной закладки — в
-   `st.container(height=WORKSPACE_HEIGHT)`, лента диалога — в
+   `st.container(height=WORKSPACE_HEIGHT)` (⚠️ **отменено в iter88**, см.
+   `UI_REVISION_SPEC.md`: центр стал обычной страницей с одним скроллом —
+   `workspace.WORKSPACE_SCROLL = False`; ленты диалога это НЕ касается), лента диалога — в
    `st.container(height=CHAT_FEED_HEIGHT, autoscroll=True)`; ввод (`chat_input`)
    стоит ПОД лентой и не двигается. Ход текущего прогона дорисовывается внутрь
    ленты (`turn_slot`), а не под полем ввода. Наличие `height`/`autoscroll`

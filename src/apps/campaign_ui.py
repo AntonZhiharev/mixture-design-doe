@@ -5668,11 +5668,17 @@ def render_workspace(ctrl: Optional["cv.CampaignController"], *,
                      project_renderer: Optional[Any] = None) -> None:
     """Закладки рабочей области + содержимое активной закладки (iter69).
 
-    Ряд закладок и подпись состояния рисуются СНАРУЖИ прокручиваемого
-    контейнера — иначе, прокрутив таблицу, человек теряет из виду сами
-    закладки. Содержимое активной закладки уходит в контейнер фиксированной
-    высоты (:data:`workspace.WORKSPACE_HEIGHT`): у него собственный скролл,
-    поэтому ответ ассистента в левой панели больше не двигает рабочую область.
+    Ряд закладок и подпись состояния рисуются ПЕРВЫМИ — над содержимым, чтобы
+    закладки были видны сразу при входе на экран.
+
+    iter88 (запрос технолога): содержимое активной закладки БОЛЬШЕ не запирается
+    в окно фиксированной высоты. iter69 обёртывал его в
+    ``st.container(height=WORKSPACE_HEIGHT)``, чтобы ответ ассистента не двигал
+    таблицу, но длинные панели (форма сетапа на 18 компонентов, план на 135
+    опытов, рабочий стол ветки) приходилось читать через щель 760 px, имея рядом
+    ещё и внешний скролл. Теперь рабочая область — обычная страница с одним
+    скроллом; аргументы контейнера считает чистая
+    :func:`workspace.workspace_box_kwargs` (там же переключатель обратно).
 
     Логика доступности закладок — чистая (:func:`workspace.tab_states`), здесь
     только показ и роутинг.
@@ -5712,8 +5718,8 @@ def render_workspace(ctrl: Optional["cv.CampaignController"], *,
     if tab is not None and tab.blurb:
         st.caption(tab.blurb)
 
-    box = st.container(height=wsx.WORKSPACE_HEIGHT, border=True) \
-        if _supports_container_height() else st.container()
+    box = st.container(**wsx.workspace_box_kwargs(
+        supports_height=_supports_container_height()))
     with box:
         _render_workspace_body(ctrl, active,
                                overview_renderer=overview_renderer,
@@ -5723,9 +5729,10 @@ def render_workspace(ctrl: Optional["cv.CampaignController"], *,
 def _supports_container_height() -> bool:
     """Умеет ли установленный Streamlit контейнер ФИКСИРОВАННОЙ высоты.
 
-    ``st.container(height=…)`` появился в 1.29; на более раннем Streamlit
-    рабочая область просто останется без собственного скролла (страница
-    поведёт себя как раньше) — это хуже по UX, но работоспособно.
+    ``st.container(height=…)`` появился в 1.29. При текущем
+    :data:`workspace.WORKSPACE_SCROLL` = ``False`` (iter88) высота не передаётся
+    вообще, и ответ этой проверки ни на что не влияет; она нужна, чтобы возврат
+    к окну iter69 (флаг в ``True``) не падал на старом Streamlit.
     """
     try:
         import inspect

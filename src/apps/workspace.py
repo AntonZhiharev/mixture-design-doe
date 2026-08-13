@@ -385,6 +385,14 @@ def decide_tab(current: Any, *, prev_phase: Any, has_project: bool,
     if str(prev_phase or "") != phase:
         key = default_tab_key(has_project=has_project, n_points=n_points,
                               n_branches=n_branches)
+        # iter90: «переход» туда, где человек УЖЕ стоит, — не переход, и
+        # рапортовать о нём нечего. Раньше уведомление всё равно вставало в
+        # дерево элементов на СЛЕДУЮЩЕМ прогоне (смена фазы фиксируется после
+        # отрисовки), то есть на первом же действии пользователя после сборки
+        # проекта: вёрстка сдвигалась, stateless-экспандеры перемонтировались,
+        # и форма сетапа захлопывалась (живой отказ 13.08.2026).
+        if str(current or "") == key:
+            return TabDecision(key=key, phase=phase)
         tab = TABS_BY_KEY.get(key)
         title = tab.title if tab is not None else key
         notice = ("" if not prev_phase else

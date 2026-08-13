@@ -3813,6 +3813,62 @@ def render_project_settings(runner) -> None:
 
 
 
+#: iter90: раскрытость формы «🆕 Новый проект» — СОСТОЯНИЕ приложения, а не
+#: производная от «есть ли проект». Прежний вызов
+#: ``st.expander(..., expanded=ctrl is None)`` держал раскрытость только в
+#: браузере, привязанной к ПОЗИЦИИ узла в дереве элементов, и пересчитывал
+#: дефолт на каждом прогоне: первое же изменение дерева после сборки проекта
+#: (отложенное ``st.info`` смены фазы, см. ``decide_tab``) перемонтировало
+#: экспандер и захлопывало форму прямо под руками технолога — внешне «страница
+#: перезагрузилась» (живой отказ 13.08.2026: правка ВЕРХНЕЙ границы
+#: процесс-оси). Ключ НЕ ``setup_*`` намеренно: это состояние ИНТЕРФЕЙСА, ему
+#: нечего делать в черновике проекта (``setup_draft_fields`` берёт ``setup_*``).
+SETUP_FORM_OPEN_KEY = "ui_setup_form_open"
+
+#: Отложенная раскрытость формы (аналог ``setup_prefill_pending``): пишется в
+#: обработчиках, когда виджет экспандера УЖЕ создан в текущем прогоне
+#: (Streamlit запрещает менять ключ созданного виджета), применяется в начале
+#: ``render_setup_form`` следующего прогона — все такие обработчики завершаются
+#: ``st.rerun``, поэтому для человека это происходит в момент его действия.
+SETUP_FORM_OPEN_PENDING = "ui_setup_form_open_pending"
+
+
+def _supports_stateful_expander() -> bool:
+    """Умеет ли установленный Streamlit ``st.expander(key=…, on_change=…)``.
+
+    Стейтфул-экспандер (раскрытость как состояние виджета) есть в 1.58;
+    ``requirements.txt`` заявляет минимум 1.28 — на старой сборке форма
+    откатывается к прежнему поведению (см. :func:`setup_expander_kwargs`).
+    """
+    try:
+        import inspect
+        params = inspect.signature(st.expander).parameters
+        return "key" in params and "on_change" in params
+    except (ValueError, TypeError):  # pragma: no cover — экзотические сборки
+        return False
+
+
+def setup_expander_kwargs(*, stateful: bool, fallback_expanded: bool
+                          ) -> Dict[str, Any]:
+    """Аргументы экспандера формы сетапа (чистая — тестируется без Streamlit).
+
+    * ``stateful=True`` → раскрытостью владеет ключ
+      :data:`SETUP_FORM_OPEN_KEY` в ``session_state`` (``on_change="rerun"``
+      делает экспандер виджетом): состояние переживает сдвиг дерева элементов
+      и НЕ пересчитывается из «есть ли проект» на каждом прогоне. ``expanded``
+      передаётся КОНСТАНТОЙ: он входит в идентичность виджета (element_id),
+      и меняющееся значение пересоздавало бы виджет со сбросом состояния —
+      ровно тот дефект, который здесь чинится.
+    * ``stateful=False`` (старый Streamlit) → прежнее поведение iter72:
+      ``expanded`` от ``fallback_expanded`` (пустая сессия — форма открыта,
+      проект есть — свёрнута).
+    """
+    if not stateful:
+        return {"expanded": bool(fallback_expanded)}
+    return {"expanded": True, "key": SETUP_FORM_OPEN_KEY,
+            "on_change": "rerun"}
+
+
 def render_setup_form() -> None:
 
     """§17.4 (Ш3b): форма РЕАЛЬНОГО сетапа — mixture + процесс + отклики.
@@ -3867,8 +3923,35 @@ def render_setup_form() -> None:
         if _stale_n is not None:
             st.session_state["setup_econ_prices"] = ""
             st.session_state["setup_econ_prices_stale_n"] = int(_stale_n)
+    # iter90: раскрытость формы — состояние ВИДЖЕТА (ключ + on_change), а не
+    # производная «есть ли проект». Прежний expanded=(ctrl is None) жил только
+    # в браузере и был привязан к ПОЗИЦИИ узла: первый же сдвиг дерева после
+    # сборки/загрузки (одноразовые сообщения decide_tab / camp_loaded_msg)
+    # перемонтировал экспандер и захлопывал форму под руками технолога —
+    # выглядело как перезагрузка страницы (живой отказ 13.08.2026: правка
+    # верхней границы процесс-оси). Отложенное значение кладут загрузчики
+    # проекта (SETUP_FORM_OPEN_PENDING) — сам виджет в их прогоне уже создан.
+    _stateful = _supports_stateful_expander()
+    _open_pending = st.session_state.pop(SETUP_FORM_OPEN_PENDING, None)
+    if _stateful:
+        if _open_pending is not None:
+            st.session_state[SETUP_FORM_OPEN_KEY] = bool(_open_pending)
+        elif SETUP_FORM_OPEN_KEY in st.session_state:
+            # ПИН (само-присваивание, как campaign_name в main): переводит
+            # ключ из widget-state в app-state. Без пина Streamlit чистит
+            # состояние виджета между прогонами, и значение снова считалось
+            # бы от дефолта — форма опять захлопывалась бы после сборки.
+            st.session_state[SETUP_FORM_OPEN_KEY] = \
+                bool(st.session_state[SETUP_FORM_OPEN_KEY])
+        else:
+            # Первый прогон сессии: пустая сессия — форма открыта (это вход
+            # в работу), проект уже есть — свёрнута. Дальше — состояние.
+            st.session_state[SETUP_FORM_OPEN_KEY] = \
+                get_campaign_controller() is None
     with st.expander("🆕 Новый проект — настройка области опытов (§17.4)",
-                     expanded=get_campaign_controller() is None):
+                     **setup_expander_kwargs(
+                         stateful=_stateful,
+                         fallback_expanded=get_campaign_controller() is None)):
         st.caption(
             "Область задаётся сразу целиком: состав смеси (сумма долей = 1) × "
             "диапазоны процесс-параметров в реальных единицах. Отклики "

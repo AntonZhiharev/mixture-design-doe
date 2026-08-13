@@ -55,7 +55,8 @@ from src.apps import workspace as wsx  # noqa: E402
 from src.apps import assistant_dock as dock  # noqa: E402
 from src.apps.assistant_dock import (render_assistant_dock,  # noqa: E402
                                       render_assistant_info)
-from src.apps.campaign_ui import (render_campaign,  # noqa: E402
+from src.apps.campaign_ui import (SETUP_FORM_OPEN_PENDING,  # noqa: E402
+                                   render_campaign,
                                    campaign_assistant_overview,
                                    get_campaign_controller,
                                    setup_prefill_from_runner)
@@ -142,6 +143,9 @@ def _load_setup_draft_into_form(root: str, sel: str) -> None:
         return
     st.session_state.pop("campaign_ctrl", None)
     st.session_state["setup_prefill_pending"] = setup_draft
+    # iter90: черновик грузят, чтобы ПРАВИТЬ форму — она должна быть раскрыта
+    # (раскрытость теперь состояние виджета, а не производная от проекта).
+    st.session_state[SETUP_FORM_OPEN_PENDING] = True
     # iter77: переключаем и ССЫЛКУ (переписка/вложения пойдут за проектом),
     # а в поле имени кладём его ИМЯ, а не имя каталога.
     _ident = cs.pref.read_identity(root, sel)
@@ -317,6 +321,10 @@ def render_campaign_persistence(root: str) -> None:
             # ДО инстанцирования виджетов формы следующего прогона.
             st.session_state["setup_prefill_pending"] = \
                 setup_prefill_from_runner(runner)
+            # iter90: проект СОБРАН и загружен — форма сетапа сворачивается
+            # (настройки видны в read-only сводке), как и до перевода
+            # раскрытости на состояние виджета.
+            st.session_state[SETUP_FORM_OPEN_PENDING] = False
             # iter77: в поле имени — ИМЯ проекта (label), а не имя каталога:
             # они теперь могут различаться (проект переименовали).
             st.session_state["campaign_name_pending"] = (

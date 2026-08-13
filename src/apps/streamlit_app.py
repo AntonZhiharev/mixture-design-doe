@@ -12,10 +12,12 @@ iter69/iter72 — РАСКЛАДКА ЭКРАНА: ТРИ зоны ``st.columns(
 Слева — диалог с помощником (ассистент как инструмент взаимодействия с
 программой), в центре — рабочая область на ЗАКЛАДКАХ (второй ряд закладок —
 ветки проекта), справа — инфо-панель постоянной дополнительной информации
-(вложения, выхлоп песочницы, состояние сессии). Содержимое закладки живёт
-в контейнере фиксированной высоты со своим скроллом. Смысл: лента диалога и
-рабочая область прокручиваются НЕЗАВИСИМО — ответ ассистента больше не уводит
-страницу с таблицы, над которой человек работает. Логика раскладки —
+(вложения, выхлоп песочницы, состояние сессии).
+
+iter88/iter89 — ПРОКРУТКА: рабочая область больше не заперта в окно 760 px, она
+обычная страница с одним скроллом (``workspace.WORKSPACE_SCROLL``), а боковые
+зоны сделаны ЛИПКИМИ (``workspace.sticky_zones_css``) — диалог и инфо-панель
+остаются в поле видимости, пока человек листает центр вниз. Логика раскладки —
 :mod:`src.apps.workspace` (чистая, без Streamlit).
 
 Salvage перенесён на C1–C3 и подключён здесь:
@@ -556,6 +558,12 @@ def main():
         render_campaign_persistence(CAMPAIGN_ROOT)   # 📁 сохранить/загрузить
         render_campaign_deleter(CAMPAIGN_ROOT)       # 🗑 удалить (под паролём)
 
+    # iter89: боковые зоны ЛИПКИЕ — при прокрутке центра диалог слева и
+    # инфо-панель справа остаются в поле видимости. CSS считает чистая
+    # `workspace.sticky_zones_css`, адресуясь к колонкам через контейнеры с
+    # ключами (`st-key-…`): порядковые селекторы поехали бы от правки раскладки.
+    st.markdown(wsx.sticky_zones_css(), unsafe_allow_html=True)
+
     dock_col, work_col, info_col = st.columns(list(wsx.MAIN_COLUMNS))
     with work_col:
         # Обзор ассистента — закладка рабочей области, а не отдельная вкладка
@@ -565,9 +573,13 @@ def main():
     ctrl_now = get_campaign_controller()
     runner_now = getattr(ctrl_now, "runner", None) if ctrl_now else None
     with dock_col:
-        render_assistant_dock(runner_now, root=CAMPAIGN_ROOT)
+        # Именованный контейнер = «ручка» для CSS (`st-key-zone_dock`): по нему
+        # правило находит саму КОЛОНКУ (`stColumn:has(...)`) и делает её липкой.
+        with st.container(key=wsx.DOCK_ZONE_KEY):
+            render_assistant_dock(runner_now, root=CAMPAIGN_ROOT)
     with info_col:
-        render_assistant_info(runner_now, root=CAMPAIGN_ROOT)
+        with st.container(key=wsx.INFO_ZONE_KEY):
+            render_assistant_info(runner_now, root=CAMPAIGN_ROOT)
 
 
 if __name__ == "__main__":

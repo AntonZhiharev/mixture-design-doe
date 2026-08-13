@@ -843,7 +843,6 @@ def package_to_setup_prefill(pkg: ProjectPackage) -> Dict[str, Any]:
     ``setup_prefill_pending``. Чистая функция: тестируется без UI.
     """
     proc = pkg.process
-    d = len(proc)
     out: Dict[str, Any] = {
         # Имена компонентов в режиме phr-спеки берутся ИЗ СПЕКИ (поле формы
         # игнорируется), но заполняем и его — иначе человек видит «A, B, C» и
@@ -859,9 +858,15 @@ def package_to_setup_prefill(pkg: ProjectPackage) -> Dict[str, Any]:
         "setup_covariates": ", ".join(pkg.covariates),
         "setup_process_levels": _levels_text(pkg),
     }
-    for i, ax in enumerate(proc):
-        out[f"setup_plo_{d}_{i}"] = float(ax["range"][0])
-        out[f"setup_phi_{d}_{i}"] = float(ax["range"][1])
+    # iter87: ключи границ — ПО ИМЕНИ оси (позиционный формат `_plo_{d}_{i}`
+    # сбрасывал введённые границы при добавлении/удалении другой оси). Хелпер
+    # ключей — один на проект; импорт локальный, как и у перевода веса замеса
+    # ниже: project_package — слой ядра и не должен по кругу зависеть от UI.
+    from ..apps.campaign_ui import process_bound_keys
+    for ax in proc:
+        k_lo, k_hi = process_bound_keys(str(ax["name"]))
+        out[k_lo] = float(ax["range"][0])
+        out[k_hi] = float(ax["range"][1])
 
     p = pkg.passport
     if "campaign_label" in p:

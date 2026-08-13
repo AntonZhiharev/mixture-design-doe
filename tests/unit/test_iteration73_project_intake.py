@@ -276,9 +276,12 @@ class TestSetupPrefill:
         assert pre["setup_proc"] == "T_plast, rotor_rpm"
         assert pre["setup_comp_mode"] == pp.SETUP_MODE_PHR
         assert pre["setup_seed"] == 3
-        # границы осей — по индексам виджетов формы (d = число осей)
-        assert pre["setup_plo_2_0"] == 165.0 and pre["setup_phi_2_0"] == 185.0
-        assert pre["setup_plo_2_1"] == 400.0 and pre["setup_phi_2_1"] == 900.0
+        # границы осей — по ИМЕНИ оси (iter87: позиционные ключи виджетов
+        # сбрасывали введённые границы при смене числа осей)
+        assert pre["setup_plo_T_plast"] == 165.0
+        assert pre["setup_phi_T_plast"] == 185.0
+        assert pre["setup_plo_rotor_rpm"] == 400.0
+        assert pre["setup_phi_rotor_rpm"] == 900.0
 
     def test_prefill_texts_parse_back_by_campaign_ui(self):
         """Текстовые поля читаются ШТАТНЫМИ парсерами формы (единый канон)."""

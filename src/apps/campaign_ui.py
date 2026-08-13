@@ -203,6 +203,20 @@ def build_setup_runner(*, mixture_names: Sequence[str],
     if len(pl) != len(process_names) or len(pu) != len(process_names):
         raise ValueError("Число границ процесса не совпадает с числом параметров "
                          f"({len(process_names)}).")
+    # iter87: ВЫРОЖДЕННЫЕ границы оси — явный отказ, а не молчаливая сборка.
+    # ``VariableBlock`` проверяет только ``lower <= upper``, поэтому «T_head =
+    # 0…0» (граница не заполнена) собиралась молча: ось-константа не несёт
+    # информации, план по ней ничего не варьирует, а технолог узнавал об этом
+    # только по результатам. NaN ловится тем же сравнением (A0.6).
+    degenerate = [nm for nm, lo, hi in zip(process_names, pl, pu)
+                  if not (float(hi) > float(lo))]
+    if degenerate:
+        raise ValueError(
+            "Границы процесс-осей не заданы (нижняя ≥ верхней): "
+            + ", ".join(degenerate)
+            + ". Задайте РЕАЛЬНЫЙ рабочий диапазон каждой оси "
+              "(например, T_plast = 165…185 °C): ось с нулевым диапазоном — "
+              "константа, план по ней ничего не изучает.")
 
     mix = VariableBlock.mixture(mixture_names, lower=mixture_lower,
                                 upper=mixture_upper)
@@ -809,6 +823,55 @@ def seed_consumption_dataframe(runner, Xs, batch_kg: float) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+#: iter87: имя листа Excel с планом, РАЗЛОЖЕННЫМ ПО ПАРТИЯМ (блокам).
+SHEET_PLAN_BY_BLOCK = "План по партиям"
+
+
+def seed_plan_by_block_dataframe(runner, Xs, Ys=None) -> pd.DataFrame:
+    """iter87: тот же стартовый план, но СГРУППИРОВАННЫЙ ПО ПАРТИЯМ (блокам).
+
+    Мотивация (технолог 13.08.2026): план выгружался в порядке генерации, а
+    ставится он ПАРТИЯМИ — оператору приходилось выбирать строки своей партии
+    глазами по столбцу «Блок». Здесь строки идут блок за блоком, а внутри блока
+    — по возрастанию номера опыта.
+
+    Инвариант: «№ опыта» — КЛЮЧ точки в общей базе (:func:`experiment_index`) и
+    здесь не перенумеровывается: та же точка в основном листе, в «Расходе
+    сырья», в «Навеске» и в базе кампании носит один и тот же номер. Меняется
+    ТОЛЬКО порядок и группировка строк.
+
+    Перед каждой партией — строка-заголовок («№ опыта» = ``«Партия 1 «Драло» —
+    5 оп.»``, координаты пустые), после — строка ``«Итого по партии»`` с числом
+    опытов. Так лист читается как наряд-задание и печатается по партиям.
+
+    Блокировка выключена (``n_blocks_start <= 1``) или план пуст ⇒ ПУСТОЙ
+    DataFrame: группировать нечего, и отдельный лист не создаётся (честнее, чем
+    лист-двойник основного). Чистая — тестируется без Streamlit."""
+    base = seed_design_dataframe(runner, Xs, Ys)
+    if base.empty or "Блок" not in base.columns:
+        return pd.DataFrame()
+    # Столбцы строк-разделителей — ТЕКСТОВЫЕ: в числовой колонке пустая строка
+    # превращается в NaN, и оператор читал бы «NaN» в шапке партии. Приводим
+    # весь лист к object, значения опытов при этом сохраняются как есть.
+    base = base.astype(object)
+    cols = list(base.columns)
+    key = "№ опыта"
+    out_rows: List[Dict[str, Any]] = []
+    for b in sorted({int(v) for v in base["Блок"]}):
+        part = base[base["Блок"] == b].sort_values(key, kind="stable")
+        name = block_display(runner, b)
+        title = (f"Партия {b} «{name}»" if name != str(b) else f"Партия {b}")
+        head: Dict[str, Any] = {c: "" for c in cols}
+        head[key] = f"{title} — {len(part)} оп."
+        out_rows.append(head)
+        for _, r in part.iterrows():
+            out_rows.append({c: r[c] for c in cols})
+        tail: Dict[str, Any] = {c: "" for c in cols}
+        tail[key] = f"Итого по партии {b}: {len(part)} оп."
+        out_rows.append(tail)
+    return pd.DataFrame(out_rows, columns=cols)
+
+
 def seed_design_excel_bytes(runner, Xs, Ys=None, *,
                             batch_kg: Optional[float] = None,
                             spec: Optional[PhrSpec] = None,
@@ -818,7 +881,12 @@ def seed_design_excel_bytes(runner, Xs, Ys=None, *,
 
     Лист «Стартовый дизайн» = :func:`seed_design_dataframe` БЕЗ колонок расхода
     (аудит 13.08.2026: дублирующие «{компонент} (кг)» делали лист нечитаемым);
-    пустые «(lab)» — места под ручной ввод откликов. Расход сырья при заданном
+    пустые «(lab)» — места под ручной ввод откликов.
+
+    iter87: при включённой блокировке добавляется лист «План по партиям»
+    (:func:`seed_plan_by_block_dataframe`) — тот же план, разложенный по блокам
+    (партия = единица постановки опытов), с СОХРАНЁННЫМИ номерами опытов: номер
+    — ключ точки в общей базе и одинаков во всех листах. Расход сырья при заданном
     ``batch_kg`` — ОТДЕЛЬНЫЙ лист «Расход сырья»
     (:func:`seed_consumption_dataframe`) с итогами по компонентам на весь план.
     Чистый хелпер (без Streamlit) — тестируется напрямую; отдаёт байты .xlsx.
@@ -840,6 +908,12 @@ def seed_design_excel_bytes(runner, Xs, Ys=None, *,
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         (df if not df.empty else pd.DataFrame({"инфо": ["дизайн пуст"]})).to_excel(
             xw, sheet_name="Стартовый дизайн", index=False)
+        # iter87: ПАРТИИ — единица постановки опытов, поэтому тот же план идёт
+        # вторым листом, разложенный по блокам (номера опытов — те же ключи).
+        # Блокировка выключена ⇒ группировать нечего, листа нет.
+        by_block = seed_plan_by_block_dataframe(runner, Xs, Ys)
+        if not by_block.empty:
+            by_block.to_excel(xw, sheet_name=SHEET_PLAN_BY_BLOCK, index=False)
         if batch_kg is not None and float(batch_kg) > 0:
             cons = seed_consumption_dataframe(runner, Xs, float(batch_kg))
             if not cons.empty:
@@ -3165,6 +3239,124 @@ def render_composition_bounds(names: Sequence[str], *, key_prefix: str = "setup"
         return lo_arr.tolist(), hi_arr.tolist()
 
 
+#: iter87: дефолтные границы process-осей — ПО ИМЕНИ, а не по позиции.
+#: Только шаблонные имена дефолтного поля «Процесс-параметры» (``T, P``):
+#: демо-пример «собрать проект в два клика» остаётся рабочим, а ось с
+#: собственным именем (``T_head``) дефолта НЕ получает — прежняя позиционная
+#: таблица выдавала ей «1…5» и проект собирался молча в нерабочей области.
+PROCESS_BOUND_DEFAULTS: Dict[str, Tuple[float, float]] = {
+    "T": (150.0, 200.0),
+    "P": (1.0, 5.0),
+}
+
+
+def process_bound_keys(name: str, *, key_prefix: str = "setup"):
+    """iter87: ключи виджетов границ ОДНОЙ process-оси — ``(нижняя, верхняя)``.
+
+    Ключ привязан к ИМЕНИ оси, а не к её позиции и числу осей. Прежняя схема
+    ``{prefix}_plo_{d}_{i}`` несла в себе ``d`` = ЧИСЛО осей: добавление пятой
+    оси меняло идентичность виджетов всех четырёх, Streamlit создавал их
+    заново со дефолтом, и введённые технологом границы (165…185 °C) молча
+    заменялись шаблонными — а старые ключи оставались в ``session_state`` и
+    уезжали в ``setup_draft.json`` (живой отказ 13.08.2026).
+
+    Один источник истины для формы, префилла из раннера и пакета проекта.
+    Чистая — тестируется без Streamlit."""
+    return f"{key_prefix}_plo_{name}", f"{key_prefix}_phi_{name}"
+
+
+def legacy_process_bound_keys(index: int, count: int, *,
+                              key_prefix: str = "setup"):
+    """iter87: ПРЕЖНИЕ (позиционные) ключи границ — ``(нижняя, верхняя)``.
+
+    Формат ``{prefix}_plo_{d}_{i}`` (``d`` — число осей, ``i`` — позиция) лежит
+    в уже сохранённых на диске ``setup_draft.json`` и в проектах, выгруженных до
+    iter87. Читаем его как ФОЛБЭК при префилле, чтобы загрузка старого проекта
+    не показывала дефолты вместо настроек (A0.6), но НЕ пишем."""
+    return (f"{key_prefix}_plo_{count}_{index}",
+            f"{key_prefix}_phi_{count}_{index}")
+
+
+def migrate_process_bound_fields(fields: Mapping[str, Any], *,
+                                 key_prefix: str = "setup"
+                                 ) -> Dict[str, Any]:
+    """iter87: перевести ПОЗИЦИОННЫЕ ключи границ префилла в ключи по имени оси.
+
+    ``fields`` — словарь полей формы (черновик с диска или префилл пакета).
+    Имена осей берутся из того же словаря (``{prefix}_proc``), поэтому перевод
+    возможен ровно тогда, когда позиционному ключу есть КОМУ соответствовать:
+    ``d`` в ключе обязан совпадать с числом осей в поле имён, иначе значения
+    относятся к другому составу осей и переносить их — выдумывать факт (§2),
+    такие ключи просто отбрасываются.
+
+    Новые (именные) ключи в ``fields`` приоритетны: если они есть, позиционный
+    дубль игнорируется. Возвращает НОВЫЙ словарь; вход не мутируется. Чистая —
+    тестируется без Streamlit."""
+    src = dict(fields or {})
+    names = _parse_names(str(src.get(f"{key_prefix}_proc", "") or ""))
+    out: Dict[str, Any] = {}
+    legacy: Dict[str, Any] = {}
+    for k, v in src.items():
+        key = str(k)
+        if (key.startswith(f"{key_prefix}_plo_")
+                or key.startswith(f"{key_prefix}_phi_")):
+            legacy[key] = v
+            continue
+        out[key] = v
+    # именные ключи (иначе — с точным префиксом плюс имя оси) оставляем как есть
+    for i, nm in enumerate(names):
+        k_lo, k_hi = process_bound_keys(nm, key_prefix=key_prefix)
+        old_lo, old_hi = legacy_process_bound_keys(i, len(names),
+                                                   key_prefix=key_prefix)
+        for new_key, old_key in ((k_lo, old_lo), (k_hi, old_hi)):
+            if new_key in legacy:
+                out[new_key] = legacy[new_key]
+            elif old_key in legacy:
+                out[new_key] = legacy[old_key]
+    # именные ключи осей, которых нет в поле имён (переименование оси в проекте):
+    # сохраняем — они безвредны и не мешают, в отличие от позиционных.
+    for key, v in legacy.items():
+        tail = key.split("_", 2)[-1]
+        if tail and not tail[0].isdigit() and key not in out:
+            out[key] = v
+    return out
+
+
+def unknown_process_axis_names(names: Sequence[str], levels_text: str,
+                               links_text: str) -> List[str]:
+    """iter87: имена осей из полей «уровни»/«связки», которых НЕТ среди осей.
+
+    Уровни (``T_mix: 95, 110``) и связки (``dT_head: T_head - T_plast : …``)
+    ссылаются на process-оси ПО ИМЕНИ. Пока имя оси и имя в этих полях совпадают,
+    штатные сеттеры раннера валидируют всё сами — но их отказ приходит только на
+    «🏗 Построить проект», уже после заполнения формы. Здесь то же расхождение
+    называется РАНЬШЕ и без блокировки (A0.6): человек видит, что `T_mix` в
+    уровнях не соответствует ни одной оси, до сборки.
+
+    Синтаксически битые строки игнорируются — их разбор и сообщения принадлежат
+    ``parse_process_levels`` / ``parse_process_links``. Порядок результата
+    детерминирован (уровни, затем связки), дубли убраны. Чистая — без Streamlit.
+    """
+    known = {str(n) for n in names}
+    out: List[str] = []
+    try:
+        used = list(parse_process_levels(levels_text).keys())
+    except ValueError:
+        used = []
+    try:
+        # parse_process_links отдаёт СЛОВАРИ для set_process_links
+        # ({name, minuend, subtrahend, lo, hi}), а не объекты ProcessLink.
+        for lk in parse_process_links(links_text):
+            used.extend([lk.get("minuend", ""), lk.get("subtrahend", "")])
+    except ValueError:
+        pass
+    for nm in used:
+        nm = str(nm).strip()
+        if nm and nm not in known and nm not in out:
+            out.append(nm)
+    return out
+
+
 def render_process_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
     """§17.4 (замечание 2): границы процесс-параметров — попарные поля L/U на КАЖДЫЙ
     параметр в РЕАЛЬНЫХ единицах (интерфейс-близнец ограничений состава).
@@ -3172,31 +3364,55 @@ def render_process_bounds(names: Sequence[str], *, key_prefix: str = "setup"):
     Заменяет ввод «через запятую»: для каждого параметра — своя строка с нижней и
     верхней РЕАЛЬНОЙ границей (T=150…200 °C, P=1…5 бар); понятнее и меньше ошибок.
     Нормировку в код [0,1] делает движок сам. Возвращает ``(lower, upper)``
-    списками реальных величин или ``(None, None)``, если параметров нет. Первые
-    две оси получают осмысленные дефолты (T=150…200, P=1…5), остальные — 0…1.
+    списками реальных величин или ``(None, None)``, если параметров нет.
+
+    iter87 (живой отказ 13.08.2026), ДВЕ правки:
+
+    * ключ виджета — по ИМЕНИ оси (:func:`process_bound_keys`), а не по позиции
+      и числу осей: границы `T_plast` больше не сбрасываются, когда рядом
+      добавили или убрали другую ось;
+    * дефолт — ПО ИМЕНИ оси (:data:`PROCESS_BOUND_DEFAULTS`), а не по позиции.
+      Прежние ``{0: (150,200), 1: (1,5)}`` выдавали ВТОРОЙ оси «1…5»
+      независимо от смысла: у проекта ПВХ на этом месте стоит `T_head`, и
+      «T_head = 1…5 °C» — не температура, а мусор, который собирался молча.
+      Теперь шаблонное значение получают только шаблонные имена формы
+      (``T``, ``P`` — то, что стоит в дефолтном «Процесс-параметры»), то есть
+      демо-пример остаётся работоспособным. Ось с собственным именем приходит
+      с ``0…0`` и ВИДИМЫМ требованием заполнить диапазон; сборку вырожденной
+      оси отвергает :func:`build_setup_runner`.
     """
     d = len(names)
     if d == 0:
         return None, None
     st.markdown("**⚙️ Границы процесс-параметров (реальные единицы)**")
     st.caption("Для каждого параметра — нижняя и верхняя РЕАЛЬНАЯ граница "
-               "(например, T = 150…200 °C, P = 1…5 бар). Нормировку в код [0,1] "
-               "программа делает сама (замечание 2).")
-    _defaults = {0: (150.0, 200.0), 1: (1.0, 5.0)}
+               "(например, T_plast = 165…185 °C, P = 1…5 бар). Нормировку в "
+               "код [0,1] программа делает сама (замечание 2). Своя ось "
+               "приходит с нулевым диапазоном намеренно: шаблонное значение "
+               "молча увело бы проект в нерабочую область.")
     lower: List[float] = []
     upper: List[float] = []
+    empty: List[str] = []
     for i in range(d):
-        dlo, dhi = _defaults.get(i, (0.0, 1.0))
+        k_lo, k_hi = process_bound_keys(names[i], key_prefix=key_prefix)
+        dlo, dhi = PROCESS_BOUND_DEFAULTS.get(str(names[i]), (0.0, 0.0))
         cc = st.columns([1, 2, 2])
         cc[0].markdown(f"**{names[i]}**")
         lo_i = cc[1].number_input(
             f"нижняя · {names[i]}", value=float(dlo), step=1.0, format="%.4f",
-            key=f"{key_prefix}_plo_{d}_{i}")
+            key=k_lo)
         hi_i = cc[2].number_input(
             f"верхняя · {names[i]}", value=float(dhi), step=1.0, format="%.4f",
-            key=f"{key_prefix}_phi_{d}_{i}")
+            key=k_hi)
         lower.append(float(lo_i))
         upper.append(float(hi_i))
+        if not (float(hi_i) > float(lo_i)):
+            empty.append(str(names[i]))
+    if empty:
+        st.warning(
+            "Не заданы границы осей: " + ", ".join(empty)
+            + ". Проект не соберётся, пока у каждой оси нет РЕАЛЬНОГО "
+              "рабочего диапазона (нижняя < верхняя).")
     return lower, upper
 
 
@@ -3231,8 +3447,10 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
     pb = sch.process_block()
     if pb is not None:
         for i in range(d):
-            out[f"setup_plo_{d}_{i}"] = float(pb.lower[i])
-            out[f"setup_phi_{d}_{i}"] = float(pb.upper[i])
+            # iter87: ключ по ИМЕНИ оси — границы не привязаны к их числу.
+            k_lo, k_hi = process_bound_keys(proc[i])
+            out[k_lo] = float(pb.lower[i])
+            out[k_hi] = float(pb.upper[i])
     # iter31: функциональные группы компонентов (проектная политика)
     out["setup_groups"] = sampling_groups_to_text(
         getattr(runner, "sampling_groups", []) or [])
@@ -3620,6 +3838,12 @@ def render_setup_form() -> None:
     # приложение StreamlitValueAssignmentNotAllowedError.
     _pending = st.session_state.pop("setup_prefill_pending", None)
     if _pending:
+        # iter87: границы process-осей переехали на ключи ПО ИМЕНИ оси. Все
+        # четыре источника префилла (панель загрузки, черновик с диска, две
+        # кнопки дока) идут через эту точку, поэтому перевод старого
+        # позиционного формата делаем ровно здесь — иначе загрузка проекта,
+        # сохранённого до iter87, показала бы пустые границы вместо настроек.
+        _pending = migrate_process_bound_fields(_pending)
         for _k, _v in cs.settable_setup_fields(_pending).items():
             st.session_state[_k] = _v
         # iter85: поле цен переживает СМЕНУ СОСТАВА — оно лежит в
@@ -3723,6 +3947,19 @@ def render_setup_form() -> None:
                  "оптимум будут выдаваться только с реализуемой разностью; "
                  "ось не может одновременно быть в связке и на дискретных "
                  "уровнях.")
+
+        # iter87: рассинхрон ИМЁН — уровни/связки ссылаются на ось, которой в
+        # поле осей нет. Штатные сеттеры отвергнут это при сборке, но сказать
+        # надо РАНЬШЕ: на живом проекте (13.08.2026) поле осей и блок границ
+        # разошлись, и человек не понимал, почему форма выглядит «чужой».
+        _unknown = unknown_process_axis_names(proc_live, levels_txt, links_txt)
+        if _unknown:
+            st.warning(
+                "В уровнях/связках упомянуты оси, которых нет в поле "
+                "«Процесс-параметры»: " + ", ".join(_unknown)
+                + f". Текущие оси: {', '.join(proc_live) or '—'}. Проект с "
+                  "таким расхождением не соберётся — поправьте имя оси или "
+                  "уберите строку.")
 
         # iter75: ЭКОНОМИКА ПРОЕКТА — плотность ρ входит в экономику проекта ПО
         # УМОЛЧАНИЮ (решение сессии 12.08.2026), поэтому объявляется ЗДЕСЬ, на

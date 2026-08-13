@@ -61,11 +61,13 @@ def test_setup_prefill_maps_runner_to_form_keys():
     assert pre["setup_hi_3_0"] == pytest.approx(0.8)
     assert pre["setup_lo_3_1"] == pytest.approx(0.1)
     assert pre["setup_hi_3_2"] == pytest.approx(0.2)
-    # реальные границы процесс-осей (ключи включают d=2)
-    assert pre["setup_plo_2_0"] == pytest.approx(120.0)
-    assert pre["setup_phi_2_0"] == pytest.approx(180.0)
-    assert pre["setup_plo_2_1"] == pytest.approx(2.0)
-    assert pre["setup_phi_2_1"] == pytest.approx(6.0)
+    # реальные границы процесс-осей: iter87 — ключ по ИМЕНИ оси (прежний
+    # позиционный «setup_plo_{d}_{i}» терял введённые границы при смене числа
+    # осей, см. tests/unit/test_iteration87_*)
+    assert pre["setup_plo_T"] == pytest.approx(120.0)
+    assert pre["setup_phi_T"] == pytest.approx(180.0)
+    assert pre["setup_plo_P"] == pytest.approx(2.0)
+    assert pre["setup_phi_P"] == pytest.approx(6.0)
 
 
 def test_setup_prefill_roundtrip_through_save_load(tmp_path):
@@ -132,8 +134,8 @@ def test_load_prefills_setup_form_and_restores_seed_points():
         assert ss["setup_seed"] == 5
         assert float(ss["setup_lo_3_0"]) == pytest.approx(0.5)
         assert float(ss["setup_hi_3_0"]) == pytest.approx(0.8)
-        assert float(ss["setup_plo_2_0"]) == pytest.approx(120.0)
-        assert float(ss["setup_phi_2_0"]) == pytest.approx(180.0)
+        assert float(ss["setup_plo_T"]) == pytest.approx(120.0)
+        assert float(ss["setup_phi_T"]) == pytest.approx(180.0)
         # регресс: черновик стартового дизайна (точки) восстановлен
         assert np.allclose(np.asarray(ss["setup_seed_X"], float), X)
         # движок загружен с верными границами

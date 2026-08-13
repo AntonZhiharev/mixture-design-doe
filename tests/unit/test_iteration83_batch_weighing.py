@@ -23,7 +23,10 @@
 Проверяемый канон:
   * :func:`batch_sigma_phr` суммирует ЛИСТЬЯ, а не все узлы: узел-тотал
     группы = сумма детей, и сложение всех узлов считало бы группы дважды
-    (ровно эта ошибка живёт в ``readonly.get_spec.sigma_phr_static``);
+    (ровно эта ошибка жила в ``readonly.get_spec.sigma_phr_static`` — ИСПРАВЛЕНА
+    в iter84: сумма переехала в ядро, :meth:`PhrSpec.sigma_phr_bounds`, и оба
+    слоя зовут её, а не считают сами; тесты — ``test_iteration84_context_budget``
+    ::TestSigmaPhrSingleSource);
   * :func:`batch_grams_per_phr` переводит вес замеса в масштаб ядра по ВЕРХУ
     Σphr — самая осторожная оценка разрешения (δ крупнее, а не мельче);
   * :func:`batch_weighing_report` считает навеску ЧЕРЕЗ ДОЛИ

@@ -882,7 +882,7 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
                        autoscroll=True) if _supports_feed_container() \
         else st.container()
     with box:
-        for item in feed:
+        for pos, item in enumerate(feed):
             with st.chat_message(item.role):
                 # Ответ ассистента и в истории раскладывается так же, как свежий
                 # (числа — свёрнутым блоком): иначе одно и то же сообщение
@@ -893,6 +893,17 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
                     st.markdown(item.content)
                 for sha in item.images:
                     _show_attachment_image(session, root, project, sha)
+                # iter84: график и таблица ЭТОГО ответа рисуются в ленте, а не
+                # только на том прогоне, где ход выполнялся. Раньше показ шёл
+                # исключительно из TurnResult.new_artifacts (память одного
+                # прогона Streamlit), поэтому любой rerun — нажатая кнопка,
+                # раскрытый экспандер, новый вопрос — убирал их из разговора:
+                # файлы оставались в проекте и в панели «🖼 Файлы расчётов», а
+                # в переписке ассистент выглядел так, будто потерял свой расчёт.
+                if item.artifacts:
+                    _render_outputs(views.message_outputs(session,
+                                                          item.artifacts),
+                                    scope=f"feed{pos}")
         # Ход ЭТОГО прогона дорисовывается в ту же ленту ниже (см. run_turn).
         turn_slot = st.container()
     st.caption(wsx.feed_hint(len(feed), wsx.dialog_count(session.messages)))

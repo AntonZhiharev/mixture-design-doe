@@ -1883,6 +1883,27 @@ class PhrSpec:
             delta_phr=None if delta_phr is None else float(delta_phr),
             effective_bounds=bounds, premix=premix, violations=violations)
 
+    def sigma_phr_bounds(self) -> Tuple[float, float]:
+        """iter84: статический интервал Σphr рецепта по ЛИСТЬЯМ (``lo``, ``hi``).
+
+        Суммируются именно ЛИСТЬЯ (:attr:`component_names`), а НЕ все узлы
+        :meth:`phr_intervals`: узел-тотал группы равен сумме своих детей, и
+        сложение всех узлов подряд считает группы ДВАЖДЫ. На референсной
+        геометрии `pvc_edge_v1` разница видна сразу: по листьям
+        ``109.85 … 147.80``, по всем узлам — ``114.85 … 162.80`` (завышение
+        верха ровно на интервал тотала группы ``SOFT``).
+
+        Метод живёт В ЯДРЕ, потому что число нужно трём независимым слоям:
+        хелперу навески UI (``apps.campaign_ui.batch_sigma_phr``), инструменту
+        ассистента (``assistant.tools.readonly.get_spec``) и подписям. До iter84
+        сумма считалась в каждом слое своим кодом, и в одном из них (инструмент
+        ассистента) жила ошибка двойного счёта — числа расходились между окном
+        технолога и ответом помощника.
+        """
+        iv = self._interval
+        return (float(sum(iv[nm][0] for nm in self.component_names)),
+                float(sum(iv[nm][1] for nm in self.component_names)))
+
     def fraction_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """Консервативный fraction-бокс ``L_i ≤ x_i ≤ U_i`` по интервалам
         phr листьев (математика экстремальных тоталей

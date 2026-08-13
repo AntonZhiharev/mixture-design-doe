@@ -525,8 +525,15 @@ def test_setup_can_disable_economics_explicitly():
 
 
 def test_setup_warns_when_all_prices_are_zero():
-    """Дефолт цен = 0: экономика «включена», но себестоимость тождественно ноль."""
+    """Явные нули: экономика «включена», но себестоимость тождественно ноль.
+
+    iter85: нули больше НЕ дефолт поля (дефолт — пусто, «цены пока неизвестны»),
+    поэтому вводим их явно. Смысл проверки прежний: заявление «всё сырьё
+    бесплатно» обязано быть озвучено, а не проглочено (A0.6).
+    """
     at = AppTest.from_file(APP, default_timeout=240).run()
+    at.session_state["setup_econ_prices"] = "0, 0, 0"
+    at.run()
     assert not at.exception
     assert any("нулевые" in str(w.value) for w in at.warning)
 

@@ -342,10 +342,18 @@ def resolve_branch(requested: Any, branch_ids: Sequence[str]) -> str:
 # ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class FeedItem:
-    """Одна реплика ленты: роль, текст, приложенные картинки."""
+    """Одна реплика ленты: роль, текст, приложенные картинки, файлы расчёта.
+
+    ``artifacts`` (iter84) — id артефактов, посчитанных ЭТИМ ответом. Нужны,
+    чтобы график и таблица оставались В РАЗГОВОРЕ, а не только на том прогоне
+    Streamlit, где ход выполнялся: до iter84 они рисовались из
+    ``TurnResult.new_artifacts`` (память одного прогона) и пропадали при первом
+    же rerun — файл на диске цел, а в переписке его больше нет.
+    """
     role: str
     content: str
     images: Tuple[str, ...] = ()
+    artifacts: Tuple[str, ...] = ()
 
 
 def feed_items(messages: Optional[Sequence[Any]], *, limit: int = FEED_LIMIT
@@ -363,9 +371,13 @@ def feed_items(messages: Optional[Sequence[Any]], *, limit: int = FEED_LIMIT
         if role not in ("user", "assistant"):
             continue
         imgs = tuple(str(s) for s in (getattr(m, "images", None) or []))
+        # iter84: файлы расчёта переносятся в ленту вместе с репликой — их
+        # показ больше не зависит от того, тот ли это прогон, в котором ход
+        # выполнялся.
+        arts = tuple(str(s) for s in (getattr(m, "artifacts", None) or []))
         out.append(FeedItem(role=role,
                             content=str(getattr(m, "content", "") or ""),
-                            images=imgs))
+                            images=imgs, artifacts=arts))
     n = int(limit)
     return out[-n:] if n > 0 else out
 

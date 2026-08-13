@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -62,6 +63,55 @@ def estimate_tokens(text: Any) -> int:
     return max(1, len(str(text or "")) // CHARS_PER_TOKEN)
 
 
+#: Заголовок раздела показаний инструментов в ответе архитектора (формат
+#: iter64). Регексп повторяет разбор :func:`assistant.prompts.parse_sections`,
+#: но живёт здесь: :mod:`.session` обязан оставаться JSON-native и не тянуть
+#: реестр инструментов, который импортирует ядро.
+_NUMBERS_HEAD_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*ЧИСЛА[ \t]*$", re.MULTILINE)
+_ANY_HEAD_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*[A-ZА-Я_]+[ \t]*$", re.MULTILINE)
+
+#: Чем заменяется вырезанное тело раздела чисел (iter84). Пометка обязательна:
+#: пустой заголовок модель прочитала бы как «инструменты ничего не вернули»,
+#: а тихое исчезновение — как «эти числа можно взять из головы». Держим её
+#: КОРОТКОЙ: она уходит в каждый ход, и длинное пояснение съедало бы ровно тот
+#: бюджет, ради которого раздел и вырезается.
+NUMBERS_OMITTED_NOTE = "[числа опущены — перезапроси инструментом]"
+
+
+def strip_numbers_section(text: Any) -> str:
+    """iter84: убрать из ответа тело раздела ``ЧИСЛА``, оставив пометку.
+
+    Нужна сборке КОНТЕКСТА: раздел чисел — снимок показаний инструментов на
+    момент того хода, и он одновременно объёмный и скоропортящийся. Замер живой
+    ПВХ-сессии: 21 520 символов из 92 191 у ответов ассистента (≈23 %) — при
+    этом спека между ходами меняется, а канон промпта требует брать геометрию
+    ВЫЗОВОМ инструмента, а не из памяти о разговоре. Показ в интерфейсе идёт
+    другим путём (:func:`assistant.views.answer_view`) и остаётся полным.
+
+    Заголовок раздела СОХРАНЯЕТСЯ вместе с пометкой: модель должна видеть, что
+    числа БЫЛИ посчитаны и что их следует перезапросить, а не решить, что
+    инструменты молчали. Раздела нет — текст возвращается без изменений.
+    """
+    src = str(text or "")
+    m = _NUMBERS_HEAD_RE.search(src)
+    if m is None:
+        return src
+    # Конец раздела — следующий заголовок формата (PATCH / OPEN_QUESTIONS) или
+    # конец текста: тело режется ровно по границе секции, чужие разделы целы.
+    nxt = _ANY_HEAD_RE.search(src, m.end())
+    end = nxt.start() if nxt else len(src)
+    body = src[m.end():end].strip()
+    if not body:
+        return src
+    out = (src[:m.end()] + "\n" + NUMBERS_OMITTED_NOTE + "\n\n"
+           + src[end:].lstrip()).rstrip()
+    # Инвариант: замена НЕ ДОЛЖНА удлинять текст. Раздел из одной короткой
+    # строки («- `get_spec`: q=19») дешевле оставить как есть, чем поменять на
+    # пометку: иначе «оптимизация контекста» местами его раздувала бы, и
+    # экономия зависела бы от того, насколько подробен был ответ модели.
+    return out if len(out) < len(src) else src
+
+
 # ----------------------------------------------------------------------
 # Записи сессии
 # ----------------------------------------------------------------------
@@ -79,6 +129,15 @@ class Message:
     оценка бюджета (:func:`estimate_tokens`) и ``session.json`` не распухают на
     мегабайт скриншота; сам data-URL собирается на момент отправки
     (:func:`assistant.files.attachment_data_url`).
+
+    ``artifacts`` (iter84) — ССЫЛКИ на артефакты хода (``Artifact.id``): график
+    и таблица, посчитанные ЭТИМ ответом. До iter84 связь «ответ ↔ его файлы»
+    жила только в результате хода (``TurnResult.new_artifacts``), то есть в
+    памяти одного прогона Streamlit: показанные под ответом график и таблица
+    исчезали при любом следующем rerun (нажали кнопку, развернули экспандер) и
+    после перезапуска приложения — файлы оставались на диске и в панели
+    «🖼 Файлы расчётов», но из САМОГО РАЗГОВОРА пропадали. В контекст модели
+    эти ссылки не идут (``chat_message`` их не отдаёт): бюджет они не жгут.
     """
     role: str
     content: str
@@ -91,6 +150,7 @@ class Message:
     name: str = ""
     usage: Dict[str, Any] = field(default_factory=dict)
     images: List[str] = field(default_factory=list)
+    artifacts: List[str] = field(default_factory=list)
 
     def to_state(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"id": self.id, "role": self.role,
@@ -109,6 +169,8 @@ class Message:
             out["usage"] = dict(self.usage)
         if self.images:
             out["images"] = list(self.images)
+        if self.artifacts:
+            out["artifacts"] = list(self.artifacts)
         return out
 
     @classmethod
@@ -123,7 +185,8 @@ class Message:
                    tool_call_id=str(d.get("tool_call_id", "")),
                    name=str(d.get("name", "")),
                    usage=dict(d.get("usage", {}) or {}),
-                   images=[str(x) for x in (d.get("images", []) or [])])
+                   images=[str(x) for x in (d.get("images", []) or [])],
+                   artifacts=[str(x) for x in (d.get("artifacts", []) or [])])
 
     def chat_message(self) -> Dict[str, Any]:
         """Вид сообщения для API модели (без внутренних полей сессии).
@@ -131,6 +194,11 @@ class Message:
         ``images`` здесь НЕ разворачивается: собрать мультимодальный
         ``content`` может только тот, у кого есть доступ к файлам проекта
         (см. :func:`assistant.llm.user_content`). Сессия остаётся JSON-native.
+
+        ``artifacts`` (iter84) тоже НЕ уходит: это ссылки для ПОКАЗА в ленте.
+        Модель узнаёт о посчитанных файлах из ответа инструмента в свой ход, и
+        отправлять ей список путей повторно значило бы жечь бюджет на данные,
+        которыми она уже не воспользуется.
         """
         out: Dict[str, Any] = {"role": self.role, "content": self.content}
         if self.tool_calls:
@@ -528,7 +596,35 @@ class AssistantSession:
                 continue
         return dict(self.usage)
 
-    def context_messages(self, *, max_tokens: int = 24000
+    def _context_bodies(self, *, strip_numbers: bool = True
+                        ) -> Dict[str, str]:
+        """iter84: ``{id сообщения: тело для КОНТЕКСТА}`` — только изменённые.
+
+        Возвращаются лишь те сообщения, у которых тело для модели отличается от
+        сохранённого: остальные идут как есть. Сама сессия не мутируется —
+        обрезка относится к сборке запроса, а на диске и на экране остаётся
+        полный текст.
+        """
+        if not strip_numbers:
+            return {}
+        # Последний ответ ассистента трогать нельзя: на его числа опирается
+        # следующий уточняющий вопрос человека.
+        last_assistant = ""
+        for msg in reversed(self.messages):
+            if msg.role == "assistant":
+                last_assistant = msg.id
+                break
+        out: Dict[str, str] = {}
+        for msg in self.messages:
+            if msg.role != "assistant" or msg.id == last_assistant:
+                continue
+            body = strip_numbers_section(msg.content)
+            if body != msg.content:
+                out[msg.id] = body
+        return out
+
+    def context_messages(self, *, max_tokens: int = 24000,
+                         strip_numbers: bool = True
                          ) -> List[Dict[str, Any]]:
         """Хвост диалога для модели в рамках бюджета + ЯВНАЯ пометка усечения.
 
@@ -536,19 +632,48 @@ class AssistantSession:
         вместо отрезанной части возвращается одно системное сообщение «опущено
         N ранних сообщений (полный лог — в session.json проекта)». Полная
         история на диске не трогается.
+
+        **iter84 — ``strip_numbers``.** У прошлых ответов ассистента вырезается
+        раздел ``## ЧИСЛА``: это СНИМОК показаний инструментов на момент того
+        хода (границы узлов, Σphr, cond/VIF, spec_hash). Держать его в контексте
+        вредно дважды. Во-первых, дорого: в живой ПВХ-сессии (43 реплики,
+        100 862 символа ≈ 25 215 токенов) переписка ОДНА перекрывала бюджет
+        24 000 токенов, то есть каждый вопрос тащил к модели весь разговор; на
+        разделы чисел там приходилось 21 520 символов (≈23 % ответов).
+        Во-вторых, опасно: спека между ходами меняется, и вчерашние
+        числа — устаревший снимок, тогда как канон промпта требует брать
+        геометрию ВЫЗОВОМ инструмента, а не из памяти о разговоре.
+
+        Раздел последнего ответа СОХРАНЯЕТСЯ: на него опирается уточняющий
+        вопрос («а почему там 0.45?»), и вырезать его значило бы порвать
+        связность прямо в живой ветке разговора. Вместо вырезанного тела
+        остаётся честная пометка — «числа опущены, перезапроси инструментом»,
+        а не пустой заголовок: молчаливое исчезновение читалось бы моделью как
+        «инструменты ничего не вернули».
+
+        Показ в интерфейсе и файл проекта эта обрезка НЕ затрагивает: она живёт
+        только в сборке запроса.
         """
         if max_tokens <= 0:
             raise ValueError("Бюджет контекста max_tokens должен быть > 0.")
+        trimmed = self._context_bodies(strip_numbers=strip_numbers)
         kept: List[Message] = []
         budget = int(max_tokens)
         for msg in reversed(self.messages):
-            cost = estimate_tokens(msg.content) + estimate_tokens(msg.tool_calls)
+            body = trimmed.get(msg.id, msg.content)
+            cost = estimate_tokens(body) + estimate_tokens(msg.tool_calls)
             if kept and cost > budget:
                 break
             budget -= cost
             kept.append(msg)
         kept.reverse()
-        out = [m.chat_message() for m in kept]
+        out = []
+        for m in kept:
+            cm = m.chat_message()
+            body = trimmed.get(m.id)
+            if body is not None:
+                cm["content"] = body
+            out.append(cm)
         n_omitted = len(self.messages) - len(kept)
         if n_omitted > 0:
             out.insert(0, {

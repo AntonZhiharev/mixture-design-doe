@@ -15,8 +15,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pandas as pd
 
-from .session import (AssistantSession, PATCH_APPLIED, PATCH_REJECTED,
-                      PATCH_STAGED, estimate_tokens)
+from .session import (AssistantSession, CHARS_PER_TOKEN, PATCH_APPLIED,
+                      PATCH_REJECTED, PATCH_STAGED, estimate_tokens)
 
 #: Сколько символов сообщения показывать в таблице ленты (полный текст —
 #: в самом чате; таблица нужна для обзора, а не для чтения).
@@ -433,6 +433,25 @@ def turn_outputs(session: AssistantSession, new_artifact_ids: Sequence[str]
                                    if str(a.id) in ids])
 
 
+def message_outputs(session: AssistantSession, artifact_ids: Sequence[str]
+                    ) -> List[OutputFile]:
+    """Файлы, приложенные к КОНКРЕТНОЙ реплике ленты (iter84).
+
+    Отличие от :func:`turn_outputs` — источник связи: там id берутся из
+    результата хода (живёт один прогон Streamlit), здесь из самого сообщения
+    (``Message.artifacts``, лежит в ``session.json``). Поэтому график и таблица
+    остаются в разговоре после rerun и после перезапуска приложения.
+
+    Порядок — как в сессии, а не как в переданном списке: артефакты одного
+    ответа читаются в том порядке, в котором их создал прогон.
+    """
+    ids = {str(i) for i in (artifact_ids or [])}
+    if not ids:
+        return []
+    return outputs_from_artifacts([a for a in session.artifacts
+                                   if str(a.id) in ids])
+
+
 def artifact_outputs(session: AssistantSession, *, limit: int = 6
                      ) -> List[OutputFile]:
     """Последние показуемые артефакты сессии (график/таблица) для панели.
@@ -833,14 +852,40 @@ def session_caption(session: AssistantSession) -> str:
     return " · ".join(parts)
 
 
-def context_caption(session: AssistantSession, *, max_tokens: int = 24000) -> str:
-    """Подпись «что уходит в модель»: сколько сообщений и было ли усечение."""
+def context_caption(session: AssistantSession, *,
+                    max_tokens: Optional[int] = None) -> str:
+    """Подпись «что уходит в модель»: сообщения, ОБЪЁМ и было ли усечение.
+
+    **iter84 — объём назван числом.** Раньше подпись говорила только про
+    количество сообщений, и стоимость хода была невидима: в живой ПВХ-сессии
+    (43 реплики) переписка занимала ~23,7 тыс. токенов при бюджете 24 тыс., то
+    есть каждый вопрос тащил к модели весь разговор целиком, а по подписи это
+    выглядело как «43 из 43 — всё в порядке». Теперь видно и сколько уходит, и
+    сколько сэкономила обрезка устаревших разделов ``ЧИСЛА``.
+
+    ``max_tokens=None`` — взять ФАКТИЧЕСКИЙ бюджет хода
+    (:data:`assistant.context.CONTEXT_TOKENS`). Свой дефолт здесь был бы вторым
+    источником истины: подпись показывала бы 24 000, пока ход считает по 12 000,
+    и «что уходит в модель» перестало бы совпадать с тем, что уходит.
+    """
+    if max_tokens is None:
+        from .context import CONTEXT_TOKENS   # локально: context тянет prompts
+        max_tokens = int(CONTEXT_TOKENS)
     ctx = session.context_messages(max_tokens=max_tokens)
+    full = session.context_messages(max_tokens=max_tokens, strip_numbers=False)
     omitted = sum(1 for m in ctx if m.get("role") == "system"
                   and str(m.get("content", "")).startswith("[сессия]"))
     n_dialog = len(ctx) - omitted
+    chars = sum(len(str(m.get("content", ""))) for m in ctx)
+    chars_full = sum(len(str(m.get("content", ""))) for m in full)
     txt = (f"в модель уходит сообщений: {n_dialog} из {len(session.messages)} "
-           f"(бюджет {max_tokens} токенов)")
+           f"(бюджет {max_tokens} токенов) · объём переписки "
+           f"≈{chars // CHARS_PER_TOKEN} токенов")
+    if chars_full > chars:
+        saved = chars_full - chars
+        txt += (f" · устаревшие разделы «ЧИСЛА» опущены: "
+                f"−{saved // CHARS_PER_TOKEN} токенов "
+                f"({100.0 * saved / chars_full:.0f}%)")
     if omitted:
         txt += " — ранние сообщения опущены, полная переписка сохранена в проекте"
     return txt

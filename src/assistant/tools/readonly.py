@@ -325,22 +325,19 @@ def get_spec(ctx: ToolContext, include_nodes: bool = True) -> Dict[str, Any]:
         "group_order": list(getattr(spec, "group_order", []) or []),
         "component_names": list(spec.component_names),
         "phr_intervals": intervals,
-        # ⚠️ ИЗВЕСТНЫЙ БАГ (найден iter83, 12.08.2026; НЕ исправлен здесь
-        # осознанно — правка меняет числа, которые ассистент уже цитировал в
-        # живых сессиях, поэтому идёт отдельным шагом).
+        # iter84: ИСПРАВЛЕН баг двойного счёта (найден iter83, 12.08.2026).
+        # Раньше здесь суммировались ВСЕ узлы `phr_intervals()`, включая
+        # узлы-ТОТАЛЫ групп; тотал группы = сумма своих детей ⇒ группы
+        # считались ДВАЖДЫ и верх Σphr был завышен: на референсной спеке
+        # `pvc_edge_v1` выходило 114.85…162.80 вместо верного 109.85…147.80
+        # (расхождение ровно на интервал тотала SOFT). Именно оттуда шли Σphr,
+        # которые ассистент цитировал в ПВХ-сессии.
         #
-        # Суммируются ВСЕ узлы `phr_intervals()`, включая узлы-ТОТАЛЫ групп, а
-        # тотал группы = сумма своих детей ⇒ группы считаются ДВАЖДЫ и верх
-        # Σphr завышен. На референсной спеке `pvc_edge_v1` (усечённой, с
-        # группой SOFT = PBNK + CPE) выходит 114.85…162.80 вместо верного
-        # 109.85…147.80 — расхождение ровно на интервал тотала SOFT.
-        #
-        # Правильно — суммировать ЛИСТЬЯ (`spec.component_names`), как это
-        # делает `apps.campaign_ui.batch_sigma_phr` (там же тесты:
-        # tests/unit/test_iteration83_batch_weighing.py::TestSigmaPhr).
-        # Подробности и числа — docs/UI_REVISION_SPEC.md §iter83 п.1.
-        "sigma_phr_static": [float(sum(v[0] for v in intervals.values())),
-                             float(sum(v[1] for v in intervals.values()))],
+        # Считает ЯДРО (`PhrSpec.sigma_phr_bounds` — сумма по ЛИСТЬЯМ): своей
+        # копии арифметики здесь больше нет, поэтому окно технолога и ответ
+        # помощника не могут разойтись. Тесты — test_iteration84_sigma_phr_fix.py
+        # и test_iteration83_batch_weighing.py::TestSigmaPhr.
+        "sigma_phr_static": [float(v) for v in spec.sigma_phr_bounds()],
         "log_axes": [d["name"] for d in nodes if d.get("scale") == "log"],
         "meta": _f(meta),
     }
@@ -951,12 +948,30 @@ def _sample_stats(spec, *, n: int, seed: int,
     long_running=True)
 def preflight(ctx: ToolContext, n: Optional[int] = None) -> Dict[str, Any]:
     runner = ctx.require_runner()
-    X = np.atleast_2d(np.asarray(getattr(runner, "X", np.empty((0, 0))), float))
+    # БАГФИКС (аудит 13.08.2026): у живого раннера пустая база — это
+    # ``X = None`` (см. MixtureProcessRunner._rebuild_arrays), а не массив
+    # (0, 0); np.asarray(None) даёт форму (1, 1), guard «база пуста» не
+    # срабатывал, и ядро падало «ожидалось 22 координат на точку, дано 1».
+    Xattr = getattr(runner, "X", None)
+    X = (np.atleast_2d(np.asarray(Xattr, float)) if Xattr is not None
+         else np.empty((0, 0)))
     source = "база точек проекта"
     if X.size == 0 or X.shape[0] == 0:
-        k = int(n or 16)
-        X = np.atleast_2d(np.asarray(runner.propose_seed(k), float))
-        source = f"предложенный seed-план (n={k}), база пуста"
+        # Черновик стартового плана (draft.seed_X в campaign.json) — план,
+        # который РЕАЛЬНО видит человек в UI до фиксации. Если он сохранён,
+        # проверять надо именно его, а не свежесгенерированный аналог.
+        draft_X = _draft_seed_X(ctx)
+        if draft_X is not None:
+            X = draft_X
+            source = (f"черновик стартового плана сохранённого проекта "
+                      f"(n={X.shape[0]}), база пуста")
+            if n is not None and int(n) != X.shape[0]:
+                source += (f"; запрошенный n={int(n)} проигнорирован — "
+                           f"проверяется план, предложенный в интерфейсе")
+        else:
+            k = int(n or 16)
+            X = np.atleast_2d(np.asarray(runner.propose_seed(k), float))
+            source = f"предложенный seed-план (n={k}), база пуста"
     try:
         report = runner.preflight(X)
     except Exception as exc:  # noqa: BLE001
@@ -980,6 +995,31 @@ def _dataclass_to_dict(obj: Any) -> Dict[str, Any]:
     if is_dataclass(obj):
         return asdict(obj)
     return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+
+
+def _draft_seed_X(ctx: ToolContext) -> Optional[np.ndarray]:
+    """``seed_X`` из черновика сохранённого проекта (``draft`` в campaign.json).
+
+    Предложенный в UI стартовый план до фиксации живёт ТОЛЬКО черновиком
+    (``session_state`` → ``draft`` при «💾 Сохранить проект»): без этого чтения
+    инструменты проверяли не тот план, что видит человек (аудит 13.08.2026).
+    Нет файла / нет черновика / битые данные → ``None`` (не ошибка: черновик
+    необязателен).
+    """
+    if not (ctx.root and ctx.project):
+        return None
+    try:
+        from src.apps.campaign_state import load_campaign_draft
+        draft = load_campaign_draft(ctx.root, ctx.project)
+    except Exception:  # noqa: BLE001 — нет campaign.json = черновика нет
+        return None
+    if not draft or draft.get("seed_X") is None:
+        return None
+    try:
+        X = np.atleast_2d(np.asarray(draft["seed_X"], float))
+    except (TypeError, ValueError):
+        return None
+    return X if X.size else None
 
 
 # ----------------------------------------------------------------------

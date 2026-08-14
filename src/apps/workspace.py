@@ -31,7 +31,11 @@ seed, база, ветки, рабочий стол, скрининг и эво�
   (:func:`workspace_box_kwargs`);
 * **липкие боковые зоны** (:func:`sticky_zones_css`, iter89) — раз центр листает
   всю страницу, диалог слева и инфо-панель справа удерживаются на экране через
-  ``position: sticky``, иначе ассистент уезжает вверх вместе с документом.
+  ``position: sticky``, иначе ассистент уезжает вверх вместе с документом;
+* **вставка скриншота** (:func:`chat_paste_js`, iter93) — ``st.chat_input``
+  буфер обмена не поддерживает вообще, поэтому Ctrl+V со скриншотом молча не
+  работал; мост перекладывает картинку из буфера в скрытый загрузчик файлов
+  того же поля ввода штатным путём.
 
 Ключи закладок совпадают с ключами шагов
 :data:`src.assistant.context.FOCUS_SECTIONS` там, где шаг существует — это
@@ -161,6 +165,111 @@ def sticky_zones_css(*, top_rem: float = STICKY_TOP_REM,
   }}
 }}
 </style>"""
+
+
+# ----------------------------------------------------------------------
+# Вставка скриншота в поле ввода диалога (iter93)
+# ----------------------------------------------------------------------
+#: Ключ поля ввода диалога (``st.chat_input(key=…)``). Живёт здесь, а не
+#: литералом в доке, потому что от него зависит ТОЧКА КРЕПЛЕНИЯ вставки:
+#: Streamlit вешает на контейнер элемента класс ``st-key-<ключ>``
+#: (``stElementContainer`` + ``iV(aV(kg(element)))`` в бандле 1.58) — это
+#: единственный документированный способ адресовать конкретный виджет из JS.
+DOCK_INPUT_KEY = "dock_input"
+
+#: Флаг «мост уже поставлен» в ``window``. Streamlit перерисовывает страницу на
+#: каждом прогоне и вставляет наш скрипт заново — без флага слушатели
+#: накапливались бы, и один скриншот вставлялся бы N раз.
+PASTE_BRIDGE_FLAG = "__doeChatPasteBridge"
+
+#: Тело моста вставки. Держим ОДНОЙ строкой-шаблоном (а не сборкой из кусков),
+#: чтобы решение читалось целиком и проверялось тестом состава.
+#:
+#: Почему это вообще нужно: ``st.chat_input`` умеет выбор файла и drag&drop, но
+#: НЕ умеет буфер обмена — в ``ChatInput.*.js`` (Streamlit 1.58) нет ни одного
+#: упоминания ``paste``/``clipboard``. Мост делает ровно то, чего не хватает:
+#: перекладывает картинку из ``clipboardData`` в скрытый ``input[type=file]``
+#: того же виджета и сообщает об этом штатным событием ``change`` — дальше
+#: работает обычный путь загрузки (``react-dropzone`` читает
+#: ``e.target.files``), поэтому файл попадает в ``chat_input`` как выбранный
+#: руками, без новых зависимостей и своего протокола.
+_PASTE_JS = """<script>
+(function () {
+  var FLAG = "__FLAG__";
+  if (window[FLAG]) { return; }
+  window[FLAG] = true;
+  var ZONE = ".st-key-__KEY__";
+
+  function pictures(cd) {
+    var out = [];
+    if (!cd) { return out; }
+    Array.prototype.slice.call(cd.items || []).forEach(function (it) {
+      if (it.kind !== "file") { return; }
+      var f = it.getAsFile();
+      if (f && String(f.type || "").indexOf("image/") === 0) { out.push(f); }
+    });
+    return out;
+  }
+
+  function named(f, n) {
+    // Из буфера файл приходит без осмысленного имени (Chrome даёт
+    // "image.png"): в переписке все скриншоты выглядели бы одинаково, а
+    // дедуп вложений идёт по sha256 — имя нужно только человеку.
+    var type = String(f.type || "image/png");
+    var ext = type.split("/")[1] || "png";
+    var name = String(f.name || "");
+    if (!name || name === "image.png" || name.indexOf(".") === -1) {
+      name = "screenshot-" + Date.now() + (n ? "-" + n : "") + "." + ext;
+    }
+    return new File([f], name, { type: type });
+  }
+
+  document.addEventListener("paste", function (ev) {
+    var imgs = pictures(ev.clipboardData);
+    // Картинок в буфере нет — уходим молча: обычная вставка текста в поле
+    // ввода должна работать как всегда.
+    if (!imgs.length) { return; }
+    var zone = document.querySelector(ZONE);
+    var input = zone ? zone.querySelector("input[type=file]") : null;
+    if (!input) { return; }
+    var dt = new DataTransfer();
+    imgs.forEach(function (f, n) { dt.items.add(named(f, n)); });
+    input.files = dt.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    ev.preventDefault();
+  }, true);
+})();
+</script>"""
+
+
+def chat_paste_js(input_key: str = DOCK_INPUT_KEY, *,
+                  flag: str = PASTE_BRIDGE_FLAG) -> str:
+    """JS-мост «Ctrl+V со скриншотом» для поля ввода диалога (iter93).
+
+    Чистая функция: возвращает ТЕКСТ вставки, ничего не рисует — так решение
+    видно целиком в одном месте и проверяется тестом, а не глазами в браузере
+    (тот же приём, что :func:`sticky_zones_css`).
+
+    Проверенные факты о Streamlit 1.58, на которых мост держится:
+
+    * ``st.chat_input`` буфер обмена НЕ поддерживает: в ``ChatInput.*.js`` нет
+      ни ``paste``, ни ``clipboard``, ни ``onPaste`` — работают только выбор
+      файла и drag&drop. Это пробел вышестоящей библиотеки, а не наш;
+    * скрытый ``input[type=file]`` виджета отдаёт файлы в ``react-dropzone``
+      через ``e.target.files``, поэтому программная подстановка ``FileList``
+      (``DataTransfer``) плюс событие ``change`` идут ШТАТНЫМ путём загрузки;
+    * контейнер элемента с ключом получает класс ``st-key-<ключ>``, что даёт
+      устойчивую точку крепления: порядковые селекторы поехали бы от любой
+      правки раскладки;
+    * ``st.html(..., unsafe_allow_javascript=True)`` не оборачивает вставку в
+      iframe и пересоздаёт узлы ``script``, поэтому код работает в ОСНОВНОМ
+      документе — то есть видит то же поле ввода, что и человек.
+
+    Мост НЕ перехватывает вставку текста: если в буфере нет картинки, событие
+    уходит дальше без изменений.
+    """
+    return (_PASTE_JS.replace("__KEY__", str(input_key))
+            .replace("__FLAG__", str(flag)))
 
 
 # ----------------------------------------------------------------------

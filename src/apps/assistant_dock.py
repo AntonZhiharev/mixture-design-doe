@@ -933,6 +933,16 @@ def _render_decisions(ctx: ToolContext, root: str, project: str) -> None:
     100 phr, потому что так делает цех» технолог зафиксировать не мог. Модели
     этот инструмент по-прежнему недоступен (iter63): она предлагает
     формулировку, записывает человек.
+
+    **iter95 — поля собраны в ``st.form``.** Живой отказ 14.08.2026: «начал
+    редактировать поле — форма побелела и перезагрузилась, как будто нажал
+    „сохранить“». Причина — модель исполнения Streamlit: значение виджета
+    фиксируется при ПОТЕРЕ ФОКУСА (дописал «Решение», кликнул в «Почему») и
+    каждая фиксация перезапускает ВЕСЬ скрипт — на большом приложении это
+    секунды белого экрана на каждое поле. Внутри ``st.form`` виджеты значений
+    не отправляют до нажатия кнопки, поэтому перезапуск остаётся ровно один —
+    на «✍️ Записать…», как человек и ожидает. Паттерн тот же, что у цен
+    проекта (``proj_prices_form`` в ``campaign_ui``).
     """
     recs = store.read_log(root, project, "decisions") if project else []
     with st.expander(f"📚 Журнал решений: {len(recs)}"):
@@ -947,16 +957,23 @@ def _render_decisions(ctx: ToolContext, root: str, project: str) -> None:
                        "спор «почему тогда так решили» разрешает этот журнал, "
                        "а не память участников.")
         st.markdown("**✍️ Зафиксировать решение**")
-        title = st.text_input("Решение одной строкой", key="dock_dec_title",
-                              placeholder="мел до 100 phr для белых компаундов")
-        why = st.text_area("Почему так решили", key="dock_dec_why", height=80,
-                           placeholder="на чём основано: опыт цеха, протокол, "
-                                       "паспорт, расчёт")
-        nodes = st.multiselect("Каких компонентов касается (необязательно)",
-                               options=node_names(ctx), key="dock_dec_nodes")
-        who = st.text_input("Кто решил", key="dock_dec_author",
-                            placeholder="фамилия или роль")
-        if st.button("✍️ Записать решение в журнал", key="dock_dec_save"):
+        # iter95: форма — правка полей НЕ перезапускает страницу; полный
+        # прогон происходит один раз, на кнопке записи (см. docstring).
+        with st.form("dock_dec_form", border=False):
+            title = st.text_input("Решение одной строкой", key="dock_dec_title",
+                                  placeholder="мел до 100 phr для белых "
+                                              "компаундов")
+            why = st.text_area("Почему так решили", key="dock_dec_why",
+                               height=80,
+                               placeholder="на чём основано: опыт цеха, "
+                                           "протокол, паспорт, расчёт")
+            nodes = st.multiselect("Каких компонентов касается (необязательно)",
+                                   options=node_names(ctx),
+                                   key="dock_dec_nodes")
+            who = st.text_input("Кто решил", key="dock_dec_author",
+                                placeholder="фамилия или роль")
+            submitted = st.form_submit_button("✍️ Записать решение в журнал")
+        if submitted:
             if not title.strip() or not why.strip():
                 st.error("Решение без обоснования в журнал не пишется: через "
                          "полгода «почему» будет важнее «что».")
@@ -985,6 +1002,9 @@ def _render_local_facts(ctx: ToolContext, root: str, project: str) -> None:
     только человек: факт, записанный моделью, отменял бы источники от своего
     имени (ASSISTANT_SPEC §370). Помощник читает эти записи (`get_local_facts`)
     и обязан считать их приоритетнее найденного в сети.
+
+    Поля собраны в ``st.form`` (iter95) — по той же причине, что и журнал
+    решений: без формы каждая потеря фокуса поля перезапускала весь скрипт.
     """
     recs = store.read_log(root, project, "local_facts") if project else []
     with st.expander(f"🏭 Факты производства (L1): {len(recs)}"):
@@ -998,17 +1018,22 @@ def _render_local_facts(ctx: ToolContext, root: str, project: str) -> None:
                        "компаунда измеряется, а не считается». Помощник "
                        "ставит эти записи ВЫШЕ литературы и справочников.")
         st.markdown("**✍️ Записать факт производства**")
-        stmt = st.text_area("Сам факт одной фразой", key="dock_fact_stmt",
-                            height=80,
-                            placeholder="смеситель типа A — не выше 120 °C")
-        scope = st.text_input("К чему относится", key="dock_fact_scope",
-                              placeholder="компонент, свойство, участок, "
-                                          "оборудование")
-        src_txt = st.text_input("Откуда известно", key="dock_fact_src",
-                                placeholder="кто сказал / протокол / номер опыта")
-        who = st.text_input("Кто утверждает", key="dock_fact_author",
-                            placeholder="фамилия или роль")
-        if st.button("✍️ Записать факт в журнал", key="dock_fact_save"):
+        # iter95: форма — правка полей НЕ перезапускает страницу (см.
+        # _render_decisions), полный прогон один — на кнопке записи.
+        with st.form("dock_fact_form", border=False):
+            stmt = st.text_area("Сам факт одной фразой", key="dock_fact_stmt",
+                                height=80,
+                                placeholder="смеситель типа A — не выше 120 °C")
+            scope = st.text_input("К чему относится", key="dock_fact_scope",
+                                  placeholder="компонент, свойство, участок, "
+                                              "оборудование")
+            src_txt = st.text_input("Откуда известно", key="dock_fact_src",
+                                    placeholder="кто сказал / протокол / "
+                                                "номер опыта")
+            who = st.text_input("Кто утверждает", key="dock_fact_author",
+                                placeholder="фамилия или роль")
+            submitted = st.form_submit_button("✍️ Записать факт в журнал")
+        if submitted:
             if not stmt.strip():
                 st.error("Пустой факт записать нельзя.")
             else:

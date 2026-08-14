@@ -314,11 +314,18 @@ class TestPlanByBlockSheet:
         for col in ("Блок", "A", "T"):
             assert list(sep[col]) == [""] * len(sep)
 
-    def test_same_columns_as_main_sheet(self):
+    def test_same_columns_as_main_sheet_except_responses(self):
+        """iter97 сузил контракт: столбцы те же, МИНУС отклики и ковариаты.
+
+        Раньше лист по партиям был полной копией основного. С iter97 отклики
+        уехали на свой лист «Отклики» (наряд на развеску и форма лаборатории —
+        разные документы), поэтому здесь сверяем состав БЕЗ «(lab)».
+        """
         r = _blocked_runner(n_blocks=2)
         X = r.propose_seed(6)
-        assert list(seed_plan_by_block_dataframe(r, X).columns) == \
-            list(ui.seed_design_dataframe(r, X).columns)
+        main = [c for c in ui.seed_design_dataframe(r, X).columns
+                if not str(c).endswith(("(lab)", "(ковариата)"))]
+        assert list(seed_plan_by_block_dataframe(r, X).columns) == main
 
     def test_empty_without_blocking(self):
         r = _blocked_runner(n_blocks=1)
@@ -351,10 +358,17 @@ class TestPlanByBlockSheet:
         assert list(main["№ опыта"]) == \
             list(ui.seed_design_dataframe(r, X)["№ опыта"])
 
-    def test_responses_carried_into_grouped_sheet(self):
-        """Внесённые в редакторе отклики уезжают и в лист по партиям."""
+    def test_responses_moved_to_their_own_sheet(self):
+        """iter97: внесённые отклики уезжают на лист «Отклики», не в наряд.
+
+        Прежний контракт iter87 требовал их в листе по партиям. Технолог
+        14.08.2026 попросил разделить документы: по наряду развешивают в цехе,
+        отклики заполняет лаборатория. Значения не теряются — меняется лист.
+        """
         r = _blocked_runner(n_blocks=2)
         X = r.propose_seed(6)
         Ys = np.arange(len(X), dtype=float).reshape(-1, 1)
-        data = _data_rows(seed_plan_by_block_dataframe(r, X, Ys))
+        plan = seed_plan_by_block_dataframe(r, X, Ys)
+        assert "y1 (lab)" not in plan.columns
+        data = _data_rows(ui.seed_responses_dataframe(r, X, Ys))
         assert set(np.asarray(data["y1 (lab)"], float)) == set(Ys.ravel())

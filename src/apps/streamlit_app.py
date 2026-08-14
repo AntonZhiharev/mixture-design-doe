@@ -59,7 +59,9 @@ from src.apps.campaign_ui import (SETUP_FORM_OPEN_PENDING,  # noqa: E402
                                    render_campaign,
                                    campaign_assistant_overview,
                                    get_campaign_controller,
+                                   mass_unit_of,
                                    setup_prefill_from_runner)
+from src.core.mass_units import mass_from_kg, mass_to_kg  # noqa: E402
 
 
 # Каталог сохранённых кампаний (в .gitignore — артефакт выполнения).
@@ -77,7 +79,11 @@ def _seed_draft_from_session() -> Optional[Dict[str, Any]]:
     черновика сохранение до фиксации давало «пустой» проект (0 точек), а
     загрузка выглядела как потеря данных. NaN кодируется как null. Размер
     пробы (``setup_seed_batch``, замечание 7) — тоже часть черновика: без
-    него после загрузки поле сбрасывалось в 0 и расход сырья терялся."""
+    него после загрузки поле сбрасывалось в 0 и расход сырья терялся.
+
+    iter97: вместе с размером пробы едет ``seed_batch_unit`` — единица массы
+    отвеса проекта на момент сохранения. Само число живёт в единице ПОКАЗА, и
+    без метки смена единицы проекта молча меняла бы величину в 1000 раз."""
     X = st.session_state.get("setup_seed_X")
     if X is None:
         return None
@@ -93,12 +99,20 @@ def _seed_draft_from_session() -> Optional[Dict[str, Any]]:
     try:
         if batch is not None and float(batch) > 0:
             draft["seed_batch"] = float(batch)
+            # iter97: число поля — в ЕДИНИЦЕ ПОКАЗА проекта, поэтому рядом
+            # едет и сама единица. Без неё «10» в граммах после смены единицы
+            # прочиталось бы как 10 кг (или наоборот) — расход сырья молча
+            # уехал бы в 1000 раз.
+            ctrl = st.session_state.get("campaign_ctrl")
+            if ctrl is not None:
+                draft["seed_batch_unit"] = mass_unit_of(ctrl.runner)
     except (TypeError, ValueError):
         pass
     return draft
 
 
-def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
+def _restore_seed_draft(draft: Optional[Dict[str, Any]],
+                        runner: Any = None) -> bool:
     """Восстановить черновик seed в session_state (обратное к сбору выше).
 
     Возвращает True, если черновик был и восстановлен. Ключ виджета-редактора
@@ -107,7 +121,12 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
     первой), а успех загрузки завершается ``st.rerun`` — чистить ключи здесь
     безопасно. Размер пробы (``seed_batch``) восстанавливается в ключ виджета
     аналогично: панель идёт раньше number_input, менять session_state ещё
-    можно."""
+    можно.
+
+    iter97: ``runner`` (загруженный проект) нужен, чтобы перевести размер пробы
+    из единицы, в которой он сохранялся, в текущую единицу отвеса проекта.
+    Без раннера или без метки единицы значение кладётся как есть — это старый
+    черновик, и выдумывать для него другую размерность нельзя."""
     for k in ("setup_seed_X", "setup_seed_Y", "setup_seed_editor",
               "setup_seed_batch", "setup_seed_df", "setup_seed_df_sig"):
         st.session_state.pop(k, None)
@@ -119,7 +138,16 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]]) -> bool:
             [[(np.nan if v is None else float(v)) for v in row]
              for row in draft["seed_Y"]], float)
     if draft.get("seed_batch") is not None:
-        st.session_state["setup_seed_batch"] = float(draft["seed_batch"])
+        # iter97: число сохранялось в единице ПОКАЗА того момента. Если проект
+        # с тех пор перевели в другую единицу, переводим значение, а не кладём
+        # его как есть: «10 г» и «10 кг» — разный расход сырья.
+        val = float(draft["seed_batch"])
+        saved_unit = draft.get("seed_batch_unit")
+        if runner is not None and saved_unit:
+            now_unit = mass_unit_of(runner)
+            if now_unit != saved_unit:
+                val = mass_from_kg(mass_to_kg(val, saved_unit), now_unit)
+        st.session_state["setup_seed_batch"] = val
     return True
 
 
@@ -314,7 +342,7 @@ def render_campaign_persistence(root: str) -> None:
             # иначе управляющий сигнал перерисовки был бы проглочен except'ом
             # и показан как «Не удалось загрузить».
             st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
-            has_draft = _restore_seed_draft(draft)
+            has_draft = _restore_seed_draft(draft, runner)
             # C2: форма сетапа должна показать НАСТРОЙКИ загруженного проекта
             # (компоненты, доли-границы, процесс-границы, отклики, seed), а не
             # дефолты «A, B, C». Применяется отложенно в render_setup_form —

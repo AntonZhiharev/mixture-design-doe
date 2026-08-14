@@ -258,7 +258,10 @@ def test_excel_gets_weighing_sheet_only_with_spec_and_delta():
     X = _plan(spec, n=2, seed=4)
     plain = pd.ExcelFile(io.BytesIO(
         seed_design_excel_bytes(runner, X)))
-    assert plain.sheet_names == ["Стартовый дизайн"]
+    # iter97: лист «Отклики» появляется всегда; предмет теста — «Навеска»,
+    # которая по-прежнему требует ОБА условия (спека + δ).
+    assert "Навеска" not in plain.sheet_names
+    assert plain.sheet_names == ["Стартовый дизайн", "Отклики"]
     withw = pd.ExcelFile(io.BytesIO(seed_design_excel_bytes(
         runner, X, spec=spec, delta_phr=0.02, grams_per_phr=5.0)))
     assert "Навеска" in withw.sheet_names

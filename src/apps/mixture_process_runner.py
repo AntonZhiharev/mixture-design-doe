@@ -58,6 +58,7 @@ import numpy as np
 from ..core.schema import (MIXTURE, PROCESS, DataPoint, ProjectSchema,
                            VariableBlock, composite_matrix)
 from ..core.simplex import SimplexRegion
+from ..core.mass_units import DEFAULT_MASS_UNIT, normalize_mass_unit
 
 from ..core.schema_evolution import (SchemaHistory, evolve_schema,
                                      known_constant,
@@ -275,6 +276,13 @@ class MixtureProcessRunner:
         # Роль ρ по умолчанию для НОВЫХ веток: PRICE_INPUT (ρ питает цену) или
         # OPTIMIZED (ρ — целевой параметр, денежный канал зануляется, И-5).
         self.rho_default_role: str = ROLE_PRICE_INPUT
+        # iter97: ЕДИНИЦА МАССЫ ОТВЕСА — параметр ПРОЕКТА (см. core/mass_units).
+        # Внутри всё считается в килограммах; это единица ПОКАЗА, одна для
+        # всех таблиц и листов Excel (план, расход сырья, база, рецепт ветки).
+        # Отдельна от ``mass_unit`` экономики: там единица цены и ρ обязана
+        # быть общей (иначе себестоимость требует коэффициентов), а отвес в
+        # цехе удобно вести в граммах при цене за килограмм.
+        self.batch_mass_unit: str = DEFAULT_MASS_UNIT
 
 
     # ------------------------------------------------------------------
@@ -1515,6 +1523,27 @@ class MixtureProcessRunner:
         self.currency_unit = str(currency_unit or "")
         self.mass_unit = str(mass_unit or "")
         self.rho_default_role = str(rho_default_role)
+
+    def set_batch_mass_unit(self, unit: str) -> None:
+        """iter97: задать ЕДИНИЦУ МАССЫ ОТВЕСА проекта (``г`` | ``кг`` | ``т``).
+
+        Единица ПОКАЗА: масса внутри проекта считается в килограммах (вес
+        замеса, ``batch_grams_per_phr``, масштаб δ_phr), а этот параметр
+        определяет, в чём масса печатается во ВСЕХ таблицах и листах Excel —
+        стартовый план, план по партиям, расход сырья, база опытов, рецепт
+        ветки. До iter97 единица была константой «кг» в слое UI, из-за чего
+        мелкие компоненты (UV 0,05 phr при замесе 10 кг) после округления
+        показывались нулями, а лист «Навеска» жил в граммах — два масштаба
+        массы в одном файле.
+
+        НЕ связана с ``mass_unit`` экономики (:meth:`set_project_economics`):
+        там единица цены и плотности обязана быть ОДНОЙ, иначе себестоимость
+        требует переводных коэффициентов; отвес же ведут в граммах при цене
+        за килограмм. Неизвестная единица — отказ
+        (:func:`core.mass_units.normalize_mass_unit`), пустая строка —
+        «по умолчанию» (кг), а не молчаливая порча подписей.
+        """
+        self.batch_mass_unit = normalize_mass_unit(unit)
 
     def _set_component_prices(self,
                               prices: Optional[Mapping[str, float]]) -> None:

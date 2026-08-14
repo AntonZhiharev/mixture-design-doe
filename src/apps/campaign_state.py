@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import numpy as np
 
 from ..core import project_ref as pref
+from ..core.mass_units import DEFAULT_MASS_UNIT
 from ..core.schema import DataPoint, ProjectSchema
 from ..core.schema_evolution import SchemaHistory
 from ..design.branches import Branch, ROLE_PRICE_INPUT
@@ -328,6 +329,12 @@ def runner_to_state(runner: MixtureProcessRunner, *,
                                   or {}).items()},
             "rho_default_role": str(getattr(runner, "rho_default_role", "")
                                     or ""),
+            # iter97: ЕДИНИЦА МАССЫ ОТВЕСА проекта (показ массы во всех
+            # таблицах и листах Excel). Без сериализации выбор «граммы»
+            # молча возвращался бы к килограммам после загрузки, и мелкие
+            # навески снова печатались бы нулями (A0.6).
+            "batch_mass_unit": str(getattr(runner, "batch_mass_unit", "")
+                                   or ""),
             "region_moves": [_region_move_to_dict(m)
                              for m in getattr(runner, "_region_moves", []) or []],
             "drop_policy": str(getattr(runner, "_drop_policy", "exclude")),
@@ -484,6 +491,15 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
         runner.mass_unit = str(r.get("mass_unit", "") or "")
         runner.rho_default_role = str(r.get("rho_default_role")
                                       or ROLE_PRICE_INPUT)
+    # iter97: единица массы отвеса. Старый сейв без ключа ⇒ «кг» (прежнее
+    # поведение выгрузок): подставлять другую единицу задним числом нельзя —
+    # это сдвинуло бы числа в уже напечатанных нарядах. Неизвестное значение
+    # в файле не валит загрузку проекта целиком: параметр относится к ПОКАЗУ,
+    # и терять из-за него измеренную базу нельзя (А0.6 — сообщаем дефолтом).
+    try:
+        runner.set_batch_mass_unit(str(r.get("batch_mass_unit", "") or ""))
+    except ValueError:
+        runner.batch_mass_unit = DEFAULT_MASS_UNIT
     runner._region_moves = [dict(m) for m in r.get("region_moves", []) or []]
     runner._drop_policy = str(r.get("drop_policy", "exclude"))
 

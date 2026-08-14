@@ -197,7 +197,9 @@ def test_excel_no_duplicate_kg_columns_in_main_sheet():
     X = _plan(spec, n=3)
     xf = pd.ExcelFile(io.BytesIO(
         seed_design_excel_bytes(r, X, batch_kg=2.0)))
-    assert xf.sheet_names == ["Стартовый дизайн", "Расход сырья"]
+    # iter97: между ними встал лист «Отклики» (рабочая форма лаборатории);
+    # предмет ЭТОГО теста — отсутствие дублей «(кг)» в основном листе.
+    assert xf.sheet_names == ["Стартовый дизайн", "Отклики", "Расход сырья"]
     main = xf.parse("Стартовый дизайн")
     assert not any(str(c).endswith("(кг)") for c in main.columns)
     # отклики остались в основном листе
@@ -210,7 +212,10 @@ def test_excel_without_batch_has_no_consumption_sheet():
     spec = _spec()
     r = _runner(spec)
     xf = pd.ExcelFile(io.BytesIO(seed_design_excel_bytes(r, _plan(spec))))
-    assert xf.sheet_names == ["Стартовый дизайн"]
+    # iter97: лист «Отклики» есть всегда (отклики нужны и без размера пробы),
+    # а «Расход сырья» без веса замеса считать нечем — его по-прежнему нет.
+    assert "Расход сырья" not in xf.sheet_names
+    assert xf.sheet_names == ["Стартовый дизайн", "Отклики"]
 
 
 def test_weighing_sheet_uses_batch_scale_not_passport():

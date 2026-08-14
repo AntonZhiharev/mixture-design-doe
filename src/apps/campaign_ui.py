@@ -30,6 +30,9 @@ import pandas as pd
 import streamlit as st
 
 
+from ..core.mass_units import (DEFAULT_MASS_UNIT, MASS_UNIT_NAMES,
+                               mass_column_label, mass_from_kg, mass_to_kg,
+                               normalize_mass_unit)
 from ..core.schema import ModelSpec, ProjectSchema, VariableBlock
 from ..core.simplex import parts_ranges_to_fraction_bounds
 from ..optimize.desirability import (ChanceConstraint, DesirabilitySpec,
@@ -280,7 +283,26 @@ def make_linear_price_fn(prices: Sequence[float]):
 COST_MODEL_LABEL = "Модель себестоимости изделия (плотность ρ → ₽/изд)"
 # Единицы по умолчанию (замечание 7): валюта и масса выносятся в подписи/Excel.
 CURRENCY_UNIT = "₽"
-MASS_UNIT = "кг"
+#: Единица массы ПО УМОЛЧАНИЮ. iter97: перестала быть единственным источником
+#: истины — теперь это лишь дефолт для проекта без выбранной единицы отвеса
+#: (см. :func:`mass_unit_of` и :attr:`MixtureProcessRunner.batch_mass_unit`).
+#: Имя сохранено: на него ссылаются подписи экономики и прежние тесты.
+MASS_UNIT = DEFAULT_MASS_UNIT
+
+
+def mass_unit_of(runner) -> str:
+    """iter97: ЕДИНИЦА МАССЫ ОТВЕСА проекта — единый источник для показа.
+
+    Читает :attr:`MixtureProcessRunner.batch_mass_unit`; отсутствие/пустое
+    значение (старый проект, объект-заглушка в тестах) → ``кг``, то есть
+    прежнее поведение выгрузок. Неизвестная единица в атрибуте тоже даёт
+    дефолт: подпись таблицы не то место, где уместно валить показ базы —
+    отказ на неверном вводе даёт сеттер раннера. Чистая (без Streamlit).
+    """
+    try:
+        return normalize_mass_unit(getattr(runner, "batch_mass_unit", ""))
+    except ValueError:
+        return DEFAULT_MASS_UNIT
 
 # iter75: экономика — блок СТАРТОВОЙ страницы (плотность ρ входит в экономику
 # проекта по умолчанию, решение сессии 12.08.2026). Ярлыки — единый источник для
@@ -482,6 +504,7 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
         blocks = []
     has_block_names = bool(getattr(runner, "block_names", {}) or {})
     mix_names = list(runner.current_schema.mixture_names)
+    mass_unit = mass_unit_of(runner)          # iter97: единица отвеса проекта
     n_mix = len(mix_names)
     # Показ процесса в АБСОЛЮТНЫХ единицах (замечание 2): mixture-доли не трогаем,
     # процесс-оси денормализуем из внутреннего кода [0,1]. Расход сырья — по долям.
@@ -509,9 +532,12 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
             row[cn] = round(float(Xreal[i, j]), 4)
 
         if batch_kg is not None and float(batch_kg) > 0:
+            # iter97: масса — в ЕДИНИЦЕ ОТВЕСА проекта (г/кг/т), а не всегда
+            # в килограммах: при замесе 10 кг мелкие компоненты в кг после
+            # округления вырождались в нули.
             for j, cn in enumerate(mix_names):
-                row[f"{cn} ({MASS_UNIT})"] = round(
-                    float(X[i, j]) * float(batch_kg), 4)
+                row[mass_column_label(cn, mass_unit)] = mass_from_kg(
+                    float(X[i, j]) * float(batch_kg), mass_unit)
         for k, pn in enumerate(props):
             row[f"{pn} (изм.)"] = (round(float(Y[i, k]), 4)
                                    if k < Y.shape[1] else np.nan)
@@ -643,6 +669,7 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
     Xs = np.atleast_2d(np.asarray(Xs, float))
     ncoord = Xs.shape[1]
     mix_names = list(runner.current_schema.mixture_names)
+    mass_unit = mass_unit_of(runner)          # iter97: единица отвеса проекта
     Ya = np.atleast_2d(np.asarray(Ys, float)) if Ys is not None else None
     # Показ процесса в АБСОЛЮТНЫХ единицах (замечание 2): mixture-доли не трогаем,
     # процесс-оси денормализуем из внутреннего кода [0,1]. Расход сырья считаем по
@@ -670,9 +697,10 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
         for j, cn in enumerate(coord_names[:ncoord]):
             row[cn] = round(float(Xreal[i, j]), 4)
         if batch_kg is not None and float(batch_kg) > 0:
+            # iter97: масса отвеса — в единице проекта (см. mass_unit_of).
             for j, cn in enumerate(mix_names):
-                row[f"{cn} ({MASS_UNIT})"] = round(
-                    float(Xs[i, j]) * float(batch_kg), 4)
+                row[mass_column_label(cn, mass_unit)] = mass_from_kg(
+                    float(Xs[i, j]) * float(batch_kg), mass_unit)
         for k, pn in enumerate(props):
             row[f"{pn} (lab)"] = (round(float(Ya[i, k]), 4)
                                   if Ya is not None and k < Ya.shape[1]
@@ -803,22 +831,24 @@ def seed_consumption_dataframe(runner, Xs, batch_kg: float) -> pd.DataFrame:
         return pd.DataFrame()
     Xs = np.atleast_2d(np.asarray(Xs, float))
     mix_names = list(runner.current_schema.mixture_names)
+    mass_unit = mass_unit_of(runner)          # iter97: единица отвеса проекта
     nums = list(experiment_index(len(getattr(runner, "points", []) or []),
                                  len(Xs)))
     rows: List[Dict[str, Any]] = []
     for i in range(len(Xs)):
         row: Dict[str, Any] = {"№ опыта": str(nums[i])}
         for j, cn in enumerate(mix_names):
-            row[f"{cn} ({MASS_UNIT})"] = round(float(Xs[i, j]) * kg, 4)
-        row[f"Σ ({MASS_UNIT})"] = round(
-            float(Xs[i, :len(mix_names)].sum()) * kg, 4)
+            row[mass_column_label(cn, mass_unit)] = mass_from_kg(
+                float(Xs[i, j]) * kg, mass_unit)
+        row[mass_column_label("Σ", mass_unit)] = mass_from_kg(
+            float(Xs[i, :len(mix_names)].sum()) * kg, mass_unit)
         rows.append(row)
     total: Dict[str, Any] = {"№ опыта": "Итого на план"}
     for j, cn in enumerate(mix_names):
-        total[f"{cn} ({MASS_UNIT})"] = round(
-            float(Xs[:, j].sum()) * kg, 4)
-    total[f"Σ ({MASS_UNIT})"] = round(
-        float(Xs[:, :len(mix_names)].sum()) * kg, 4)
+        total[mass_column_label(cn, mass_unit)] = mass_from_kg(
+            float(Xs[:, j].sum()) * kg, mass_unit)
+    total[mass_column_label("Σ", mass_unit)] = mass_from_kg(
+        float(Xs[:, :len(mix_names)].sum()) * kg, mass_unit)
     rows.append(total)
     return pd.DataFrame(rows)
 
@@ -826,28 +856,25 @@ def seed_consumption_dataframe(runner, Xs, batch_kg: float) -> pd.DataFrame:
 #: iter87: имя листа Excel с планом, РАЗЛОЖЕННЫМ ПО ПАРТИЯМ (блокам).
 SHEET_PLAN_BY_BLOCK = "План по партиям"
 
+#: iter97: имя листа Excel с ОТКЛИКАМИ (рабочая форма лаборатории).
+SHEET_RESPONSES = "Отклики"
 
-def seed_plan_by_block_dataframe(runner, Xs, Ys=None) -> pd.DataFrame:
-    """iter87: тот же стартовый план, но СГРУППИРОВАННЫЙ ПО ПАРТИЯМ (блокам).
 
-    Мотивация (технолог 13.08.2026): план выгружался в порядке генерации, а
-    ставится он ПАРТИЯМИ — оператору приходилось выбирать строки своей партии
-    глазами по столбцу «Блок». Здесь строки идут блок за блоком, а внутри блока
-    — по возрастанию номера опыта.
+def _group_rows_by_block(runner, base: pd.DataFrame) -> pd.DataFrame:
+    """iter97: разложить таблицу плана ПО ПАРТИЯМ (общая механика двух листов).
 
-    Инвариант: «№ опыта» — КЛЮЧ точки в общей базе (:func:`experiment_index`) и
-    здесь не перенумеровывается: та же точка в основном листе, в «Расходе
-    сырья», в «Навеске» и в базе кампании носит один и тот же номер. Меняется
-    ТОЛЬКО порядок и группировка строк.
+    Выделено из :func:`seed_plan_by_block_dataframe`, потому что ТУ ЖЕ
+    группировку требует лист «Отклики» (:func:`seed_responses_dataframe`):
+    оператор и лаборатория читают один и тот же наряд, и разъезд их форматов
+    (в одном листе шапка партии, в другом — плоский список) заставлял бы
+    сверять строки глазами.
 
-    Перед каждой партией — строка-заголовок («№ опыта» = ``«Партия 1 «Драло» —
-    5 оп.»``, координаты пустые), после — строка ``«Итого по партии»`` с числом
-    опытов. Так лист читается как наряд-задание и печатается по партиям.
-
-    Блокировка выключена (``n_blocks_start <= 1``) или план пуст ⇒ ПУСТОЙ
-    DataFrame: группировать нечего, и отдельный лист не создаётся (честнее, чем
-    лист-двойник основного). Чистая — тестируется без Streamlit."""
-    base = seed_design_dataframe(runner, Xs, Ys)
+    Требует столбец ``Блок`` во входной таблице; строки идут блок за блоком, а
+    внутри блока — по возрастанию «№ опыта» (ключ точки в общей базе, он НЕ
+    перенумеровывается). Перед каждой партией — строка-заголовок, после —
+    «Итого по партии». Пустая таблица или отсутствие «Блок» ⇒ пустой
+    DataFrame: группировать нечего. Чистая (без Streamlit).
+    """
     if base.empty or "Блок" not in base.columns:
         return pd.DataFrame()
     # Столбцы строк-разделителей — ТЕКСТОВЫЕ: в числовой колонке пустая строка
@@ -872,6 +899,106 @@ def seed_plan_by_block_dataframe(runner, Xs, Ys=None) -> pd.DataFrame:
     return pd.DataFrame(out_rows, columns=cols)
 
 
+def seed_plan_by_block_dataframe(runner, Xs, Ys=None, *,
+                                 batch_kg: Optional[float] = None
+                                 ) -> pd.DataFrame:
+    """iter87: тот же стартовый план, но СГРУППИРОВАННЫЙ ПО ПАРТИЯМ (блокам).
+
+    Мотивация (технолог 13.08.2026): план выгружался в порядке генерации, а
+    ставится он ПАРТИЯМИ — оператору приходилось выбирать строки своей партии
+    глазами по столбцу «Блок». Здесь строки идут блок за блоком, а внутри блока
+    — по возрастанию номера опыта.
+
+    Инвариант: «№ опыта» — КЛЮЧ точки в общей базе (:func:`experiment_index`) и
+    здесь не перенумеровывается: та же точка в основном листе, в «Расходе
+    сырья», в «Навеске» и в базе кампании носит один и тот же номер. Меняется
+    ТОЛЬКО порядок и группировка строк.
+
+    Перед каждой партией — строка-заголовок («№ опыта» = ``«Партия 1 «Драло» —
+    5 оп.»``, координаты пустые), после — строка ``«Итого по партии»`` с числом
+    опытов. Так лист читается как наряд-задание и печатается по партиям.
+
+    iter97 (запрос технолога 14.08.2026): при заданном ``batch_kg`` состав
+    компонентов идёт НАВЕСКОЙ — доля × вес замеса в единице отвеса проекта
+    (:func:`mass_unit_of`), а не долями Шеффе. Причина: с этого листа
+    развешивают, и доля «0,0187» требовала ручного умножения на вес замеса у
+    каждой из ~19 позиций — там и рождались ошибки. Доли остаются на листе
+    «Стартовый дизайн» (полный снимок плана), процесс-оси здесь — в реальных
+    единицах, как и были. ``batch_kg`` не задан ⇒ прежнее поведение (доли):
+    без веса замеса навеску считать нечем, а подставлять «1 кг» значило бы
+    выдать доли за граммы.
+
+    iter97: столбцы откликов и ковариат с этого листа УБРАНЫ — они уехали на
+    отдельный лист «Отклики» (:func:`seed_responses_dataframe`). Наряд на
+    развеску и форма для лаборатории — разные документы: первый печатают в
+    цех, второй заполняют по результатам измерений.
+
+    Блокировка выключена (``n_blocks_start <= 1``) или план пуст ⇒ ПУСТОЙ
+    DataFrame: группировать нечего, и отдельный лист не создаётся (честнее, чем
+    лист-двойник основного). Чистая — тестируется без Streamlit."""
+    base = seed_design_dataframe(runner, Xs, Ys, batch_kg=batch_kg)
+    if base.empty or "Блок" not in base.columns:
+        return pd.DataFrame()
+    props = list(runner.property_names)
+    cov_names = list(getattr(runner, "covariate_names", []) or [])
+    drop = [f"{p} (lab)" for p in props] + [f"{c} (ковариата)"
+                                            for c in cov_names]
+    mass_unit = mass_unit_of(runner)
+    weigh = batch_kg is not None and float(batch_kg) > 0
+    if weigh:
+        # Навеска ЗАМЕНЯЕТ долю: две колонки на компонент («A» и «A (кг)») при
+        # q≈19 дают 38 столбцов, и оператор всё равно смотрит только в массу.
+        drop += list(runner.current_schema.mixture_names)
+    # Порядок важен: сначала УБРАТЬ колонки долей, и только потом переименовать
+    # массовые в имена компонентов — иначе drop унёс бы уже переименованную
+    # навеску (столбцы стали бы одноимёнными).
+    base = base.drop(columns=[c for c in drop if c in base.columns])
+    if weigh:
+        base = base.rename(
+            columns={mass_column_label(cn, mass_unit): cn
+                     for cn in runner.current_schema.mixture_names})
+    return _group_rows_by_block(runner, base)
+
+
+def seed_responses_dataframe(runner, Xs, Ys=None) -> pd.DataFrame:
+    """iter97: ОТКЛИКИ стартового плана отдельной таблицей (лист «Отклики»).
+
+    Запрос технолога 14.08.2026: отклики нужно отделить от наряда на развеску
+    и заполнять по образцу «Плана по партиям». Причина разделения — разные
+    документы и разные руки: наряд с навесками печатают в цех и по нему
+    развешивают, а сюда лаборатория вписывает измеренные свойства. Пока и то и
+    другое жило в одном листе, строка тянулась на ~40 столбцов, и колонки
+    «(lab)» оказывались за краем печатной страницы.
+
+    Формат — ТОТ ЖЕ, что у :func:`seed_plan_by_block_dataframe`
+    (:func:`_group_rows_by_block`): партия за партией, шапка «Партия N …»,
+    строка «Итого по партии», номера опытов СОХРАНЕНЫ (ключ точки в общей
+    базе — по нему лист сверяется с нарядом). Столбцы: «№ опыта», Блок/Партия,
+    ``{свойство} (lab)`` (пустые — места под ручной ввод либо уже внесённые
+    ``Ys``) и ``{ковариата} (ковариата)`` — условия прогона (P3.1).
+
+    Координат состава здесь НЕТ намеренно: они в наряде, а дублирование дало
+    бы два места правды об одном опыте. Блокировка выключена ⇒ группировки
+    нет, и лист остаётся ПЛОСКИМ списком опытов (не пустым: отклики нужны
+    всегда, в отличие от разбиения по партиям). Чистая (без Streamlit).
+    """
+    base = seed_design_dataframe(runner, Xs, Ys)
+    if base.empty:
+        return pd.DataFrame()
+    props = list(runner.property_names)
+    cov_names = list(getattr(runner, "covariate_names", []) or [])
+    keep = (["№ опыта"]
+            + [c for c in ("Блок", "Партия") if c in base.columns]
+            + [f"{p} (lab)" for p in props]
+            + [f"{c} (ковариата)" for c in cov_names])
+    resp = base[[c for c in keep if c in base.columns]]
+    if "Блок" not in resp.columns:
+        # Одна партия — группировать нечего: плоский список опытов честнее
+        # единственной шапки «Партия 1», которая ничего не разделяет.
+        return resp.reset_index(drop=True)
+    return _group_rows_by_block(runner, resp)
+
+
 def seed_design_excel_bytes(runner, Xs, Ys=None, *,
                             batch_kg: Optional[float] = None,
                             spec: Optional[PhrSpec] = None,
@@ -890,6 +1017,13 @@ def seed_design_excel_bytes(runner, Xs, Ys=None, *,
     ``batch_kg`` — ОТДЕЛЬНЫЙ лист «Расход сырья»
     (:func:`seed_consumption_dataframe`) с итогами по компонентам на весь план.
     Чистый хелпер (без Streamlit) — тестируется напрямую; отдаёт байты .xlsx.
+
+    iter97 (запрос технолога 14.08.2026): на листе «План по партиям» состав при
+    заданном ``batch_kg`` — уже НАВЕСКА (доля × вес замеса) в единице отвеса
+    проекта, готовая к весам; отклики уехали на СВОЙ лист «Отклики»
+    (:func:`seed_responses_dataframe`) в том же формате «партия за партией».
+    Лист «Стартовый дизайн» не тронут — он остаётся полным снимком плана
+    (доли + процесс + «(lab)» + ковариаты).
 
     iter42.4: при активной phr-спеке и заданном ``delta_phr`` добавляется ЛИСТ
     «Навеска» (:func:`seed_weighing_dataframe`) — phr nominal/actual, граммы,
@@ -911,9 +1045,18 @@ def seed_design_excel_bytes(runner, Xs, Ys=None, *,
         # iter87: ПАРТИИ — единица постановки опытов, поэтому тот же план идёт
         # вторым листом, разложенный по блокам (номера опытов — те же ключи).
         # Блокировка выключена ⇒ группировать нечего, листа нет.
-        by_block = seed_plan_by_block_dataframe(runner, Xs, Ys)
+        # iter97: при заданном размере пробы состав на этом листе — уже НАВЕСКА
+        # (доля × вес замеса) в единице отвеса проекта: с него развешивают.
+        by_block = seed_plan_by_block_dataframe(runner, Xs, Ys,
+                                                batch_kg=batch_kg)
         if not by_block.empty:
             by_block.to_excel(xw, sheet_name=SHEET_PLAN_BY_BLOCK, index=False)
+        # iter97: ОТКЛИКИ — отдельный лист по образцу «Плана по партиям»
+        # (шапка партии, номера опытов, итоги). Наряд на развеску и форма
+        # лаборатории — разные документы (см. seed_responses_dataframe).
+        resp_df = seed_responses_dataframe(runner, Xs, Ys)
+        if not resp_df.empty:
+            resp_df.to_excel(xw, sheet_name=SHEET_RESPONSES, index=False)
         if batch_kg is not None and float(batch_kg) > 0:
             cons = seed_consumption_dataframe(runner, Xs, float(batch_kg))
             if not cons.empty:
@@ -966,8 +1109,11 @@ def _recipe_row_dataframe(runner, branch_id, res, *,
     for j, cn in enumerate(coord_names[:x.shape[1]]):
         row[cn] = round(float(xr[j]), 4)
     if batch_kg is not None and float(batch_kg) > 0:
+        # iter97: масса отвеса — в единице проекта (см. mass_unit_of).
+        mass_unit = mass_unit_of(runner)
         for j, cn in enumerate(mix_names):
-            row[f"{cn} ({MASS_UNIT})"] = round(float(x[0, j]) * float(batch_kg), 4)
+            row[mass_column_label(cn, mass_unit)] = mass_from_kg(
+                float(x[0, j]) * float(batch_kg), mass_unit)
     for pn, val in (res.properties or {}).items():
         row[f"{pn} (прогноз)"] = round(float(val), 4)
     row["d_overall"] = round(float(res.d_overall), 4)
@@ -3481,6 +3627,10 @@ def setup_prefill_from_runner(runner) -> Dict[str, Any]:
     out["setup_pass_weigh_gpp"] = batch_kg_from_grams_per_phr(
         getattr(runner, "phr_spec", None),
         getattr(runner, "grams_per_phr", 0.0))
+    # iter97: единица массы отвеса — тоже политика проекта: без префилла
+    # повторная сборка из формы молча вернула бы килограммы, и мелкие навески
+    # снова превратились бы в нули в выгрузках.
+    out["setup_batch_mass_unit"] = mass_unit_of(runner)
     # iter52/P2.1-UI: дискретные уровни process-осей — политика кампании,
     # которую после загрузки обязана показывать и ФОРМА (иначе повторная
     # сборка проекта молча вернула бы непрерывные оси).
@@ -4204,6 +4354,22 @@ def render_setup_form() -> None:
                  "считается достижимость навески КАЖДОГО компонента: "
                  "массовые доли спеки × вес замеса = граммы. При сборке "
                  "проекта покажем, что не взвешивается и где нужен премикс.")
+        # iter97: ЕДИНИЦА МАССЫ ОТВЕСА — один раз на проект, дальше тащится во
+        # ВСЕ таблицы и листы Excel. Раньше единица была константой «кг» в коде
+        # UI, и при замесе 10 кг мелкие компоненты (UV 0,05 phr ≈ 2 г) после
+        # округления печатались нулями, а лист «Навеска» жил в граммах — в
+        # одном файле два масштаба массы.
+        batch_unit = st.selectbox(
+            "Единица массы отвеса (для всех таблиц и выгрузок)",
+            MASS_UNIT_NAMES,
+            index=MASS_UNIT_NAMES.index(DEFAULT_MASS_UNIT),
+            key="setup_batch_mass_unit",
+            help="В чём показывать массу компонентов везде: план по партиям, "
+                 "расход сырья, база опытов, рецепт ветки. Внутри проект "
+                 "считает в килограммах — это единица ПОКАЗА, на математику "
+                 "и на δ навески она не влияет. Для мелких добавок (0,05 phr) "
+                 "берите граммы: в килограммах они округляются в нули. Это НЕ "
+                 "единица цены сырья — та задаётся в блоке экономики выше.")
         # P3.1: ковариаты базы — телеметрия прогона (M(t)/SME, Die_Pressure,
         # торк, вытяжка, наработка вала): столбцы базы, НЕ отклики модели.
         cov_txt = st.text_input(
@@ -4289,6 +4455,10 @@ def render_setup_form() -> None:
                     step_g,
                     0.0 if batch_kg <= 0
                     else batch_grams_per_phr(phr_spec_live, batch_kg))
+                # iter97: единица массы отвеса — ШТАТНЫМ сеттером (валидация
+                # обозначения там же, A0.6): проект собирается с ОДНОЙ
+                # единицей показа для всех таблиц и листов Excel.
+                runner.set_batch_mass_unit(batch_unit)
                 # iter52/P2.1-UI: дискретные уровни — ПОСЛЕ сборки схемы
                 # (валидация имён/границ — штатным set_process_levels, A0.6).
                 levels_now = parse_process_levels(levels_txt)
@@ -4612,17 +4782,24 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     # Замечание 7: размер ПРОБЫ (партии) — добавляет столбцы расхода сырья
     # {компонент} (кг) = доля·batch, чтобы понимать, сколько взвесить на опыт.
     mix_names = list(runner.current_schema.mixture_names)
+    # iter97: поле «Размер пробы» — в ЕДИНИЦЕ ОТВЕСА проекта. Внутри всё
+    # считается в килограммах (batch_kg), поэтому введённое значение сразу
+    # переводится: иначе «10» в граммах уехало бы в расчёт как 10 кг.
+    seed_mass_unit = mass_unit_of(runner)
     batch = st.number_input(
-        f"Размер пробы, {MASS_UNIT}/опыт (для расхода сырья и Excel)",
+        f"Размер пробы, {seed_mass_unit}/опыт (для расхода сырья и Excel)",
         min_value=0.0, value=0.0, step=0.1, key="setup_seed_batch",
         help="0 — только состав в долях; >0 — добавит столбцы расхода сырья "
-             f"({MASS_UNIT}) = доля компонента × размер пробы (замечание 7); "
-             "в Excel расход уходит ОТДЕЛЬНЫМ листом «Расход сырья» с итогами "
-             "по компонентам на весь план, а лист «Навеска» считает граммы от "
-             "ЭТОГО размера пробы (единый масштаб массы, решение 13.08.2026). "
-             "На сам дизайн (координаты) не влияет — только показ и выгрузка.")
-    batch_kg = float(batch) if batch > 0 else None
-    mass_cols = ([f"{c} ({MASS_UNIT})" for c in mix_names]
+             f"({seed_mass_unit}) = доля компонента × размер пробы "
+             "(замечание 7); в Excel расход уходит ОТДЕЛЬНЫМ листом «Расход "
+             "сырья» с итогами по компонентам на весь план, лист «План по "
+             "партиям» показывает состав уже НАВЕСКОЙ (iter97), а лист "
+             "«Навеска» считает граммы от ЭТОГО размера пробы (единый масштаб "
+             "массы, решение 13.08.2026). Единица — «Единица массы отвеса» из "
+             "настроек проекта. На сам дизайн (координаты) не влияет — только "
+             "показ и выгрузка.")
+    batch_kg = mass_to_kg(float(batch), seed_mass_unit) if batch > 0 else None
+    mass_cols = ([mass_column_label(c, seed_mass_unit) for c in mix_names]
                  if batch_kg is not None else [])
 
     Ys = st.session_state.get("setup_seed_Y")
@@ -5343,15 +5520,19 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
             "предсказанные свойства целей, общий d_overall и по-целевые d[·]. "
             "Считается по кнопке (M8-argmax дорогой); при размере пробы > 0 "
             "добавляется расход сырья на пробу.")
+        # iter97: единица — та же, что во всём проекте (mass_unit_of); ввод
+        # переводится в килограммы, потому что арифметика рецепта в кг.
+        rec_mass_unit = mass_unit_of(runner)
         rec_batch = st.number_input(
-            f"Размер пробы, {MASS_UNIT}/опыт (для расхода сырья и Excel)",
+            f"Размер пробы, {rec_mass_unit}/опыт (для расхода сырья и Excel)",
             min_value=0.0, value=0.0, step=0.1, key=f"camp_wb_recipe_batch_{bsel}")
         rkey = f"cache_recipe_{bsel}"
         if st.button("📋 Рассчитать рецепт ветки (x*)",
                      key=f"camp_wb_recipe_btn_{bsel}"):
             import io
             try:
-                bk = float(rec_batch) if float(rec_batch) > 0 else None
+                bk = (mass_to_kg(float(rec_batch), rec_mass_unit)
+                      if float(rec_batch) > 0 else None)
                 # iter43.3: рецепт + binding_report ОДНИМ прогоном argmax
                 df_rec, brep = branch_recipe_with_binding(
                     runner, bsel, batch_kg=bk)
@@ -6068,18 +6249,23 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
 
     with st.expander("⬇️ Выгрузить общую базу опытов в Excel (C3)",
                      expanded=True):
+        # iter97: единица массы — параметр проекта, а не константа слоя UI.
+        base_mass_unit = mass_unit_of(runner)
         st.caption(
             "Общая база всех измеренных опытов (И-1): № опыта, источник, состав "
             "(доли) + процесс (реальные единицы) и измеренные отклики. Укажите "
-            f"размер партии ({MASS_UNIT}) — добавится расход каждого компонента на "
-            "опыт, чтобы понимать, сколько сырья взвесить (замечание 7).")
+            f"размер партии ({base_mass_unit}) — добавится расход каждого "
+            "компонента на опыт, чтобы понимать, сколько сырья взвесить "
+            "(замечание 7).")
         bc = st.columns([1, 2])
         batch = bc[0].number_input(
-            f"Размер партии, {MASS_UNIT}/опыт", min_value=0.0, value=0.0,
+            f"Размер партии, {base_mass_unit}/опыт", min_value=0.0, value=0.0,
             step=0.1, key="camp_base_batch",
             help="0 — только состав в долях; >0 — добавит столбцы расхода сырья "
-                 f"({MASS_UNIT}) = доля компонента × размер партии.")
-        batch_kg = float(batch) if batch > 0 else None
+                 f"({base_mass_unit}) = доля компонента × размер партии "
+                 "(единица — «Единица массы отвеса» из настроек проекта).")
+        batch_kg = (mass_to_kg(float(batch), base_mass_unit)
+                    if batch > 0 else None)
         base_df = campaign_base_dataframe(runner, batch_kg=batch_kg)
         st.dataframe(base_df, width="stretch", hide_index=True)
         _blk_txt = base_blocking_caption(runner)

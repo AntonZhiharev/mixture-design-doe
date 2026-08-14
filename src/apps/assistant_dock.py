@@ -386,8 +386,22 @@ def _render_setup_edits(ctx: ToolContext, session, runner: Any) -> None:
         return                     # пустая панель не рисуется: шаг редкий
     st.markdown(f"**📝 Предложенные правки полей формы: {len(staged)}**")
     if runner is not None:
-        st.warning("Проект уже собран: правки полей формы к нему не "
-                   "применяются — они относились к черновику до сборки.")
+        # iter94: правка применяется и при собранном проекте (поля — черновик
+        # пересборки), но цена называется по СТАДИИ: пустая база ничего не
+        # стоит, измеренная — стоит всех опытов. Прежде кнопка была disabled, и
+        # правка застревала в стейдже даже там, где терять было нечего.
+        n_pts = int(len(getattr(runner, "points", []) or []))
+        n_br = int(len(getattr(runner, "branches", {}) or {}))
+        if n_pts or n_br:
+            st.warning(
+                f"Проект ЖИВОЙ: {n_pts} измеренных точек, {n_br} веток. "
+                f"Применение правки обновит ПОЛЯ ФОРМЫ; движок не изменится, "
+                f"пока вы не нажмёте «🏗 Построить проект» — а сборка создаст "
+                f"проект с ПУСТОЙ базой. Чтобы сохранить опыты, правьте живой "
+                f"проект панелями «📋 Настройки проекта» и «🧬 Эволюция схемы».")
+        else:
+            st.info("Проект собран, но не измерен (0 точек, 0 веток): правка "
+                    "полей и пересборка сейчас ничего не стоят.")
     for s in staged:
         st.caption(f"`{s.id}` · {s.label or 'без метки'} · полей: "
                    f"{len(s.fields)}" + (f" · {s.rationale}" if s.rationale
@@ -398,11 +412,8 @@ def _render_setup_edits(ctx: ToolContext, session, runner: Any) -> None:
             width="stretch", hide_index=True)
         c = st.columns(2)
         if c[0].button("✅ Применить правку", key=f"dock_apply_setup_{s.id}",
-                       disabled=runner is not None,
-                       help=("Значения лягут в поля формы «🆕 Новый проект»; "
-                             "проект соберёт кнопка «🏗 Построить проект»")
-                            if runner is None else
-                            "Проект уже собран — правка полей неприменима"):
+                       help="Значения лягут в поля формы «🆕 Новый проект»; "
+                            "проект соберёт кнопка «🏗 Построить проект»"):
             try:
                 out = actx.human_apply_setup(ctx, s.id, author="человек (UI)")
             except ToolError as exc:
@@ -414,6 +425,10 @@ def _render_setup_edits(ctx: ToolContext, session, runner: Any) -> None:
                     "next_step", "")
                 actx.persist_session(ctx)
                 st.success(out.get("next_step", "Правка применена."))
+                # iter94: цена пересборки живого проекта — отдельной строкой,
+                # чтобы она не потерялась в success-сообщении.
+                if out.get("warning"):
+                    st.warning(out["warning"])
                 st.rerun()
         reason = st.text_input("причина отказа",
                                key=f"dock_setup_reason_{s.id}",

@@ -38,9 +38,10 @@ from ..consent import DEFAULT_REGISTRY, ConsentError, ConsentRegistry
 from ..session import (PATCH_APPLIED, PATCH_REJECTED, StagedPatch,
                        StagedProject, StagedSetup, StagedSpec)
 from ..store import append_log
-from .readonly import (_f, active_spec, build_patched_spec,
-                       build_spec_from_package, has_project, normalize_patch,
-                       normalize_spec_package, spec_package_diff, spec_payload,
+from .readonly import (ROUTE_LIVE, ROUTE_REBUILD, STAGE_LIVE, _f, active_spec,
+                       build_patched_spec, build_spec_from_package, has_project,
+                       normalize_patch, normalize_spec_package, project_stage,
+                       setup_field_route, spec_package_diff, spec_payload,
                        validate_spec)
 from .registry import PROPOSE, WRITE, ToolContext, ToolError, register
 
@@ -948,8 +949,11 @@ _SETUP_SCALARS = (str, int, float, bool)
         "'setup_preflight_pairs' — пары построчно «A | B», 'setup_phr_json' — "
         "phr-спека JSON). Правка кладётся в СТЕЙДЖ; применяет человек "
         "кнопкой, значения попадут в поля формы, а проект соберёт кнопка "
-        "«🏗 Построить проект». Для СОБРАННОГО проекта не годится — там "
-        "propose_patch/propose_spec."),
+        "«🏗 Построить проект». Работает и при СОБРАННОМ проекте: ответ несёт "
+        "'stage' и 'routes' по каждому полю — route='live' значит, что поле "
+        "правится штатной операцией движка БЕЗ потери измеренной базы (тогда "
+        "предлагай её), route='rebuild' — что значение поедет только "
+        "пересборкой."),
     parameters={"type": "object", "properties": {
         "fields": {"type": "object",
                    "description": "{ключ_поля_формы: новое значение} — "
@@ -976,13 +980,6 @@ def propose_setup_fields(ctx: ToolContext, fields: Any, rationale: str,
     скалярные значения — иначе применённая правка молча не легла бы в виджеты.
     """
     session = ctx.require_session()
-    if ctx.runner is not None:
-        return {"staged": False, "ok": False,
-                "error": "Проект в сессии уже СОБРАН: поля формы сетапа — "
-                         "черновик пересборки, точечная правка полей к нему "
-                         "не применяется. Геометрию правь пакетом спеки "
-                         "(propose_spec) или патчем (propose_patch).",
-                "hint": "Правка не положена в стейдж."}
     if not isinstance(fields, dict) or not fields:
         return {"staged": False, "ok": False,
                 "error": "Ожидается непустой объект {ключ_поля: значение}.",
@@ -1005,21 +1002,45 @@ def propose_setup_fields(ctx: ToolContext, fields: Any, rationale: str,
                 "hint": "Правка не положена в стейдж."}
 
     current = dict((ctx.extra or {}).get("setup_fields") or {})
+    stage_info = project_stage(ctx)
+    stage = str(stage_info["stage"])
+    routes = {k: setup_field_route(k, stage) for k in fields}
     staged = session.stage_setup(StagedSetup(
         fields={str(k): v for k, v in fields.items()},
         label=str(label or ""), rationale=str(rationale or ""),
         level=str(level or ""), source=str(source or ""),
         confidence=str(confidence or "")))
-    return _f({
+    out = {
         "staged": True, "ok": True, "setup_id": staged.id,
         "fields": dict(staged.fields),
         "current_values": {k: current.get(k) for k in staged.fields},
+        "stage": stage, "stage_why": stage_info["why"], "routes": routes,
         "note": ("Правка НЕ применена: она в стейдже (панель «📝 Предложенные "
                  "правки полей»). Применяет человек кнопкой; значения лягут в "
                  "поля формы «🆕 Новый проект», проект соберёт кнопка "
                  "«🏗 Построить проект». Скажи пользователю, какие поля и "
                  "почему меняются."),
-    })
+    }
+    # iter94: у СОБРАННОГО проекта правка полей больше не отвергается слепо — но
+    # цена называется вслух. Поля с живой операцией движка правятся без потери
+    # базы; остальные едут только через пересборку, и при измеренной базе это
+    # решение человека, а не «просто ещё одна правка формы».
+    if stage == STAGE_LIVE:
+        rebuild = sorted(k for k, r in routes.items()
+                         if r["route"] == ROUTE_REBUILD)
+        live = sorted(k for k, r in routes.items() if r["route"] == ROUTE_LIVE)
+        out["warning"] = (
+            f"Проект ЖИВОЙ: {stage_info['n_points']} измеренных точек, "
+            f"{stage_info['n_branches']} веток. Применение полей формы означает "
+            f"ПЕРЕСБОРКУ проекта — измеренная база и ветки при этом не "
+            f"переносятся."
+            + (f" Поля {live} можно применить БЕЗ пересборки, живой операцией "
+               f"движка — предложи этот путь." if live else "")
+            + (f" Поля {rebuild} живой операции не имеют." if rebuild else ""))
+    elif has_project(ctx):
+        out["note"] += (" Проект уже собран, но база пуста (0 точек, 0 веток): "
+                        "пересборка из формы ничего не стоит.")
+    return _f(out)
 
 
 @register(
@@ -1027,7 +1048,9 @@ def propose_setup_fields(ctx: ToolContext, fields: Any, rationale: str,
     description=(
         "ПРИМЕНИТЬ правку полей формы сетапа из стейджа: значения переносятся "
         "в поля формы «🆕 Новый проект». Требует разовый токен подтверждения "
-        "человека — кнопка в интерфейсе. Отклоняется, если проект уже собран."),
+        "человека — кнопка в интерфейсе. У СОБРАННОГО проекта тоже работает "
+        "(поля — черновик пересборки), но при измеренной базе ответ несёт "
+        "'warning' с ценой: сборка создаст проект с пустой базой."),
     parameters={"type": "object", "properties": {
         "setup_id": {"type": "string", "description": "id правки из стейджа"},
         "human_token": {"type": "string", "description": "разовый токен"},
@@ -1053,10 +1076,11 @@ def apply_setup_fields(ctx: ToolContext, setup_id: str, human_token: str,
         raise ToolError(
             f"Правка '{setup_id}' уже в статусе '{staged.status}': повторное "
             f"применение запрещено — предложите новую правку.")
-    if ctx.runner is not None:
-        raise ToolError(
-            "Проект в сессии уже собран: правка полей формы к нему не "
-            "применяется. Правка остаётся в стейдже.")
+    # iter94: слепого запрета «проект собран» здесь больше нет. Правка полей —
+    # это правка ЧЕРНОВИКА пересборки, и решение о её цене принимает человек той
+    # же кнопкой; наша обязанность — назвать цену, а не молча отказать. Прежний
+    # отказ бил и по проектам с ПУСТОЙ базой, где терять было нечего.
+    stage_info = project_stage(ctx)
     _consume(ctx, human_token, action="apply_setup", target=str(setup_id))
 
     session.set_setup_status(staged.id, PATCH_APPLIED, reason=str(note or ""))
@@ -1069,10 +1093,11 @@ def apply_setup_fields(ctx: ToolContext, setup_id: str, human_token: str,
         "level": staged.level, "source": staged.source,
         "confidence": staged.confidence, "setup_id": staged.id,
         "fields": sorted(staged.fields), "note": str(note or ""),
-        "kind": "apply_setup"})
-    return _f({
+        "stage": stage_info["stage"], "kind": "apply_setup"})
+    out: Dict[str, Any] = {
         "ok": True, "setup_id": staged.id, "status": PATCH_APPLIED,
         "setup_prefill": dict(staged.fields), "decision": decision,
+        "stage": stage_info["stage"], "stage_why": stage_info["why"],
         "next_step": (f"Поля {sorted(staged.fields)} формы «🆕 Новый проект» "
                       f"обновлены из правки. Проверьте их и нажмите "
                       f"«🏗 Построить проект» — сборка проекта остаётся "
@@ -1080,7 +1105,20 @@ def apply_setup_fields(ctx: ToolContext, setup_id: str, human_token: str,
         "persist_hint": ("Черновик формы можно сохранить кнопкой "
                          "«💾 Сохранить проект» (панель «📁 Проект») — "
                          "он переживёт перезапуск и до сборки."),
-    })
+    }
+    if stage_info["stage"] == STAGE_LIVE:
+        # Поля обновлены, но движок ещё СТАРЫЙ: пока человек не нажал сборку,
+        # ничего не потеряно. Молчать об этом нельзя — иначе он узнает цену
+        # только по исчезнувшей базе.
+        out["warning"] = (
+            f"Поля обновлены, но проект НЕ пересобран: в движке по-прежнему "
+            f"{stage_info['n_points']} измеренных точек и "
+            f"{stage_info['n_branches']} веток. Кнопка «🏗 Построить проект» "
+            f"создаст НОВЫЙ проект с ПУСТОЙ базой — прежние опыты и ветки в него "
+            f"не перейдут. Если нужно сохранить базу, применяйте правку живыми "
+            f"операциями проекта (панели «📋 Настройки проекта» и «🧬 Эволюция "
+            f"схемы»), а не пересборкой.")
+    return _f(out)
 
 
 @register(

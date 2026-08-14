@@ -302,6 +302,127 @@ class MixtureProcessRunner:
     # ------------------------------------------------------------------
     # Стартовая ограниченная фаза (v1) — заменяет старый mask-путь
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # РАСШИРЕНИЕ ОБЪЯВЛЕННОЙ ВСЕЛЕННОЙ (iter94): full_schema — не приговор
+    # ------------------------------------------------------------------
+    def _check_declaration(self, mix_add: Sequence[Tuple[str, float, float]],
+                           proc_add: Sequence[Tuple[str, float, float]]) -> None:
+        """Проверить объявление новых переменных ДО правки полной схемы (A0.6).
+
+        Отдельным методом, чтобы отказ случался ЦЕЛИКОМ: полусостояние
+        «mixture дописан, process отвергнут» оставило бы вселенную и baseline
+        рассогласованными.
+        """
+        if not mix_add and not proc_add:
+            raise ValueError("declare_variables: не задано ни одной переменной.")
+        names = [nm for nm, _, _ in list(mix_add) + list(proc_add)]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Дубли имён внутри объявления: {names}.")
+        taken = set(self.full_schema.mixture_names)
+        taken |= set(self.full_schema.process_names)
+        taken |= set(self.property_names)
+        taken |= set(getattr(self, "covariate_names", []) or [])
+        dup = [nm for nm in names if nm in taken]
+        if dup:
+            raise ValueError(
+                f"Имена {dup} в проекте уже заняты (компонент, ось, отклик или "
+                f"ковариата). Переменные различаются ИМЕНЕМ — одноимённые "
+                f"столбцы сделали бы базу неразличимой.")
+        for nm, lo, hi in proc_add:
+            if not (hi > lo):
+                raise ValueError(
+                    f"Ось '{nm}': границы [{lo}, {hi}] выродились (нижняя ≥ "
+                    f"верхней). Ось-константа не несёт информации — план по ней "
+                    f"ничего не варьирует.")
+        # Оракул синтетической истины несёт СВОЮ схему и набор термов: измерить
+        # переменную, которой в его схеме нет, он не может (вернул бы Y другой
+        # физики). Ручной оракул кампании (ManualOracle) размерность не фиксирует:
+        # истину вносит человек, поэтому расширение для него законно.
+        if getattr(self.oracle, "schema", None) is not None:
+            raise ValueError(
+                "Оракул проекта привязан к ФИКСИРОВАННОЙ схеме и новые "
+                "переменные измерять не умеет: объявление отклонено, чтобы не "
+                "получить отклики другой физики. Расширение доступно кампании с "
+                "ручным вводом откликов (истину вносит человек).")
+
+    def declare_variables(self, *,
+                          mixture: Sequence[Tuple[str, float, float]] = (),
+                          process: Sequence[Tuple[str, float, float]] = ()
+                          ) -> ProjectSchema:
+        """ОБЪЯВИТЬ новые переменные в ПОЛНОЙ схеме проекта (без bump версии).
+
+        Прежде состав вселенной фиксировался конструктором: ``full_schema``
+        присваивалась один раз, а ``augment_phase_*`` умел только РАСКРЫВАТЬ
+        объявленное. Поэтому компонент, о котором не подумали при рождении
+        проекта, было некуда добавить — и единственным путём оставалась
+        пересборка с потерей измеренной базы (чего канон И-1 не допускает).
+
+        Имена дописываются в КОНЕЦ соответствующего блока полной схемы — тем же
+        правилом, которым живёт ``migrate_point`` (старые координаты = ПРЕФИКС
+        новых, :mod:`core.schema_evolution`). Поэтому миграцию точек менять не
+        потребовалось: объявление НИЧЕГО не вводит в игру, оно лишь расширяет
+        вселенную. Ввод в игру — по-прежнему ``augment_phase_*`` с ЯВНОЙ
+        политикой миграции (A0.6).
+
+        ``baseline`` продлевается согласованно: новый mixture-компонент получает
+        ``0.0`` (грань симплекса — та же величина, что политика миграции старых
+        точек, §15.0.4), новая process-ось — ``0.5`` в коде (середина интервала).
+        ВАЖНО: mixture-значение вставляется ПЕРЕД process-частью, потому что
+        baseline — один вектор ``[mix(q_full), proc(d_full)]``; дописывание в
+        конец сдвинуло бы process-координаты и молча испортило бы измерение.
+
+        Оракул, привязанный к ФИКСИРОВАННОЙ схеме (синтетическая истина в
+        тестах), новую переменную мерить не умеет — такое расширение отвергается
+        явно, а не даёт молча неверные Y.
+        """
+        mix_add = [(str(nm), float(lo), float(hi)) for nm, lo, hi in mixture]
+        proc_add = [(str(nm), float(lo), float(hi)) for nm, lo, hi in process]
+        self._check_declaration(mix_add, proc_add)
+
+
+        blocks = list(self.full_schema.blocks)
+        baseline = list(np.asarray(self.baseline, float).ravel())
+        mix_base = list(baseline[:self.q_full])
+        proc_base = list(baseline[self.q_full:self.q_full + self.d_full])
+
+        if mix_add:
+            mb = self.full_schema.mixture_block()
+            new_mb = VariableBlock.mixture(
+                ([] if mb is None else list(mb.names)) + [p[0] for p in mix_add],
+                lower=([] if mb is None else list(mb.lower)) + [p[1] for p in mix_add],
+                upper=([] if mb is None else list(mb.upper)) + [p[2] for p in mix_add])
+            blocks = ([b for b in blocks if not b.is_mixture] + [new_mb]
+                      if mb is None
+                      else [new_mb if b.is_mixture else b for b in blocks])
+            # Грань симплекса: новый компонент входит в baseline нулём, поэтому
+            # Σ mixture-части не меняется (A+B+0 = A+B).
+            mix_base += [0.0] * len(mix_add)
+        if proc_add:
+            pb = self.full_schema.process_block()
+            new_pb = VariableBlock.process(
+                ([] if pb is None else list(pb.names)) + [p[0] for p in proc_add],
+                lower=([] if pb is None else list(pb.lower)) + [p[1] for p in proc_add],
+                upper=([] if pb is None else list(pb.upper)) + [p[2] for p in proc_add])
+            blocks = ([b for b in blocks if not b.is_process] + [new_pb]
+                      if pb is None
+                      else [new_pb if b.is_process else b for b in blocks])
+            proc_base += [0.5] * len(proc_add)
+
+        # Полная схема — НЕ версия фазы: version/responses/model/migration
+        # сохраняются как есть (объявление не меняет ни состав игры, ни модель).
+        self.full_schema = ProjectSchema(
+            version=self.full_schema.version, blocks=tuple(blocks),
+            responses=self.full_schema.responses, model=self.full_schema.model,
+            migration=dict(self.full_schema.migration),
+            change_log=tuple(self.full_schema.change_log))
+        self._full_mix = self.full_schema.mixture_block()
+        self._full_proc = self.full_schema.process_block()
+        self.q_full = int(self.full_schema.n_mixture)
+        self.d_full = int(self.full_schema.n_process)
+        self.dim_full = self.q_full + self.d_full
+        self.baseline = np.asarray(mix_base + proc_base, float)
+        return self.full_schema
+
     def begin_phase(self, mixture_free: Sequence[str],
                     process_free: Sequence[str] = ()
                     ) -> "MixtureProcessRunner":
@@ -379,7 +500,9 @@ class MixtureProcessRunner:
         self.schema_history.add(new)
         self.current_schema = new
         self.current_schema_version = int(new.version)
-        self.fit_surrogates()
+        # iter94: пустая база — законное состояние (проект собран, план не снят):
+        # операция схемы не должна падать из-за отсутствия суррогатов.
+        self.refit_if_possible()
         return new
 
     def augment_phase_mixture(self, mixture_vars: Sequence[str], *,
@@ -401,7 +524,7 @@ class MixtureProcessRunner:
         self.schema_history.add(new)
         self.current_schema = new
         self.current_schema_version = int(new.version)
-        self.fit_surrogates()
+        self.refit_if_possible()          # iter94: пустая база — не сбой
         return new
 
     def augment_phase_atomic(self, process_vars: Sequence[str],
@@ -422,7 +545,7 @@ class MixtureProcessRunner:
         self.schema_history.add(new)
         self.current_schema = new
         self.current_schema_version = int(new.version)
-        self.fit_surrogates()
+        self.refit_if_possible()          # iter94: пустая база — не сбой
         return new
 
     # ------------------------------------------------------------------
@@ -483,7 +606,7 @@ class MixtureProcessRunner:
             "move_type": move.move_type, "deltas": dict(deltas),
             "intent": intent, "policy": policy,
             "version": int(self.current_schema_version)})
-        self.fit_surrogates()
+        self.refit_if_possible()          # iter94: пустая база — не сбой
         return move
 
     # ------------------------------------------------------------------
@@ -857,6 +980,26 @@ class MixtureProcessRunner:
             gp = GPExpert(mean_model=self.gp_mean_model, kernel=self.gp_kernel,
                           seed=self.seed, n_restarts=self.n_restarts)
             self.surrogates[name] = gp.fit(self.X, self.Y[:, i])
+
+    def refit_if_possible(self) -> bool:
+        """Переобучить суррогаты, ЕСЛИ база непуста; иначе — сбросить их.
+
+        iter94: операции схемы (``augment_phase_*`` / ``move_region``) звали
+        :meth:`fit_surrogates` напрямую, а тот на пустой базе бросает
+        ``RuntimeError('Нет данных')``. Из-за этого правка геометрии проекта,
+        собранного но ещё НЕ измеренного (ровно стадия «проект создан, план не
+        снят»), падала — хотя менять там нечему мешать: суррогаты производны от
+        точек, а точек нет. Пустая база — законное состояние, а не сбой.
+
+        Возвращает True, если модели переобучены. Ошибки самого фита не глотаем:
+        падение на непустой базе — настоящий сигнал.
+        """
+        self._rebuild_arrays()
+        if self.X is None or len(self.X) == 0:
+            self.surrogates = {}
+            return False
+        self.fit_surrogates()
+        return True
 
     def seed_initial(self, n: int = 12, seed: Optional[int] = None
                      ) -> Dict[str, Any]:

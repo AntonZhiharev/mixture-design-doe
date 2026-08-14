@@ -279,11 +279,19 @@ class TestSetupFieldTools:
                        allowed_kinds=[READONLY])
         assert out["n"] == 0 and "первичный ввод" in out["note"]
 
-    def test_propose_refused_when_project_built(self):
+    def test_propose_allowed_when_project_built(self):
+        """iter94: у собранного проекта правка полей больше НЕ отвергается.
+
+        Прежде здесь стоял слепой отказ «проект уже СОБРАН», и он бил даже по
+        проекту с пустой базой, где терять было нечего. Теперь правка ложится в
+        стейдж, а ответ несёт стадию и маршрут применения по каждому полю.
+        """
         out = dispatch(_ctx(runner=_runner()), "propose_setup_fields",
                        {"fields": {"setup_resp": "x"}, "rationale": "r"},
                        allowed_kinds=[PROPOSE])
-        assert out["staged"] is False and "СОБРАН" in out["error"]
+        assert out["staged"] is True
+        assert out["stage"] == "empty"          # движок есть, база пуста
+        assert out["routes"]["setup_resp"]["route"] == "live"
 
     def test_propose_refuses_non_setup_keys_and_objects(self):
         ctx = _ctx()
@@ -328,15 +336,21 @@ class TestSetupFieldTools:
         with pytest.raises(ToolError, match="уже в статусе"):
             actx.human_apply_setup(ctx, out["setup_id"])
 
-    def test_apply_refused_when_project_built(self, tmp_path):
-        """Правка предложена до сборки, применена после — явный отказ."""
+    def test_apply_allowed_when_project_built(self, tmp_path):
+        """iter94: правка применяется и после сборки — поля это черновик.
+
+        Раньше здесь был ``ToolError``: правка, предложенная до сборки,
+        застревала в стейдже навсегда. Теперь она применяется (движок при этом
+        НЕ трогается — меняются только поля формы), а стадия отдаётся в ответе.
+        """
         ctx = _ctx(tmp_path, consent=ConsentRegistry())
         out = dispatch(ctx, "propose_setup_fields",
                        {"fields": {"setup_seed": 5}, "rationale": "r"},
                        allowed_kinds=[PROPOSE])
         ctx.runner = _runner()
-        with pytest.raises(ToolError, match="уже собран"):
-            actx.human_apply_setup(ctx, out["setup_id"])
+        res = actx.human_apply_setup(ctx, out["setup_id"])
+        assert res["ok"] is True and res["stage"] == "empty"
+        assert res["setup_prefill"] == {"setup_seed": 5}
 
     def test_reject_flow_logs_reason(self, tmp_path):
         ctx = _ctx(tmp_path, consent=ConsentRegistry())

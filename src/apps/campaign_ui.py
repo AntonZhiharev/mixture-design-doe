@@ -5551,42 +5551,93 @@ def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
     with st.expander("🧬 Эволюция схемы (§16.2 — раскрыть ось/отклик, подвинуть "
                      "границы)"):
         st.caption(
-            "Живой проект меняется: раскрыть объявленную процесс-ось/компонент, "
-            "ввести новый отклик, подвинуть границы области. Миграция старых точек "
-            "— по ЯВНОЙ политике (A0.6). База не урезается (И-1); версия растёт.")
+            "Живой проект меняется ЗДЕСЬ, а не пересборкой: добавить компонент "
+            "или процесс-ось (в том числе СОВСЕМ новые, iter94), ввести отклик, "
+            "подвинуть границы, выключить компонент из поиска. Миграция старых "
+            "точек — по ЯВНОЙ политике (A0.6); база не урезается (И-1), версия "
+            "растёт. Пересборка в форме «🆕 Новый проект» — другое действие: она "
+            "создаёт проект с ПУСТОЙ базой.")
 
-        # --- раскрыть процесс-переменную (known_constant baseline) ---
-        st.markdown("**➕ Раскрыть процесс-переменную** (из полной схемы)")
-        if hidden_proc:
-            pc = st.columns([2, 2, 2])
-            pv = pc[0].selectbox("переменная", hidden_proc, key="camp_ev_proc")
-            pconst = pc[1].number_input("константа у старых точек (миграция)",
-                                        value=0.0, step=0.1, key="camp_ev_proc_c")
-            if pc[2].button("➕ Добавить процесс-ось", key="camp_ev_proc_btn"):
-                try:
-                    ctrl.add_process_var(pv, known_constant(float(pconst)))
-                    st.success(f"Процесс-ось «{pv}» раскрыта (миграция "
-                               f"known_constant={pconst}); версия схемы поднята.")
-                except (ValueError, KeyError, RuntimeError) as exc:
-                    st.error(str(exc))
-        else:
-            st.caption("Все объявленные процесс-оси уже в схеме.")
+        # --- добавить процесс-ось: объявленную ИЛИ СОВСЕМ НОВУЮ (iter94) ---
+        st.markdown("**➕ Добавить процесс-ось** (объявленную или новую)")
+        st.caption(
+            "Имя из списка — раскрытие объявленной оси (границы берутся из "
+            "полной схемы). Новое имя — ось ОБЪЯВЛЯЕТСЯ в проекте, и тогда "
+            "нужны её границы в реальных единицах: их называет технолог, "
+            "система диапазон железа не выдумывает. База опытов в обоих "
+            "случаях ЦЕЛА (И-1).")
+        pc = st.columns([2, 2, 2, 2])
+        pv = pc[0].text_input("имя оси", value=(hidden_proc[0] if hidden_proc
+                                                else ""),
+                              key="camp_ev_proc",
+                              help=f"объявлены, но не в игре: {hidden_proc}"
+                                   if hidden_proc else
+                                   "все объявленные оси уже в игре — "
+                                   "введите новое имя")
+        pconst = pc[1].number_input("значение у старых точек (миграция)",
+                                    value=0.0, step=0.1, key="camp_ev_proc_c",
+                                    help="Реальные единицы: при каком значении "
+                                         "этой оси фактически мерились уже "
+                                         "снятые точки (A0.6 — молчаливой "
+                                         "миграции нет).")
+        p_lo = pc[2].number_input("нижняя (для НОВОЙ оси)", value=0.0,
+                                  step=1.0, key="camp_ev_proc_lo")
+        p_hi = pc[3].number_input("верхняя (для НОВОЙ оси)", value=0.0,
+                                  step=1.0, key="camp_ev_proc_hi")
+        if st.button("➕ Добавить процесс-ось", key="camp_ev_proc_btn"):
+            try:
+                nm = str(pv).strip()
+                if not nm:
+                    raise ValueError("Задайте имя процесс-оси.")
+                known = nm in set(full_proc)
+                ctrl.add_process_var(
+                    nm, known_constant(float(pconst)),
+                    lower=None if known else float(p_lo),
+                    upper=None if known else float(p_hi))
+                st.success(
+                    (f"Ось «{nm}» раскрыта" if known
+                     else f"Ось «{nm}» ОБЪЯВЛЕНА и введена в игру "
+                          f"[{p_lo:g}; {p_hi:g}]")
+                    + f" (миграция known_constant={pconst:g}); версия схемы "
+                      f"поднята, база опытов цела.")
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
 
-        # --- раскрыть компонент смеси (Σ-совместимо: known_constant(0)) ---
-        st.markdown("**➕ Раскрыть компонент смеси** (грань симплекса C=0)")
-        if hidden_mix:
-            mc = st.columns([3, 2])
-            mv = mc[0].selectbox("компонент", hidden_mix, key="camp_ev_mix")
-            if mc[1].button("➕ Добавить компонент", key="camp_ev_mix_btn"):
-                try:
-                    ctrl.add_mixture_component(mv)
-                    st.success(f"Компонент «{mv}» раскрыт (миграция "
-                               "known_constant(0.0), грань симплекса); версия "
-                               "поднята.")
-                except (ValueError, KeyError, RuntimeError) as exc:
-                    st.error(str(exc))
-        else:
-            st.caption("Все объявленные компоненты смеси уже в схеме.")
+        # --- добавить компонент смеси: объявленный ИЛИ НОВЫЙ (iter94) ---
+        st.markdown("**➕ Добавить компонент смеси** (грань симплекса C=0)")
+        st.caption(
+            "Новый компонент дописывается в КОНЕЦ состава; старые точки "
+            "мигрируют на грань симплекса C=0 — единственное значение, при "
+            "котором Σ сходится (A+B+0 = A+B). Измеренные опыты сохраняются.")
+        mc = st.columns([3, 2, 2, 2])
+        mv = mc[0].text_input("имя компонента",
+                              value=(hidden_mix[0] if hidden_mix else ""),
+                              key="camp_ev_mix",
+                              help=f"объявлены, но не в игре: {hidden_mix}"
+                                   if hidden_mix else
+                                   "все объявленные компоненты уже в игре — "
+                                   "введите новое имя")
+        m_lo = mc[1].number_input("нижняя доля", value=0.0, step=0.01,
+                                  key="camp_ev_mix_lo")
+        m_hi = mc[2].number_input("верхняя доля", value=1.0, step=0.01,
+                                  key="camp_ev_mix_hi")
+        if mc[3].button("➕ Добавить компонент", key="camp_ev_mix_btn"):
+            try:
+                nm = str(mv).strip()
+                if not nm:
+                    raise ValueError("Задайте имя компонента.")
+                known = nm in set(full_mix)
+                ctrl.add_mixture_component(
+                    nm, lower=None if known else float(m_lo),
+                    upper=None if known else float(m_hi))
+                st.success(
+                    (f"Компонент «{nm}» раскрыт" if known
+                     else f"Компонент «{nm}» ОБЪЯВЛЕН и введён в состав "
+                          f"[{m_lo:g}; {m_hi:g}]")
+                    + " (миграция known_constant(0.0), грань симплекса); "
+                      "версия поднята, база опытов цела.")
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
 
         # --- ввести новый отклик ---
         st.markdown("**➕ Ввести новый отклик** (у старых точек Y=MISSING)")
@@ -5614,6 +5665,30 @@ def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
                                    key="camp_ev_bound_hi")
         mv_intent = bc[3].selectbox("намерение", ["relax", "restrict"],
                                     key="camp_ev_bound_intent")
+        # iter94: «убрать компонент» — это ДЕАКТИВАЦИЯ, а не удаление из схемы.
+        # Удаление обесценило бы базу: migrate_point для удалённого компонента
+        # возвращает None, то есть каждая старая точка стала бы негодной.
+        st.caption(
+            "«Выключить из поиска» = зажать ось в точку: компонент/режим "
+            "перестаёт варьироваться в планах и не получает влияния в анализе, "
+            "но измеренные точки ОСТАЮТСЯ в истории и вернутся в работу при "
+            "обратном расширении границ. Удаления из схемы нет намеренно — оно "
+            "сделало бы негодной каждую снятую точку.")
+        dz = st.columns([3, 2, 3])
+        off_val = dz[0].number_input(
+            "значение, на котором фиксируем", value=0.0, step=0.01,
+            key="camp_ev_off_val",
+            help="Для компонента смеси — 0 (грань симплекса). Для процесс-оси — "
+                 "рабочее значение в реальных единицах.")
+        if dz[1].button("⏸ Выключить из поиска", key="camp_ev_off_btn"):
+            try:
+                ctrl.deactivate_variable(mv_ax, value=float(off_val))
+                st.success(
+                    f"«{mv_ax}» выключен(а) из поиска: зафиксирован(а) на "
+                    f"{off_val:g}. Версия схемы не менялась (region-move), "
+                    f"история опытов цела — вернуть можно движением границ.")
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
         if st.button("↔ Применить движение границ", key="camp_ev_bound_btn"):
             try:
                 if mv_intent == "relax":

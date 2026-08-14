@@ -32,7 +32,7 @@ A0.6: модуль НИЧЕГО не меняет — он только ЧИТА
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -1203,6 +1203,24 @@ class CampaignController:
                 f"молчаливой миграции нет.")
         return dict(migration)
 
+    def _declare_or_refuse(self, name: str, *, kind: str,
+                           declared: Sequence[str], **decl: Any) -> None:
+        """Объявить новую переменную в полной схеме ИЛИ отказать по-старому.
+
+        iter94: состав проекта перестал быть приговором конструктора — новое имя
+        дописывается в ПОЛНУЮ схему (``runner.declare_variables``) и дальше
+        раскрывается штатным ``augment_phase_*``. Но у кампании с СИНТЕТИЧЕСКОЙ
+        истиной (оракул со своей схемой) измерить новую переменную нечем, и там
+        сохраняется прежний ``KeyError``: отказ по существу, а не молча неверные
+        отклики.
+        """
+        try:
+            self.runner.declare_variables(**decl)
+        except ValueError as exc:
+            raise KeyError(
+                f"{kind} '{name}' не объявлен(а) в проекте {list(declared)} и "
+                f"объявить нельзя: {exc}") from exc
+
     def add_process_var(self, name: str, migration: Dict[str, Any], *,
                         lower: Optional[float] = None,
                         upper: Optional[float] = None) -> Any:
@@ -1216,9 +1234,22 @@ class CampaignController:
         proc = (list(self.runner._full_proc.names)
                 if getattr(self.runner, "_full_proc", None) else [])
         if name not in proc:
-            raise KeyError(
-                f"process-переменная '{name}' не объявлена в полной схеме {proc} "
-                f"— фасад раскрывает объявленные оси (append новой вне ядра, §16.6).")
+            # iter94: ось, не объявленную при рождении проекта, СНАЧАЛА объявляем
+            # в полной схеме, а потом раскрываем штатным путём. Прежде здесь был
+            # отказ, и единственным способом добавить ось оставалась пересборка
+            # проекта — то есть потеря измеренной базы (нарушение И-1).
+            if lower is None or upper is None:
+                # KeyError (а не ValueError) — прежний контракт «такого имени в
+                # проекте нет»: у объявленной оси границы берутся из полной
+                # схемы, у НОВОЙ их взять негде, и выдумывать диапазон железа за
+                # технолога нельзя.
+                raise KeyError(
+                    f"Ось '{name}' в проекте не объявлена ({proc}): чтобы ввести "
+                    f"НОВУЮ ось, передайте её границы в реальных единицах "
+                    f"(lower/upper) — диапазон железа называет технолог.")
+            self._declare_or_refuse(name, kind="ось", declared=proc,
+                                    process=[(name, float(lower), float(upper))])
+            proc = list(self.runner._full_proc.names)
         mig = self._require_migration_policy(name, migration)
         bounds = ({name: (float(lower), float(upper))}
                   if lower is not None and upper is not None else None)
@@ -1242,10 +1273,17 @@ class CampaignController:
         mix = (list(self.runner._full_mix.names)
                if getattr(self.runner, "_full_mix", None) else [])
         if name not in mix:
-            raise KeyError(
-                f"mixture-компонент '{name}' не объявлен в полной схеме {mix} — "
-                f"фасад раскрывает объявленные компоненты (append нового вне ядра, "
-                f"§16.6).")
+            # iter94: компонент, не объявленный при рождении проекта, СНАЧАЛА
+            # объявляем в полной схеме (append в КОНЕЦ — то же правило, что у
+            # migrate_point), а потом раскрываем штатным augment. Прежде здесь
+            # был отказ, и добавить компонент можно было только пересборкой
+            # проекта, то есть потеряв измеренную базу (нарушение И-1).
+            self._declare_or_refuse(
+                name, kind="компонент", declared=mix,
+                mixture=[(name,
+                          0.0 if lower is None else float(lower),
+                          1.0 if upper is None else float(upper))])
+            mix = list(self.runner._full_mix.names)
         if migration is None:
             mig = known_constant(0.0)
         else:
@@ -1280,6 +1318,30 @@ class CampaignController:
         r.current_schema_version = int(new.version)
         self._undo.clear()
         return new
+
+    def deactivate_variable(self, var: str, *, value: float = 0.0,
+                            **kw) -> Any:
+        """iter94: ВЫКЛЮЧИТЬ переменную из поиска, не удаляя её из схемы.
+
+        Решение по существу вместо «удаления»: удалить компонент из схемы нельзя
+        физически — ``migrate_point`` возвращает для удалённого компонента
+        ``None``, то есть КАЖДАЯ старая точка стала бы негодной и измеренная база
+        обесценилась бы. Поэтому «убрать компонент» выражается зажимом области в
+        точку ``[value, value]`` (для компонента ``value=0`` — грань симплекса):
+
+          * кандидаты плана перестают его варьировать (он больше не ось поиска);
+          * анализ откликов не приписывает ему влияния — столбец константен;
+          * общая база ЦЕЛА (И-1), точки вне новой области лишь исключаются из
+            активного pool и ВОССТАНАВЛИВАЮТСЯ обратным расширением (§15.0.3.3).
+
+        Это region-move: версия схемы НЕ растёт. Обратная операция — обычный
+        :meth:`relax_bounds` с прежними границами.
+        """
+        kw.setdefault("intent", "deactivate")
+        v = float(value)
+        out = self.runner.move_region({var: (v, v)}, **kw)
+        self._undo.clear()
+        return out
 
     def relax_bounds(self, var: str, lower: float, upper: float,
                      **kw) -> Any:

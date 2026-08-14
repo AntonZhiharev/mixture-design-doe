@@ -702,6 +702,99 @@ def has_project(ctx: ToolContext) -> bool:
     return ctx.runner is not None
 
 
+#: Стадии проекта (iter94). Определяют, КАК применяется правка, а не «можно ли».
+STAGE_DRAFT = "draft"        #: движка нет — данные живут в полях формы
+STAGE_EMPTY = "empty"        #: проект собран, база пуста и веток нет
+STAGE_LIVE = "live"          #: есть измеренные точки и/или ветки
+
+
+def project_stage(ctx: ToolContext) -> Dict[str, Any]:
+    """Стадия проекта: ``draft`` / ``empty`` / ``live`` + чем она обоснована.
+
+    iter94: прежде правка полей формы запрещалась по слепому признаку «движок
+    есть» — и отказ приходил даже проекту с ПУСТОЙ базой, где терять было нечего
+    (ровно тот живой случай: 0 точек, 0 веток). Стадия различает три состояния,
+    потому что цена правки в них разная:
+
+    * ``draft`` — движка нет: правка полей формы ничего не рушит;
+    * ``empty`` — проект собран, но не измерен: пересборка стоит ноль опытов, а
+      живые операции схемы применимы;
+    * ``live`` — есть измеренные точки и/или ветки: пересборка стоит базы,
+      поэтому правка обязана идти операциями, сохраняющими историю (И-1).
+    """
+    runner = ctx.runner
+    if runner is None:
+        return {"stage": STAGE_DRAFT, "n_points": 0, "n_branches": 0,
+                "why": "Движка в сессии нет: данные проекта — значения полей "
+                       "формы «🆕 Новый проект»."}
+    n_points = int(len(getattr(runner, "points", []) or []))
+    n_branches = int(len(getattr(runner, "branches", {}) or {}))
+    if n_points == 0 and n_branches == 0:
+        return {"stage": STAGE_EMPTY, "n_points": 0, "n_branches": 0,
+                "why": "Проект собран, но НЕ измерен (0 точек, 0 веток): "
+                       "терять при правке нечего."}
+    return {"stage": STAGE_LIVE, "n_points": n_points, "n_branches": n_branches,
+            "why": f"Проект живой: {n_points} измеренных точек, "
+                   f"{n_branches} веток — пересборка обесценила бы их."}
+
+
+#: Пути применения правки поля формы (iter94).
+ROUTE_FORM = "form"          #: значение ложится в поле формы (сборка — за человеком)
+ROUTE_LIVE = "live"          #: у собранного проекта есть штатный сеттер/операция
+ROUTE_REBUILD = "rebuild"    #: только пересборка: живых операций нет
+
+#: Поля формы, для которых у СОБРАННОГО проекта есть живой путь без пересборки —
+#: имя поля → чем оно применяется в движке. Источник карты — штатные сеттеры
+#: (:mod:`apps.mixture_process_runner`) и фасад (:class:`apps.campaign.
+#: CampaignController`); список сверяется тестом, чтобы не разъехаться с ядром.
+SETUP_LIVE_ROUTES: Dict[str, str] = {
+    "setup_process_levels": "runner.set_process_levels",
+    "setup_process_links": "runner.set_process_links",
+    "setup_covariates": "runner.set_covariate_names",
+    "setup_preflight_pairs": "runner.set_preflight_pairs",
+    "setup_pass_weigh_step": "runner.set_weighing_resolution",
+    "setup_pass_weigh_gpp": "runner.set_weighing_resolution",
+    "setup_campaign_label": "runner.set_campaign_label",
+    "setup_material_lots": "runner.set_material_lots",
+    "setup_anchor_recipes": "runner.set_anchor_recipes",
+    "setup_groups": "runner.set_mixture_sampling_groups",
+    "setup_phr_json": "runner.set_phr_spec (propose_patch / propose_spec)",
+    "setup_econ_on": "runner.set_project_economics",
+    "setup_econ_rho": "runner.set_project_economics",
+    "setup_econ_prices": "ctrl.set_project_prices (панель «📋 Настройки проекта»)",
+    "setup_econ_cur": "runner.set_project_economics",
+    "setup_econ_mass": "runner.set_project_economics",
+    "setup_econ_rho_unit": "runner.set_project_economics",
+    "setup_econ_rho_role": "runner.set_project_economics",
+    "setup_mix": "ctrl.add_mixture_component / deactivate_variable",
+    "setup_proc": "ctrl.add_process_var / deactivate_variable",
+    "setup_resp": "ctrl.add_response (у старых точек Y=MISSING)",
+}
+
+
+def setup_field_route(key: str, stage: str) -> Dict[str, str]:
+    """Каким путём применяется правка поля ``key`` на стадии ``stage``.
+
+    iter94: ответ «нельзя» заменён ответом «вот так». До сборки любое поле —
+    черновик (``form``). У собранного проекта поле либо имеет живую операцию,
+    сохраняющую базу (``live``), либо требует пересборки (``rebuild``) — и тогда
+    цена названа вслух, а не спрятана за отказом.
+    """
+    k = str(key)
+    if stage == STAGE_DRAFT:
+        return {"route": ROUTE_FORM,
+                "how": "Значение ляжет в поле формы «🆕 Новый проект»; проект "
+                       "соберёт человек кнопкой «🏗 Построить проект»."}
+    live = SETUP_LIVE_ROUTES.get(k)
+    if live:
+        return {"route": ROUTE_LIVE, "how": live}
+    return {"route": ROUTE_REBUILD,
+            "how": ("Живой операции для этого поля в движке нет: значение "
+                    "применится только при пересборке проекта из формы. При "
+                    "пустой базе это бесплатно; при измеренной — стоит всех "
+                    "снятых опытов, поэтому решает человек.")}
+
+
 @register(
     "get_setup_fields",
     description=(
@@ -720,14 +813,31 @@ def get_setup_fields(ctx: ToolContext) -> Dict[str, Any]:
     ошибка: MCP-сервер и демо работают без формы.
     """
     fields = dict((ctx.extra or {}).get("setup_fields") or {})
+    stage_info = project_stage(ctx)
+    stage = str(stage_info["stage"])
     out: Dict[str, Any] = {
         "n": len(fields), "fields": _f(fields),
         "project_present": has_project(ctx),
+        "stage": stage, "stage_why": stage_info["why"],
+        "n_points": stage_info["n_points"],
+        "n_branches": stage_info["n_branches"],
+        # iter94: по КАЖДОМУ заполненному полю — каким путём поедет правка.
+        # Раньше ответ был один на всех («проект собран — нельзя»), и модель не
+        # могла отличить поле с живым сеттером от поля, требующего пересборки.
+        "routes": {k: setup_field_route(k, stage) for k in fields},
     }
-    if has_project(ctx):
-        out["note"] = ("Проект уже СОБРАН: поля формы — лишь черновик "
-                       "пересборки, состояние движка смотри в "
-                       "campaign_overview/get_spec.")
+    if stage == STAGE_LIVE:
+        out["note"] = (
+            f"Проект ЖИВОЙ ({stage_info['n_points']} точек, "
+            f"{stage_info['n_branches']} веток). Правку предлагай по 'routes': "
+            f"route='live' — применяется штатной операцией движка, база цела; "
+            f"route='rebuild' — только пересборкой, а она обесценит измеренные "
+            f"опыты. Состояние движка — campaign_overview/get_spec.")
+    elif stage == STAGE_EMPTY:
+        out["note"] = ("Проект собран, но НЕ измерен (0 точек, 0 веток): поля "
+                       "формы — черновик пересборки, и пересборка сейчас "
+                       "бесплатна. Точечную правку полей предлагай обычным "
+                       "propose_setup_fields.")
     elif not fields:
         out["note"] = ("Форма пуста или снимок недоступен (вызов вне UI). "
                        "Если проекта нет и полей нет — это первичный ввод: "

@@ -45,9 +45,14 @@ from typing import Any, Callable, Dict, List, Optional
 #: ``apply_setup`` (iter76) — применение ТОЧЕЧНОЙ ПРАВКИ ПОЛЕЙ формы сетапа
 #: несобранного проекта: до сборки данные живут в полях формы, и согласие на
 #: пакет проекта целиком не есть согласие на правку отдельного поля.
+#: ``apply_note`` / ``reject_note`` (iter96) — фиксация ПРЕДЛОЖЕННОЙ записи
+#: журнала (решение компании или L1-факт) и отказ от неё. Отдельно от
+#: ``record_decision``/``add_local_fact``, которыми пишет РУЧНАЯ форма: там
+#: цель подтверждения — текст, набранный человеком, здесь — идентификатор
+#: предложения помощника, поля которого человек мог поправить перед записью.
 ACTIONS = ("apply_patch", "reject_patch", "record_decision", "add_local_fact",
            "apply_spec", "reject_spec", "apply_project", "reject_project",
-           "apply_setup", "reject_setup")
+           "apply_setup", "reject_setup", "apply_note", "reject_note")
 
 #: Срок жизни подтверждения по умолчанию, сек.
 DEFAULT_TTL_S = 600.0

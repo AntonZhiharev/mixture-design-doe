@@ -22,7 +22,8 @@ from __future__ import annotations
 
 from .consent import Consent, ConsentError, ConsentRegistry, issue_token
 from .session import (Artifact, Attachment, AssistantSession, Message,
-                      StagedPatch, StagedProject, StagedSpec, ToolCall)
+                      StagedNote, StagedPatch, StagedProject, StagedSpec,
+                      ToolCall)
 from .store import (append_log, append_log_by_ref, assistant_dir,
                     assistant_dir_by_ref, artifacts_dir, dir_for_ref,
                     files_dir, load_session, load_session_by_ref, read_log,
@@ -31,7 +32,7 @@ from .store import (append_log, append_log_by_ref, assistant_dir,
 
 __all__ = [
     "AssistantSession", "Message", "Attachment", "Artifact", "StagedPatch",
-    "StagedSpec", "StagedProject", "ToolCall",
+    "StagedSpec", "StagedProject", "StagedNote", "ToolCall",
     "assistant_dir", "files_dir", "artifacts_dir", "session_path",
     "save_session", "load_session", "append_log", "read_log",
     # iter77: доступ по ССЫЛКЕ проекта (переименование не рвёт переписку)

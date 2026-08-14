@@ -69,7 +69,7 @@ from src.apps import workspace as wsx
 from src.assistant import config as ai_config
 from src.assistant import context as actx
 from src.assistant import files as afiles
-from src.assistant import llm, store, views
+from src.assistant import llm, session as asess, store, views
 from src.assistant import turn_job as tj
 from src.assistant.consent import ConsentRegistry
 from src.assistant.context import UiFocus
@@ -1055,6 +1055,122 @@ def _render_local_facts(ctx: ToolContext, root: str, project: str) -> None:
                                    + str(rec.get("note", "проект не выбран")))
 
 
+def _note_fields_form(ctx: ToolContext, note) -> Dict[str, Any]:
+    """Поля предложенной записи как ВИДЖЕТЫ: человек правит их до фиксации.
+
+    Виджеты рисуются по виду записи (``session.NOTE_FIELDS``), значения по
+    умолчанию — то, что предложил помощник. Возвращается словарь «поле →
+    значение из формы»: он и уходит в ``apply_note``, поэтому в журнал попадает
+    именно то, что человек видел на экране.
+    """
+    src = dict(note.fields or {})
+    out: Dict[str, Any] = {}
+    if note.kind == asess.NOTE_DECISION:
+        out["title"] = st.text_input(
+            "Решение одной строкой", value=str(src.get("title", "") or ""),
+            key=f"dock_note_title_{note.id}")
+        out["rationale"] = st.text_area(
+            "Почему так решили", value=str(src.get("rationale", "") or ""),
+            height=80, key=f"dock_note_why_{note.id}")
+        # Узлы предложения могут не входить в текущую спеку (её могло не быть
+        # вовсе) — тогда multiselect с таким значением по умолчанию упал бы.
+        proposed = [str(v) for v in (src.get("nodes") or [])]
+        options = list(dict.fromkeys(node_names(ctx) + proposed))
+        out["nodes"] = st.multiselect(
+            "Каких компонентов касается", options=options, default=proposed,
+            key=f"dock_note_nodes_{note.id}")
+        out["author"] = st.text_input(
+            "Кто решил", value=str(src.get("author", "") or ""),
+            key=f"dock_note_author_{note.id}",
+            placeholder="фамилия или роль")
+    else:
+        out["statement"] = st.text_area(
+            "Сам факт одной фразой", value=str(src.get("statement", "") or ""),
+            height=80, key=f"dock_note_stmt_{note.id}")
+        out["scope"] = st.text_input(
+            "К чему относится", value=str(src.get("scope", "") or ""),
+            key=f"dock_note_scope_{note.id}")
+        out["source"] = st.text_input(
+            "Откуда известно", value=str(src.get("source", "") or ""),
+            key=f"dock_note_src_{note.id}",
+            placeholder="кто сказал / протокол / номер опыта")
+        out["author"] = st.text_input(
+            "Кто утверждает", value=str(src.get("author", "") or ""),
+            key=f"dock_note_author_{note.id}",
+            placeholder="фамилия или роль")
+    return out
+
+
+def _render_note_proposals(ctx: ToolContext, session) -> None:
+    """Панель ПРЕДЛОЖЕННЫХ ЗАПИСЕЙ в журналы проекта (iter96).
+
+    Закрывает разрыв, оставшийся после iter80: инструменты записи есть, кнопки
+    ручного ввода есть, а предложение помощника доходило до журнала только
+    текстом в ответе — формулировку из «## OPEN_QUESTIONS» человек переносил в
+    поля посимвольно. На живой ПВХ-сессии это регулярно не делалось: решение
+    обсудили, а журнал остался пустым.
+
+    Устройство панели повторяет уже принятый в проекте контур утверждения
+    (пакеты спеки/проекта, правки полей формы): помощник кладёт предложение в
+    стейдж (``propose_decision`` / ``propose_fact``), человек ВИДИТ и ПРАВИТ
+    поля и фиксирует кнопкой. Отличие одно и существенное: поля здесь
+    редактируемые, потому что запись идёт от имени человека — он подписывает
+    формулировку, а не одобряет чужую.
+
+    Поля собраны в ``st.form`` (iter95): правка текста не перезапускает скрипт,
+    полный прогон один — на нажатой кнопке.
+    """
+    staged = session.staged_notes()
+    st.markdown(f"**📝 Предложенные записи в журналы: {len(staged)}**")
+    st.caption(views.staged_notes_caption(session))
+    if not staged:
+        return
+    for note in staged:
+        head = (f"`{note.id}` · {views.note_kind_label(note.kind)}"
+                + (f" · {note.label}" if note.label else ""))
+        st.caption(head + (f" · зачем сейчас: {note.why_now}"
+                           if note.why_now else ""))
+        with st.form(f"dock_note_form_{note.id}", border=True):
+            fields = _note_fields_form(ctx, note)
+            reason = st.text_input(
+                "Причина отказа (нужна только для «Отклонить»)",
+                key=f"dock_note_reason_{note.id}",
+                placeholder="почему не записываем")
+            cols = st.columns(2)
+            with cols[0]:
+                save = st.form_submit_button(
+                    views.note_button(note.kind),
+                    help="Запись уйдёт в журнал проекта С ВАШЕЙ правкой полей")
+            with cols[1]:
+                drop = st.form_submit_button("⛔ Отклонить запись")
+        if save:
+            try:
+                out = actx.human_apply_note(ctx, note.id, fields=fields,
+                                            author="человек (UI)")
+            except ToolError as exc:
+                st.error(str(exc))
+            else:
+                actx.persist_session(ctx)
+                st.success(views.note_apply_caption(out))
+                if out.get("note"):
+                    st.info(out["note"])
+                st.rerun()
+        elif drop:
+            if not reason.strip():
+                st.error("Отказ тоже идёт в журнал решений — назовите причину.")
+            else:
+                try:
+                    actx.human_reject_note(ctx, note.id, reason.strip(),
+                                           author="человек (UI)")
+                except ToolError as exc:
+                    st.error(str(exc))
+                else:
+                    actx.persist_session(ctx)
+                    st.success("Запись отклонена, отказ занесён в журнал "
+                               "решений.")
+                    st.rerun()
+
+
 def _render_artifacts(session) -> None:
     """Графики и таблицы прогонов ЭТОГО проекта (живут после перезапуска)."""
     shown = views.artifact_outputs(session)
@@ -1220,6 +1336,11 @@ def render_assistant_info(runner: Any = None, *, root: str = "") -> None:
     # Журнал — ПОСЛЕ файлов и ПЕРЕД состоянием переписки: это история проекта,
     # а не служебное состояние сеанса. Нужен он на любой закладке, поэтому
     # живёт в постоянной правой зоне, а не под лентой диалога (iter72).
+    # iter96: ПРЕДЛОЖЕННЫЕ записи — прямо над журналами, в которые они лягут.
+    # Панель стоит здесь, а не в левой зоне утверждений, намеренно: человек
+    # правит формулировку, глядя на историю рядом («это уже записано»), а
+    # предложение относится к журналам проекта, а не к геометрии.
+    _render_note_proposals(ctx, session)
     _render_decisions(ctx, root, project)
     _render_local_facts(ctx, root, project)
 

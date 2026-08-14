@@ -902,6 +902,50 @@ def human_add_local_fact(ctx: Any, statement: str, *, scope: str = "",
                     allowed_kinds=[WRITE])
 
 
+def human_apply_note(ctx: Any, note_id: str, *,
+                     fields: Optional[Dict[str, Any]] = None,
+                     author: str = "", note: str = "",
+                     ttl_s: Optional[float] = None) -> Dict[str, Any]:
+    """Зафиксировать ПРЕДЛОЖЕННУЮ запись журнала от имени человека (iter96).
+
+    Закрывает разрыв, который остался после iter80: инструменты записи есть, но
+    предложение помощника доходило до журнала только в виде текста в ответе —
+    формулировку человек переносил в поля руками. Теперь запись живёт в стейдже,
+    ``fields`` несёт ПРАВКУ человека (то, что он видел на экране), и в журнал
+    попадает именно она.
+
+    Автором записи остаётся человек: модели класс ``write`` не выдан (iter63), а
+    ``propose_decision``/``propose_fact`` кладут предложение и не более того.
+    """
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_apply_note_token
+
+    token = issue_apply_note_token(ctx, note_id, ttl_s=ttl_s, note=note)
+    args: Dict[str, Any] = {"note_id": note_id, "human_token": token,
+                            "author": author}
+    if fields:
+        args["fields"] = dict(fields)
+    return dispatch(ctx, "apply_note", args, allowed_kinds=[WRITE])
+
+
+def human_reject_note(ctx: Any, note_id: str, reason: str, *,
+                      author: str = "", ttl_s: Optional[float] = None
+                      ) -> Dict[str, Any]:
+    """Отклонить предложенную запись журнала от имени человека (iter96).
+
+    Отказ тоже идёт в журнал решений: «мы обсуждали и решили НЕ записывать это
+    как факт цеха» — содержательная часть истории проекта.
+    """
+    from .tools import WRITE, dispatch
+    from .tools.write import issue_reject_note_token
+
+    token = issue_reject_note_token(ctx, note_id, ttl_s=ttl_s)
+    return dispatch(ctx, "reject_note",
+                    {"note_id": note_id, "human_token": token,
+                     "reason": reason, "author": author},
+                    allowed_kinds=[WRITE])
+
+
 def persist_session(ctx: Any) -> bool:
     """Сохранить сессию проекта на диск; вернуть, состоялась ли запись.
 

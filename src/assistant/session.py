@@ -511,6 +511,122 @@ class StagedSetup:
                    id=str(d.get("id", "")) or _new_id("setup"))
 
 
+#: Виды ПРЕДЛОЖЕННОЙ записи в журналы проекта (iter96).
+#: ``decision`` — решение компании (ADR, ``decision_log.jsonl``);
+#: ``fact`` — L1-факт производства (``local_facts.jsonl``).
+NOTE_DECISION = "decision"
+NOTE_FACT = "fact"
+NOTE_KINDS = (NOTE_DECISION, NOTE_FACT)
+
+#: Поля записи по виду: что человек видит и правит ДО фиксации. Порядок — тот
+#: же, что у формы в интерфейсе, и он же задаёт порядок колонок таблицы.
+NOTE_FIELDS = {
+    NOTE_DECISION: ("title", "rationale", "nodes", "author"),
+    NOTE_FACT: ("statement", "scope", "source", "author"),
+}
+
+#: Какие поля записи обязаны быть непустыми, иначе фиксировать нечего. Правило
+#: то же, что у ручной формы iter80: решение без обоснования в журнал не идёт —
+#: через полгода «почему» важнее «что».
+NOTE_REQUIRED = {
+    NOTE_DECISION: ("title", "rationale"),
+    NOTE_FACT: ("statement",),
+}
+
+#: Подпись кнопки фиксации по виду записи. Живёт ЗДЕСЬ, потому что её называют
+#: три места: интерфейс (рисует кнопку), результат инструмента (модель говорит
+#: «нажмите …») и системный промпт (карта экрана, iter74). Расхождение любого из
+#: них с остальными отправляет человека искать кнопку, которой нет.
+NOTE_BUTTON = {
+    NOTE_DECISION: "✅ Зафиксировать решение",
+    NOTE_FACT: "✅ Зафиксировать факт",
+}
+
+
+@dataclass
+class StagedNote:
+    """Предложенная ЗАПИСЬ В ЖУРНАЛ проекта: решение (ADR) или L1-факт (iter96).
+
+    Зачем стейдж, если инструменты записи (``record_decision`` /
+    ``add_local_fact``) существуют с iter63. Они относятся к классу ``write``,
+    то есть модели недоступны по построению, а человеку в iter80 дали форму в
+    правой инфо-панели. Из-за этого предложение помощника жило ТОЛЬКО текстом
+    ответа: формулировку из раздела ``## OPEN_QUESTIONS`` человек переносил в
+    поля руками, посимвольно, и на живой ПВХ-сессии это регулярно не делалось
+    вовсе — решение обсудили, а журнал остался пустым.
+
+    Здесь запись проходит тем же путём, что патч и пакет спеки: помощник
+    ПРЕДЛАГАЕТ (``propose_decision`` / ``propose_fact``), человек видит поля,
+    ПРАВИТ их и фиксирует кнопкой (разовый токен). Автором записи остаётся
+    человек — L1-факт, записанный моделью, отменял бы литературу от своего
+    имени (ASSISTANT_SPEC §370).
+
+    ``kind`` — вид записи (:data:`NOTE_KINDS`), ``fields`` — значения полей
+    (:data:`NOTE_FIELDS`) в том виде, в котором они лягут в журнал. Поля
+    хранятся отдельно от служебных ``rationale``/``level``/``source`` пакетов
+    намеренно: у записи журнала своя структура, и притворяться патчем ей не
+    нужно.
+    """
+    kind: str = NOTE_DECISION
+    fields: Dict[str, Any] = field(default_factory=dict)
+    label: str = ""
+    why_now: str = ""
+    level: str = ""
+    confidence: str = ""
+    status: str = PATCH_STAGED
+    applied_ts: str = ""
+    reason: str = ""
+    edited: bool = False
+    ts: str = field(default_factory=_now)
+    id: str = field(default_factory=lambda: _new_id("note"))
+
+    def field_names(self) -> List[str]:
+        """Поля своего вида — источник порядка для формы и таблицы."""
+        return list(NOTE_FIELDS.get(self.kind, ()))
+
+    def value(self, name: str) -> Any:
+        return self.fields.get(str(name))
+
+    def missing(self, fields: Optional[Dict[str, Any]] = None) -> List[str]:
+        """Обязательные поля, оставшиеся пустыми (проверка ПЕРЕД записью).
+
+        Проверяются как значения из стейджа, так и правка человека: кнопка
+        «зафиксировать» не должна писать в журнал запись, у которой нет ни
+        сути, ни обоснования.
+        """
+        src = dict(self.fields if fields is None else fields)
+        out: List[str] = []
+        for name in NOTE_REQUIRED.get(self.kind, ()):
+            val = src.get(name)
+            if val is None or not str(val).strip():
+                out.append(name)
+        return out
+
+    def to_state(self) -> Dict[str, Any]:
+        return {"id": self.id, "kind": self.kind, "fields": dict(self.fields),
+                "label": self.label, "why_now": self.why_now,
+                "level": self.level, "confidence": self.confidence,
+                "status": self.status, "applied_ts": self.applied_ts,
+                "reason": self.reason, "edited": bool(self.edited),
+                "ts": self.ts}
+
+    @classmethod
+    def from_state(cls, d: Dict[str, Any]) -> "StagedNote":
+        d = dict(d or {})
+        return cls(kind=str(d.get("kind", NOTE_DECISION)),
+                   fields=dict(d.get("fields", {}) or {}),
+                   label=str(d.get("label", "")),
+                   why_now=str(d.get("why_now", "")),
+                   level=str(d.get("level", "")),
+                   confidence=str(d.get("confidence", "")),
+                   status=str(d.get("status", PATCH_STAGED)),
+                   applied_ts=str(d.get("applied_ts", "")),
+                   reason=str(d.get("reason", "")),
+                   edited=bool(d.get("edited", False)),
+                   ts=str(d.get("ts", "")) or _now(),
+                   id=str(d.get("id", "")) or _new_id("note"))
+
+
 @dataclass
 class ToolCall:
     """Запись аудита вызова инструмента (дублируется в ``tool_calls.jsonl``)."""
@@ -571,6 +687,7 @@ class AssistantSession:
     specs: List[StagedSpec] = field(default_factory=list)
     projects: List[StagedProject] = field(default_factory=list)
     setups: List[StagedSetup] = field(default_factory=list)
+    notes: List[StagedNote] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
 
@@ -897,6 +1014,61 @@ class AssistantSession:
     def staged_setups(self) -> List[StagedSetup]:
         return [s for s in self.setups if s.status == PATCH_STAGED]
 
+    # -- предложенные записи в журналы (iter96) -------------------------
+    def stage_note(self, note: StagedNote) -> StagedNote:
+        """Положить ПРЕДЛОЖЕННУЮ запись журнала в стейдж (фиксирует человек).
+
+        Вид записи проверяется здесь: неизвестный вид означал бы, что кнопка
+        человека не знает, в какой журнал писать. Обязательные поля тоже
+        проверяются до стейджа — предложение «запиши решение», у которого нет
+        ни сути, ни обоснования, только создавало бы видимость работы.
+        """
+        if note.kind not in NOTE_KINDS:
+            raise ValueError(
+                f"Неизвестный вид записи журнала {note.kind!r}: допустимы "
+                f"{NOTE_KINDS} ('decision' — решение компании, 'fact' — "
+                f"L1-факт производства).")
+        missing = note.missing()
+        if missing:
+            raise ValueError(
+                f"Запись вида '{note.kind}' без обязательных полей {missing} "
+                f"не принимается: фиксировать нечего.")
+        note.status = PATCH_STAGED
+        self.notes.append(note)
+        self.updated_at = _now()
+        return note
+
+    def note_by_id(self, note_id: str) -> Optional[StagedNote]:
+        for n in self.notes:
+            if n.id == note_id:
+                return n
+        return None
+
+    def set_note_status(self, note_id: str, status: str, *,
+                        reason: str = "") -> StagedNote:
+        """Перевести запись в терминальный статус (протокол патчей)."""
+        if status not in PATCH_STATUSES:
+            raise ValueError(f"Неизвестный статус записи журнала {status!r}: "
+                             f"допустимы {PATCH_STATUSES}.")
+        n = self.note_by_id(note_id)
+        if n is None:
+            raise KeyError(f"Предложенной записи '{note_id}' нет в сессии.")
+        if n.status != PATCH_STAGED:
+            raise ValueError(
+                f"Запись '{note_id}' уже в статусе '{n.status}' — повторный "
+                f"переход запрещён (в журнал она пишется один раз).")
+        n.status = status
+        n.reason = reason
+        n.applied_ts = _now()
+        self.updated_at = _now()
+        return n
+
+    def staged_notes(self, kind: str = "") -> List[StagedNote]:
+        """Записи, ожидающие решения человека (при желании — одного вида)."""
+        k = str(kind or "")
+        return [n for n in self.notes
+                if n.status == PATCH_STAGED and (not k or n.kind == k)]
+
     # -- аудит вызовов --------------------------------------------------
     def add_tool_call(self, call: ToolCall) -> ToolCall:
         self.tool_calls.append(call)
@@ -916,7 +1088,7 @@ class AssistantSession:
     def is_empty(self) -> bool:
         return not (self.messages or self.attachments or self.patches
                     or self.specs or self.projects or self.setups
-                    or self.artifacts or self.tool_calls)
+                    or self.notes or self.artifacts or self.tool_calls)
 
     def to_state(self) -> Dict[str, Any]:
         return {
@@ -934,6 +1106,7 @@ class AssistantSession:
             "specs": [s.to_state() for s in self.specs],
             "projects": [p.to_state() for p in self.projects],
             "setups": [s.to_state() for s in self.setups],
+            "notes": [n.to_state() for n in self.notes],
             # iter77: ССЫЛКА на проект пишется, только когда она есть, —
             # иначе сессии, записанные до перехода на ссылку, изменили бы
             # состояние на диске от одного лишь чтения (round-trip должен
@@ -979,6 +1152,11 @@ class AssistantSession:
         # iter76: правки полей формы сетапа — тот же принцип совместимости.
         s.setups = [StagedSetup.from_state(d) for d in
                     (state.get("setups", []) or [])]
+        # iter96: предложенные записи журналов — тот же принцип совместимости:
+        # сессии, записанные до этого шага, ключа 'notes' не имеют и должны
+        # открываться без ошибки (иначе шаг стоил бы человеку переписки).
+        s.notes = [StagedNote.from_state(d) for d in
+                   (state.get("notes", []) or [])]
         s.tool_calls = [ToolCall.from_state(d) for d in
                         (state.get("tool_calls", []) or [])]
         return s

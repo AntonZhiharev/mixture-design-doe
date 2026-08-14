@@ -15,8 +15,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pandas as pd
 
-from .session import (AssistantSession, CHARS_PER_TOKEN, PATCH_APPLIED,
-                      PATCH_REJECTED, PATCH_STAGED, estimate_tokens)
+from .session import (AssistantSession, CHARS_PER_TOKEN, NOTE_BUTTON,
+                      NOTE_DECISION, NOTE_FACT, PATCH_APPLIED, PATCH_REJECTED,
+                      PATCH_STAGED, estimate_tokens)
 
 #: Сколько символов сообщения показывать в таблице ленты (полный текст —
 #: в самом чате; таблица нужна для обзора, а не для чтения).
@@ -193,6 +194,99 @@ def staged_projects_dataframe(session: AssistantSession, *,
         "id", "метка", "компонентов", "откликов", "процесс-осей", "состав",
         "отклики", "оси", "ковариат", "хеш спеки", "знание", "статус",
         "обоснование"])
+
+
+#: iter96. Вид предложенной записи журнала на языке интерфейса.
+NOTE_KIND_LABEL: Dict[str, str] = {NOTE_DECISION: "решение (журнал решений)",
+                                   NOTE_FACT: "факт производства (L1)"}
+
+
+def note_kind_label(kind: Any) -> str:
+    """Вид предложенной записи словами; незнакомый — КАК ЕСТЬ (см. iter80)."""
+    key = str(kind or "").strip()
+    return NOTE_KIND_LABEL.get(key, key or "запись")
+
+
+def note_button(kind: Any) -> str:
+    """Подпись кнопки фиксации записи (источник — :mod:`.session`).
+
+    UI берёт подпись отсюда, чтобы текст кнопки, слова инструмента («нажмите
+    …») и карта экрана в промпте не разъезжались.
+    """
+    return NOTE_BUTTON.get(str(kind or "").strip(), "✅ Зафиксировать запись")
+
+
+def note_subject(note: Any) -> str:
+    """Суть предложенной записи одной строкой (заголовок или сам факт)."""
+    fields = dict(getattr(note, "fields", {}) or {})
+    return str(fields.get("title") or fields.get("statement") or "").strip()
+
+
+def staged_notes_dataframe(session: AssistantSession, *,
+                           only_staged: bool = False) -> pd.DataFrame:
+    """Предложенные ЗАПИСИ В ЖУРНАЛЫ: решение компании и L1-факт (iter96).
+
+    Отдельная таблица от патчей и пакетов: там предлагается ИЗМЕНЕНИЕ проекта,
+    здесь — ЗАПИСЬ В ИСТОРИЮ, и цена ошибки другая (неверная запись не портит
+    геометрию, но искажает основание будущих решений). Колонка «правил человек»
+    отвечает на вопрос ревизора: в журнал легла формулировка модели или та,
+    которую поправил технолог.
+    """
+    rows: List[Dict[str, Any]] = []
+    for n in session.notes:
+        if only_staged and n.status != PATCH_STAGED:
+            continue
+        fields = dict(n.fields or {})
+        rows.append({
+            "id": n.id,
+            "вид": note_kind_label(n.kind),
+            "суть": _short(note_subject(n), 70),
+            "обоснование": _short(fields.get("rationale")
+                                  or fields.get("source", ""), 70),
+            "область/узлы": _short(", ".join(fields.get("nodes", []))
+                                   if isinstance(fields.get("nodes"), list)
+                                   else fields.get("scope", ""), 40) or "—",
+            "кто": str(fields.get("author", "") or "—"),
+            "знание": n.level or "—",
+            "уверенность": n.confidence or "—",
+            "правил человек": "да" if n.edited else "нет",
+            "статус": _STATUS_LABEL.get(n.status, n.status),
+        })
+    return pd.DataFrame(rows, columns=["id", "вид", "суть", "обоснование",
+                                       "область/узлы", "кто", "знание",
+                                       "уверенность", "правил человек",
+                                       "статус"])
+
+
+def staged_notes_caption(session: AssistantSession) -> str:
+    """Подпись панели предложенных записей: сколько чего ждёт решения."""
+    staged = session.staged_notes()
+    if not staged:
+        return ("Пусто. Здесь появляются формулировки, которые помощник "
+                "предлагает записать в журнал решений или в факты "
+                "производства. Записывает их ЧЕЛОВЕК — поля можно поправить "
+                "перед фиксацией.")
+    dec = sum(1 for n in staged if n.kind == NOTE_DECISION)
+    fact = len(staged) - dec
+    return (f"ждут решения: {len(staged)} · решений: {dec} · "
+            f"фактов производства: {fact}")
+
+
+def note_apply_caption(result: Mapping[str, Any]) -> str:
+    """Итог фиксации записи словами: куда легло и правил ли человек поля."""
+    r = dict(result or {})
+    kind = str(r.get("kind", ""))
+    where = ("журнал решений" if kind == NOTE_DECISION
+             else "факты производства (L1)")
+    edited = list(r.get("edited_fields", []) or [])
+    rec = dict(r.get("decision") or r.get("fact") or r.get("record") or {})
+    parts = [f"Запись добавлена в {where}"]
+    if edited:
+        parts.append("с вашей правкой полей: " + ", ".join(edited))
+    if not rec.get("persisted", True):
+        parts.append("НО на диск не сохранена: "
+                     + str(rec.get("note", "проект не выбран")))
+    return ". ".join(parts) + "."
 
 
 def _unit_name(d: Mapping[str, Any]) -> str:
@@ -505,6 +599,12 @@ DECISION_KINDS: Dict[str, str] = {
     "apply_setup": "поля формы заполнены",
     "reject_setup": "правка полей отклонена",
     "decision": "решение человека",
+    # iter96: отказ от ПРЕДЛОЖЕННОЙ записи журнала. Принятая запись пишется
+    # видом самого журнала (`decision` / L1-факт), а отказ — событие истории:
+    # «обсудили и решили НЕ записывать» должно быть видно, иначе предложение
+    # молча исчезает из панели без следа.
+    "reject_decision_note": "запись решения отклонена",
+    "reject_fact_note": "запись факта отклонена",
 }
 
 

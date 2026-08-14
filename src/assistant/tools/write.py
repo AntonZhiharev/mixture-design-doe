@@ -35,7 +35,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from ..consent import DEFAULT_REGISTRY, ConsentError, ConsentRegistry
-from ..session import (PATCH_APPLIED, PATCH_REJECTED, StagedPatch,
+from ..session import (NOTE_BUTTON, NOTE_DECISION, NOTE_FACT, NOTE_FIELDS,
+                       PATCH_APPLIED, PATCH_REJECTED, StagedNote, StagedPatch,
                        StagedProject, StagedSetup, StagedSpec)
 from ..store import append_log
 from .readonly import (ROUTE_LIVE, ROUTE_REBUILD, STAGE_LIVE, _f, active_spec,
@@ -1213,6 +1214,284 @@ def add_local_fact(ctx: ToolContext, statement: str, human_token: str,
 
 
 # ----------------------------------------------------------------------
+# ПРЕДЛОЖЕННЫЕ записи журналов (iter96): предложить → человек правит и пишет
+# ----------------------------------------------------------------------
+#: Куда пишется запись каждого вида и как называется её объект в ответе.
+_NOTE_LOG = {NOTE_DECISION: "decisions", NOTE_FACT: "local_facts"}
+_NOTE_OUT_KEY = {NOTE_DECISION: "decision", NOTE_FACT: "fact"}
+
+def _note_text(value: Any) -> str:
+    return str(value if value is not None else "").strip()
+
+
+def _note_nodes(value: Any) -> List[str]:
+    """Узлы решения из строки или списка (модель присылает и то, и другое)."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def _stage_note(ctx: ToolContext, kind: str, fields: Dict[str, Any], *,
+                label: str, why_now: str, level: str,
+                confidence: str) -> Dict[str, Any]:
+    """Общая часть предложений журнала: стейдж + подсказка «что нажать».
+
+    Отказ возвращается РЕЗУЛЬТАТОМ (``staged=False``), а не исключением: модели
+    нужен разбор «чего не хватает», из которого она сделает следующий шаг, — то
+    же правило, что у :func:`propose_setup_fields`.
+    """
+    session = ctx.require_session()
+    note = StagedNote(kind=kind, fields=fields, label=_note_text(label),
+                      why_now=_note_text(why_now), level=_note_text(level),
+                      confidence=_note_text(confidence))
+    missing = note.missing()
+    if missing:
+        return {"staged": False, "ok": False,
+                "error": f"Не заполнены обязательные поля {missing}: запись "
+                         f"без них в журнал не пишется (через полгода «почему» "
+                         f"важнее «что»).",
+                "hint": "Предложение НЕ положено в стейдж."}
+    session.stage_note(note)
+    return {
+        "staged": True, "ok": True, "note_id": note.id, "kind": note.kind,
+        "fields": dict(note.fields),
+        "editable": list(NOTE_FIELDS.get(kind, ())),
+        "button": NOTE_BUTTON.get(kind, ""),
+        "note": (f"Запись НЕ сделана: она в стейдже (панель «📝 Предложенные "
+                 f"записи в журналы», правая инфо-панель). Человек может "
+                 f"ПОПРАВИТЬ любое поле и нажать «{NOTE_BUTTON.get(kind, '')}» "
+                 f"— автором записи остаётся он. Назови в ответе кнопку и то, "
+                 f"что именно предлагается записать."),
+    }
+
+
+@register(
+    "propose_decision",
+    description=(
+        "ПРЕДЛОЖИТЬ запись РЕШЕНИЯ КОМПАНИИ (ADR) в журнал проекта: что "
+        "решили, почему, каких узлов касается. Запись НЕ делается — она "
+        "кладётся в стейдж, человек правит поля и фиксирует кнопкой "
+        "«✅ Зафиксировать решение» (автор записи — он). Пользуйся этим вместо "
+        "того, чтобы просить перенести формулировку в поля руками: так "
+        "договорённость не теряется между ходами. Заголовок — одной строкой по "
+        "делу, обоснование — на чём основано (L1-факт цеха, паспорт, расчёт, "
+        "протокол)."),
+    parameters={"type": "object", "properties": {
+        "title": {"type": "string",
+                  "description": "суть решения одной строкой"},
+        "rationale": {"type": "string",
+                      "description": "почему так решили: на чём основано"},
+        "nodes": {"type": "array", "items": {"type": "string"},
+                  "description": "затронутые узлы спеки (необязательно)"},
+        "author": {"type": "string",
+                   "description": "кто решил (если знаешь из разговора)"},
+        "label": {"type": "string",
+                  "description": "короткая метка предложения для панели"},
+        "why_now": {"type": "string",
+                    "description": "почему запись нужна именно сейчас"},
+        "level": {"type": "string", "description": "L1 | L2 | L3"},
+        "confidence": {"type": "string", "description": "high | med | low"}},
+        "required": ["title", "rationale"]},
+    kind=PROPOSE)
+def propose_decision(ctx: ToolContext, title: str, rationale: str,
+                     nodes: Optional[Sequence[str]] = None, author: str = "",
+                     label: str = "", why_now: str = "", level: str = "",
+                     confidence: str = "") -> Dict[str, Any]:
+    """Предложить решение в журнал (ADR) — фиксирует человек кнопкой.
+
+    Спорить с ядром здесь нечем: журнал решений — это текст, а не геометрия,
+    поэтому валидации спеки нет. Есть проверка ПОЛНОТЫ: без заголовка и
+    обоснования запись бессмысленна.
+    """
+    fields = {"title": _note_text(title), "rationale": _note_text(rationale),
+              "nodes": _note_nodes(nodes), "author": _note_text(author)}
+    return _stage_note(ctx, NOTE_DECISION, fields, label=label,
+                       why_now=why_now, level=level, confidence=confidence)
+
+
+@register(
+    "propose_fact",
+    description=(
+        "ПРЕДЛОЖИТЬ запись ФАКТА ПРОИЗВОДСТВА (L1) в журнал проекта: знание "
+        "цеха, которое отменяет литературу и справочники. Запись НЕ делается — "
+        "она кладётся в стейдж, человек правит формулировку и фиксирует "
+        "кнопкой «✅ Зафиксировать факт»: L1-факт, записанный тобой, отменял бы "
+        "источники от твоего имени. Формулируй ОДНОЙ проверяемой фразой "
+        "(«смеситель типа A — не выше 120 °C») и всегда указывай, откуда это "
+        "известно; услышал в разговоре — так и напиши в source."),
+    parameters={"type": "object", "properties": {
+        "statement": {"type": "string",
+                      "description": "сам факт одной проверяемой фразой"},
+        "scope": {"type": "string",
+                  "description": "к чему относится: узел, свойство, участок, "
+                                 "оборудование"},
+        "source": {"type": "string",
+                   "description": "откуда известно: кто сказал / протокол / "
+                                  "номер опыта"},
+        "author": {"type": "string",
+                   "description": "кто утверждает (если знаешь из разговора)"},
+        "label": {"type": "string",
+                  "description": "короткая метка предложения для панели"},
+        "why_now": {"type": "string",
+                    "description": "почему факт важно записать сейчас"},
+        "level": {"type": "string",
+                  "description": "уровень знания (по умолчанию L1)"},
+        "confidence": {"type": "string", "description": "high | med | low"}},
+        "required": ["statement"]},
+    kind=PROPOSE)
+def propose_fact(ctx: ToolContext, statement: str, scope: str = "",
+                 source: str = "", author: str = "", label: str = "",
+                 why_now: str = "", level: str = "",
+                 confidence: str = "") -> Dict[str, Any]:
+    """Предложить L1-факт цеха — записывает человек кнопкой."""
+    fields = {"statement": _note_text(statement), "scope": _note_text(scope),
+              "source": _note_text(source), "author": _note_text(author)}
+    return _stage_note(ctx, NOTE_FACT, fields, label=label, why_now=why_now,
+                       level=level or "L1", confidence=confidence)
+
+
+def _apply_decision_note(ctx: ToolContext, note: StagedNote,
+                         fields: Dict[str, Any],
+                         author: str) -> Dict[str, Any]:
+    """Записать РЕШЕНИЕ из предложения (поля — уже с правкой человека)."""
+    spec_hash = ""
+    try:
+        spec_hash = ctx.require_spec().spec_hash()
+    except ToolError:
+        pass                                  # решение может быть и до спеки
+    return _log(ctx, "decisions", {
+        "ts": _now(), "title": _note_text(fields.get("title")),
+        "rationale": _note_text(fields.get("rationale")),
+        "nodes": _note_nodes(fields.get("nodes")),
+        "author": (_note_text(author) or _note_text(fields.get("author"))
+                   or "человек"),
+        "spec_hash": spec_hash, "kind": "decision",
+        "note_id": note.id, "proposed_by": "assistant",
+        "edited_by_human": bool(note.edited),
+        "level": note.level, "confidence": note.confidence})
+
+
+def _apply_fact_note(ctx: ToolContext, note: StagedNote,
+                     fields: Dict[str, Any], author: str) -> Dict[str, Any]:
+    """Записать L1-ФАКТ из предложения (поля — уже с правкой человека)."""
+    return _log(ctx, "local_facts", {
+        "ts": _now(), "statement": _note_text(fields.get("statement")),
+        "scope": _note_text(fields.get("scope")),
+        "source": _note_text(fields.get("source")),
+        "author": (_note_text(author) or _note_text(fields.get("author"))
+                   or "технолог"),
+        "level": note.level or "L1",
+        "note_id": note.id, "proposed_by": "assistant",
+        "edited_by_human": bool(note.edited)})
+
+
+@register(
+    "apply_note",
+    description=(
+        "ЗАФИКСИРОВАТЬ предложенную запись журнала (решение компании или "
+        "L1-факт) — решение человека, требует токен. Поля можно передать "
+        "исправленными: в журнал уходит ТО, что человек видел и поправил, а не "
+        "исходная формулировка модели."),
+    parameters={"type": "object", "properties": {
+        "note_id": {"type": "string",
+                    "description": "id предложенной записи из стейджа"},
+        "human_token": {"type": "string", "description": "разовый токен"},
+        "fields": {"type": "object",
+                   "description": "поля записи после правки человеком"},
+        "author": {"type": "string", "description": "кто фиксирует"}},
+        "required": ["note_id", "human_token"]},
+    kind=WRITE)
+def apply_note(ctx: ToolContext, note_id: str, human_token: str,
+               fields: Optional[Dict[str, Any]] = None,
+               author: str = "") -> Dict[str, Any]:
+    """Фиксация записи человеком: правка полей → журнал проекта.
+
+    Правка ПРИМЕНЯЕТСЯ К ЗАПИСИ В СТЕЙДЖЕ, а не подменяет её молча: изменённые
+    значения сохраняются в предложении (``edited=True``), поэтому в сессии
+    видно, что человек взял формулировку не как есть. В журнал попадает
+    отредактированный текст — иначе кнопка «поправил и записал» писала бы одно,
+    а показывала другое.
+
+    Неизвестные ключи правки отклоняются: молча проглоченное поле выглядело бы
+    как записанное. Проверки идут ДО гашения токена — отказ не должен стоить
+    человеку подтверждения.
+    """
+    session = ctx.require_session()
+    note = session.note_by_id(str(note_id))
+    if note is None:
+        raise ToolError(f"Предложенной записи '{note_id}' нет в сессии.")
+    edits = dict(fields or {})
+    allowed = set(note.field_names())
+    unknown = sorted(str(k) for k in edits if str(k) not in allowed)
+    if unknown:
+        raise ToolError(
+            f"Запись вида '{note.kind}' не имеет полей {unknown}: допустимы "
+            f"{sorted(allowed)}. Правка не применена.")
+    merged = dict(note.fields)
+    merged.update(edits)
+    missing = note.missing(merged)
+    if missing:
+        raise ToolError(
+            f"После правки не заполнены обязательные поля {missing}: пустую "
+            f"запись в журнал писать нельзя.")
+
+    _consume(ctx, human_token, action="apply_note", target=str(note.id))
+    changed = sorted(str(k) for k in edits
+                     if str(edits[k]) != str(note.fields.get(k, "")))
+    note.fields = merged
+    if changed:
+        note.edited = True
+    session.set_note_status(note.id, PATCH_APPLIED)
+    rec = (_apply_decision_note(ctx, note, merged, author)
+           if note.kind == NOTE_DECISION
+           else _apply_fact_note(ctx, note, merged, author))
+    out = {"ok": True, "note_id": note.id, "kind": note.kind,
+           "status": PATCH_APPLIED, "log": _NOTE_LOG.get(note.kind, ""),
+           "edited_fields": changed,
+           _NOTE_OUT_KEY.get(note.kind, "record"): rec}
+    if note.kind == NOTE_FACT:
+        out["note"] = ("L1 отменяет L2/L3: при конфликте с литературой выноси "
+                       "расхождение в OPEN_QUESTIONS, не усредняй.")
+    return out
+
+
+@register(
+    "reject_note",
+    description=(
+        "Отклонить предложенную запись журнала (решение человека, требует "
+        "токен). Отказ идёт в журнал РЕШЕНИЙ: «почему не стали это "
+        "записывать» — тоже часть истории проекта."),
+    parameters={"type": "object", "properties": {
+        "note_id": {"type": "string", "description": "id записи из стейджа"},
+        "human_token": {"type": "string", "description": "разовый токен"},
+        "reason": {"type": "string", "description": "почему не записываем"},
+        "author": {"type": "string", "description": "кто решил"}},
+        "required": ["note_id", "human_token", "reason"]},
+    kind=WRITE)
+def reject_note(ctx: ToolContext, note_id: str, human_token: str,
+                reason: str, author: str = "") -> Dict[str, Any]:
+    session = ctx.require_session()
+    note = session.note_by_id(str(note_id))
+    if note is None:
+        raise ToolError(f"Предложенной записи '{note_id}' нет в сессии.")
+    _consume(ctx, human_token, action="reject_note", target=str(note.id))
+    session.set_note_status(note.id, PATCH_REJECTED, reason=str(reason))
+    subject = _note_text(note.fields.get("title")
+                         or note.fields.get("statement")) or note.id
+    decision = _log(ctx, "decisions", {
+        "ts": _now(),
+        "title": f"ОТКЛОНЕНО: запись в журнал «{subject}»",
+        "nodes": _note_nodes(note.fields.get("nodes")),
+        "author": _note_text(author) or "человек",
+        "spec_hash": "", "rationale": str(reason), "note_id": note.id,
+        "level": note.level, "kind": f"reject_{note.kind}_note"})
+    return {"ok": True, "note_id": note.id, "kind": note.kind,
+            "status": PATCH_REJECTED, "decision": decision}
+
+
+# ----------------------------------------------------------------------
 # Хелперы для UI (кнопки подтверждения)
 # ----------------------------------------------------------------------
 def issue_apply_token(ctx: ToolContext, patch_id: str, *,
@@ -1324,4 +1603,26 @@ def issue_fact_token(ctx: ToolContext, statement: str, *,
                      ttl_s: Optional[float] = None) -> str:
     """Токен на запись L1-факта (кнопка «Добавить факт цеха»)."""
     return registry_for(ctx).issue("add_local_fact", str(statement),
+                                   ttl_s=ttl_s).token
+
+
+def issue_apply_note_token(ctx: ToolContext, note_id: str, *,
+                           ttl_s: Optional[float] = None,
+                           note: str = "") -> str:
+    """Токен на фиксацию ПРЕДЛОЖЕННОЙ записи журнала (iter96).
+
+    ``context_hash`` пуст намеренно: запись журнала — это текст решения или
+    факта цеха, и правка геометрии между нажатием кнопки и записью её не
+    обесценивает (в самой записи ``spec_hash`` фиксируется на момент записи).
+    Цель подтверждения — идентификатор предложения: согласие записать одно
+    решение не переносится на другое.
+    """
+    return registry_for(ctx).issue("apply_note", str(note_id), ttl_s=ttl_s,
+                                   note=note).token
+
+
+def issue_reject_note_token(ctx: ToolContext, note_id: str, *,
+                            ttl_s: Optional[float] = None) -> str:
+    """Токен на отказ от предложенной записи журнала (кнопка «Отклонить»)."""
+    return registry_for(ctx).issue("reject_note", str(note_id),
                                    ttl_s=ttl_s).token

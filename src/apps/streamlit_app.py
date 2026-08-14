@@ -571,6 +571,13 @@ def main():
     # `workspace.sticky_zones_css`, адресуясь к колонкам через контейнеры с
     # ключами (`st-key-…`): порядковые селекторы поехали бы от правки раскладки.
     st.markdown(wsx.sticky_zones_css(), unsafe_allow_html=True)
+    # iter94: обратная сторона липкости — `position: sticky` создаёт stacking
+    # context, и раскрытая на весь экран картинка (обёртка Streamlit:
+    # `position: fixed`, z-index 1000050) оставалась ВНУТРИ колонки, обрезанная
+    # её `max-height`/`overflow`: сквозь «полноэкранный» показ просвечивала
+    # страница. Правило снимает липкость с той колонки, где сейчас раскрыто
+    # (признак — кнопка «Close fullscreen», её нет в свёрнутом состоянии).
+    st.markdown(wsx.fullscreen_escape_css(), unsafe_allow_html=True)
 
     dock_col, work_col, info_col = st.columns(list(wsx.MAIN_COLUMNS))
     with work_col:

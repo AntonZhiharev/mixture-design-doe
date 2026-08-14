@@ -32,17 +32,26 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .config import DEFAULT_MODEL, OPENROUTER_URL, api_key, model_name
+from .config import (DEFAULT_MODEL, OPENROUTER_URL, REQUEST_HEADROOM_S,
+                     api_key, model_name)
+from .config import max_iterations as cfg_max_iterations
+from .config import time_budget_s as cfg_time_budget_s
 
 #: Суффикс веб-плагина OpenRouter.
 ONLINE_SUFFIX = ":online"
 
 #: Максимум итераций «модель → инструменты → модель» на один вопрос.
-MAX_ITERATIONS = 8
+#: Значение по умолчанию берётся из :mod:`.config` (оператор может поднять его
+#: переменной окружения, не правя код).
+MAX_ITERATIONS = cfg_max_iterations()
 
 #: Общий бюджет времени на цикл (сек). Длинные инструменты (`run_pytest`)
 #: учитываются здесь же.
-TIME_BUDGET_S = 180.0
+#:
+#: iter92: это ЛИШЬ ДЕФОЛТ момента импорта. Значение читается из окружения
+#: (:func:`config.time_budget_s`) на КАЖДЫЙ ход — иначе смена настройки в
+#: панели требовала бы перезапуска приложения.
+TIME_BUDGET_S = cfg_time_budget_s()
 
 #: Сколько символов результата инструмента отдаём модели. Хвост усечём с
 #: ЯВНОЙ пометкой: молча обрезанная таблица выглядит как «данных нет».
@@ -331,6 +340,41 @@ def _parse_args(raw: Any) -> Dict[str, Any]:
     return parsed
 
 
+def _budget_text(budget_s: float, res: "LLMResult", *,
+                 before_request: bool = False) -> str:
+    """Текст обрыва по бюджету — с ЧЕСТНЫМ перечислением сделанного (iter92).
+
+    Прежняя формулировка обещала «контекст вызовов сохранён в сессии, повторите
+    вопрос». Обещание не выполнялось: ``run_turn`` не дописывал
+    ``new_messages``, поэтому повтор начинался с чистого листа и упирался в тот
+    же предел (два хода 14.08.2026 — 234 с и 210 с, одинаковый финал). Теперь
+    контекст действительно сохраняется, а текст называет ЧТО именно сделано и
+    что делать дальше, включая настройку бюджета.
+    """
+    done = ", ".join(dict.fromkeys(str(c.get("tool", "")) for c in res.calls
+                                   if c.get("tool")))
+    head = ("⏱ Бюджет времени на этот ход исчерпан "
+            f"({budget_s:.0f} с)")
+    if before_request:
+        head += (": на новое обращение к модели времени не осталось, "
+                 "поэтому оно НЕ отправлено (лишний запрос стоил бы денег "
+                 "и всё равно не успел бы)")
+    else:
+        head += ": ответ не завершён"
+    body = [head + "."]
+    if done:
+        body.append(f"Выполнено инструментов: {len(res.calls)} ({done}) — их "
+                    f"результаты записаны в переписку, поэтому ПОВТОР вопроса "
+                    f"продолжит работу с этого места, а не начнёт заново.")
+    else:
+        body.append("Инструменты выполнить не успели: время ушло на генерацию "
+                    "ответа модели.")
+    body.append("Если это повторяется, дело не в инструментах, а в объёме "
+                "генерации: сузьте вопрос (одна ось, один узел) или поднимите "
+                "бюджет времени в панели «Модель и ключ».")
+    return "\n\n".join(body)
+
+
 # ----------------------------------------------------------------------
 # Цикл «модель → инструменты → модель»
 # ----------------------------------------------------------------------
@@ -340,8 +384,8 @@ def run_tool_loop(messages: Sequence[Dict[str, Any]], *,
                   model: Optional[str] = None, key: Optional[str] = None,
                   web: bool = False, temperature: float = DEFAULT_TEMPERATURE,
                   timeout: int = DEFAULT_TIMEOUT,
-                  max_iterations: int = MAX_ITERATIONS,
-                  time_budget_s: float = TIME_BUDGET_S,
+                  max_iterations: Optional[int] = None,
+                  time_budget_s: Optional[float] = None,
                   transport: Optional[Callable[..., Dict[str, Any]]] = None,
                   on_event: Optional[Callable[[Dict[str, Any]], None]] = None
                   ) -> LLMResult:
@@ -352,7 +396,15 @@ def run_tool_loop(messages: Sequence[Dict[str, Any]], *,
     как результат инструмента (A0.6 — отказ объясняет себя, и модель может его
     учесть). ``on_event`` получает события прогресса для UI:
     ``llm_request`` / ``tool_start`` / ``tool_end`` / ``done``.
+
+    ``max_iterations`` / ``time_budget_s`` по умолчанию читаются из окружения
+    (:mod:`.config`) на КАЖДЫЙ вызов: оператор меняет их в панели, а не правкой
+    кода, и новое значение должно действовать со следующего же хода.
     """
+    if max_iterations is None:
+        max_iterations = cfg_max_iterations()
+    if time_budget_s is None:
+        time_budget_s = cfg_time_budget_s()
     if max_iterations < 1:
         raise ValueError("max_iterations должен быть ≥ 1.")
     convo: List[Dict[str, Any]] = list(messages)
@@ -368,6 +420,18 @@ def run_tool_loop(messages: Sequence[Dict[str, Any]], *,
                 pass
 
     for it in range(1, int(max_iterations) + 1):
+        # iter92: предохранитель ПЕРЕД обращением к модели. Раньше бюджет
+        # проверялся только ПОСЛЕ инструментов, поэтому ход успевал заказать
+        # (и оплатить) генерацию, которую тут же обрывал: в живой ПВХ-сессии
+        # 14.08.2026 два хода подряд сожгли ≈480 тыс. prompt-токенов и
+        # закончились одним и тем же «бюджет исчерпан». Ждать смысла нет:
+        # запрос с пакетом проекта — это минуты, а не остаток в пару секунд.
+        left = float(time_budget_s) - (time.monotonic() - started)
+        if it > 1 and left < REQUEST_HEADROOM_S:
+            res.stopped_reason = "time_budget"
+            res.text = _budget_text(float(time_budget_s), res, before_request=True)
+            emit("done", iteration=it - 1, reason="time_budget")
+            return res
         res.iterations = it
         emit("llm_request", iteration=it, model=res.model)
         body = chat_once(convo, tools=tools, model=model, key=key, web=web,
@@ -427,11 +491,8 @@ def run_tool_loop(messages: Sequence[Dict[str, Any]], *,
 
         if time.monotonic() - started > float(time_budget_s):
             res.stopped_reason = "time_budget"
-            res.text = (content or "") + (
-                "\n\n⏱ Бюджет времени на этот ход исчерпан "
-                f"({time_budget_s:.0f} с): часть инструментов выполнена, "
-                "ответ не завершён. Повторите вопрос — контекст вызовов "
-                "сохранён в сессии.")
+            res.text = (content or "") + "\n\n" + _budget_text(
+                float(time_budget_s), res)
             emit("done", iteration=it, reason="time_budget")
             return res
 

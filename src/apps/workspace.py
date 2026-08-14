@@ -471,6 +471,18 @@ class FeedItem:
     artifacts: Tuple[str, ...] = ()
 
 
+def _is_tool_stub(message: Any) -> bool:
+    """Реплика ассистента БЕЗ текста, но с заявкой на вызовы (iter92).
+
+    Отдельная функция, а не условие внутри цикла: то же правило нужно
+    :func:`dialog_count`, иначе подпись «реплик в ленте N из M» разошлась бы
+    с тем, что видно на экране.
+    """
+    if str(getattr(message, "content", "") or "").strip():
+        return False
+    return bool(getattr(message, "tool_calls", None))
+
+
 def feed_items(messages: Optional[Sequence[Any]], *, limit: int = FEED_LIMIT
                ) -> List[FeedItem]:
     """Реплики для показа в ленте — СТАРЫЕ СВЕРХУ, новые снизу.
@@ -484,6 +496,14 @@ def feed_items(messages: Optional[Sequence[Any]], *, limit: int = FEED_LIMIT
     for m in list(messages or []):
         role = str(getattr(m, "role", "") or "")
         if role not in ("user", "assistant"):
+            continue
+        if role == "assistant" and _is_tool_stub(m):
+            # iter92: реплика-ЗАЯВКА на инструменты (текста нет, есть только
+            # tool_calls) в переписку не идёт. Такие сообщения появились в
+            # сессии вместе с сохранением контекста прерванного хода; в ленте
+            # они рисовались бы пустым пузырём «помощник ничего не сказал»,
+            # хотя он как раз работал. Что именно он вызывал, видно в панели
+            # хода и в аудите вызовов.
             continue
         imgs = tuple(str(s) for s in (getattr(m, "images", None) or []))
         # iter84: файлы расчёта переносятся в ленту вместе с репликой — их
@@ -505,7 +525,8 @@ def dialog_count(messages: Optional[Sequence[Any]]) -> int:
     ответы инструментов.
     """
     return sum(1 for m in list(messages or [])
-               if str(getattr(m, "role", "") or "") in ("user", "assistant"))
+               if str(getattr(m, "role", "") or "") in ("user", "assistant")
+               and not _is_tool_stub(m))
 
 
 def feed_hint(n_shown: int, n_total: int) -> str:

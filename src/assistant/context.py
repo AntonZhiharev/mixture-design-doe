@@ -531,6 +531,50 @@ def _image_urls(session: AssistantSession, root: str, project: str,
     return urls, errors
 
 
+#: Сколько символов результата инструмента переносится в ПЕРЕПИСКУ при обрыве
+#: хода (iter92). Модели в свой ход результат уходил целиком (до
+#: ``llm.MAX_TOOL_RESULT_CHARS`` = 20 000); в память разговора столько класть
+#: нельзя — один прерванный ход с четырьмя пакетами проекта раздул бы
+#: `session.json` и бюджет следующего хода сильнее, чем сэкономил. Держим
+#: «шапку» результата: она отвечает на вопрос «этот вызов уже сделан и что он
+#: вернул», а полные числа модель при нужде перезапросит.
+RESUME_TOOL_CHARS = 2000
+
+#: Пометка усечения. Молча обрезанный результат модель прочитала бы как
+#: «инструмент вернул вот это и всё» — и сделала бы вывод по половине таблицы.
+RESUME_CLIP_NOTE = ("\n…[в переписке сохранена шапка результата; нужны полные "
+                    "числа — вызови инструмент снова]")
+
+
+def _persist_tool_context(session: AssistantSession,
+                          new_messages: Sequence[Dict[str, Any]]) -> int:
+    """Дописать в сессию вызовы и их результаты ПРЕРВАННОГО хода (iter92).
+
+    Возвращает число записанных сообщений. Пустой ответ модели без вызовов не
+    пишется: реплика-пустышка в переписке выглядела бы как «помощник промолчал».
+
+    Роль ``tool`` в ленту не попадает (``workspace.feed_items`` пропускает
+    служебные роли), но в контекст следующего хода идёт: ``Message.chat_message``
+    отдаёт ``tool_calls`` / ``tool_call_id`` / ``name`` как есть.
+    """
+    written = 0
+    for m in list(new_messages or []):
+        role = str((m or {}).get("role", ""))
+        if role not in ("assistant", "tool"):
+            continue
+        content = str(m.get("content", "") or "")
+        calls = list(m.get("tool_calls") or [])
+        if role == "assistant" and not calls and not content.strip():
+            continue
+        if role == "tool" and len(content) > RESUME_TOOL_CHARS:
+            content = content[:RESUME_TOOL_CHARS] + RESUME_CLIP_NOTE
+        session.add_message(role, content, tool_calls=calls,
+                            tool_call_id=str(m.get("tool_call_id", "") or ""),
+                            name=str(m.get("name", "") or ""))
+        written += 1
+    return written
+
+
 def run_turn(session: AssistantSession, ctx: Any, question: str, *,
              focus: Any = None, spec_hash: str = "",
              has_runner: Optional[bool] = None, web: Optional[bool] = None,
@@ -647,6 +691,21 @@ def run_turn(session: AssistantSession, ctx: Any, question: str, *,
         res.model = out.model
         res.web = bool(out.web)
         res.stopped_reason = out.stopped_reason
+        # iter92: КОНТЕКСТ ВЫЗОВОВ — в сессию. ASSISTANT_SPEC §219 требует
+        # дописывать `new_messages` целиком (включая роль `tool`), «иначе
+        # следующий вопрос потеряет контекст уже сделанных вызовов». Демо
+        # (run_assistant_demo) и тесты iter60 это делали, боевой ход — нет:
+        # в переписке оставались только user/assistant. Из-за этого обрыв по
+        # бюджету становился ЛОВУШКОЙ — повтор вопроса заново заказывал те же
+        # вызовы и снова не успевал (замер живой ПВХ-сессии 14.08.2026: 234 с
+        # и 210 с, ≈480 тыс. prompt-токенов, один и тот же финал).
+        #
+        # Пишем ТОЛЬКО при обрыве (`stopped_reason != final`): у завершённого
+        # хода ответ модели уже содержит выводы, и держать рядом полный дубль
+        # аргументов-пакетов значило бы жечь бюджет ради данных, которые
+        # модель сама пересказала (тот же довод, что в iter84 про `## ЧИСЛА`).
+        if out.stopped_reason != "final":
+            _persist_tool_context(session, out.new_messages)
     res.duration_s = round(time.monotonic() - t0, 3)
     res.sections = parse_sections(res.text)
 

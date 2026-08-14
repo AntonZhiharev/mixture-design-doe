@@ -170,14 +170,20 @@ class TestDockUsesView:
         assert "views.answer_view" in src
         assert "st.expander" in src
 
-    def test_both_places_go_through_render_answer(self):
-        """История и свежий ход раскладываются ОДИНАКОВО.
+    def test_answer_is_laid_out_in_exactly_one_place(self):
+        """История и свежий ответ раскладываются ОДИНАКОВО.
 
         Иначе одно и то же сообщение выглядело бы по-разному до и после
         перезапуска приложения.
+
+        iter91 усилил этот инвариант до предела: раскладка осталась ОДНА.
+        Ход выполняется в фоне и сам дописывает ответ в сессию, поэтому свежая
+        реплика приезжает в ленту тем же путём, что история, — второе место
+        показа («ответ этого прогона») стало не нужно и удалено вместе с
+        причиной терять ответ при rerun.
         """
         src = inspect.getsource(dock.render_assistant_dock)
-        assert src.count("_render_answer(") == 2
+        assert src.count("_render_answer(") == 1
         assert "st.markdown(res.text" not in src
 
 
@@ -231,8 +237,14 @@ class TestDownloadKeysUnique:
         assert params["scope"].kind is inspect.Parameter.KEYWORD_ONLY
         assert params["scope"].default is inspect.Parameter.empty
 
-    def test_both_call_sites_pass_distinct_scope(self):
-        turn = inspect.getsource(dock.render_assistant_dock)
+    def test_call_sites_pass_distinct_scope(self):
+        """Каждое место показа называет СВОЙ scope — ключи не столкнутся.
+
+        iter91: место «ответ этого прогона» (``scope="turn"``) исчезло вместе с
+        синхронным ходом — свежий ответ приезжает в ленту как обычная реплика,
+        и её файлы уже рисуются с ``scope=f"feed{pos}"``.
+        """
+        feed = inspect.getsource(dock.render_assistant_dock)
         panel = inspect.getsource(dock._render_artifacts)
-        assert 'scope="turn"' in turn
+        assert 'scope=f"feed{pos}"' in feed
         assert 'scope="panel"' in panel

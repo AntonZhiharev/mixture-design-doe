@@ -65,6 +65,7 @@ from src.assistant import config as ai_config
 from src.assistant import context as actx
 from src.assistant import files as afiles
 from src.assistant import llm, store, views
+from src.assistant import turn_job as tj
 from src.assistant.consent import ConsentRegistry
 from src.assistant.context import UiFocus
 from src.assistant.tools import AGENT_KINDS, ToolContext, ToolError
@@ -80,6 +81,12 @@ K_PENDING = "assistant_pending_question"
 #: K_PENDING отправляется автоматически на следующем прогоне, а этот ждёт
 #: явного нажатия кнопки — повтор к модели должен быть решением человека.
 K_FAILED = "assistant_failed_question"
+#: iter91: ХОД В ПОЛЁТЕ (:class:`src.assistant.turn_job.TurnJob`). Ход идёт в
+#: своём потоке, а здесь живёт его состояние — поэтому перезапуск скрипта
+#: (правка поля, раскрытая форма, переключённая закладка) больше не обрывает
+#: ответ: раньше ход выполнялся ВНУТРИ прогона, и `RerunException`
+#: (BaseException!) убивала его до записи ответа в сессию.
+K_JOB = "assistant_turn_job"
 #: iter76: уведомление о ПЕРЕКЛЮЧЕНИИ переписки при смене имени проекта.
 #: Начиная с iter77 смена ИМЕНИ переписку уже не переключает (ключ — ссылка),
 #: поэтому сообщение появляется только при смене САМОГО проекта (загрузили
@@ -226,6 +233,36 @@ def _render_connection() -> None:
                 st.success(f"Сохранено в `{path}`")
             except (ValueError, OSError) as exc:
                 st.error(str(exc))
+        _render_limits()
+
+
+def _render_limits() -> None:
+    """Бюджет времени хода и предел шагов (iter92).
+
+    Почему это настройка, а не константа: на кампании из 23 узлов один ход
+    честно идёт дольше прежних 180 с (замер 14.08.2026 — 234 с), и упираться в
+    предел, который нельзя поднять без правки кода, — тупик для технолога.
+    Значения пишутся в тот же локальный `.env` и читаются на КАЖДЫЙ ход.
+    """
+    budget = st.number_input(
+        "⏱ Бюджет времени на один ход, с", min_value=ai_config.MIN_TIME_BUDGET_S,
+        max_value=1800.0, step=30.0, value=float(ai_config.time_budget_s()),
+        key="dock_budget",
+        help="Ход прерывается по этому пределу. Прерванный ход НЕ пропадает: "
+             "сделанные вызовы и их результаты остаются в переписке, и повтор "
+             "вопроса продолжает работу с этого места.")
+    iters = st.number_input(
+        "🔧 Предел обращений к инструментам за ход", min_value=1, max_value=40,
+        step=1, value=int(ai_config.max_iterations()), key="dock_iters",
+        help="Один шаг = один запрос к модели плюс заказанные ею вызовы.")
+    if st.button("💾 Сохранить лимиты", key="dock_save_limits"):
+        try:
+            path = ai_config.save_limits(budget_s=float(budget),
+                                         iterations=int(iters))
+            st.success(f"Лимиты сохранены в `{path}` — действуют со следующего "
+                       f"вопроса.")
+        except (ValueError, OSError) as exc:
+            st.error(str(exc))
 
 
 def _render_focus(focus: UiFocus, ctx: ToolContext) -> UiFocus:
@@ -667,6 +704,161 @@ def _chat_submission(session, root: str, project: str):
     return (question or None), images
 
 
+def current_job() -> Optional[tj.TurnJob]:
+    """Ход в полёте из состояния приложения (или ``None``)."""
+    job = st.session_state.get(K_JOB)
+    return job if isinstance(job, tj.TurnJob) else None
+
+
+def start_background_turn(session, ctx: ToolContext, question: str, *,
+                          focus: Any, images: Optional[List[str]] = None
+                          ) -> tj.TurnJob:
+    """Отправить вопрос в ФОНОВЫЙ ход и запомнить его в состоянии (iter91).
+
+    Ключевая правка шага: ``run_turn`` больше не вызывается в теле прогона.
+    Он идёт в своём потоке и сам пишет ответ в сессию и на диск, поэтому
+    ``RerunException`` от любого виджета его не касается — перезапускается
+    только отрисовка.
+
+    Поток помечается ``add_script_run_ctx``: без контекста Streamlit сыплет в
+    консоль «missing ScriptRunContext», а нам он нужен ещё и потому, что
+    инструменты хода читают ``ctx``/сессию, собранные в главном потоке. Сам
+    воркер ``st.*`` НЕ зовёт (в ``src/assistant/**`` нет ``import streamlit``)
+    — иначе вернулся бы исходный дефект.
+    """
+    if (job := current_job()) is not None and job.running:
+        raise tj.TurnBusy("Помощник ещё отвечает на предыдущий вопрос.")
+
+    def _wrap(th):
+        try:
+            from streamlit.runtime.scriptrunner import add_script_run_ctx
+            return add_script_run_ctx(th, get_script_run_ctx())
+        except Exception:                    # noqa: BLE001 — версия/сборка
+            return th                        # без метки поток тоже работает
+
+    # `question` и `images` подставляет само задание (оно их помнит и
+    # показывает, пока ход идёт), остальное — аргументы run_turn.
+    job = tj.start_turn(
+        actx.run_turn, question=question, images=list(images or []),
+        thread_wrapper=_wrap,
+        session=session, ctx=ctx, focus=focus, spec_hash=spec_hash_of(ctx),
+        kinds=AGENT_KINDS)
+    st.session_state[K_JOB] = job
+    return job
+
+
+def get_script_run_ctx():
+    """Контекст прогона (или ``None``) — обёртка ради читаемости и версий."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx as _g
+        return _g()
+    except Exception:                        # noqa: BLE001
+        return None
+
+
+#: Как часто перерисовывать прогресс идущего хода (с). Это ФРАГМЕНТНЫЙ прогон:
+#: он не перебивает скрипт и не трогает остальную страницу — человек в это время
+#: спокойно правит поля (`script_requests._fragment_run_should_not_preempt_script`).
+PROGRESS_EVERY_S = 1.5
+
+
+def _supports_fragment() -> bool:
+    """Есть ли ``st.fragment`` (1.37+). Без него прогресс просто статичный."""
+    return callable(getattr(st, "fragment", None))
+
+
+def _render_turn_progress() -> None:
+    """Живой прогресс идущего хода и показ итога завершённого (iter91).
+
+    Ход выполняется в фоне, поэтому здесь только ЧТЕНИЕ его состояния:
+
+    * идёт — подпись «что сейчас считается» (та же ``llm.progress_caption``,
+      что и раньше) обновляется фрагментом раз в :data:`PROGRESS_EVERY_S`;
+      как только ход завершился, фрагмент просит ПОЛНЫЙ прогон, чтобы ответ
+      встал в ленту;
+    * завершён и ещё не показан — подпись итога, аудит вызовов и кнопка
+      повтора. Сам текст ответа перерисовывать не нужно: воркер уже дописал
+      его в сессию, и лента выше нарисовала его как обычную реплику (iter84 —
+      файлы расчёта тоже приезжают вместе с сообщением).
+
+    Прогресс рисуется в СВОЁМ месте (под лентой), а не во внешнем контейнере
+    ленты: элементы фрагмента, отданные в созданный СНАРУЖИ контейнер, при
+    фрагментных прогонах не очищаются, а накапливаются (docstring
+    ``st.fragment``, 1.58) — подписи «идёт N с» копились бы каждые
+    :data:`PROGRESS_EVERY_S` секунд.
+    """
+    job = current_job()
+    if job is None:
+        # Отказ прошлого хода не должен исчезать при движении виджета: кнопка
+        # повтора живёт до успешного ответа или до нового вопроса.
+        _render_retry(st.session_state.get(K_LAST_TURN))
+        return
+
+    if job.running:
+        if _supports_fragment():
+            _turn_progress_fragment()
+        else:
+            st.caption(tj.job_caption(job,
+                                      event_caption=llm.progress_caption))
+        st.caption("⏳ Помощник отвечает в фоне. Можно листать закладки и "
+                   "править поля — ответ придёт в переписку сам и не "
+                   "потеряется.")
+        return
+
+    # --- ход завершён ---
+    res = job.result
+    if not job.shown:
+        job.shown = True
+        st.session_state[K_LAST_TURN] = res
+        # Ответ воркер записал в сессию сам, но в ПАМЯТИ этого прогона сессия
+        # могла быть перечитана с диска (смена проекта) — перезагружать её тут
+        # не надо: следующий прогон возьмёт актуальную.
+    if res is None:
+        st.error(f"⛔ Ход не выполнен: {job.error or 'причина неизвестна'}")
+        st.session_state.pop(K_JOB, None)
+        return
+
+    for err in list(getattr(res, "image_errors", []) or []):
+        st.warning(f"Изображение не дошло до модели — {err}")
+    st.caption(views.turn_caption(res))
+    if getattr(res, "calls", None):
+        with st.expander("🔧 Что было посчитано"):
+            st.dataframe(views.tool_calls_dataframe(res.calls),
+                         width="stretch", hide_index=True)
+    _render_retry(res)
+
+
+#: Собранный фрагмент прогресса (создаётся при первом показе, см.
+#: :func:`_turn_progress_fragment`): `st.fragment` оборачивает функцию, и
+#: пересоздавать обёртку на каждом прогоне не нужно.
+_PROGRESS_FRAGMENT = None
+
+
+def _turn_progress_fragment() -> None:
+    """Обёртка: фрагмент создаётся один раз, а вызывается каждый прогон."""
+    global _PROGRESS_FRAGMENT
+    if _PROGRESS_FRAGMENT is None:
+        _PROGRESS_FRAGMENT = st.fragment(run_every=PROGRESS_EVERY_S)(
+            _draw_progress_tick)
+    _PROGRESS_FRAGMENT()
+
+
+def _draw_progress_tick() -> None:
+    """Тело фрагмента: подпись прогресса, а на финише — полный прогон.
+
+    ``st.rerun(scope="app")`` здесь и есть переход «фон → лента»: пока ход
+    идёт, перерисовывается только этот фрагмент; когда воркер закончил, нужен
+    полный прогон, иначе новая реплика не появится в ленте.
+    """
+    job = current_job()
+    if job is None:
+        return
+    if job.done:
+        st.rerun(scope="app")
+    st.caption(tj.job_caption(job, event_caption=llm.progress_caption))
+    st.caption("_ход идёт в фоне — перезагрузка страницы его не прервёт_")
+
+
 def _supports_feed_container() -> bool:
     """Умеет ли установленный Streamlit ленту с ФИКСИРОВАННОЙ высотой и автоскроллом.
 
@@ -904,48 +1096,28 @@ def render_assistant_dock(runner: Any = None, *, root: str = "") -> None:
                     _render_outputs(views.message_outputs(session,
                                                           item.artifacts),
                                     scope=f"feed{pos}")
-        # Ход ЭТОГО прогона дорисовывается в ту же ленту ниже (см. run_turn).
-        turn_slot = st.container()
     st.caption(wsx.feed_hint(len(feed), wsx.dialog_count(session.messages)))
 
     # Поле ввода — ПОД лентой и не двигается: лента прокручивается внутри себя.
     typed, images = _chat_submission(session, root, project)
     question = typed or asked or st.session_state.pop(K_PENDING, None)
 
+    # iter91: новый вопрос УХОДИТ В ФОН, а не выполняется в этом прогоне.
     if question or images:
-        with turn_slot:
-            with st.chat_message("user"):
-                st.markdown(question or "_(изображение без текста)_")
-                for sha in images:
-                    _show_attachment_image(session, root, project, sha)
-            progress = st.empty()
-            with st.chat_message("assistant"):
-                with st.spinner("Считаю инструментами ядра…"):
-                    res = actx.run_turn(
-                        session, ctx, question or "", focus=focus,
-                        spec_hash=spec_hash_of(ctx), kinds=AGENT_KINDS,
-                        images=images,
-                        on_event=lambda e: progress.caption(
-                            llm.progress_caption(e)))
-                progress.empty()
-                _render_answer(res.text)
-                # Графики/таблицы, посчитанные в ходе, — сразу в ответе: файл,
-                # который надо искать в другой панели, разговору не помогает.
-                _render_outputs(views.turn_outputs(session, res.new_artifacts),
-                                scope="turn")
-        for err in res.image_errors:
-            st.warning(f"Изображение не дошло до модели — {err}")
-        st.caption(views.turn_caption(res))
-        st.session_state[K_LAST_TURN] = res
-        if res.calls:
-            with st.expander("🔧 Что было посчитано"):
-                st.dataframe(views.tool_calls_dataframe(res.calls),
-                             width="stretch", hide_index=True)
-        _render_retry(res, fresh=True)
-    else:
-        # Отказ прошлого хода не должен исчезать при любом движении виджета:
-        # кнопка повтора живёт до успешного ответа или до нового вопроса.
-        _render_retry(st.session_state.get(K_LAST_TURN))
+        try:
+            start_background_turn(session, ctx, question or "", focus=focus,
+                                  images=images)
+        except tj.TurnBusy as exc:
+            # Два хода в одну сессию писать нельзя (общий файл переписки).
+            # Молча проглотить вопрос тоже нельзя — человек его уже задал.
+            st.warning(f"{exc} Дождитесь ответа и спросите снова — вопрос "
+                       f"НЕ отправлен, повторите его после ответа.")
+        else:
+            # Rerun сразу: вопрос уже в сессии (run_turn пишет его первым),
+            # поэтому лента дорисует его сама, а ниже встанет живой прогресс.
+            st.rerun()
+
+    _render_turn_progress()
 
     # iter73: пакеты ПРОЕКТА — самая верхняя панель утверждения: пока проекта
     # нет, всё остальное (патчи, пакеты спеки) применять некуда, и держать их

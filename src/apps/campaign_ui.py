@@ -519,6 +519,13 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
             covs = list(runner.active_point_covariates())
         except Exception:  # noqa: BLE001 — ковариаты не критичны для показа
             covs = []
+    # iter98: причины непроведённых измерений — по АКТИВНЫМ точкам (тот же
+    # порядок, что X/Y). Ячейка «н/и (причина)» вместо пустоты.
+    reasons_by_row: List[Dict[str, str]] = []
+    try:
+        reasons_by_row = list(runner.active_point_missing_reasons())
+    except Exception:  # noqa: BLE001 — причины не критичны для показа
+        reasons_by_row = []
 
     rows: List[Dict[str, Any]] = []
     for i in range(len(X)):
@@ -539,8 +546,16 @@ def campaign_base_dataframe(runner, *, batch_kg: Optional[float] = None
                 row[mass_column_label(cn, mass_unit)] = mass_from_kg(
                     float(X[i, j]) * float(batch_kg), mass_unit)
         for k, pn in enumerate(props):
-            row[f"{pn} (изм.)"] = (round(float(Y[i, k]), 4)
-                                   if k < Y.shape[1] else np.nan)
+            if k >= Y.shape[1]:
+                row[f"{pn} (изм.)"] = np.nan
+                continue
+            v = float(Y[i, k])
+            if np.isfinite(v):
+                row[f"{pn} (изм.)"] = round(v, 4)
+            else:
+                # iter98: непроведённое измерение — явная пометка с причиной
+                rs = reasons_by_row[i] if i < len(reasons_by_row) else {}
+                row[f"{pn} (изм.)"] = unmeasured_cell(rs.get(pn, ""))
         for cn in cov_names:
             v = (covs[i].get(cn) if i < len(covs) else None)
             row[f"{cn} (ковариата)"] = (round(float(v), 4)
@@ -602,6 +617,151 @@ def covariates_editor_df(runner) -> pd.DataFrame:
             row[cn] = float(v) if v is not None else None
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+#: iter98: суффикс столбца-причины «почему отклик не измерен» в таблицах ввода
+#: откликов (seed/добор). Один столбец на точку, текст свободный: «Opacity:
+#: образец не получен (SQ=1); Gloss60: то же».
+MISSING_REASON_COL = "не измерено — причина"
+#: iter98: как показывается непроведённое измерение в таблицах базы/Excel.
+UNMEASURED_LABEL = "н/и"
+
+
+def unmeasured_cell(reason: str = "") -> str:
+    """iter98: текст ячейки для НЕ ПРОВЕДЁННОГО измерения (чистая).
+
+    «н/и (образец не получен: SQ=1)» — а не пустая ячейка и не 0: пустота
+    читается как «забыли ввести», ноль — как измерение (A0.6).
+    """
+    reason = str(reason or "").strip()
+    return f"{UNMEASURED_LABEL} ({reason})" if reason else UNMEASURED_LABEL
+
+
+def parse_missing_reasons(text: Any, props: Sequence[str]) -> Dict[str, str]:
+    """iter98: разобрать ячейку причин в ``{отклик: причина}`` (чистая).
+
+    Формат ячейки — пары ``отклик: причина`` через ``;`` (или перенос
+    строки): ``"Opacity: образец не получен (SQ=1); Gloss60: то же"``.
+    Специальный случай — текст БЕЗ имени отклика (``"образец не получен"``):
+    считается общей причиной и возвращается под ключом ``"*"``; вызывающий
+    код раздаёт её всем пустым откликам строки. Имена сравниваются без
+    учёта регистра, отдаются в написании ``props``. Пустая ячейка → ``{}``.
+    """
+    if text is None:
+        return {}
+    if isinstance(text, float) and np.isnan(text):
+        return {}
+    s = str(text).strip()
+    if not s:
+        return {}
+    lookup = {p.lower(): p for p in props}
+    out: Dict[str, str] = {}
+    general: List[str] = []
+    for chunk in (c.strip() for c in s.replace("\n", ";").split(";")):
+        if not chunk:
+            continue
+        if ":" in chunk:
+            head, tail = chunk.split(":", 1)
+            key = lookup.get(head.strip().lower())
+            if key is not None:
+                out[key] = tail.strip()
+                continue
+        general.append(chunk)
+    if general:
+        out["*"] = "; ".join(general)
+    return out
+
+
+def missing_reason_rows_from_editor(edited, props: Sequence[str],
+                                    *, col: str = MISSING_REASON_COL,
+                                    lab_suffix: str = " (lab)"
+                                    ) -> Optional[List[Dict[str, str]]]:
+    """iter98: собрать per-point причины «не измерено» из таблицы-редактора.
+
+    Для каждой строки: пустые ячейки ``{отклик}{lab_suffix}`` — это
+    непроведённые измерения; им раздаются причины из столбца ``col``
+    (:func:`parse_missing_reasons`): именованная — своему отклику, общая
+    (``"*"``) — всем пустым без своей. Возвращает список длиной в число строк
+    (вход ``missing_reasons=`` для ``commit_seed``/``commit_measured``) или
+    ``None``, если столбца причин в таблице нет (прежнее поведение).
+    Проверку «у каждой пустой ячейки есть причина» делает РАННЕР (канон
+    iter52: правила в UI не дублируются) — здесь только сборка.
+    """
+    if col not in edited.columns:
+        return None
+    out: List[Dict[str, str]] = []
+    for _, row in edited.iterrows():
+        parsed = parse_missing_reasons(row.get(col), props)
+        general = parsed.pop("*", "")
+        reasons: Dict[str, str] = {}
+        for p in props:
+            lab = f"{p}{lab_suffix}"
+            if lab not in edited.columns:
+                continue
+            v = row[lab]
+            empty = (v is None or (isinstance(v, float) and np.isnan(v))
+                     or (isinstance(v, str) and not v.strip()))
+            if not empty:
+                continue
+            txt = parsed.get(p) or general
+            if txt:
+                reasons[p] = txt
+        # именованная причина у ЗАПОЛНЕННОГО отклика — оставляем: раннер
+        # ответит противоречием (A0.6), молча выбрасывать нельзя
+        for p, txt in parsed.items():
+            reasons.setdefault(p, txt)
+        out.append(reasons)
+    return out
+
+
+def missing_report_dataframe(runner) -> pd.DataFrame:
+    """iter98: непроведённые измерения базы одной таблицей (чистая).
+
+    Строка на пару (опыт, отклик): «№ опыта», «источник», «отклик»,
+    «причина». Пустой отчёт → пустой DataFrame с этими же столбцами — чтобы
+    подпись «непроведённых измерений нет» опиралась на факт, а не на
+    отсутствие таблицы.
+    """
+    cols = ["№ опыта", "источник", "отклик", "причина"]
+    rep = (runner.missing_report()
+           if hasattr(runner, "missing_report") else [])
+    rows = [{"№ опыта": r["experiment"],
+             "источник": origin_label(runner, r["origin"]),
+             "отклик": r["response"],
+             "причина": r["reason"] or "(причина не записана)"}
+            for r in rep]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def surrogate_coverage_caption(runner) -> str:
+    """iter98: подпись «на чём обучена модель каждого свойства» (чистая).
+
+    Свойства с пропусками перечисляются явно: «Opacity: модель на 14 из 20
+    опытов (6 не измерено)». Без пропусков — одна строка про полноту.
+    Свойство без единого измерения названо отдельно — модели у него НЕТ,
+    и оптимизатор по нему не считает (A0.6).
+    """
+    cov = (runner.surrogate_coverage()
+           if hasattr(runner, "surrogate_coverage") else {})
+    if not cov:
+        return ""
+    partial = [(n, c) for n, c in cov.items() if int(c.get("n_missing", 0))]
+    unfitted = [n for n, c in cov.items() if not c.get("fitted")]
+    if not partial and not unfitted:
+        n_base = next(iter(cov.values())).get("n_base", 0)
+        return (f"Модели всех свойств обучены на полной базе "
+                f"({n_base} опытов, непроведённых измерений нет).")
+    parts = []
+    for n, c in partial:
+        if c.get("fitted"):
+            parts.append(f"{n}: модель на {c['n_train']} из {c['n_base']} "
+                         f"опытов ({c['n_missing']} не измерено)")
+    txt = ("Модели свойств учатся только на измеренных точках. "
+           + "; ".join(parts) + ("." if parts else ""))
+    if unfitted:
+        txt += (f" Без единого измерения — {', '.join(unfitted)}: модели нет, "
+                f"цели по этим свойствам считать не из чего.")
+    return txt
 
 
 def covariate_rows_from_editor(edited, names: Sequence[str],
@@ -705,6 +865,9 @@ def seed_design_dataframe(runner, Xs, Ys=None, *, batch_kg: Optional[float] = No
             row[f"{pn} (lab)"] = (round(float(Ya[i, k]), 4)
                                   if Ya is not None and k < Ya.shape[1]
                                   else np.nan)
+        # iter98: столбец причин «не измерено» — заполняется ТОЛЬКО когда
+        # ячейка отклика оставлена пустой (образец не получен и т.п.).
+        row[MISSING_REASON_COL] = ""
         # P3.1: места под ТЕЛЕМЕТРИЮ прогона (объявленные ковариаты) —
         # заполняются при измерении; пустые ячейки допустимы (не отклик).
         for cn in cov_names_seed:
@@ -941,8 +1104,9 @@ def seed_plan_by_block_dataframe(runner, Xs, Ys=None, *,
         return pd.DataFrame()
     props = list(runner.property_names)
     cov_names = list(getattr(runner, "covariate_names", []) or [])
-    drop = [f"{p} (lab)" for p in props] + [f"{c} (ковариата)"
-                                            for c in cov_names]
+    drop = ([f"{p} (lab)" for p in props] + [f"{c} (ковариата)"
+                                             for c in cov_names]
+            + [MISSING_REASON_COL])
     mass_unit = mass_unit_of(runner)
     weigh = batch_kg is not None and float(batch_kg) > 0
     if weigh:
@@ -990,6 +1154,7 @@ def seed_responses_dataframe(runner, Xs, Ys=None) -> pd.DataFrame:
     keep = (["№ опыта"]
             + [c for c in ("Блок", "Партия") if c in base.columns]
             + [f"{p} (lab)" for p in props]
+            + [MISSING_REASON_COL]
             + [f"{c} (ковариата)" for c in cov_names])
     resp = base[[c for c in keep if c in base.columns]]
     if "Блок" not in resp.columns:
@@ -4835,7 +5000,12 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                "значениями»"
                + (" и «… (ковариата)» — условия прогона, пустые ячейки "
                   "допустимы (P3.1)" if cov_names_ui else "")
-               + ":")
+               + ". Если измерение НЕ ПРОВОДИЛОСЬ (образец не получен, "
+               f"поверхность негодная) — оставьте ячейку пустой и впишите "
+               f"причину в «{MISSING_REASON_COL}»: «Opacity: образец не "
+               f"получен (SurfaceQuality=1); Gloss60: то же» или одну общую "
+               f"причину для всех пустых. Пустая ячейка без причины не "
+               f"фиксируется:")
     blk_cols = [c for c in ("Блок", "Партия") if c in df.columns]
     edited = st.data_editor(df, width="stretch", height=320,
                             hide_index=True,
@@ -4910,27 +5080,35 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
 
         try:
             Y = np.column_stack([np.asarray(edited[c], float) for c in lab_cols])
-            if np.isnan(Y).any():
+            if np.isnan(Y).all():
                 raise ValueError(
-                    "Заполните измеренные отклики (столбцы «… (lab)») для ВСЕХ "
-                    "точек — вручную в таблице или кнопкой «🧪 Заполнить "
-                    "тестовыми значениями». План с пустыми ячейками "
-                    "зафиксировать нельзя.")
+                    "Ни одного измеренного отклика: заполните столбцы «… (lab)» "
+                    "— вручную в таблице или кнопкой «🧪 Заполнить тестовыми "
+                    "значениями». План без измерений зафиксировать нельзя.")
             # P3.1: телеметрия прогона из столбцов «(ковариата)» — NaN
             # пропускаются (не снята); валидация имён/чисел — раннером.
             covs_seed = (covariate_rows_from_editor(edited, cov_names_ui)
                          if cov_names_ui else None)
-            out = ctrl.commit_seed(Xs, Y, covariates=covs_seed)
+            # iter98: пустые «(lab)» = измерение не проводилось — причина из
+            # столбца причин; проверку «у каждой пустой есть причина» делает
+            # раннер (отказ текстом, A0.6).
+            reasons_seed = missing_reason_rows_from_editor(edited, props)
+            out = ctrl.commit_seed(Xs, Y, covariates=covs_seed,
+                                   missing_reasons=reasons_seed)
 
             for k in ("setup_seed_X", "setup_seed_Y",
                       "setup_seed_df", "setup_seed_df_sig"):
                 st.session_state.pop(k, None)
             # P0: уведомление через _flash — st.success перед st.rerun не
             # доживал до глаз пользователя (rerun стирает вывод прогона).
+            n_miss = int(out.get("n_missing", 0))
             _flash(
                 f"Стартовый план зафиксирован: +{out['added']} точек (источник "
                 f"«стартовый план»), общая база = {out['n_base']}, модели "
-                "свойств обучены. Дальше — создание веток (Ш4, §17.5).")
+                "свойств обучены"
+                + (f"; непроведённых измерений: {n_miss} (с причинами, в "
+                   f"модели не входят)" if n_miss else "")
+                + ". Дальше — создание веток (Ш4, §17.5).")
             # База стала непустой → сразу перерисовать вкладку, чтобы открылось
             # создание веток (§17.5) без второго клика (иначе ранний return в
             # render_campaign держит seed-секцию до следующего взаимодействия).
@@ -5626,6 +5804,8 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         for j, col in enumerate(lab_cols):
             df[col] = (np.round(np.asarray(Ys, float)[:, j], 4)
                        if Ys is not None else np.nan)
+        # iter98: причина «не измерено» — для пустых «(lab)».
+        df[MISSING_REASON_COL] = ""
         # P3.1: столбцы под телеметрию прогона (объявленные ковариаты) —
         # заполняются при измерении; пустые ячейки допустимы (не отклик).
         wb_cov_names = list(getattr(runner, "covariate_names", []) or [])
@@ -5640,7 +5820,10 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                    "только столбцы «свойство (lab)» — вручную или кнопкой "
                    "тестовых значений"
                    + (" и «… (ковариата)» — условия прогона (P3.1)"
-                      if wb_cov_names else "") + ":")
+                      if wb_cov_names else "")
+                   + f". Непроведённое измерение — пустая ячейка + причина в "
+                   f"«{MISSING_REASON_COL}» («Opacity: образец не получен "
+                   f"(SurfaceQuality=1)»); без причины не фиксируется:")
         edited = st.data_editor(df, width="stretch", height=280,
                                 hide_index=True,
                                 disabled=["№ опыта", *coord_names[:Xs.shape[1]]],
@@ -5652,16 +5835,19 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
                 d_before = float(br_now.d_best)
                 Y = np.column_stack([np.asarray(edited[c], float)
                                      for c in lab_cols])
-                if np.isnan(Y).any():
+                if np.isnan(Y).all():
                     raise ValueError(
-                        "Заполните измеренные отклики (столбцы «… (lab)») для "
-                        "ВСЕХ предложенных точек — вручную или кнопкой "
-                        "«🧪 Заполнить тестовыми значениями». Точки с пустыми "
-                        "ячейками в базу не добавляются.")
+                        "Ни одного измеренного отклика: заполните столбцы "
+                        "«… (lab)» — вручную или кнопкой «🧪 Заполнить "
+                        "тестовыми значениями». Раунд без измерений в базу "
+                        "не добавляется.")
                 # P3.1: телеметрия прогона из столбцов «(ковариата)»
                 covs_wb = (covariate_rows_from_editor(edited, wb_cov_names)
                            if wb_cov_names else None)
-                res = ctrl.commit_measured(bsel, Xs, Y, covariates=covs_wb)
+                # iter98: причины непроведённых измерений (пустые «(lab)»)
+                reasons_wb = missing_reason_rows_from_editor(edited, props)
+                res = ctrl.commit_measured(bsel, Xs, Y, covariates=covs_wb,
+                                           missing_reasons=reasons_wb)
 
                 st.session_state.pop(kx, None)
                 st.session_state.pop(ky, None)
@@ -6271,12 +6457,63 @@ def render_base_panel(ctrl: "cv.CampaignController") -> None:
         _blk_txt = base_blocking_caption(runner)
         if _blk_txt:
             st.caption(_blk_txt)
+        # iter98: на чём обучена модель каждого свойства (пропуски видны)
+        _cov_txt = surrogate_coverage_caption(runner)
+        if _cov_txt:
+            st.caption(_cov_txt)
         st.download_button(
             "⬇️ Скачать .xlsx",
             data=campaign_base_excel_bytes(runner, batch_kg=batch_kg),
             file_name="campaign_base.xlsx", key="camp_base_dl",
             mime="application/vnd.openxmlformats-officedocument."
                  "spreadsheetml.sheet")
+
+    # iter98: НЕПРОВЕДЁННЫЕ измерения — отдельный список с причинами и
+    # операция «пометить как не измерено» (обратная к коррекции опечатки).
+    _miss_df = missing_report_dataframe(runner)
+    with st.expander(f"🚫 Непроведённые измерения ({len(_miss_df)})"):
+        st.caption(
+            "Ячейка «н/и (причина)» в базе — измерение НЕ ПРОВОДИЛОСЬ "
+            "(например, образец не получен на экструдере: SurfaceQuality "
+            "ниже 4, и оптику с бугристой поверхности не снимали). Такие "
+            "значения в модель свойства не входят (она учится только на "
+            "измеренных точках), а опыт с непроверенной целью не считается "
+            "лучшим в ветке. Ничем не подменяются: ноль или «худшее значение» "
+            "отравили бы модель (§13.7).")
+        if _miss_df.empty:
+            st.caption("Непроведённых измерений в базе нет.")
+        else:
+            st.dataframe(_miss_df, width="stretch", hide_index=True)
+        st.markdown("**Пометить измерение как не проведённое**")
+        st.caption(
+            "Если число внесено по ошибке (например, оптика снята с негодного "
+            "образца) — переведите отклик в «не измерено» с причиной. "
+            "Координаты и № опыта сохраняются (И-1), модели переобучаются.")
+        n_pts = len(getattr(runner, "points", []) or [])
+        if n_pts:
+            _mu_num = st.number_input("№ опыта", min_value=1,
+                                      max_value=n_pts, value=1, step=1,
+                                      key="camp_mu_num")
+            _mu_props = st.multiselect("Отклики", list(runner.property_names),
+                                       key="camp_mu_props")
+            _mu_reason = st.text_input(
+                "Причина (обязательна)", key="camp_mu_reason",
+                placeholder="образец не получен: SurfaceQuality=1")
+            if st.button("🚫 Пометить как не измерено", key="camp_mu_apply"):
+                try:
+                    if not _mu_props:
+                        raise ValueError("Выберите хотя бы один отклик.")
+                    out = ctrl.mark_unmeasured_point(
+                        int(_mu_num) - 1,
+                        {p: _mu_reason for p in _mu_props})
+                    _invalidate_branch_caches()
+                    _flash(f"Опыт №{int(_mu_num)}: отклики "
+                           f"{', '.join(out['changed'])} помечены как не "
+                           f"измеренные. Модели переобучены, ветки "
+                           f"пересчитаны.")
+                    st.rerun()
+                except (ValueError, KeyError, IndexError, RuntimeError) as exc:
+                    st.error(str(exc))
 
     # §17.2.1: КОРРЕКЦИЯ ошибки ввода измеренных откликов (правка опечатки Y).
     with st.expander("✏️ Исправить измеренные отклики (коррекция ошибок ввода, "

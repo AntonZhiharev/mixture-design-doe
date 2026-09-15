@@ -55,8 +55,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..core.schema import (MIXTURE, PROCESS, DataPoint, ProjectSchema,
-                           VariableBlock, composite_matrix)
+from ..core.schema import (MISSING, MIXTURE, PROCESS, DataPoint, ProjectSchema,
+                           VariableBlock, composite_matrix, is_missing)
 from ..core.simplex import SimplexRegion
 from ..core.mass_units import DEFAULT_MASS_UNIT, normalize_mass_unit
 
@@ -89,6 +89,41 @@ from ..optimize.desirability import (ChanceConstraint, Desirability,
                                      make_item_cost_fn)
 
 
+#: iter98: ключ ``origin_tag`` точки с причинами НЕПРОВЕДЁННЫХ измерений
+#: ``{отклик: "почему не измерено"}`` — рядом с ``covariates``/``block``.
+MISSING_REASONS_TAG = "missing_reasons"
+
+
+def measured_desirability(specs: Mapping[str, DesirabilitySpec],
+                          measured: Mapping[str, np.ndarray]) -> np.ndarray:
+    """iter98: желательность ИЗМЕРЕННЫХ точек при частично пустых откликах.
+
+    ``measured`` — ``{отклик: столбец}`` со ``NaN`` там, где измерение не
+    проводилось. Точка, у которой хотя бы один отклик цели НЕ измерен,
+    получает ``d = 0``: её нельзя объявить лучшей (``d_best``), потому что
+    цель по ней не проверена. Это НЕ подстановка «плохого значения» в
+    модель — суррогаты учатся отдельно, на измеренных (:meth:`fit_surrogates`);
+    это лишь запрет считать непроверенное рекордом. Для оптимизатора по
+    суррогату (argmax/acquisition) функция не используется — там NaN нет.
+
+    Все точки с полными измерениями считаются штатным
+    :class:`Desirability` (числа совпадают с прежним поведением).
+    """
+    names = list(specs)
+    cols = {n: np.atleast_1d(np.asarray(measured[n], float)).ravel()
+            for n in names}
+    n = len(next(iter(cols.values()))) if cols else 0
+    out = np.zeros(n, float)
+    if n == 0:
+        return out
+    complete = np.ones(n, bool)
+    for c in cols.values():
+        complete &= np.isfinite(c)
+    if np.any(complete):
+        sub = {k: v[complete] for k, v in cols.items()}
+        out[complete] = np.asarray(Desirability(specs).overall(sub),
+                                   float).ravel()
+    return out
 
 
 def _expand_delta(schema, var, side, new_bound):
@@ -846,7 +881,8 @@ class MixtureProcessRunner:
 
     def _make_point(self, coords_cur: np.ndarray, y_row: np.ndarray,
                     origin: str, block: Optional[int] = None,
-                    covariates: Optional[Mapping[str, float]] = None
+                    covariates: Optional[Mapping[str, float]] = None,
+                    missing_reasons: Optional[Mapping[str, str]] = None
                     ) -> DataPoint:
         coords_cur = np.asarray(coords_cur, float).ravel()
         X: Dict[str, List[float]] = {}
@@ -854,8 +890,23 @@ class MixtureProcessRunner:
             X[MIXTURE] = [float(v) for v in coords_cur[:self.q]]
         if self.d > 0:
             X[PROCESS] = [float(v) for v in coords_cur[self.q:self.q + self.d]]
-        Y = {name: float(y_row[i]) for i, name in enumerate(self.property_names)}
+        # iter98: NaN в строке Y — это «измерение не проводилось» (§13.7
+        # MISSING), а не число. Хранится сентинелом, в модель не попадает.
+        Y: Dict[str, Any] = {}
+        for i, name in enumerate(self.property_names):
+            v = float(y_row[i])
+            Y[name] = MISSING if not np.isfinite(v) else v
         tag = {"origin": origin, "schema_version": self.current_schema_version}
+        # iter98: ПРИЧИНА непроведённого измерения — per-point метаданные
+        # (как covariates): «образец не получен, SurfaceQuality=1». Через
+        # полгода «почему не измерено» важнее «что». Пишется только для
+        # откликов, которые действительно MISSING.
+        if missing_reasons:
+            reasons = {str(k): str(v).strip()
+                       for k, v in missing_reasons.items()
+                       if k in Y and is_missing(Y[k]) and str(v).strip()}
+            if reasons:
+                tag[MISSING_REASONS_TAG] = reasons
         # iter37 (п.2): индикатор кампании/геометрии — метаданные, которые
         # постфактум не восстанавливаются. Фаза = schema_version (уже в теге),
         # партия = block; сюда добавляются метка кампании и отпечаток активной
@@ -971,23 +1022,83 @@ class MixtureProcessRunner:
             self.X = None; self.Y = None; self.origin = []
             return
         self.X = composite_matrix(self.current_schema, mig)
+        # iter98: MISSING (§13.7) → NaN в numpy-кэше. Это ЕДИНСТВЕННОЕ место,
+        # где сентинел становится числом, и это число — NaN, а не 0/среднее:
+        # любой потребитель ``Y`` обязан маскировать его сам (fit_surrogates,
+        # _measured_desirability, response_coverage).
         self.Y = np.asarray(
-            [[float(p.Y[name]) for name in self.property_names] for p in mig],
-            float)
+            [[(np.nan if is_missing(p.Y.get(name, MISSING))
+               else float(p.Y[name])) for name in self.property_names]
+             for p in mig], float)
         self.origin = [p.origin_tag.get("origin", "seed") for p in mig]
 
     # ------------------------------------------------------------------
     # Общая модель проекта (GP на каждое свойство, составные координаты)
     # ------------------------------------------------------------------
     def fit_surrogates(self) -> None:
+        """Обучить суррогат КАЖДОГО свойства на его ИЗМЕРЕННЫХ точках.
+
+        iter98: столбец ``Y[:, i]`` маскируется по конечности отдельно для
+        каждого свойства — точка с непроведённым измерением Opacity остаётся
+        в обучении Gloss/SurfaceQuality (те измерены). Свойство без единого
+        измерения суррогата не получает (в ``surrogates`` его нет —
+        потребители и так проверяют ``name in self.surrogates``), а причина
+        видна в :meth:`surrogate_coverage`. Подстановок (0, среднее) НЕТ:
+        отравленную модель нельзя отладить (§13.7).
+        """
         self._rebuild_arrays()
         if self.X is None or len(self.X) == 0:
             raise RuntimeError("Нет данных: сначала seed_initial().")
         self.surrogates = {}
+        self._surrogate_n_train: Dict[str, int] = {}
         for i, name in enumerate(self.property_names):
+            col = self.Y[:, i]
+            mask = np.isfinite(col)
+            n_meas = int(mask.sum())
+            self._surrogate_n_train[name] = n_meas
+            if n_meas == 0:
+                continue
             gp = GPExpert(mean_model=self.gp_mean_model, kernel=self.gp_kernel,
                           seed=self.seed, n_restarts=self.n_restarts)
-            self.surrogates[name] = gp.fit(self.X, self.Y[:, i])
+            self.surrogates[name] = gp.fit(self.X[mask], col[mask])
+
+    def surrogate_coverage(self) -> Dict[str, Dict[str, Any]]:
+        """iter98: на скольких точках обучен суррогат каждого свойства.
+
+        ``{свойство → {n_train, n_base, n_missing, fitted}}`` по АКТИВНОЙ базе
+        (мигрированные к текущей схеме точки, как ``X``/``Y``). Read-only.
+        Отличие от ``response_coverage`` (campaign.py): там — по всей
+        истории ``points``, здесь — по тому, что реально видит модель.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        n_base = 0 if self.Y is None else int(len(self.Y))
+        for i, name in enumerate(self.property_names):
+            n_meas = (0 if self.Y is None
+                      else int(np.isfinite(self.Y[:, i]).sum()))
+            out[name] = {"n_train": n_meas, "n_base": n_base,
+                         "n_missing": n_base - n_meas,
+                         "fitted": name in self.surrogates}
+        return out
+
+    def missing_report(self) -> List[Dict[str, Any]]:
+        """iter98: список непроведённых измерений с причинами (по всей базе).
+
+        Строка на пару (точка, отклик) с ``MISSING`` в ``Y``: ``{point_index
+        (0-based), experiment (1-based), origin, response, reason}``; причина
+        пустая строка, если не записана. Read-only, порядок — порядок базы.
+        """
+        rows: List[Dict[str, Any]] = []
+        for i, p in enumerate(self.points):
+            reasons = dict(p.origin_tag.get(MISSING_REASONS_TAG, {}) or {})
+            for name in self.property_names:
+                if is_missing(p.Y.get(name, MISSING)):
+                    rows.append({
+                        "point_index": i, "experiment": i + 1,
+                        "origin": p.origin_tag.get("origin", "seed"),
+                        "response": name,
+                        "reason": str(reasons.get(name, "")),
+                    })
+        return rows
 
     def refit_if_possible(self) -> bool:
         """Переобучить суррогаты, ЕСЛИ база непуста; иначе — сбросить их.
@@ -1090,7 +1201,8 @@ class MixtureProcessRunner:
         return np.vstack(chosen)
 
     def commit_seed(self, X: Any, Y: Any, *,
-                    covariates: Optional[Sequence[Any]] = None
+                    covariates: Optional[Sequence[Any]] = None,
+                    missing_reasons: Optional[Sequence[Any]] = None
                     ) -> Dict[str, Any]:
         """§17.4: ЗАФИКСИРОВАТЬ измеренные ``Y`` стартового seed-дизайна.
 
@@ -1100,13 +1212,21 @@ class MixtureProcessRunner:
         пользователь). Точки ДОПИСЫВАЮТСЯ в ОБЩУЮ базу с origin-тегом ``"seed"``
         (И-1, без урезания истории), суррогаты переобучаются. В отличие от
         :meth:`seed_initial` (авто-оракул), Y приходит от пользователя. Пустой
-        ``X`` — no-op. Возвращает ``{added, n_base, P}``.
+        ``X`` — no-op. Возвращает ``{added, n_base, P, n_missing}``.
 
         ``covariates`` (P3.1) — необязательная per-point телеметрия прогона:
         последовательность длины ``n`` из ``{имя: значение}`` (``None``/пустой
         словарь у строки — телеметрии нет, это допустимо: ковариата может
         быть снята не на каждом опыте). Имена валидируются против ОБЪЯВЛЕННЫХ
         :attr:`covariate_names` (A0.6 — опечатка не молчит).
+
+        iter98: ``NaN`` в ``Y`` = измерение НЕ ПРОВОДИЛОСЬ (§13.7 MISSING) —
+        например, образец не получен на экструдере (SurfaceQuality < 4) и
+        оптика не снята. Такая ячейка ОБЯЗАНА иметь причину в
+        ``missing_reasons`` (последовательность длины ``n`` из ``{отклик:
+        текст}``; ``None`` у строки без пропусков), иначе отказ: пустая
+        ячейка без причины неотличима от забытого ввода. Причина у
+        измеренного отклика — тоже отказ (противоречие).
         """
         newX = np.atleast_2d(np.asarray(X, float))
         Ynew = np.atleast_2d(np.asarray(Y, float))
@@ -1122,8 +1242,10 @@ class MixtureProcessRunner:
                 f"Y: ожидалось {P} свойств на строку ({list(self.property_names)}), "
                 f"дано {Ynew.shape[1]}.")
         if newX.shape[0] == 0:
-            return {"added": 0, "n_base": len(self.points), "P": P}
+            return {"added": 0, "n_base": len(self.points), "P": P,
+                    "n_missing": 0}
         cov_rows = self._covariate_rows(covariates, len(newX))
+        reason_rows = self._missing_reason_rows(Ynew, missing_reasons)
         # стартовый blocking: оптимальные метки партий; если база уже непуста
         # (повторный seed-коммит) — сдвигаем номера за существующие блоки
         labels = self.seed_block_labels(newX)
@@ -1132,9 +1254,59 @@ class MixtureProcessRunner:
         for i in range(len(newX)):
             self.points.append(self._make_point(newX[i], Ynew[i], "seed",
                                                 block=int(labels[i]) + offset,
-                                                covariates=cov_rows[i]))
+                                                covariates=cov_rows[i],
+                                                missing_reasons=reason_rows[i]))
         self.fit_surrogates()
-        return {"added": int(len(newX)), "n_base": len(self.points), "P": P}
+        return {"added": int(len(newX)), "n_base": len(self.points), "P": P,
+                "n_missing": int(np.sum(~np.isfinite(Ynew)))}
+
+    def _missing_reason_rows(self, Ynew: np.ndarray,
+                             missing_reasons: Optional[Sequence[Any]]
+                             ) -> List[Dict[str, str]]:
+        """iter98: пер-строчная валидация причин непроведённых измерений.
+
+        Контракт (A0.6 — ничего не молчит):
+          * каждая ``NaN``-ячейка ``Ynew`` ОБЯЗАНА иметь непустую причину;
+          * причина у КОНЕЧНОЙ ячейки — противоречие (отклик и измерен, и
+            «не измерен»);
+          * имя отклика — из ``property_names``.
+        Без ``NaN`` в ``Ynew`` аргумент не нужен (``None`` → пустые строки).
+        """
+        n = int(Ynew.shape[0])
+        nan_mask = ~np.isfinite(Ynew)
+        if missing_reasons is None:
+            rows: List[Any] = [None] * n
+        else:
+            rows = list(missing_reasons)
+            if len(rows) != n:
+                raise ValueError(
+                    f"missing_reasons: строк {len(rows)} ≠ числу точек {n}.")
+        out: List[Dict[str, str]] = []
+        for i in range(n):
+            given = {str(k): str(v).strip()
+                     for k, v in (rows[i] or {}).items()}
+            unknown = [k for k in given if k not in self.prop_index]
+            if unknown:
+                raise KeyError(
+                    f"missing_reasons[{i}]: отклики {sorted(unknown)} не среди "
+                    f"свойств {list(self.property_names)}.")
+            missing_here = [nm for j, nm in enumerate(self.property_names)
+                            if nan_mask[i, j]]
+            no_reason = [nm for nm in missing_here if not given.get(nm)]
+            if no_reason:
+                raise ValueError(
+                    f"Точка {i + 1}: отклики {no_reason} не измерены, но причина "
+                    f"не указана. Пустая ячейка без причины неотличима от "
+                    f"забытого ввода — напишите, почему измерение не "
+                    f"проводилось (например, «образец не получен: "
+                    f"SurfaceQuality=1»).")
+            contradict = [nm for nm in given if nm not in missing_here]
+            if contradict:
+                raise ValueError(
+                    f"Точка {i + 1}: у откликов {contradict} есть и измеренное "
+                    f"значение, и причина «не измерено» — уберите одно из двух.")
+            out.append({nm: given[nm] for nm in missing_here})
+        return out
 
     # ------------------------------------------------------------------
     # §17.2.1 КОРРЕКЦИЯ ОШИБКИ ВВОДА: исправить измеренные Y уже зафиксированной
@@ -1173,22 +1345,81 @@ class MixtureProcessRunner:
             except (TypeError, ValueError):
                 raise ValueError(f"Значение отклика '{k}' не число: {v!r}.")
             if not np.isfinite(fv):
-                raise ValueError(f"Значение отклика '{k}' не конечно: {v!r}.")
+                raise ValueError(
+                    f"Значение отклика '{k}' не конечно: {v!r}. Чтобы пометить "
+                    f"измерение как НЕ ПРОВЕДЁННОЕ — mark_unmeasured(...) с "
+                    f"причиной.")
             clean[k] = fv
 
         pt = self.points[idx]
         changed: Dict[str, Dict[str, Optional[float]]] = {}
+        reasons = dict(pt.origin_tag.get(MISSING_REASONS_TAG, {}) or {})
         for k, fv in clean.items():
             old = pt.Y.get(k, None)
-            try:
-                old_f = float(old) if old is not None else None
-            except (TypeError, ValueError):
-                old_f = None
+            old_f = None if is_missing(old) else float(old)
             pt.Y[k] = fv
+            # iter98: значение появилось — причина «не измерено» устарела
+            reasons.pop(k, None)
             changed[k] = {"old": old_f, "new": fv}
+        if reasons:
+            pt.origin_tag[MISSING_REASONS_TAG] = reasons
+        else:
+            pt.origin_tag.pop(MISSING_REASONS_TAG, None)
 
         origin = (pt.origin_tag.get("origin", "seed")
                   if getattr(pt, "origin_tag", None) else "seed")
+        self.fit_surrogates()
+        return {"point_index": idx, "origin": origin, "changed": changed,
+                "n_base": len(self.points), "P": len(self.property_names)}
+
+    def mark_unmeasured(self, point_index: int,
+                        reasons: Mapping[str, str]) -> Dict[str, Any]:
+        """iter98: пометить отклики УЖЕ зафиксированной точки как НЕ ИЗМЕРЕННЫЕ.
+
+        Обратная операция к :meth:`correct_measured`: значение отклика
+        заменяется на ``MISSING`` (§13.7), причина пишется в
+        ``origin_tag["missing_reasons"]``. Нужна, когда число внесли по
+        ошибке (например, оптику сняли с бугристого образца и потом решили,
+        что это не измерение материала), либо когда причину надо
+        дописать/поправить у уже пустого отклика. ``reasons`` — ``{отклик:
+        текст}``, пустая причина — отказ (A0.6). Координаты, происхождение и
+        номер опыта не меняются (И-1); суррогаты переобучаются.
+        Возвращает ``{point_index, origin, changed:{отклик:{old,new:None,
+        reason}}}``.
+        """
+        n = len(self.points)
+        idx = int(point_index)
+        if not (0 <= idx < n):
+            raise IndexError(
+                f"point_index={point_index} вне диапазона [0, {n}) общей базы.")
+        if not reasons:
+            raise ValueError(
+                "Нет откликов: передайте {отклик: причина, ...}.")
+        unknown = [k for k in reasons if k not in self.prop_index]
+        if unknown:
+            raise KeyError(
+                f"Отклики {sorted(unknown)} не среди свойств оракула "
+                f"{list(self.property_names)}.")
+        clean: Dict[str, str] = {}
+        for k, v in reasons.items():
+            txt = str(v or "").strip()
+            if not txt:
+                raise ValueError(
+                    f"Отклик '{k}': причина «не измерено» пустая — без причины "
+                    f"пропуск неотличим от забытого ввода.")
+            clean[str(k)] = txt
+
+        pt = self.points[idx]
+        stored = dict(pt.origin_tag.get(MISSING_REASONS_TAG, {}) or {})
+        changed: Dict[str, Dict[str, Any]] = {}
+        for k, txt in clean.items():
+            old = pt.Y.get(k, None)
+            old_f = None if is_missing(old) else float(old)
+            pt.Y[k] = MISSING
+            stored[k] = txt
+            changed[k] = {"old": old_f, "new": None, "reason": txt}
+        pt.origin_tag[MISSING_REASONS_TAG] = stored
+        origin = pt.origin_tag.get("origin", "seed")
         self.fit_surrogates()
         return {"point_index": idx, "origin": origin, "changed": changed,
                 "n_base": len(self.points), "P": len(self.property_names)}
@@ -1869,6 +2100,12 @@ class MixtureProcessRunner:
         """P3.1: ковариаты АКТИВНЫХ точек в порядке ``self.X`` (как
         :meth:`point_blocks` — origin_tag переживает миграцию схемы)."""
         return [dict(p.origin_tag.get("covariates", {}) or {})
+                for p in self._migrated_points()]
+
+    def active_point_missing_reasons(self) -> List[Dict[str, str]]:
+        """iter98: причины непроведённых измерений АКТИВНЫХ точек в порядке
+        ``self.X`` (как :meth:`active_point_covariates`)."""
+        return [dict(p.origin_tag.get(MISSING_REASONS_TAG, {}) or {})
                 for p in self._migrated_points()]
 
     # ------------------------------------------------------------------
@@ -2592,7 +2829,8 @@ class MixtureProcessRunner:
         return np.vstack(newX_list)
 
     def commit_measured(self, branch_id: str, X: Any, Y: Any, *,
-                        covariates: Optional[Sequence[Any]] = None
+                        covariates: Optional[Sequence[Any]] = None,
+                        missing_reasons: Optional[Sequence[Any]] = None
                         ) -> Dict[str, Any]:
         """§17.2: ЗАФИКСИРОВАТЬ измеренные отклики ``Y`` предложенных точек.
 
@@ -2606,6 +2844,11 @@ class MixtureProcessRunner:
 
         ``covariates`` (P3.1) — необязательная per-point телеметрия прогона
         (контракт как у :meth:`commit_seed`).
+
+        iter98: ``NaN`` в ``Y`` = измерение не проводилось; каждой такой ячейке
+        нужна причина в ``missing_reasons`` (контракт как у :meth:`commit_seed`).
+        Точка с непроверенной целью не может стать ``x_best``
+        (:func:`measured_desirability`), но её измеренные отклики учат модель.
         """
         if branch_id not in self.branches:
             raise KeyError(f"Нет ветки '{branch_id}'.")
@@ -2630,16 +2873,19 @@ class MixtureProcessRunner:
                     "n_base": int(0 if self.X is None else len(self.X))}
 
         cov_rows = self._covariate_rows(covariates, len(newX))
+        reason_rows = self._missing_reason_rows(Ynew, missing_reasons)
         # blocking добора: commit-раунд — НОВАЯ партия → ОДИН новый блок
         blk = self._next_block()
         for i in range(len(newX)):
             self.points.append(
                 self._make_point(newX[i], Ynew[i], f"branch:{branch_id}",
-                                 block=blk, covariates=cov_rows[i]))
+                                 block=blk, covariates=cov_rows[i],
+                                 missing_reasons=reason_rows[i]))
         br.spent += len(newX)
 
         # измеренный d_best (§3): цена за изделие — по ИЗМЕРЕННОЙ ρ (в Ynew),
         # а не по суррогату; argmax/acquisition в propose_points — по ρ̂.
+        # iter98: точка с непроверенной целью (NaN) в рекорд не идёт (d=0).
         specs = dict(br.goal)
         meas = {name: Ynew[:, self.prop_index[name]] for name in br.goal}
         if branch_id in self._branch_cost:
@@ -2648,8 +2894,7 @@ class MixtureProcessRunner:
             rho_meas = Ynew[:, self.prop_index[cfg["rho_property"]]]
             meas[cfg["cost_name"]] = pc * rho_meas
             specs[cfg["cost_name"]] = cfg["cost_spec"]
-        desir = Desirability(specs)
-        d_meas = np.asarray(desir.overall(meas), float).ravel()
+        d_meas = measured_desirability(specs, meas)
 
         bi = int(np.argmax(d_meas))
         if float(d_meas[bi]) > br.d_best:

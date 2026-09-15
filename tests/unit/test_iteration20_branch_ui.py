@@ -248,7 +248,9 @@ def test_commit_seed_without_Y_shows_friendly_error_not_nan_crash():
     _click(at, "setup_commit_seed")
     assert not at.exception                          # UI не упал
     msgs = " ".join(e.value for e in at.error)
-    assert "Заполните измеренные отклики" in msgs     # понятная подсказка
+    # понятная подсказка (iter98: формулировка «ни одного измеренного отклика»
+    # — полностью пустая таблица; частичные пропуски теперь допустимы с причиной)
+    assert "заполните столбцы" in msgs and "(lab)" in msgs
     assert "NaN" not in msgs                          # без сырого sklearn-текста
     assert len(at.session_state["campaign_ctrl"].runner.points) == 0  # база пуста
 

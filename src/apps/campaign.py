@@ -45,6 +45,8 @@ from ..optimize.desirability import Desirability, DesirabilitySpec
 # поэтому наследованная веткой цена переживает save/load). Импорт безопасен:
 # campaign_state тянет mixture_process_runner, но НЕ campaign — цикла нет.
 from . import campaign_state as cs
+# iter98: желательность измеренных точек при непроведённых измерениях (NaN).
+from .mixture_process_runner import measured_desirability
 
 
 # ----------------------------------------------------------------------
@@ -739,7 +741,9 @@ class CampaignController:
                              float)
             meas[cfg["cost_name"]] = pc * rho
             specs[cfg["cost_name"]] = cfg["cost_spec"]
-        d = np.asarray(Desirability(specs).overall(meas), float).ravel()
+        # iter98: NaN (измерение не проводилось) ⇒ точка не претендует на
+        # рекорд — тот же контракт, что у commit_measured.
+        d = measured_desirability(specs, meas)
         if d.size == 0:
             return
         bi = int(np.argmax(d))
@@ -976,7 +980,9 @@ class CampaignController:
         return self.runner.propose_points(branch_id, n_points=n_points, **kw)
 
     def commit_measured(self, branch_id: str, X: Any, Y: Any, *,
-                        covariates: Optional[Any] = None) -> Dict[str, Any]:
+                        covariates: Optional[Any] = None,
+                        missing_reasons: Optional[Any] = None
+                        ) -> Dict[str, Any]:
         """§17.2: зафиксировать ВНЕСЁННЫЕ Y предложенных точек ветки.
 
         Доливает измеренные точки в ОБЩУЮ базу (origin=branch:{id}, И-1) через
@@ -984,9 +990,11 @@ class CampaignController:
         измеренная правда откату не подлежит (как :meth:`run_round`, Тр-7.2/7.3).
         Вторая половина ручного цикла «предложить → зафиксировать Y».
         ``covariates`` (P3.1) — необязательная per-point телеметрия прогона.
+        ``missing_reasons`` (iter98) — причины непроведённых измерений (NaN в Y).
         """
         out = self.runner.commit_measured(branch_id, X, Y,
-                                          covariates=covariates)
+                                          covariates=covariates,
+                                          missing_reasons=missing_reasons)
         self._undo.clear()
         return out
 
@@ -1000,15 +1008,34 @@ class CampaignController:
         return self.runner.propose_seed(n, **kw)
 
     def commit_seed(self, X: Any, Y: Any, *,
-                    covariates: Optional[Any] = None) -> Dict[str, Any]:
+                    covariates: Optional[Any] = None,
+                    missing_reasons: Optional[Any] = None) -> Dict[str, Any]:
         """§17.4: зафиксировать ВНЕСЁННЫЕ Y стартового seed-дизайна.
 
         Проброс в :meth:`MixtureProcessRunner.commit_seed`: точки в ОБЩУЮ базу
         (origin "seed", И-1), суррогаты обучаются. Стартовые измерения — правда,
         поэтому дно undo запечатывается (как :meth:`commit_measured`).
         ``covariates`` (P3.1) — необязательная per-point телеметрия прогона.
+        ``missing_reasons`` (iter98) — причины непроведённых измерений (NaN в Y).
         """
-        out = self.runner.commit_seed(X, Y, covariates=covariates)
+        out = self.runner.commit_seed(X, Y, covariates=covariates,
+                                      missing_reasons=missing_reasons)
+        self._undo.clear()
+        return out
+
+    # -- iter98: пометить измерение точки как НЕ ПРОВЕДЁННОЕ (с причиной) -----
+    def mark_unmeasured_point(self, point_index: int,
+                              reasons: Dict[str, str]) -> Dict[str, Any]:
+        """iter98: перевести отклики точки в «не измерено» с причиной.
+
+        Проброс в :meth:`MixtureProcessRunner.mark_unmeasured`. Меняет
+        измеренную правду (значение → MISSING), поэтому — как
+        :meth:`correct_measured_point`: все ветки переоцениваются, дно undo
+        запечатывается.
+        """
+        out = self.runner.mark_unmeasured(point_index, reasons)
+        for bid in list(getattr(self.runner, "branches", {}) or {}):
+            self._rescore(bid)
         self._undo.clear()
         return out
 

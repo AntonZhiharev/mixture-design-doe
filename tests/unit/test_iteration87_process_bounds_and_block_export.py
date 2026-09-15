@@ -320,11 +320,14 @@ class TestPlanByBlockSheet:
         Раньше лист по партиям был полной копией основного. С iter97 отклики
         уехали на свой лист «Отклики» (наряд на развеску и форма лаборатории —
         разные документы), поэтому здесь сверяем состав БЕЗ «(lab)».
+        iter98: столбец причин «не измерено» — тоже часть формы лаборатории,
+        на наряде его нет.
         """
         r = _blocked_runner(n_blocks=2)
         X = r.propose_seed(6)
         main = [c for c in ui.seed_design_dataframe(r, X).columns
-                if not str(c).endswith(("(lab)", "(ковариата)"))]
+                if not str(c).endswith(("(lab)", "(ковариата)"))
+                and c != ui.MISSING_REASON_COL]
         assert list(seed_plan_by_block_dataframe(r, X).columns) == main
 
     def test_empty_without_blocking(self):

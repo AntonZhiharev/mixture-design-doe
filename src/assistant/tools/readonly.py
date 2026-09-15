@@ -1241,6 +1241,14 @@ def get_runs(ctx: ToolContext, limit: int = 50) -> Dict[str, Any]:
         "covariate_names": list(getattr(runner, "covariate_names", []) or []),
         "origin_counts": dict(runner.origin_counts()
                               if hasattr(runner, "origin_counts") else {}),
+        # iter98: null в Y = измерение НЕ проводилось; причины — здесь и в
+        # origin_tag.missing_reasons каждой точки. Чтобы модель не считала
+        # null нулём, факт назван отдельным полем.
+        "unmeasured": list(runner.missing_report()
+                           if hasattr(runner, "missing_report") else []),
+        "surrogate_coverage": dict(
+            runner.surrogate_coverage()
+            if hasattr(runner, "surrogate_coverage") else {}),
         "runs": rows,
     })
 
@@ -1268,6 +1276,10 @@ def campaign_overview(ctx: ToolContext) -> Dict[str, Any]:
                          getattr(runner, "grams_per_phr", 0.0) or 0)},
         "process_levels": _f(getattr(runner, "process_levels", {}) or {}),
         "covariate_names": list(getattr(runner, "covariate_names", []) or []),
+        # iter98: на скольких точках обучена модель каждого свойства
+        "surrogate_coverage": dict(
+            runner.surrogate_coverage()
+            if hasattr(runner, "surrogate_coverage") else {}),
     }
     branches = []
     for bid, b in (getattr(runner, "branches", {}) or {}).items():

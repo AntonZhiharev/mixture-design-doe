@@ -194,8 +194,38 @@ def test_relax_then_restrict_reversible():
 # ======================================================================
 # add_response — новый отклик bump'ает версию схемы (Y[new]=MISSING у старых)
 # ======================================================================
-def test_add_response_bumps_version():
+def test_add_response_refused_for_fixed_truth_oracle():
+    """iter99: синтетическая истина новый отклик отдать не может — отказ ЦЕЛИКОМ.
+
+    До iter99 фасад поднимал версию схемы, но ядро (``property_names``) отклика
+    не видело — полусостояние. Теперь отказ явный, и схема остаётся нетронутой.
+    """
     r = _runner()
+    ctrl = CampaignController(r)
+    v0 = r.current_schema_version
+    n_hist = len(r.points)
+
+    with pytest.raises(ValueError, match="не умеет"):
+        ctrl.add_response(ResponseSpec("newresp", kind="min"))
+
+    assert r.current_schema_version == v0               # схема не тронута
+    assert "newresp" not in r.current_schema.response_names
+    assert "newresp" not in r.property_names
+    assert len(r.points) == n_hist                     # И-1
+
+
+def test_add_response_bumps_version_and_enters_measurement_loop():
+    """iter99: у ручной кампании новый отклик входит и в схему, и в ядро."""
+    from src.apps.campaign_ui import build_setup_runner
+    from src.core.schema import is_missing
+
+    r = build_setup_runner(
+        mixture_names=["A", "B", "C"], process_names=["T"],
+        process_lower=[0.0], process_upper=[1.0],
+        response_names=["strength", "gloss"], seed=1)
+    X = np.asarray(r.propose_seed(6, seed=1), float)
+    Y = np.vstack([r._measure(x) for x in X])
+    r.commit_seed(X, Y)
     ctrl = CampaignController(r)
     v0 = r.current_schema_version
     n_hist = len(r.points)
@@ -205,4 +235,15 @@ def test_add_response_bumps_version():
     assert new.version == v0 + 1
     assert r.current_schema_version == v0 + 1
     assert "newresp" in r.current_schema.response_names
+    assert list(r.property_names) == ["strength", "gloss", "newresp"]
+    assert r.prop_index["newresp"] == 2
     assert len(r.points) == n_hist                     # И-1
+    # у старых точек — честный MISSING с причиной, старые Y целы
+    assert all(is_missing(p.Y["newresp"]) for p in r.points)
+    assert all("newresp" in p.origin_tag["missing_reasons"] for p in r.points)
+    assert np.allclose([p.Y["strength"] for p in r.points], Y[:, 0])
+    assert r.surrogate_coverage()["newresp"] == {
+        "n_train": 0, "n_base": n_hist, "n_missing": n_hist, "fitted": False}
+    # повтор того же имени — отказ
+    with pytest.raises(ValueError, match="уже есть"):
+        ctrl.add_response(ResponseSpec("newresp"))

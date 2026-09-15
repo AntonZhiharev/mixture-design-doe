@@ -184,6 +184,102 @@ def item_price_fn(truth: MultiMixtureProcessTruth,
     return _fn
 
 
+# ======================================================================
+# iter99: «РВАНАЯ» лаборатория — гейт измеримости (torn domain)
+# ======================================================================
+#: Гейт-отклик torn-мира: всегда измерим (качество поверхности образца, 0–10).
+GATE_3COMP = "surface"
+#: Порог годности образца: ниже — оптика с образца не снимается.
+GATE_THRESHOLD_3COMP = 4.0
+#: Отклики, зависящие от годного образца (MISSING при surface < порога).
+GATED_3COMP = ("gloss", "dry_time")
+# Разреженная истина гейта: A даёт гладкую поверхность, C — бугристую, T —
+# вогнутый оптимум по температуре. Калибровано так, чтобы измеримой была
+# МЕНЬШАЯ часть области (~35–40 %) — как в живой постановке технолога
+# (15.09.2026: 10 полных точек из 70).
+TRUTH_GATE_3COMP: Dict[str, float] = {"A": 6, "B": 2, "C": 1,
+                                       "T": 2, "T^2": -2, "A*B": 4}
+
+
+def build_truth_3comp_gated(noise_sd: float = 0.0) -> MultiMixtureProcessTruth:
+    """Истина 3-комп мира + гейт-отклик ``surface`` (6 откликов).
+
+    Те же коэффициенты, что :func:`build_truth_3comp`; ``surface`` — шестой
+    отклик, всегда измеримый. Эталон (``branch_optimum``) считается по ЭТОЙ
+    истине, чтобы аналитический оптимум учитывал гейт в цели ветки.
+    """
+    s = truth_schema_3comp()
+    coef_by = {prop: coef_from_terms(s, sparse)
+               for prop, sparse in TRUTH_3COMP.items()}
+    coef_by[GATE_3COMP] = coef_from_terms(s, TRUTH_GATE_3COMP)
+    return MultiMixtureProcessTruth(s, coef_by, noise_sd=float(noise_sd))
+
+
+class TornLab:
+    """Оракул с РВАНОЙ областью определения откликов (iter99).
+
+    Обёртка над :class:`MultiMixtureProcessTruth`: гейт-отклик (``gate``)
+    измерим всегда; ``gated``-отклики отдаются как ``NaN`` там, где
+    ``gate < threshold`` — образец не получен, оптика не снята. ``NaN`` в Y
+    для ядра означает «измерение не проводилось» (§13.7, iter98) и ОБЯЗАН
+    сопровождаться причиной — её собирает :meth:`reasons`.
+
+    Это модель реальной лаборатории, а не «плохое значение»: суррогат
+    gated-отклика учится только на годных образцах, а ветка без гейта в цели
+    не знает границ измеримого (см. ``test_iteration99_torn_domain_battle``).
+    ``schema`` пробрасывается от истины — раннер по ней распознаёт оракул с
+    фиксированной физикой (объявление новых переменных/откликов отвергается).
+    """
+
+    def __init__(self, truth: MultiMixtureProcessTruth, *,
+                 gate: str = GATE_3COMP,
+                 threshold: float = GATE_THRESHOLD_3COMP,
+                 gated: Sequence[str] = GATED_3COMP):
+        if gate not in truth.property_names:
+            raise KeyError(f"Гейт '{gate}' не среди откликов истины "
+                           f"{truth.property_names}.")
+        bad = [g for g in gated if g not in truth.property_names]
+        if bad:
+            raise KeyError(f"gated-отклики {bad} не среди откликов истины.")
+        self.truth = truth
+        self.schema = truth.schema
+        self.property_names = list(truth.property_names)
+        self.gate = str(gate)
+        self.threshold = float(threshold)
+        self.gated = tuple(str(g) for g in gated)
+        self._gi = self.property_names.index(self.gate)
+        self.n_calls = 0
+        self.n_unmeasurable = 0
+
+    def feasible(self, Xc) -> np.ndarray:
+        """Маска «образец годен» по БЕЗШУМНОЙ истине гейта (для эталона)."""
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        g = np.asarray(self.truth.truths[self.gate].true(Xc), float).ravel()
+        return g >= self.threshold
+
+    def evaluate(self, Xc) -> np.ndarray:
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        Y = np.atleast_2d(self.truth.evaluate(Xc)).astype(float)
+        bad = Y[:, self._gi] < self.threshold
+        for g in self.gated:
+            Y[bad, self.property_names.index(g)] = np.nan
+        self.n_calls += int(len(Xc))
+        self.n_unmeasurable += int(bad.sum())
+        return Y
+
+    def reasons(self, Y) -> list:
+        """Причины пропусков для ``commit_seed``/``commit_measured`` по строкам Y."""
+        Y = np.atleast_2d(np.asarray(Y, float))
+        out = []
+        for row in Y:
+            miss = {g: (f"образец не получен: {self.gate}="
+                        f"{row[self._gi]:.2f} < {self.threshold:g}")
+                    for g in self.gated
+                    if not np.isfinite(row[self.property_names.index(g)])}
+            out.append(miss or None)
+        return out
+
+
 # ----------------------------------------------------------------------
 # Реестр «миров» для хелпера откликов (единая точка выбора)
 # ----------------------------------------------------------------------

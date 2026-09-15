@@ -466,6 +466,79 @@ class MixtureProcessRunner:
         self.baseline = np.asarray(mix_base + proc_base, float)
         return self.full_schema
 
+    def declare_response(self, name: str, *,
+                         reason: Optional[str] = None) -> Dict[str, Any]:
+        """iter99: ВВЕСТИ новый ОТКЛИК в измерительный контур посреди кампании.
+
+        До iter99 «добавить отклик» существовало только наполовину: фасад
+        (``CampaignController.add_response``) и UI поднимали версию схемы и
+        писали ``ResponseSpec`` в ``schema.responses``, но ``property_names`` /
+        ``prop_index`` раннера задавались один раз из оракула и не росли.
+        Итог: схема знала про отклик, а ``commit_*`` отвергал строку Y с лишним
+        столбцом, ветка на новый отклик не создавалась, в таблицах UI столбца не
+        было — обещанное «у старых точек Y=MISSING» не выполнялось.
+
+        Контракт (симметричен :meth:`declare_variables`, iter94):
+          * имя не занято (компонент / ось / отклик / ковариата — одноимённые
+            столбцы сделали бы базу неразличимой);
+          * оракул ОБЯЗАН уметь отдавать новый отклик — протокол
+            ``oracle.declare_response(name)``. Ручной оракул кампании
+            (истину вносит человек) его реализует; синтетическая истина с
+            фиксированным набором свойств — нет, и объявление отвергается
+            явно, а не даёт молча Y другой физики (A0.6);
+          * у КАЖДОЙ уже снятой точки ``Y[name] = MISSING`` с причиной в
+            ``origin_tag["missing_reasons"]`` (§13.7 / iter98: пропуск без
+            причины неотличим от забытого ввода) — ``reason`` или текст по
+            умолчанию «отклик введён после проведения опыта»;
+          * суррогат нового отклика появится, когда накопятся его измерения
+            (:meth:`fit_surrogates` пропускает свойство без единого замера);
+            общая база не урезается (И-1).
+
+        Версию схемы метод НЕ поднимает — это дело фасада
+        (``evolve_schema(add_responses=…)``): раннер отвечает за измерительный
+        контур, схема — за состав/область/модель. Возвращает
+        ``{response, P, n_backfilled, reason}``.
+        """
+        nm = str(name).strip()
+        if not nm:
+            raise ValueError("declare_response: имя отклика пустое.")
+        taken = set(self.full_schema.mixture_names)
+        taken |= set(self.full_schema.process_names)
+        taken |= set(self.property_names)
+        taken |= set(getattr(self, "covariate_names", []) or [])
+        if nm in taken:
+            raise ValueError(
+                f"Имя '{nm}' в проекте уже занято (компонент, ось, отклик или "
+                f"ковариата). Отклики различаются ИМЕНЕМ — одноимённые столбцы "
+                f"сделали бы базу неразличимой.")
+        hook = getattr(self.oracle, "declare_response", None)
+        if not callable(hook):
+            raise ValueError(
+                f"Оракул проекта ({type(self.oracle).__name__}) не умеет "
+                f"отдавать новые отклики: набор его свойств фиксирован "
+                f"{list(self.property_names)}. Объявление '{nm}' отклонено, чтобы "
+                f"не получить молча отклики другой физики. Ввод отклика посреди "
+                f"кампании доступен проекту с ручным вводом откликов (истину "
+                f"вносит человек).")
+        hook(nm)
+        if nm not in list(getattr(self.oracle, "property_names", [])):
+            raise RuntimeError(
+                f"Оракул принял отклик '{nm}', но не отдаёт его в property_names "
+                f"— контракт declare_response нарушен.")
+
+        self.property_names.append(nm)
+        self.prop_index = {n: i for i, n in enumerate(self.property_names)}
+        why = str(reason or "").strip() or (
+            f"отклик «{nm}» введён после проведения опыта")
+        for p in self.points:
+            p.Y[nm] = MISSING
+            stored = dict(p.origin_tag.get(MISSING_REASONS_TAG, {}) or {})
+            stored[nm] = why
+            p.origin_tag[MISSING_REASONS_TAG] = stored
+        self.refit_if_possible()
+        return {"response": nm, "P": len(self.property_names),
+                "n_backfilled": len(self.points), "reason": why}
+
     def begin_phase(self, mixture_free: Sequence[str],
                     process_free: Sequence[str] = ()
                     ) -> "MixtureProcessRunner":

@@ -1328,17 +1328,29 @@ class CampaignController:
         self._undo.clear()
         return out
 
-    def add_response(self, spec) -> Any:
+    def add_response(self, spec, *, reason: Optional[str] = None) -> Any:
         """§16.2: ввести новый ОТКЛИК в схему (v+1); у старых точек Y[new]=MISSING.
 
-        Обёртка над ``evolve_schema(add_responses=…)``: эволюционирует СХЕМУ
-        (bump версии, change_log). Физические измерения даёт оракул
-        (``property_names``), поэтому суррогаты здесь не переобучаются — новый
-        отклик подхватится, когда оракул начнёт его отдавать (у исторических
-        точек значение честно MISSING, суррогат учится только на измеренных,
-        §13.7).
+        Две половины ОДНОЙ операции (iter99):
+          1. измерительный контур — ``runner.declare_response``: отклик входит в
+             ``property_names``/``prop_index``, у каждой снятой точки
+             ``Y[new]=MISSING`` с причиной (``reason`` или «введён после опыта»),
+             оракул обязан уметь его отдавать (ручной — да; синтетическая истина —
+             явный отказ, A0.6). Идёт ПЕРВОЙ: если оракул откажет, схема остаётся
+             нетронутой — полусостояние «схема знает, ядро нет» исключено (до
+             iter99 фасад делал только шаг 2, и обещанное «у старых точек
+             MISSING» не выполнялось: столбца не было ни в Y, ни в UI);
+          2. схема — ``evolve_schema(add_responses=…)``: bump версии, change_log.
+
+        Суррогат нового отклика появится, когда накопятся его измерения (учится
+        только на измеренных, §13.7). База не урезается (И-1).
         """
         r = self.runner
+        if str(spec.name) in list(r.property_names):
+            raise ValueError(
+                f"Отклик '{spec.name}' уже есть в проекте "
+                f"({list(r.property_names)}).")
+        r.declare_response(spec.name, reason=reason)
         new = evolve_schema(r.current_schema, add_responses=[spec])
         r.schema_history.add(new)
         r.current_schema = new

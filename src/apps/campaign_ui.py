@@ -148,6 +148,22 @@ class ManualOracle:
     def __init__(self, property_names: Sequence[str]):
         self.property_names: List[str] = list(property_names)
 
+    def declare_response(self, name: str) -> None:
+        """iter99: протокол ввода нового отклика посреди кампании.
+
+        Ручной оракул размерность откликов не фиксирует — истину вносит человек,
+        поэтому новое имя просто дописывается в конец ``property_names`` (порядок
+        столбцов Y старых точек не меняется). Синтетические истины этот метод
+        НЕ реализуют, и :meth:`MixtureProcessRunner.declare_response` отказывает
+        им явно (A0.6).
+        """
+        nm = str(name).strip()
+        if not nm:
+            raise ValueError("Имя отклика пустое.")
+        if nm in self.property_names:
+            raise ValueError(f"Отклик '{nm}' уже есть у оракула.")
+        self.property_names.append(nm)
+
     def evaluate(self, Xc) -> np.ndarray:
         Xc = np.atleast_2d(np.asarray(Xc, float))
         n, dim = Xc.shape
@@ -6015,10 +6031,16 @@ def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
                 from ..core.schema import ResponseSpec
                 if not new_resp.strip():
                     raise ValueError("Задайте имя отклика.")
-                ctrl.add_response(ResponseSpec(name=new_resp.strip()))
-                st.success(f"Отклик «{new_resp.strip()}» введён в схему (версия "
-                           "поднята; у старых точек значение MISSING, §13.7).")
-            except (ValueError, KeyError, TypeError) as exc:
+                out = ctrl.add_response(ResponseSpec(name=new_resp.strip()))
+                # iter99: отклик вошёл и в схему, и в измерительный контур
+                # (столбец Y, лист «Отклики», ветки) — говорим об этом прямо.
+                st.success(
+                    f"Отклик «{new_resp.strip()}» введён (версия схемы "
+                    f"{out.version}); у {len(ctrl.runner.points)} снятых точек "
+                    f"значение «не измерено» с причиной, столбец появился в "
+                    f"листе «Отклики» — его можно мерить на новых точках и "
+                    f"ставить целью ветки (§13.7).")
+            except (ValueError, KeyError, TypeError, RuntimeError) as exc:
                 st.error(str(exc))
 
         # --- подвинуть границы (region-move, без bump) ---

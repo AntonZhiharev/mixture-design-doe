@@ -16,8 +16,12 @@ core/schema.py — §13–14 фундамент: блочная схема пе�
   * Точка = составной объект ``{X: {block_kind: [...]}, Y: {resp: val|MISSING}}``
     + ``schema_version`` + ``origin_tag``. **Не плоский массив.**
   * ``MISSING`` — явный сентинел, допустим **только в Y**, не в X.
-  * ``X["PROCESS"]`` хранится **в коде [0,1]**; физические единицы — через
-    ``code↔real`` блока.
+  * ``X["PROCESS"]`` хранится **в ФИЗИЧЕСКИХ единицах** (iter102; до неё — в
+    коде [0,1]). Код [0,1] — представление для расчётов, его строит
+    :func:`composite_coords` под КОНКРЕТНУЮ схему. Причина смены: границы
+    process-оси двигаются (``move_region``), и точка, хранящая код, молча
+    «переезжала» вместе с границами — измеренный Y оказывался приписан
+    другому режиму. Физика точки от границ области не зависит.
   * Сумма ``=1`` проверяется **только** для ``X["MIXTURE"]``.
   * ≤1 MIXTURE-блок, ≤1 PROCESS-блок, оба пустых запрещены.
 
@@ -128,20 +132,32 @@ class VariableBlock:
 
     # -- code ↔ real (только PROCESS) ----------------------------------
     def to_code(self, real: Sequence[float]) -> np.ndarray:
-        """Физические единицы → код [0,1] (покомпонентно, обратимо)."""
+        """Физические единицы → код [0,1] (покомпонентно, обратимо).
+
+        Вырожденная ось (``lo == hi``, зажата в точку) кодируется 0: другого
+        кода у единственного допустимого значения нет.
+        """
         real = np.asarray(real, dtype=float)
         lo = np.asarray(self.lower, float)
         hi = np.asarray(self.upper, float)
-        span = np.where(hi - lo > _TOL, hi - lo, 1.0)
-        return (real - lo) / span
+        span = hi - lo
+        degenerate = span <= _TOL
+        out = (real - lo) / np.where(degenerate, 1.0, span)
+        return np.where(degenerate, 0.0, out)
 
     def from_code(self, code: Sequence[float]) -> np.ndarray:
-        """Код [0,1] → физические единицы (обратное к ``to_code``)."""
+        """Код [0,1] → физические единицы (обратное к ``to_code``).
+
+        Вырожденная ось (``lo == hi``) даёт ``lo`` при любом коде. До iter102
+        подставлялся ``span = 1``: зажатая ось ``T = 170`` отдавала
+        ``170 + код`` — кандидаты плана «варьировали» T на градус.
+        """
         code = np.asarray(code, dtype=float)
         lo = np.asarray(self.lower, float)
         hi = np.asarray(self.upper, float)
-        span = np.where(hi - lo > _TOL, hi - lo, 1.0)
-        return lo + code * span
+        span = hi - lo
+        degenerate = span <= _TOL
+        return np.where(degenerate, lo, lo + code * span)
 
     def as_simplex_region(self) -> SimplexRegion:
         """MIXTURE-блок → :class:`SimplexRegion` (переиспользование M1-геометрии)."""
@@ -405,9 +421,12 @@ class DataPoint:
     """Одна точка плана: координаты по блокам + отклики + происхождение.
 
     ``X`` — словарь ``{block_kind: [coords...]}``; для PROCESS координаты — в
-    коде [0,1]. ``Y`` — словарь ``{response_name: float | MISSING}`` (MISSING
-    допустим поколоночно). ``origin_tag`` — например
-    ``{"stage": "M2", "branch_id": None, "schema_version": 1}``.
+    ФИЗИЧЕСКИХ единицах оси (iter102: температура в °C, обороты в Гц — как их
+    выставлял оператор). Код [0,1] — производное представление под конкретную
+    схему (:meth:`process_code`, :func:`composite_coords`). ``Y`` — словарь
+    ``{response_name: float | MISSING}`` (MISSING допустим поколоночно).
+    ``origin_tag`` — например ``{"stage": "M2", "branch_id": None,
+    "schema_version": 1}``.
     """
 
     schema_version: int
@@ -421,16 +440,38 @@ class DataPoint:
         v = self.X.get(MIXTURE)
         return np.asarray(v, float) if v is not None else None
 
-    def process_code(self) -> Optional[np.ndarray]:
+    def process_real(self) -> Optional[np.ndarray]:
+        """PROCESS-координаты в физических единицах (как хранятся)."""
         v = self.X.get(PROCESS)
         return np.asarray(v, float) if v is not None else None
+
+    def process_code(self, schema: Optional[ProjectSchema] = None
+                     ) -> Optional[np.ndarray]:
+        """PROCESS-координаты в коде [0,1] ОТНОСИТЕЛЬНО границ ``schema``.
+
+        Без схемы код не определён (физика хранится, границы — у схемы):
+        ``schema=None`` — явный отказ, а не молчаливое «как хранится».
+        """
+        v = self.X.get(PROCESS)
+        if v is None:
+            return None
+        if schema is None:
+            raise ValueError(
+                "process_code требует схему: с iter102 PROCESS-координаты "
+                "хранятся в физических единицах, код зависит от границ.")
+        pb = schema.process_block()
+        if pb is None:
+            raise ValueError("В схеме нет process-блока — кодировать нечего.")
+        return pb.to_code(np.asarray(v, float))
 
     # -- валидация -----------------------------------------------------
     def validate(self, schema: ProjectSchema, *, tol: float = 1e-6) -> "DataPoint":
         """Поблочная проверка инвариантов (§13.1/§13.4). Возвращает self.
 
-        Σx=1 проверяется ТОЛЬКО на MIXTURE-блоке; интервал [0,1] — ТОЛЬКО на
-        PROCESS; ``MISSING`` запрещён в X (допустим только в Y).
+        Σx=1 проверяется ТОЛЬКО на MIXTURE-блоке; вхождение в границы блока
+        ``lo ≤ v ≤ hi`` (физические единицы) — ТОЛЬКО на PROCESS; ``MISSING``
+        запрещён в X (допустим только в Y). ``tol`` для PROCESS — доля
+        размаха оси (у зажатой оси — абсолютная).
         """
         mb = schema.mixture_block()
         pb = schema.process_block()
@@ -457,9 +498,10 @@ class DataPoint:
             z = self.X.get(PROCESS)
             if z is None or len(z) != pb.size:
                 raise ValueError("X[PROCESS] отсутствует или не той длины.")
-            z = np.asarray(z, float)
-            if np.any(z < -tol) or np.any(z > 1.0 + tol):
-                raise ValueError("PROCESS-координаты должны быть в коде [0,1].")
+            if not process_in_bounds(pb, z, tol=tol):
+                raise ValueError(
+                    "PROCESS-координаты (физические единицы) вне границ блока "
+                    f"{list(pb.lower)}…{list(pb.upper)}: {list(map(float, z))}.")
         elif PROCESS in self.X:
             raise ValueError("X содержит PROCESS, но в схеме нет process-блока.")
 
@@ -473,16 +515,30 @@ class DataPoint:
     def to_dict(self) -> Dict[str, Any]:
         # MISSING кодируется на диск как JSON null (декодируется обратно в MISSING)
         y = {k: (None if is_missing(v) else float(v)) for k, v in self.Y.items()}
-        return {
+        out = {
             "schema_version": int(self.schema_version),
             "X": {k: [float(c) for c in v] for k, v in self.X.items()},
             "Y": y,
             "origin_tag": dict(self.origin_tag),
             "fixed_in_augment": bool(self.fixed_in_augment),
         }
+        # iter102: маркер представления PROCESS. Сейв без маркера — старый
+        # формат (код [0,1]); его переводит в физику загрузчик, знающий
+        # границы версии точки (см. ``schema_evolution.point_from_legacy_code``).
+        if PROCESS in self.X:
+            out[PROCESS_UNITS_KEY] = PROCESS_UNITS_REAL
+        return out
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "DataPoint":
+        """Прочитать точку; ``process_units`` НЕ интерпретируется здесь.
+
+        Старый сейв (без ключа) содержит PROCESS в коде — перевести его в
+        физику можно только зная схему версии точки, поэтому конверсия
+        живёт у владельца истории (``point_from_legacy_code``), а здесь
+        координаты читаются дословно. Признак формата доступен через
+        :func:`point_dict_process_units`.
+        """
         y_raw = d.get("Y", {})
         y = {k: (MISSING if v is None else float(v)) for k, v in y_raw.items()}
         return cls(
@@ -494,6 +550,36 @@ class DataPoint:
         )
 
 
+#: Ключ и значения маркера представления PROCESS-координат в сериализации.
+PROCESS_UNITS_KEY = "process_units"
+PROCESS_UNITS_REAL = "real"
+PROCESS_UNITS_CODE = "code"
+
+
+def point_dict_process_units(d: Dict[str, Any]) -> str:
+    """Представление PROCESS в словаре точки: ``"real"`` (iter102+) или
+    ``"code"`` (старый сейв без маркера)."""
+    return str(d.get(PROCESS_UNITS_KEY) or PROCESS_UNITS_CODE)
+
+
+def process_in_bounds(block: VariableBlock, values: Sequence[float], *,
+                      tol: float = 1e-6) -> bool:
+    """``lo ≤ v ≤ hi`` покомпонентно для PROCESS-блока в физических единицах.
+
+    ``tol`` — относительная доля размаха оси; на зажатой оси (``lo == hi``)
+    — абсолютный допуск. Единый предикат для :meth:`DataPoint.validate` и
+    :func:`schema_evolution.point_in_region` — два места не разъедутся.
+    """
+    v = np.asarray(values, float)
+    lo = np.asarray(block.lower, float)
+    hi = np.asarray(block.upper, float)
+    if v.shape != lo.shape:
+        return False
+    span = hi - lo
+    eps = np.where(span > _TOL, tol * span, tol)
+    return bool(np.all(v >= lo - eps) and np.all(v <= hi + eps))
+
+
 # ----------------------------------------------------------------------
 # Составные координаты (mixture x, затем process code) — общий слой
 # ----------------------------------------------------------------------
@@ -501,14 +587,18 @@ def composite_coords(schema: ProjectSchema, point: DataPoint) -> np.ndarray:
     """Точка → плоский вектор координат в каноническом порядке (x..., z_code...).
 
     Используется внутренними расчётами (генератор термов, геометрия). MIXTURE —
-    доли как есть; PROCESS — код [0,1] как хранится.
+    доли как есть; PROCESS — код [0,1] ОТНОСИТЕЛЬНО границ ``schema``
+    (iter102: точка хранит физику, код строится здесь). Код точки, лежащей
+    вне границ ``schema``, выйдет за [0,1] — это сигнал вызывающему (активный
+    pool фильтруется ``point_in_region`` раньше), а не повод клипать молча.
     """
     parts: List[np.ndarray] = []
     for b in ordered_blocks(schema):
         coords = point.X.get(b.kind)
         if coords is None or len(coords) != b.size:
             raise ValueError(f"Точка не содержит координат блока {b.kind} нужной длины.")
-        parts.append(np.asarray(coords, float))
+        vals = np.asarray(coords, float)
+        parts.append(b.to_code(vals) if b.is_process else vals)
     if not parts:
         return np.empty(0)
     return np.concatenate(parts)

@@ -261,10 +261,12 @@ def process_code_to_real(runner, X):
     """Составной ``X`` (процесс в коде [0,1]) → копия с процесс-осями в РЕАЛЬНЫХ
     единицах (замечание 2). Mixture-доли остаются как есть (они уже физические).
 
-    Раннер хранит точки в внутреннем коде [0,1] по каждой процесс-оси; для показа
-    и Excel пользователю нужны абсолютные величины (T=150…200 °C, а не 0…1).
-    Денормализация — покомпонентная :meth:`VariableBlock.from_code` процесс-блока
-    ТЕКУЩЕЙ схемы (обратимо к нормировке движка). Чистая (без Streamlit)."""
+    Кандидаты плана и матрица ``runner.X`` живут в коде [0,1] по каждой
+    процесс-оси ТЕКУЩЕЙ схемы; для показа и Excel пользователю нужны
+    абсолютные величины (T=150…200 °C, а не 0…1). Денормализация —
+    покомпонентная :meth:`VariableBlock.from_code` процесс-блока ТЕКУЩЕЙ схемы.
+    Чистая (без Streamlit). iter102: сами ТОЧКИ базы (``DataPoint``) хранят
+    физику; эта функция — про код кандидатов/матриц, не про точки."""
     X = np.atleast_2d(np.asarray(X, float)).copy()
     pb = runner.current_schema.process_block()
     q = len(runner.current_schema.mixture_names)
@@ -274,6 +276,59 @@ def process_code_to_real(runner, X):
             for i in range(len(X)):
                 X[i, q:q + d] = pb.from_code(X[i, q:q + d])
     return X
+
+
+def process_bounds_of(runner) -> Optional[Dict[str, List[float]]]:
+    """Границы process-осей ТЕКУЩЕЙ схемы: ``{имя: [lo, hi]}`` или ``None``.
+
+    iter102: снимок границ, при которых сгенерирован незафиксированный план
+    (``setup_seed_X`` — код [0,1]). Без него код плана после движения границ
+    читался бы под новые границы, и напечатанный в наряде режим T разъехался
+    бы с тем, что зафиксирует ``commit_seed``. Чистая (без Streamlit)."""
+    pb = runner.current_schema.process_block()
+    if pb is None:
+        return None
+    return {str(n): [float(lo), float(hi)]
+            for n, lo, hi in zip(pb.names, pb.lower, pb.upper)}
+
+
+def recode_seed_plan(X, saved_bounds: Optional[Dict[str, List[float]]],
+                     runner) -> Tuple[np.ndarray, int]:
+    """Перекодировать код process-осей плана из ``saved_bounds`` в границы
+    ТЕКУЩЕЙ схемы, СОХРАНЯЯ физику режима (iter102).
+
+    Возвращает ``(X_recoded, n_outside)``: ``n_outside`` — число строк, чей
+    физический режим лежит вне текущих границ (их код вышел за [0,1]; строки
+    НЕ клипуются и НЕ выбрасываются — решение за человеком, A0.6). Без
+    ``saved_bounds`` (старый черновик) план возвращается как есть с
+    ``n_outside = 0``: выдумывать прежние границы нельзя. При равных границах
+    — тождество. Чистая (без Streamlit)."""
+    X = np.atleast_2d(np.asarray(X, float)).copy()
+    pb = runner.current_schema.process_block()
+    if pb is None or not saved_bounds:
+        return X, 0
+    q = len(runner.current_schema.mixture_names)
+    d = len(pb.names)
+    if X.shape[1] < q + d or d == 0:
+        return X, 0
+    names = list(pb.names)
+    if any(nm not in saved_bounds for nm in names):
+        # состав осей сменился — план принадлежит другой схеме, не трогаем
+        return X, 0
+    lo_old = np.array([float(saved_bounds[nm][0]) for nm in names])
+    hi_old = np.array([float(saved_bounds[nm][1]) for nm in names])
+    lo_new = np.asarray(pb.lower, float)
+    hi_new = np.asarray(pb.upper, float)
+    if np.allclose(lo_old, lo_new) and np.allclose(hi_old, hi_new):
+        return X, 0
+    from ..core.schema import VariableBlock
+    old_block = VariableBlock.process(names, lower=lo_old, upper=hi_old)
+    real = old_block.from_code(X[:, q:q + d])
+    code_new = pb.to_code(real)
+    outside = int(np.any((code_new < -1e-9) | (code_new > 1.0 + 1e-9),
+                         axis=1).sum())
+    X[:, q:q + d] = code_new
+    return X, outside
 
 
 
@@ -4666,7 +4721,8 @@ def render_setup_form() -> None:
                 st.session_state["campaign_ctrl"] = cv.CampaignController(runner)
 
                 for k in ("setup_seed_X", "setup_seed_Y",
-                          "setup_seed_df", "setup_seed_df_sig"):
+                          "setup_seed_df", "setup_seed_df_sig",
+                          "setup_seed_proc_bounds"):
                     st.session_state.pop(k, None)
                 st.success(
                     f"Проект собран: смесь {mix} × процесс {proc}, отклики {resp}."
@@ -4773,6 +4829,9 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     if sc[3].button("📐 Предложить стартовый план", key="setup_propose_seed"):
         X = np.asarray(ctrl.propose_seed(int(seed_n), seed=int(seed_design)), float)
         st.session_state["setup_seed_X"] = X
+        # iter102: границы process-осей, под которые сгенерирован код плана
+        # (для перекодировки при движении границ до фиксации и для сейва).
+        st.session_state["setup_seed_proc_bounds"] = process_bounds_of(runner)
         st.session_state.pop("setup_seed_Y", None)
         # Новый дизайн — сброс состояния редактора Y (иначе data_editor наложит
         # СТАРЫЕ правки ячеек на новые строки); кнопка выше редактора, поэтому
@@ -5113,7 +5172,8 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
                                    missing_reasons=reasons_seed)
 
             for k in ("setup_seed_X", "setup_seed_Y",
-                      "setup_seed_df", "setup_seed_df_sig"):
+                      "setup_seed_df", "setup_seed_df_sig",
+                      "setup_seed_proc_bounds"):
                 st.session_state.pop(k, None)
             # P0: уведомление через _flash — st.success перед st.rerun не
             # доживал до глаз пользователя (rerun стирает вывод прогона).
@@ -6069,9 +6129,44 @@ def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
             key="camp_ev_off_val",
             help="Для компонента смеси — 0 (грань симплекса). Для процесс-оси — "
                  "рабочее значение в реальных единицах.")
+        # iter102: незафиксированный план (setup_seed_X) хранит process-код под
+        # границы момента генерации. Движение process-границы обязано
+        # перекодировать его с сохранением ФИЗИКИ режима — иначе таблица
+        # навески молча покажет другие T, чем напечатаны в наряде.
+        if st.session_state.get("setup_seed_X") is not None \
+                and mv_ax in cur_proc:
+            st.info(
+                "В сессии есть НЕЗАФИКСИРОВАННЫЙ стартовый план: при движении "
+                f"границ «{mv_ax}» его строки будут перекодированы так, чтобы "
+                "физический режим (реальные единицы) остался прежним; строки, "
+                "вышедшие за новые границы, будут посчитаны и показаны.")
+
+        def _recode_pending_plan() -> None:
+            Xp = st.session_state.get("setup_seed_X")
+            if Xp is None:
+                return
+            saved = st.session_state.get("setup_seed_proc_bounds")
+            Xn, n_out = recode_seed_plan(Xp, saved, ctrl.runner)
+            st.session_state["setup_seed_X"] = Xn
+            st.session_state["setup_seed_proc_bounds"] = process_bounds_of(
+                ctrl.runner)
+            for k in ("setup_seed_df", "setup_seed_df_sig"):
+                st.session_state.pop(k, None)
+            if n_out:
+                st.warning(
+                    f"У {n_out} строк незафиксированного плана режим лежит "
+                    "ВНЕ новых границ (код вне [0,1]); физика сохранена, "
+                    "решение по ним — за вами (расширить границы назад или "
+                    "снять строки).")
+
         if dz[1].button("⏸ Выключить из поиска", key="camp_ev_off_btn"):
             try:
+                _pb_before = process_bounds_of(ctrl.runner)
+                if st.session_state.get("setup_seed_X") is not None \
+                        and "setup_seed_proc_bounds" not in st.session_state:
+                    st.session_state["setup_seed_proc_bounds"] = _pb_before
                 ctrl.deactivate_variable(mv_ax, value=float(off_val))
+                _recode_pending_plan()
                 st.success(
                     f"«{mv_ax}» выключен(а) из поиска: зафиксирован(а) на "
                     f"{off_val:g}. Версия схемы не менялась (region-move), "
@@ -6080,10 +6175,15 @@ def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
                 st.error(str(exc))
         if st.button("↔ Применить движение границ", key="camp_ev_bound_btn"):
             try:
+                _pb_before = process_bounds_of(ctrl.runner)
+                if st.session_state.get("setup_seed_X") is not None \
+                        and "setup_seed_proc_bounds" not in st.session_state:
+                    st.session_state["setup_seed_proc_bounds"] = _pb_before
                 if mv_intent == "relax":
                     ctrl.relax_bounds(mv_ax, float(mv_lo), float(mv_hi))
                 else:
                     ctrl.restrict_bounds(mv_ax, float(mv_lo), float(mv_hi))
+                _recode_pending_plan()
                 st.success(f"Границы «{mv_ax}» → [{mv_lo}, {mv_hi}] ({mv_intent}); "
                            "область обновлена (история цела, И-1).")
             except (ValueError, KeyError, RuntimeError) as exc:

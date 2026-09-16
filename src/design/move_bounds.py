@@ -299,7 +299,8 @@ def _has_measured_Y(point: DataPoint) -> bool:
 
 
 def _project_to_region(point: DataPoint, region: ProjectSchema) -> DataPoint:
-    """Спроецировать координаты точки в область (mixture-clip + process-clip [0,1])."""
+    """Спроецировать координаты точки в область (mixture-clip + process-clip к
+    ``[lo, hi]`` блока в физических единицах, iter102)."""
     new_X: Dict[str, List[float]] = {}
     mb = region.mixture_block()
     if mb is not None and MIXTURE in point.X:
@@ -307,7 +308,8 @@ def _project_to_region(point: DataPoint, region: ProjectSchema) -> DataPoint:
         new_X[MIXTURE] = [float(v) for v in x]
     pb = region.process_block()
     if pb is not None and PROCESS in point.X:
-        z = np.clip(np.asarray(point.X[PROCESS], float), 0.0, 1.0)
+        z = np.clip(np.asarray(point.X[PROCESS], float),
+                    np.asarray(pb.lower, float), np.asarray(pb.upper, float))
         new_X[PROCESS] = [float(v) for v in z]
     # координаты прочих блоков (если вдруг есть) — без изменений
     for k, v in point.X.items():

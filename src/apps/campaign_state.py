@@ -34,7 +34,7 @@ import numpy as np
 from ..core import project_ref as pref
 from ..core.mass_units import DEFAULT_MASS_UNIT
 from ..core.schema import DataPoint, ProjectSchema
-from ..core.schema_evolution import SchemaHistory
+from ..core.schema_evolution import SchemaHistory, point_from_legacy_code
 from ..design.branches import Branch, ROLE_PRICE_INPUT
 from ..design.linked_axes import ProcessLink
 from ..design.phr_sampler import PhrSpec
@@ -57,6 +57,7 @@ _SETUP_DRAFT_FILE = "setup_draft.json"
 #: относятся к текущему плану, а не к настройкам проекта.
 _SETUP_DRAFT_SKIP = frozenset({
     "setup_seed_X", "setup_seed_Y", "setup_seed_df", "setup_seed_df_sig",
+    "setup_seed_proc_bounds",
     "setup_phr_spec_obj", "setup_phr_tree",
     # iter81: кэш preflight стартового плана — состояние ПРОГОНА. Сам объект
     # не сериализуется, а текст ошибки без объекта показывал бы на экране
@@ -359,6 +360,27 @@ def _default_oracle(property_names: Sequence[str]):
     return ManualOracle(list(property_names))
 
 
+def _schema_of_version(history: SchemaHistory, runner: MixtureProcessRunner,
+                       point_dict: Dict[str, Any]) -> ProjectSchema:
+    """Схема версии точки для перевода старого кода в физику (iter102).
+
+    Версия ищется в истории; версия текущей схемы берётся из
+    ``runner.current_schema`` — у неё АКТУАЛЬНЫЕ границы после move_region
+    (история хранит тот же объект, но здесь это явно). Точка неизвестной
+    версии — отказ: выдумывать границы для интерпретации кода нельзя (A0.6).
+    """
+    v = int(point_dict["schema_version"])
+    if v == int(runner.current_schema_version):
+        return runner.current_schema
+    try:
+        return history.get(v)
+    except KeyError as exc:
+        raise ValueError(
+            f"Точка ссылается на версию схемы {v}, которой нет в истории "
+            f"({[s.version for s in history.versions]}): сейв не согласован."
+        ) from exc
+
+
 def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
                       price_fn_registry: Optional[Dict[str, Callable]] = None
                       ) -> MixtureProcessRunner:
@@ -397,7 +419,14 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     runner.current_schema = ProjectSchema.from_dict(r["current_schema"])
     runner.current_schema_version = int(r["current_schema_version"])
 
-    runner.points = [DataPoint.from_dict(d) for d in r.get("points", [])]
+    # iter102: PROCESS-координаты точки — в ФИЗИЧЕСКИХ единицах. Старый сейв
+    # (без маркера ``process_units``) хранил код [0,1]; переводим его по
+    # границам схемы ТОЙ версии, на которую точка ссылается — тем же
+    # преобразованием, каким UI показывал её до iter102. Сейв в новом формате
+    # читается дословно (идемпотентно по маркеру).
+    runner.points = [
+        point_from_legacy_code(d, _schema_of_version(history, runner, d))
+        for d in r.get("points", [])]
     runner.branches = {bid: Branch.from_state(d)
                        for bid, d in r.get("branches", {}).items()}
 

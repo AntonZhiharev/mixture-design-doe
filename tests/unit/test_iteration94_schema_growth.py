@@ -200,9 +200,11 @@ class TestMeasuredBaseSurvives:
         assert r.current_schema_version == v0 + 1
         assert len(r.points) == n0
         assert len(r._migrated_points()) == n0
-        # 50 Hz в интервале 40…60 → код 0.5 у всех исторических точек
-        assert all(abs(float(p.X["PROCESS"][-1]) - 0.5) < 1e-9
+        # iter102: у исторических точек хранится ФИЗИКА — ровно 50 Hz (то, при
+        # чём они мерились); код 0.5 под [40,60] — производное в матрице X
+        assert all(abs(float(p.X["PROCESS"][-1]) - 50.0) < 1e-9
                    for p in r._migrated_points())
+        assert np.allclose(r.X[:, -1], 0.5)
 
     def test_new_axis_without_bounds_refused_by_name(self):
         """Границы НОВОЙ оси не выдумываются: нет lower/upper — явный отказ.

@@ -111,9 +111,11 @@ def _mp_schema():
 
 
 def test_datapoint_valid_passes():
+    # iter102: PROCESS в точке — ФИЗИЧЕСКИЕ единицы (T=140 ∈ [100,200],
+    # t=16 ∈ [10,20]); код [0,1] строится под схему в composite_coords.
     s = _mp_schema()
     pt = DataPoint(schema_version=1,
-                   X={MIXTURE: [0.2, 0.3, 0.5], PROCESS: [0.4, 0.6]},
+                   X={MIXTURE: [0.2, 0.3, 0.5], PROCESS: [140.0, 16.0]},
                    Y={"visc": 12.0}, origin_tag={"stage": "M2"})
     assert pt.validate(s) is pt
 
@@ -125,36 +127,54 @@ def test_datapoint_mixture_sum_must_be_one():
         pt.validate(s)
 
 
-def test_datapoint_process_must_be_coded_unit_interval():
+def test_datapoint_process_must_be_within_block_bounds():
+    # iter102: физическое значение вне границ блока — отказ (t=0.5 ∉ [10,20]).
+    # До iter102 здесь проверялся код ∈ [0,1], и 150 «не было кодом».
     s = _mp_schema()
-    pt = DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [150.0, 0.5]})  # 150 не код
-    with pytest.raises(ValueError):
+    pt = DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [150.0, 0.5]})
+    with pytest.raises(ValueError, match="вне границ"):
         pt.validate(s)
+    # у зажатой оси (lo == hi) допуск абсолютный, а не доля нулевого размаха
+    s_pin = ProjectSchema.mixture_process(
+        VariableBlock.mixture(["A", "B", "C"]),
+        VariableBlock.process(["T", "t"], [170, 10], [170, 20]))
+    DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [170.0, 15.0]}).validate(s_pin)
+    with pytest.raises(ValueError, match="вне границ"):
+        DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [171.0, 15.0]}).validate(s_pin)
 
 
 def test_missing_forbidden_in_X_allowed_in_Y():
     s = _mp_schema()
-    bad = DataPoint(1, {MIXTURE: [0.2, MISSING, 0.5], PROCESS: [0.4, 0.6]})
+    bad = DataPoint(1, {MIXTURE: [0.2, MISSING, 0.5], PROCESS: [140.0, 16.0]})
     with pytest.raises(ValueError):
         bad.validate(s)
-    ok = DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [0.4, 0.6]},
+    ok = DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [140.0, 16.0]},
                    Y={"visc": MISSING})
     assert ok.validate(s) is ok
 
 
 # ----------------------------------------------------------------------
-# Составные координаты: порядок MIXTURE → PROCESS, обратимость
+# Составные координаты: порядок MIXTURE → PROCESS, код под схему (iter102)
 # ----------------------------------------------------------------------
 def test_composite_coords_order_and_split():
     s = _mp_schema()
-    pt = DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [0.4, 0.6]})
+    pt = DataPoint(1, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [140.0, 16.0]})
     vec = composite_coords(s, pt)
-    assert np.allclose(vec, [0.2, 0.3, 0.5, 0.4, 0.6])     # mixture, затем process
+    # mixture как есть, process — КОД под границы схемы: (140−100)/100, (16−10)/10
+    assert np.allclose(vec, [0.2, 0.3, 0.5, 0.4, 0.6])
     parts = split_composite(s, vec)
     assert np.allclose(parts[MIXTURE], [0.2, 0.3, 0.5])
     assert np.allclose(parts[PROCESS], [0.4, 0.6])
     M = composite_matrix(s, [pt, pt])
     assert M.shape == (2, 5)
+    # та же точка под ДРУГИМИ границами T — другой код, физика та же
+    s2 = ProjectSchema.mixture_process(
+        VariableBlock.mixture(["A", "B", "C"]),
+        VariableBlock.process(["T", "t"], [120, 10], [160, 20]))
+    assert np.allclose(composite_coords(s2, pt)[3], 0.5)
+    assert np.allclose(pt.process_code(s2), [0.5, 0.6])
+    with pytest.raises(ValueError, match="требует схему"):
+        pt.process_code()
 
 
 def test_ordered_blocks_mixture_first():
@@ -174,15 +194,18 @@ def test_schema_serialization_roundtrip():
 
 
 def test_datapoint_serialization_roundtrip_with_missing():
-    pt = DataPoint(2, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [0.4, 0.6]},
+    pt = DataPoint(2, {MIXTURE: [0.2, 0.3, 0.5], PROCESS: [140.0, 16.0]},
                    Y={"visc": 12.0, "cost": MISSING},
                    origin_tag={"stage": "M5", "schema_version": 2})
     d = pt.to_dict()
     assert d["Y"]["cost"] is None                  # MISSING → null на диске
+    assert d["process_units"] == "real"            # iter102: маркер формата
     pt2 = DataPoint.from_dict(d)
     assert is_missing(pt2.Y["cost"]) and pt2.Y["visc"] == 12.0
     assert pt2.schema_version == 2
-    assert np.allclose(pt2.X[PROCESS], [0.4, 0.6])
+    assert np.allclose(pt2.X[PROCESS], [140.0, 16.0])   # физика дословно
+    # точка без process-блока маркера не несёт (нечего маркировать)
+    assert "process_units" not in DataPoint(1, {MIXTURE: [0.5, 0.5]}).to_dict()
 
 
 # ----------------------------------------------------------------------

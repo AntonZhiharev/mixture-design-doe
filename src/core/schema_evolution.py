@@ -22,8 +22,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .schema import (MIXTURE, MISSING, PROCESS, DataPoint, ProjectSchema,
-                     ResponseSpec, VariableBlock)
+from .schema import (MIXTURE, MISSING, PROCESS, PROCESS_UNITS_REAL, DataPoint,
+                     ProjectSchema, ResponseSpec, VariableBlock,
+                     point_dict_process_units, process_in_bounds)
 
 
 # Политики миграции — JSON-native dict (сериализуются в ProjectSchema.migration).
@@ -235,33 +236,34 @@ def migrate_point(point: DataPoint, old_schema: ProjectSchema,
         return None  # у цели нет mixture-блока, а у точки есть — несовместимо
 
 
-    # PROCESS: старые координаты должны быть ПРЕФИКСОМ целевых (evolve добавляет в конец)
+    # PROCESS: старые координаты должны быть ПРЕФИКСОМ целевых (evolve добавляет
+    # в конец). iter102: координаты — ФИЗИЧЕСКИЕ, поэтому старые копируются
+    # дословно (границы целевой версии на них не влияют), а ``known-constant``
+    # кладётся как есть — без code-трансформа под границы цели.
     pb = target.process_block()
     if pb is not None:
         target_names = list(target.process_names)
         old_names = list(old_schema.process_names)
         if target_names[:len(old_names)] != old_names:
             return None  # переупорядочивание не поддержано
-        old_codes = list(point.X.get(PROCESS, []))
-        if len(old_codes) != len(old_names):
+        old_vals = list(point.X.get(PROCESS, []))
+        if len(old_vals) != len(old_names):
             return None  # точка несогласована со своей версией
-        codes = [float(c) for c in old_codes]
+        vals = [float(c) for c in old_vals]
         for j in range(len(old_names), len(target_names)):
             nm = target_names[j]
             pol = target.migration.get(nm) or {"policy": UNKNOWN}
             kind = pol.get("policy")
             if kind == KNOWN_CONSTANT:
-                lo, hi = pb.lower[j], pb.upper[j]
-                v = float(pol["value"])
-                codes.append((v - lo) / (hi - lo) if hi > lo else 0.0)
+                vals.append(float(pol["value"]))        # реальное значение оси
             elif kind == RECOMPUTE:
                 fn = (recompute_fns or {}).get(pol.get("fn"))
                 if fn is None:
                     return None
-                codes.append(float(fn(point)))
+                vals.append(float(fn(point)))
             else:  # unknown / неизвестная политика
                 return None
-        new_X[PROCESS] = codes
+        new_X[PROCESS] = vals
     elif PROCESS in point.X:
         return None  # у цели нет process-блока, а у точки есть
 
@@ -277,10 +279,13 @@ def migrate_point(point: DataPoint, old_schema: ProjectSchema,
 def point_in_region(point: DataPoint, schema: ProjectSchema, *,
                     tol: float = 1e-6) -> bool:
     """Лежит ли точка в области ``schema``: mixture ∈ симплекс-регион (L≤x≤U, Σ=1)
-    И process-коды ∈ [0,1]. Переиспользует :meth:`SimplexRegion.is_feasible`.
+    И process-значения ∈ ``[lo, hi]`` блока (физические единицы, iter102).
+    Переиспользует :meth:`SimplexRegion.is_feasible` и :func:`process_in_bounds`.
 
     Это ось ``within_new_bounds`` (Предусловие 4): после смены границ (relax ИЛИ
     сужение) точка обязана попасть в НОВУЮ область, иначе она не годна как fixed.
+    До iter102 для PROCESS проверялся лишь код ∈ [0,1], поэтому сужение
+    process-оси не исключало ни одной точки — они «переезжали» с границами.
     """
     mb = schema.mixture_block()
     if mb is not None:
@@ -290,11 +295,37 @@ def point_in_region(point: DataPoint, schema: ProjectSchema, *,
     pb = schema.process_block()
     if pb is not None:
         z = point.X.get(PROCESS)
-        if z is None:
+        if z is None or len(z) != pb.size:
             return False
-        if any((c < -tol or c > 1.0 + tol) for c in z):
+        if not process_in_bounds(pb, z, tol=tol):
             return False
     return True
+
+
+def point_from_legacy_code(d: Dict[str, Any], schema_of_version: ProjectSchema
+                           ) -> DataPoint:
+    """Прочитать словарь точки из СТАРОГО сейва (PROCESS в коде [0,1]) →
+    точка iter102 с PROCESS в физических единицах.
+
+    Код интерпретируется по границам схемы ТОЙ версии, на которую точка
+    ссылается (``schema_of_version``) — ровно так её и показывал UI до
+    iter102 (``process_code_to_real``). Словарь с маркером ``process_units:
+    "real"`` читается дословно (уже новый формат). Идемпотентно по маркеру.
+    """
+    pt = DataPoint.from_dict(d)
+    if point_dict_process_units(d) == PROCESS_UNITS_REAL:
+        return pt
+    z = pt.X.get(PROCESS)
+    if z is None:
+        return pt
+    pb = schema_of_version.process_block()
+    if pb is None or len(z) != pb.size:
+        raise ValueError(
+            f"Точка версии {pt.schema_version} несёт {len(z)} PROCESS-координат, "
+            f"а схема версии — {0 if pb is None else pb.size}: старый сейв "
+            "не согласован, конвертировать код в физику нельзя.")
+    pt.X[PROCESS] = [float(v) for v in pb.from_code(z)]
+    return pt
 
 
 def select_fixed_rows(points: Sequence[DataPoint], target_schema: ProjectSchema,

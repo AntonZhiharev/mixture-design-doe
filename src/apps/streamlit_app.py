@@ -60,6 +60,8 @@ from src.apps.campaign_ui import (SETUP_FORM_OPEN_PENDING,  # noqa: E402
                                    campaign_assistant_overview,
                                    get_campaign_controller,
                                    mass_unit_of,
+                                   process_bounds_of,
+                                   recode_seed_plan,
                                    setup_prefill_from_runner)
 from src.core.mass_units import mass_from_kg, mass_to_kg  # noqa: E402
 
@@ -90,6 +92,18 @@ def _seed_draft_from_session() -> Optional[Dict[str, Any]]:
     X = np.atleast_2d(np.asarray(X, float))
     draft: Dict[str, Any] = {
         "seed_X": [[float(v) for v in row] for row in X]}
+    # iter102: process-часть плана — код [0,1] относительно границ схемы НА
+    # МОМЕНТ генерации. Пишем эти границы рядом: если до фиксации Y границы
+    # подвинут, план перекодируется под новые с сохранением ФИЗИКИ режима
+    # (T в наряде останется тем же), а не прочитается «как есть» под другие.
+    pbounds = st.session_state.get("setup_seed_proc_bounds")
+    if not pbounds:
+        ctrl_b = st.session_state.get("campaign_ctrl")
+        if ctrl_b is not None:
+            pbounds = process_bounds_of(ctrl_b.runner)
+    if pbounds:
+        draft["seed_proc_bounds"] = {str(k): [float(v[0]), float(v[1])]
+                                     for k, v in dict(pbounds).items()}
     Y = st.session_state.get("setup_seed_Y")
     if Y is not None:
         Y = np.atleast_2d(np.asarray(Y, float))
@@ -128,11 +142,26 @@ def _restore_seed_draft(draft: Optional[Dict[str, Any]],
     Без раннера или без метки единицы значение кладётся как есть — это старый
     черновик, и выдумывать для него другую размерность нельзя."""
     for k in ("setup_seed_X", "setup_seed_Y", "setup_seed_editor",
-              "setup_seed_batch", "setup_seed_df", "setup_seed_df_sig"):
+              "setup_seed_batch", "setup_seed_df", "setup_seed_df_sig",
+              "setup_seed_proc_bounds"):
         st.session_state.pop(k, None)
     if not draft or draft.get("seed_X") is None:
         return False
-    st.session_state["setup_seed_X"] = np.asarray(draft["seed_X"], float)
+    X = np.asarray(draft["seed_X"], float)
+    # iter102: границы process-осей могли измениться с момента генерации плана
+    # — перекодируем код под текущие, сохраняя физику режима. Строки, чей
+    # режим вышел за новые границы, не трогаем и не выбрасываем — сообщаем.
+    if runner is not None:
+        X, n_out = recode_seed_plan(X, draft.get("seed_proc_bounds"), runner)
+        if n_out:
+            st.session_state["camp_seed_recode_msg"] = (
+                f"Границы процесс-осей изменились после генерации плана: "
+                f"режимы {n_out} из {len(X)} строк лежат ВНЕ текущих границ "
+                f"(их код вне [0,1]). План перекодирован без потери физики; "
+                f"такие строки либо вернуть расширением границ, либо снять "
+                f"из плана осознанно.")
+        st.session_state["setup_seed_proc_bounds"] = process_bounds_of(runner)
+    st.session_state["setup_seed_X"] = X
     if draft.get("seed_Y") is not None:
         st.session_state["setup_seed_Y"] = np.asarray(
             [[(np.nan if v is None else float(v)) for v in row]
@@ -366,6 +395,8 @@ def render_campaign_persistence(root: str) -> None:
 
     if st.session_state.get("camp_loaded_msg"):
         st.success(st.session_state.pop("camp_loaded_msg"))
+    if st.session_state.get("camp_seed_recode_msg"):
+        st.warning(st.session_state.pop("camp_seed_recode_msg"))
 
 
 def render_campaign_deleter(root: str) -> None:

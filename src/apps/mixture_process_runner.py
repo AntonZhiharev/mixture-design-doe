@@ -950,8 +950,41 @@ class MixtureProcessRunner:
         mix_full[:mix_cur.size] = mix_cur
         proc_full = self.baseline[self.q_full:self.q_full + self.d_full].copy()
         if proc_cur.size:
-            proc_full[:proc_cur.size] = proc_cur
+            # iter102: код текущей фазы → ФИЗИКА (границы текущей схемы) → код
+            # ПОЛНОЙ схемы. После move_region по process-оси границы фазы ≠
+            # границам полной схемы, и прямое копирование кода отдавало бы
+            # оракулу другой режим. При равных границах — тождество.
+            proc_full[:proc_cur.size] = self._full_proc.to_code(
+                self._proc_code_to_real(proc_cur))[:proc_cur.size]
         return np.concatenate([mix_full, proc_full])
+
+    # ------------------------------------------------------------------
+    # iter102: PROCESS — физика в точке, код [0,1] лишь под конкретную схему
+    # ------------------------------------------------------------------
+    def _proc_code_to_real(self, proc_code: np.ndarray) -> np.ndarray:
+        """Код process-осей ТЕКУЩЕЙ схемы → физические единицы (n или d)."""
+        pb = self.current_schema.process_block()
+        if pb is None:
+            return np.asarray(proc_code, float)
+        return pb.from_code(np.asarray(proc_code, float))
+
+    def _proc_real_to_code(self, proc_real: np.ndarray) -> np.ndarray:
+        """Физические единицы process-осей → код ТЕКУЩЕЙ схемы."""
+        pb = self.current_schema.process_block()
+        if pb is None:
+            return np.asarray(proc_real, float)
+        return pb.to_code(np.asarray(proc_real, float))
+
+    def _from_full_process(self, proc_full_code: np.ndarray) -> np.ndarray:
+        """Код process-осей ПОЛНОЙ схемы → код ТЕКУЩЕЙ (префикс ``d`` осей).
+
+        Обратное к :meth:`_to_full` по process-части: через физику, чтобы
+        границы фазы (после move_region) и полной схемы не путались.
+        """
+        if self.d == 0 or self._full_proc is None:
+            return np.empty(0)
+        real = self._full_proc.from_code(np.asarray(proc_full_code, float))
+        return self._proc_real_to_code(real[:self.d])
 
     def _measure(self, coords_cur: np.ndarray) -> np.ndarray:
         """Измерить набор current-координат оракулом (ПО ВСЕМ P свойствам)."""
@@ -969,7 +1002,12 @@ class MixtureProcessRunner:
         if self.q > 0:
             X[MIXTURE] = [float(v) for v in coords_cur[:self.q]]
         if self.d > 0:
-            X[PROCESS] = [float(v) for v in coords_cur[self.q:self.q + self.d]]
+            # iter102: точка хранит ФИЗИЧЕСКИЕ значения process-осей. Код
+            # кандидата (Sobol в [0,1]) интерпретируется по границам ТЕКУЩЕЙ
+            # схемы ровно здесь, один раз — дальше границы могут двигаться, а
+            # режим, при котором снят опыт, остаётся тем, что напечатан в наряде.
+            X[PROCESS] = [float(v) for v in self._proc_code_to_real(
+                coords_cur[self.q:self.q + self.d])]
         # iter98: NaN в строке Y — это «измерение не проводилось» (§13.7
         # MISSING), а не число. Хранится сентинелом, в модель не попадает.
         Y: Dict[str, Any] = {}
@@ -2768,8 +2806,11 @@ class MixtureProcessRunner:
             xb = np.asarray(xb, float).ravel()
             mix = xb[:self.q]
             if mix.size == self.q and abs(float(mix.sum()) - 1.0) < 1e-6:
-                if self.d > 0 and xb.size >= self.q_full + self.d:
-                    proc = xb[self.q_full:self.q_full + self.d]
+                if self.d > 0 and xb.size >= self.q_full + self.d_full:
+                    # iter102: x_best — полный вектор (код ПОЛНОЙ схемы);
+                    # в координаты фазы — через физику (границы могли двигаться)
+                    proc = self._from_full_process(
+                        xb[self.q_full:self.q_full + self.d_full])
                 return np.concatenate([mix, proc]) if self.d > 0 else mix
         mix = np.asarray(self._mixture_region().centroid(), float).ravel()
         return np.concatenate([mix, proc]) if self.d > 0 else mix

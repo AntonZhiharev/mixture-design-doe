@@ -24,7 +24,7 @@ import pytest
 
 from src.core.schema import (MIXTURE, PROCESS, MISSING, is_missing,
                              VariableBlock, ModelSpec, ResponseSpec,
-                             ProjectSchema, DataPoint)
+                             ProjectSchema, DataPoint, composite_coords)
 from src.core.schema_evolution import (
     SchemaHistory, evolve_schema, migrate_point, select_fixed_rows,
     known_constant, unknown, recompute)
@@ -93,10 +93,13 @@ def test_stage2_migrate_known_constant():
     assert len(used) == len(pts) and skipped == []
     mp = used[0]
     assert mp.schema_version == 2 and mp.fixed_in_augment
-    assert np.allclose(mp.X[PROCESS], [0.5, 0.5])   # (150-100)/100, (15-10)/10
+    # iter102: known-constant хранится РЕАЛЬНЫМ значением (150 °C, 15), код
+    # (0.5, 0.5) — производное под границы v2 через composite_coords
+    assert np.allclose(mp.X[PROCESS], [150.0, 15.0])
+    assert np.allclose(composite_coords(s2, mp)[3:], [0.5, 0.5])
     assert mp.X[MIXTURE] == pts[0].X[MIXTURE]       # рецепт сохранён
     assert mp.Y["y1"] == pts[0].Y["y1"]             # измеренный отклик сохранён
-    mp.validate(s2)                                  # Σx=1 на mixture, z∈[0,1]
+    mp.validate(s2)                                  # Σx=1 на mixture, z в границах
 
 
 # ----------------------------------------------------------------------
@@ -134,7 +137,9 @@ def test_stage3_known_parameter_reuses_and_new_response_missing():
     used, skipped = select_fixed_rows(v2, s3, hist)
     assert len(used) == len(v2) and skipped == []
     mp = used[0]
-    assert np.allclose(mp.X[PROCESS], [0.5, 0.5, 0.5])   # pH: (6-3)/(9-3)=0.5
+    # iter102: физика (150, 15, pH=6); код pH под v3 = (6−3)/(9−3) = 0.5
+    assert np.allclose(mp.X[PROCESS], [150.0, 15.0, 6.0])
+    assert np.allclose(composite_coords(s3, mp)[3:], [0.5, 0.5, 0.5])
     assert mp.Y["y1"] == v2[0].Y["y1"]                   # старый отклик сохранён
     assert is_missing(mp.Y["y2"])                        # новый отклик → MISSING (не 0!)
     mp.validate(s3)

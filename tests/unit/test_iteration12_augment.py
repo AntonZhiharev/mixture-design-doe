@@ -84,8 +84,10 @@ def test_condition_A_rejects_mismatched_moments():
 def test_select_fixed_rows_schema_evolution():
     target = _mp()
     p_old = DataPoint(schema_version=1, X={MIXTURE: [0.3, 0.3, 0.4]})       # нет PROCESS
+    # iter102: PROCESS в точке — физика (T=150 ∈ [100,200], t=15 ∈ [10,20]);
+    # fixed-матрица — в КОДЕ под target (0.5, 0.5)
     p_new = DataPoint(schema_version=2,
-                      X={MIXTURE: [0.2, 0.3, 0.5], PROCESS: [0.5, 0.5]})
+                      X={MIXTURE: [0.2, 0.3, 0.5], PROCESS: [150.0, 15.0]})
     fixed, used, skipped = select_fixed_rows([p_old, p_new], target)
     assert used == [p_new]
     assert skipped == [p_old]                # новая переменная z → нужна миграция

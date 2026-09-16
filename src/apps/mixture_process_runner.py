@@ -1259,7 +1259,8 @@ class MixtureProcessRunner:
     # отдельная от branch-цикла пара; origin точек = "seed".
     # ------------------------------------------------------------------
     def propose_seed(self, n: int = 12, *, seed: Optional[int] = None,
-                     reuse_existing: bool = True) -> np.ndarray:
+                     reuse_existing: bool = True,
+                     feasibility=None) -> np.ndarray:
         """§17.4: ПРЕДЛОЖИТЬ стартовый seed-дизайн БЕЗ измерения (read-only).
 
         Возвращает ``n`` составных кандидатов ТЕКУЩЕЙ схемы (mixture-region ×
@@ -1272,16 +1273,22 @@ class MixtureProcessRunner:
         seed новой фазы после ``augment_phase_*``), план по умолчанию
         ПРИСТЁГИВАЕТСЯ к существующим точкам — :meth:`propose_augment`
         (greedy maximin от existing), а не генерируется с нуля.
-        ``reuse_existing=False`` — прежнее поведение принудительно."""
+        ``reuse_existing=False`` — прежнее поведение принудительно.
+
+        ``feasibility`` (iter103) — множитель измеримости ``X → P(измеримо|x)``
+        для добора (см. :meth:`propose_augment`, :meth:`gate_feasibility_fn`).
+        На пустой базе или при ``reuse_existing=False`` не применяется:
+        стартовый план фазы без данных о гейте выдумывать нечем."""
         s = self.seed if seed is None else int(seed)
         if reuse_existing and self.points:
-            return self.propose_augment(int(n), seed=s)
+            return self.propose_augment(int(n), seed=s,
+                                        feasibility=feasibility)
         return self._phase_candidates(int(n), s)
 
     def propose_augment(self, n: int, *, seed: Optional[int] = None,
                         n_candidates: int = 600,
-                        groups: Optional[Sequence[Sequence[str]]] = None
-                        ) -> np.ndarray:
+                        groups: Optional[Sequence[Sequence[str]]] = None,
+                        feasibility=None) -> np.ndarray:
         """iter37 (скрин-аудит п.1): ДОБОР ``n`` точек текущей фазы,
         ДОПОЛНЯЮЩИЙ существующую базу (greedy maximin от existing).
 
@@ -1296,6 +1303,20 @@ class MixtureProcessRunner:
         заполняют дыры области ОТНОСИТЕЛЬНО фазы-1, а не дублируют её.
         Пустая база → первые ``n`` кандидатов пула (обычный план фазы).
         Read-only (A0.6), детерминированно по ``seed``.
+
+        ``feasibility`` (iter103, OPEN §16.2.1.2): callable ``X → P(измеримо|x)``
+        (см. :func:`design.branches.gate_feasibility`,
+        :meth:`gate_feasibility_fn`). Критерий выбора становится
+        ``d_min(x) · P(измеримо|x)`` — тот же множитель, что у explore-члена
+        acquisition (iter100). Без него maximin после сужения области
+        (:func:`design.branches.edge_region` → :meth:`move_region`)
+        отталкивается от точек, сгущённых в измеримой зоне, и уводит ВСЕ точки
+        добора в дыру, где gated-отклики не снимаются (iter101: 6 из 6).
+        ``None`` — прежнее поведение бит-в-бит. Если кандидатов с
+        ``P ≥ 0.5`` меньше ``n`` — ``UserWarning`` (A0.6: добор частично уйдёт
+        в неизмеримую зону, и это должно быть видно ДО измерения).
+        На пустой базе первая точка — самый измеримый кандидат, далее тот же
+        жадный критерий.
         """
         s = self.seed if seed is None else int(seed)
         n = int(n)
@@ -1303,19 +1324,47 @@ class MixtureProcessRunner:
             return np.empty((0, self.dim), float)
         pool = self._phase_candidates(max(int(n_candidates), 4 * n), s,
                                       groups=groups)
+        p_feas: Optional[np.ndarray] = None
+        if feasibility is not None:
+            p_feas = np.clip(np.asarray(feasibility(pool), float).ravel(),
+                             0.0, 1.0)
+            if p_feas.shape != (len(pool),):
+                raise ValueError(
+                    "feasibility должна вернуть по одной вероятности на "
+                    f"кандидата: {p_feas.shape} != ({len(pool)},).")
+            n_ok = int((p_feas >= 0.5).sum())
+            if n_ok < n:
+                warnings.warn(
+                    f"Добор {n} точек: лишь {n_ok} кандидатов из {len(pool)} "
+                    f"имеют P(измеримо) ≥ 0.5 — часть точек добора попадёт в "
+                    f"неизмеримую зону. Расширьте область или проверьте гейт.",
+                    UserWarning, stacklevel=2)
         mig = self._migrated_points()
-        if not mig:
-            return pool[:n]
-        base = np.asarray(composite_matrix(self.current_schema, mig), float)
-        # min-дистанция² каждого кандидата до существующих точек
-        d2 = np.min(((pool[:, None, :] - base[None, :, :]) ** 2).sum(-1),
-                    axis=1)
         chosen: List[np.ndarray] = []
-        for _ in range(min(n, len(pool))):
-            j = int(np.argmax(d2))
+        taken = np.zeros(len(pool), bool)
+        if mig:
+            base = np.asarray(composite_matrix(self.current_schema, mig), float)
+            # min-дистанция² каждого кандидата до существующих точек
+            d2 = np.min(((pool[:, None, :] - base[None, :, :]) ** 2).sum(-1),
+                        axis=1)
+        elif p_feas is None:
+            return pool[:n]
+        else:
+            # без базы дистанции считать не от чего: стартуем с самого
+            # измеримого кандидата, дальше — обычный жадный критерий
+            j0 = int(np.argmax(p_feas))
+            chosen.append(pool[j0])
+            taken[j0] = True
+            d2 = ((pool - pool[j0]) ** 2).sum(axis=1)
+        while len(chosen) < min(n, len(pool)):
+            score = np.sqrt(np.maximum(d2, 0.0))
+            if p_feas is not None:
+                score = score * p_feas
+            score[taken] = -np.inf                # не выбирать повторно
+            j = int(np.argmax(score))
             chosen.append(pool[j])
+            taken[j] = True
             d2 = np.minimum(d2, ((pool - pool[j]) ** 2).sum(axis=1))
-            d2[j] = -1.0                      # не выбирать повторно
         return np.vstack(chosen)
 
     def commit_seed(self, X: Any, Y: Any, *,
@@ -2719,6 +2768,70 @@ class MixtureProcessRunner:
             return None
         return gate_feasibility(self.surrogates[g["response"]],
                                 g["threshold"], g["direction"])
+
+    def gate_feasibility_fn(self, response: str, threshold: float,
+                            direction: str = "ge"):
+        """iter103: множитель измеримости ``X → P(измеримо|x)`` БЕЗ ветки.
+
+        Для добора точек области (:meth:`propose_augment` /
+        :meth:`propose_seed` с ``feasibility=``), где ветки ещё нет или гейт
+        нужен вне её контекста. Читает ОБЩИЙ суррогат гейт-отклика
+        (:func:`design.branches.gate_feasibility`). Отклик не среди свойств —
+        ``KeyError``; суррогат гейта ещё не обучен (ни одного измерения) —
+        ``RuntimeError`` с причиной, а не молчаливый множитель ≡ 1: без данных
+        о гейте измеримость выводить нечем (A0.6).
+        """
+        if response not in self.property_names:
+            raise KeyError(f"Гейт '{response}' не среди свойств оракула "
+                           f"{self.property_names}.")
+        if direction not in ("ge", "le"):
+            raise ValueError(f"direction гейта: 'ge' | 'le', дано '{direction}'.")
+        if response not in self.surrogates:
+            cov = self.surrogate_coverage().get(response, {})
+            raise RuntimeError(
+                f"Суррогат гейта '{response}' не обучен (измерений: "
+                f"{cov.get('n_train', 0)} из {cov.get('n_base', 0)} точек) — "
+                f"P(измеримо|x) вывести нечем. Сначала домерьте гейт.")
+        return gate_feasibility(self.surrogates[response], float(threshold),
+                                direction)
+
+    def edge_box_to_deltas(self, box: Mapping[str, "tuple"], *,
+                           axes: Optional[Sequence[str]] = None
+                           ) -> Dict[str, "tuple"]:
+        """iter103: бокс :func:`design.branches.edge_region` → дельты
+        :meth:`move_region` в единицах СХЕМЫ.
+
+        ``edge_region`` работает в координатах кандидатов: mixture — доли,
+        process — КОД [0,1]. Границы process-блока схемы (и ``move_region``)
+        — физика (iter102). Здесь process-оси переводятся кодом → физика по
+        ТЕКУЩЕМУ блоку (``from_code``), mixture-компоненты берутся дословно.
+        ``axes`` — какие оси включить (дефолт — все имена бокса); неизвестное
+        имя — ``KeyError``. Read-only: ничего не двигает.
+        """
+        sch = self.current_schema
+        mix_names = list(sch.mixture_names)
+        proc_names = list(sch.process_names)
+        pb = sch.process_block()
+        names = list(box.keys()) if axes is None else [str(a) for a in axes]
+        out: Dict[str, "tuple"] = {}
+        for nm in names:
+            if nm not in box:
+                raise KeyError(f"Ось '{nm}' отсутствует в боксе {sorted(box)}.")
+            lo, hi = (float(v) for v in box[nm])
+            if nm in mix_names:
+                out[nm] = (lo, hi)
+            elif nm in proc_names and pb is not None:
+                j = proc_names.index(nm)
+                code = np.zeros(len(proc_names))
+                code[j] = lo
+                lo_r = float(pb.from_code(code)[j])
+                code[j] = hi
+                hi_r = float(pb.from_code(code)[j])
+                out[nm] = (lo_r, hi_r)
+            else:
+                raise KeyError(f"Ось '{nm}' не среди компонентов "
+                               f"{mix_names} и process-осей {proc_names}.")
+        return out
 
 
     # ------------------------------------------------------------------

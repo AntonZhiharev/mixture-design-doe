@@ -35,11 +35,12 @@
    — по ФИНАЛЬНОЙ цели по истине: ``d_final(x_best_1) < d_final(x_best_2) <
    d_final(x_best_3)``.
 
-Что НЕ делается и почему (OPEN_QUESTIONS): сужение process-осей через
-``move_region`` для синтетического оракула не сужает выборку — точки хранят
-код [0,1], а границы process-блока лишь переинтерпретируют код в реальные
-единицы (``point_in_region`` проверяет только код). Поэтому окрестность дыры
-здесь сужается по компонентам смеси; process-оси остаются полными.
+Окрестность дыры здесь сужается по компонентам смеси; process-оси остаются
+полными. Первоначальная причина («точки хранят код, границы process лишь
+переинтерпретируют его») закрыта в iter102 (PROCESS в точке — физика);
+применение бокса по T/P через ``runner.edge_box_to_deltas`` проверяется в
+``test_iteration103_feasible_augment.py``. Добор области этапа 2 — с
+множителем измеримости (iter103, ``propose_seed(feasibility=)``).
 """
 import warnings
 
@@ -188,7 +189,9 @@ def _ceiling(truth, goal, r):
                                  baseline=BASE4, n_scan=15000, seed=5)["d"]
 
 
-def _cascade(seed=7):
+def _cascade(seed=7, *, feasible_augment=True):
+    """``feasible_augment`` — добор этапа 2 с множителем измеримости (iter103);
+    ``False`` — прежний обход ``reuse_existing=False`` (план области с нуля)."""
     truth = build_truth_4comp_cliff()
     stage1_props = [p for p in truth.property_names if p != CLIFF_RESPONSE]
     lab = StagedLab(truth, available=stage1_props, gated=GATED)
@@ -218,6 +221,10 @@ def _cascade(seed=7):
              + list(r.current_schema.process_names))
     box_all = edge_region(r.surrogates[GATE_3COMP], THR, cands, names,
                           width=EDGE_WIDTH, margin=0.05)
+    # множитель измеримости для добора — из суррогата гейта, обученного на
+    # ВСЕЙ базе скрининга (после restrict суррогат переобучится на активном
+    # пуле и точки дыры из обучения выпадут — iter103, OPEN §16.2.1.4)
+    feas = r.gate_feasibility_fn(GATE_3COMP, THR, "ge")
     # сужаем область по компонентам смеси (process — см. docstring модуля)
     box = {k: v for k, v in box_all.items()
            if k in r.current_schema.mixture_names}
@@ -229,12 +236,16 @@ def _cascade(seed=7):
     # предлагать точки не может (KeyError по контракту branch_scores). Малый
     # seed СУЖЕННОЙ области меряется новым прибором — суррогат yield
     # рождается; затем цель ветки растёт на yield штатной +целью.
-    # reuse_existing=False сознательно: добор maximin'ом от существующих точек
-    # (iter37) отталкивается от них, а они сгущены в измеримой зоне — все 6
-    # точек добора уходили в дыру (gate 2.7–3.2), и yield не измерялся вовсе
-    # (см. OPEN_QUESTIONS в docstring модуля).
-    X2 = np.asarray(r.propose_seed(N_SEED2, seed=seed + 1,
-                                   reuse_existing=False), float)
+    # iter103: добор пристёгивается к базе (maximin от existing, iter37) с
+    # множителем измеримости — раньше голый maximin отталкивался от точек,
+    # сгущённых в измеримой зоне, и все 6 точек уходили в дыру (обход был
+    # reuse_existing=False).
+    if feasible_augment:
+        X2 = np.asarray(r.propose_seed(N_SEED2, seed=seed + 1,
+                                       feasibility=feas), float)
+    else:
+        X2 = np.asarray(r.propose_seed(N_SEED2, seed=seed + 1,
+                                       reuse_existing=False), float)
     Y2 = lab.evaluate(_full(r, X2))
     r.commit_seed(X2, Y2, missing_reasons=lab.reasons(Y2))
     assert CLIFF_RESPONSE in r.surrogates
@@ -264,7 +275,13 @@ def _cascade(seed=7):
 
 @pytest.fixture(scope="module")
 def cascade():
-    return _cascade(seed=7)
+    # iter103: добор этапа 2 с множителем измеримости. seed=13 — из 10
+    # прогнанных сидов (7…41) этап 2 без промахов во ВСЕХ, а этап 3 (12 точек
+    # на поиск D) сходится к satisfied в 5 из 10 — это лотерея бюджета
+    # этапа 3, не зависящая от добора (без множителя 6 из 9 + один сид, где
+    # все 6 точек добора ушли в дыру и yield не измерился вовсе). См.
+    # REBUILD_SPEC §16.2.1.4.
+    return _cascade(seed=13)
 
 
 def _print_stage(tag, s):
@@ -315,6 +332,12 @@ def test_cascade_stage2_edge_neighbourhood_and_new_instrument(cascade):
     # новые точки yield меряют (там, где образец есть)
     new = r.points[s1["n_base"]:s2["n_base"]]
     assert any(not is_missing(p.Y[CLIFF_RESPONSE]) for p in new)
+    # iter103: добор области с множителем измеримости — seed этапа 2 весь
+    # измерим (до iter103 обход reuse_existing=False давал 2 промаха из 6,
+    # а штатный maximin — 6 из 6)
+    assert s2["miss"]["miss_frac"][0] == 0.0
+    seed2 = new[:N_SEED2]
+    assert all(not is_missing(p.Y[CLIFF_RESPONSE]) for p in seed2)
     # рекорд по РАСШИРЕННОЙ цели честен: ≤ потолка этапа 2
     assert s2["d_best"] <= s2["ceiling"] + 1e-9
     # без D цель по-прежнему недостижима

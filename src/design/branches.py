@@ -184,6 +184,62 @@ def gate_feasibility(surrogate: "object", threshold: float,
     return _p
 
 
+def edge_region(surrogate: "object", threshold: float,
+                candidates: np.ndarray, names: Sequence[str], *,
+                width: float, margin: float = 0.0, min_points: int = 8
+                ) -> Dict[str, "tuple"]:
+    """Окрестность КРОМКИ измеримости как бокс по координатам (iter101).
+
+    Каскад «скрининг → уточнение окрестности дыры»: после скрининга суррогат
+    гейта знает карту дыры (iter99: accuracy ~1.0), и вторую стадию имеет
+    смысл вести не по всей области, а в полосе вдоль кромки —
+    ``|μ_gate(x) − threshold| ≤ width`` по ПРЕДСКАЗАННОМУ СРЕДНЕМУ гейта.
+    Полоса задаётся в ЕДИНИЦАХ ГЕЙТА («surface 4 ± 0.75») — это язык
+    технолога и физики, а не модели. Полоса по вероятности
+    ``P(измеримо|x)`` здесь непригодна: у GP без шума σ→0 возле данных, и
+    ``Φ((μ−thr)/σ)`` — почти ступенька, «полоса» схлопывается в несколько
+    кандидатов и зависит от того, как обучился суррогат, а не от кромки.
+
+    Функция берёт кандидатов из полосы и возвращает их покоординатный
+    bounding-box (с запасом ``margin``, обрезанным к [0,1]) в формате дельт
+    ``move_region``: ``{имя: (lo, hi)}``.
+
+    Почему бокс, а не выпуклая оболочка: область раннера — это bounds
+    (§15.0.3), ничем другим сужение не выражается. Бокс точек симплекса
+    симплекс-замкнут по построению: для каждой вершины бокса найдётся точка
+    ``x*`` полосы с ``x*_v = U_v``, и у неё ``Σ_{w≠v} x*_w = 1 − U_v ≥
+    Σ_{w≠v} L_w`` ⇒ ``U_v ≤ 1 − Σ_{w≠v} L_w``; ``ΣL ≤ 1 ≤ ΣU`` — из любой
+    точки полосы. Запас ``margin`` расширяет бокс, а расширение инварианта не
+    ломает (кроме обрезки [0,1], которая тоже безопасна).
+
+    В полосе меньше ``min_points`` кандидатов ⇒ ``ValueError``: сужать
+    область по 2–3 точкам — значит выдумывать геометрию за данные. Функция
+    чистая, раннера не знает; соответствие координат именам — дело
+    вызывающего (``names`` в порядке столбцов ``candidates``).
+    """
+    X = np.atleast_2d(np.asarray(candidates, float))
+    names = [str(n) for n in names]
+    if X.shape[1] != len(names):
+        raise ValueError(f"names ({len(names)}) не совпадают со столбцами "
+                         f"candidates ({X.shape[1]}).")
+    w = float(width)
+    if not (w > 0.0):
+        raise ValueError(f"width (полуширина полосы в единицах гейта) должна "
+                         f"быть > 0, дано {width}.")
+    mu = np.asarray(surrogate.predict(X).mean, float).ravel()
+    band = np.abs(mu - float(threshold)) <= w
+    n_band = int(band.sum())
+    if n_band < int(min_points):
+        raise ValueError(
+            f"В полосе |μ_gate − {threshold:g}| ≤ {w:g} лишь {n_band} кандидатов "
+            f"из {len(X)} (нужно ≥ {min_points}): кромка либо не выучена "
+            f"суррогатом гейта, либо её в области нет — расширьте width.")
+    m = float(margin)
+    lo = np.clip(X[band].min(axis=0) - m, 0.0, 1.0)
+    hi = np.clip(X[band].max(axis=0) + m, 0.0, 1.0)
+    return {nm: (float(lo[j]), float(hi[j])) for j, nm in enumerate(names)}
+
+
 def branch_scores(surrogates: Mapping[str, "object"],
                   goal: Mapping[str, DesirabilitySpec],
                   candidates: np.ndarray,

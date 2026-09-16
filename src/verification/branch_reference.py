@@ -21,6 +21,7 @@ from typing import Any, Dict, Mapping
 
 import numpy as np
 
+from ..core.schema import ProjectSchema
 from ..optimize.desirability import Desirability, DesirabilitySpec
 from .mixture_process_truth import (MultiMixtureProcessTruth,
                                     composite_random_points)
@@ -54,6 +55,49 @@ def _desirability_at(truth: MultiMixtureProcessTruth,
         means[cost_name] = np.asarray(cost_fn(Xc), float).ravel()
         specs[cost_name] = cost_spec
     return Desirability(specs).overall(means)
+
+
+def _stochastic_polish(batch_obj, v0: np.ndarray, lo: np.ndarray,
+                       hi: np.ndarray, q: int, *, seed: int,
+                       n_iter: int = 10, n_samp: int = 120,
+                       radius: float = 0.05) -> "tuple":
+    """Derivative-free полировка эталона вокруг ``v0`` (iter101).
+
+    Оптимум цели с гейтом/обрывом лежит НА РАЗРЫВЕ (``yield`` скачет с
+    ``y_cliff`` в 0 при ``surface = порог``): SLSQP с численным градиентом
+    через разрыв «уточняет» вниз (живой пример: 0.8467 → 0.8442 из той же
+    точки), и потолок оказывается ниже измеренного ``d_best`` при нулевом
+    шуме. Здесь — локальный случайный поиск со сжимающимся радиусом:
+    ``n_samp`` возмущений ``v0`` (первые ``q`` координат — доли: клип к
+    бокcу и перенормировка Σ=1, остальные — клип к боксу), берётся лучшее,
+    без улучшения радиус делится вдвое. Только вверх: возвращает точку не
+    хуже стартовой. Непрерывности не требует.
+    """
+    rng = np.random.default_rng(seed)
+    v = np.asarray(v0, float).copy()
+    best = float(batch_obj(v[None, :])[0])
+    r = float(radius)
+    k = v.size
+    for _ in range(int(n_iter)):
+        V = v[None, :] + rng.normal(0.0, r, size=(int(n_samp), k))
+        V = np.clip(V, lo, hi)
+        if q > 0:
+            s = V[:, :q].sum(axis=1, keepdims=True)
+            s = np.where(s > 1e-12, s, 1.0)
+            V[:, :q] = V[:, :q] / s
+            ok = (np.all(V[:, :q] >= lo[:q] - 1e-9, axis=1)
+                  & np.all(V[:, :q] <= hi[:q] + 1e-9, axis=1))
+            V = V[ok]
+        if V.shape[0] == 0:
+            r *= 0.5
+            continue
+        d = np.asarray(batch_obj(V), float).ravel()
+        j = int(np.argmax(d))
+        if d[j] > best + 1e-12:
+            best, v = float(d[j]), V[j].copy()
+        else:
+            r *= 0.5
+    return v, best
 
 
 def branch_optimum(truth: MultiMixtureProcessTruth,
@@ -127,10 +171,141 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
         except Exception:  # noqa: BLE001 — без scipy остаётся скан-оптимум
             pass
 
+    if refine and q + d > 0:
+        # iter101: оптимум цели с гейтом лежит на разрыве (кромка) — SLSQP
+        # там не уточняет, derivative-free полировка добирает (только вверх)
+        mb = schema.mixture_block()
+        lo_v = np.concatenate([np.asarray(mb.lower, float) if q else [],
+                               np.zeros(d)])
+        hi_v = np.concatenate([np.asarray(mb.upper, float) if q else [],
+                               np.ones(d)])
+        best_x, best_d = _stochastic_polish(
+            lambda Vb: _desirability_at(truth, goal, Vb, **ckw),
+            best_x, lo_v, hi_v, q, seed=int(seed) + 17)
+
     y_opt = {p: float(truth.truths[p].true(best_x.reshape(1, -1))[0])
              for p in truth.property_names}
     return {"x": best_x, "d": float(best_d), "y": y_opt,
             "x_scan": x_scan, "d_scan": d_scan}
+
+
+# ----------------------------------------------------------------------
+# Оптимум на ОБЛАСТИ ФАЗЫ (iter101): границы схемы раннера, не полная истина
+# ----------------------------------------------------------------------
+def branch_optimum_region(truth: MultiMixtureProcessTruth,
+                          goal: Mapping[str, DesirabilitySpec],
+                          region: ProjectSchema, *,
+                          baseline, n_scan: int = 20000, seed: int = 0,
+                          refine: bool = True, n_starts: int = 5
+                          ) -> Dict[str, Any]:
+    """Аналитический потолок ветки НА ОБЛАСТИ ``region`` (схема текущей фазы).
+
+    Отличие от :func:`branch_optimum` (полная область истины) и
+    :func:`branch_optimum_masked` (маска «свободен/закрыт»): здесь область —
+    произвольная схема раннера с её bounds по компонентам и process-осям:
+    после ``move_region`` (сужение к окрестности дыры) или до
+    ``augment_phase_mixture`` (компонент D ещё не введён ⇒ его в ``region``
+    нет, физически D=0). Именно с ЭТИМ потолком честно сравнивать ``d_best``
+    этапа каскада: глобальный оптимум может лежать вне области этапа.
+
+    Координаты области → полный вектор истины по правилу ``_to_full`` раннера:
+    mixture-компоненты истины, отсутствующие в ``region``, = 0 (грань
+    симплекса, §15.0.4); отсутствующие process-оси = ``baseline`` (код).
+    Компоненты ``region`` обязаны быть ПРЕФИКСОМ компонентов истины (append
+    идёт в конец) — иначе ``ValueError``. Мультистарт SLSQP из top-K скана
+    по СВОБОДНЫМ координатам; ``d`` — строгая верхняя граница для ``d_best``
+    этапа при нулевом шуме.
+    """
+    from ..core.simplex import SimplexRegion
+
+    schema = truth.schema
+    q, d = int(schema.n_mixture), int(schema.n_process)
+    tm, tp = list(schema.mixture_names), list(schema.process_names)
+    rm, rp = list(region.mixture_names), list(region.process_names)
+    if tm[:len(rm)] != rm or tp[:len(rp)] != rp:
+        raise ValueError(
+            f"Область {rm}×{rp} не префикс истины {tm}×{tp}: append идёт в "
+            f"конец, иная раскладка координат не поддержана.")
+    base = np.asarray(baseline, float).ravel()
+    if base.size != q + d:
+        raise ValueError(f"baseline длины {base.size}, ожидалось {q + d}.")
+    qr, dr = len(rm), len(rp)
+    mb = region.mixture_block()
+
+    def expand(v: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, float).ravel()
+        x = np.zeros(q + d)
+        x[:qr] = v[:qr]                       # доли области; остальные = 0
+        x[q:] = base[q:]                      # закрытые оси на baseline
+        x[q:q + dr] = v[qr:qr + dr]
+        return x
+
+    rng = np.random.default_rng(seed)
+    parts = []
+    if qr > 0:
+        reg = SimplexRegion(lower=np.asarray(mb.lower, float),
+                            upper=np.asarray(mb.upper, float))
+        parts.append(np.atleast_2d(reg.random_points(int(n_scan), seed=seed)))
+    if dr > 0:
+        parts.append(rng.uniform(0.0, 1.0, size=(int(n_scan), dr)))
+    V = np.hstack(parts) if parts else np.empty((int(n_scan), 0))
+    X = np.vstack([expand(v) for v in V])
+    dvals = np.asarray(_desirability_at(truth, goal, X), float).ravel()
+    b = int(np.argmax(dvals))
+    best_v, best_d = V[b].copy(), float(dvals[b])
+
+    if refine and V.shape[1] > 0:
+        try:
+            from scipy.optimize import minimize
+
+            bounds = ([(float(lo), float(hi))
+                       for lo, hi in zip(mb.lower, mb.upper)] if qr else [])
+            bounds += [(0.0, 1.0)] * dr
+            cons = ([{"type": "eq",
+                      "fun": lambda v: float(np.sum(v[:qr]) - 1.0)}]
+                    if qr > 0 else [])
+            topk = np.argsort(dvals)[::-1][:max(1, int(n_starts))]
+            for si in topk:
+                res = minimize(
+                    lambda v: -float(_desirability_at(truth, goal,
+                                                      expand(v))[0]),
+                    V[si], method="SLSQP", bounds=bounds, constraints=cons,
+                    options={"maxiter": 300, "ftol": 1e-9})
+                cand = np.asarray(res.x, float)
+                if qr > 0:
+                    cand[:qr] = np.clip(cand[:qr], 0.0, None)
+                    s = cand[:qr].sum()
+                    if s > 0:
+                        cand[:qr] /= s
+                    if not reg.is_feasible(cand[:qr], tol=1e-6):
+                        continue              # SLSQP вышел за bounds области
+                if dr > 0:
+                    cand[qr:] = np.clip(cand[qr:], 0.0, 1.0)
+                d_cand = float(_desirability_at(truth, goal, expand(cand))[0])
+                if d_cand >= best_d:
+                    best_v, best_d = cand, d_cand
+        except Exception:  # noqa: BLE001 — без scipy остаётся скан-оптимум
+            pass
+
+    if refine and V.shape[1] > 0:
+        # оптимум на разрыве (кромка гейта): градиентный SLSQP его не берёт,
+        # derivative-free полировка — берёт (см. _stochastic_polish)
+        lo_v = np.concatenate([np.asarray(mb.lower, float) if qr else [],
+                               np.zeros(dr)])
+        hi_v = np.concatenate([np.asarray(mb.upper, float) if qr else [],
+                               np.ones(dr)])
+
+        def _batch(Vb):
+            Xb = np.vstack([expand(v) for v in Vb])
+            return _desirability_at(truth, goal, Xb)
+
+        best_v, best_d = _stochastic_polish(_batch, best_v, lo_v, hi_v, qr,
+                                            seed=int(seed) + 17)
+
+    best_x = expand(best_v)
+    y_opt = {p: float(truth.truths[p].true(best_x.reshape(1, -1))[0])
+             for p in truth.property_names}
+    return {"x": best_x, "d": float(best_d), "y": y_opt}
 
 
 

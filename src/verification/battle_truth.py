@@ -330,7 +330,10 @@ class ExpCliffResponse:
                        float).ravel()
         y = np.exp(self.k * (self.g_max - g)) - 1.0
         y[g < self.threshold] = 0.0
-        return y
+        # iter101: в мирах, где гейт превышает g_max (4-комп мир с D до 9.6),
+        # выход далеко от кромки физически исчерпан — 0, а не отрицательный.
+        # В 3-комп мире g ≤ g_max, поведение бит-в-бит прежнее.
+        return np.maximum(y, 0.0)
 
     def evaluate(self, Xc, *, active_schema=None) -> np.ndarray:
         y = self.true(Xc, active_schema=active_schema)
@@ -408,6 +411,143 @@ def build_truth_3comp_cliff(noise_sd: float = 0.0, *, k: float = CLIFF_K,
     """
     base = build_truth_3comp_gated(noise_sd=noise_sd)
     return CliffTruth(base, k=k, noise_sd=noise_sd, seed=seed)
+
+
+# ======================================================================
+# iter101: КАСКАД — 4-й компонент D сжимает дыру, прибор yield появляется позже
+# ======================================================================
+COMPS_4COMP = ["A", "B", "C", "D"]
+
+
+def _with_d(base: Mapping[str, float], extra: Mapping[str, float]
+            ) -> Dict[str, float]:
+    out = dict(base)
+    out.update(extra)
+    return out
+
+
+#: Разреженная истина 4-комп мира {A,B,C,D} × {T,P}: коэффициенты 3-комп мира
+#: + вклад D. На грани D=0 истина СОВПАДАЕТ с 3-комп миром (термы с D
+#: обнуляются, проверено: max|Δ| ~ 1e-14) — этапы каскада без D живут ровно
+#: в физике iter99/iter100. D — технологическая добавка (совместитель):
+#: усиливает gloss-гряду ``B*C`` (``B*D``, ``C*D``) и одновременно
+#: СГЛАЖИВАЕТ поверхность именно там (гейт ``C*D``, ``B*D``), то есть сжимает
+#: дыру вокруг гряды. Калибровка (скан 40k точек, эталон ``branch_optimum``
+#: для цели gloss≥8 max ∧ strength≥6 max ∧ surface≥4 [∧ yield max]): в
+#: 3-комп мире максимум gloss (11.79) лежит В ДЫРЕ (surface 2.3), потолок
+#: цели 0.805 (0.849 с yield) — недостижим при satisfy 0.9; с D доля
+#: измеримой области 0.62 → 0.93, потолок 1.0 (0.945 с yield: оптимум
+#: по-прежнему на кромке, но кромка сдвинулась в зону высокого gloss).
+TRUTH_4COMP: Dict[str, Dict[str, float]] = {
+    "strength": _with_d(TRUTH_3COMP["strength"],
+                        {"D": 12, "A*D": 16, "B*D": 20, "C*D": 20}),
+    "gloss": _with_d(TRUTH_3COMP["gloss"], {"D": 6, "B*D": 16, "C*D": 16}),
+    "dry_time": _with_d(TRUTH_3COMP["dry_time"], {"D": 1}),
+    "price": _with_d(TRUTH_3COMP["price"], {"D": 3.0}),
+    "rho": _with_d(TRUTH_3COMP["rho"], {"D": 0.9}),
+}
+#: Гейт 4-комп мира: D поднимает поверхность, сильнее всего вместе с C и B.
+#: Максимум гейта над полной областью 9.6 > ``CLIFF_G_MAX`` — там ``yield``
+#: обрезается нулём (выход исчерпан далеко от кромки); шкала ``y_cliff`` на
+#: кромке та же, что в iter100.
+TRUTH_GATE_4COMP: Dict[str, float] = _with_d(
+    TRUTH_GATE_3COMP, {"D": 8, "C*D": 16, "B*D": 10})
+
+
+def build_truth_4comp_gated(noise_sd: float = 0.0) -> MultiMixtureProcessTruth:
+    """Истина 4-комп мира {A,B,C,D} × {T,P} + гейт ``surface`` (6 откликов)."""
+    s = truth_schema_econ()
+    coef_by = {prop: coef_from_terms(s, sparse)
+               for prop, sparse in TRUTH_4COMP.items()}
+    coef_by[GATE_3COMP] = coef_from_terms(s, TRUTH_GATE_4COMP)
+    return MultiMixtureProcessTruth(s, coef_by, noise_sd=float(noise_sd))
+
+
+def build_truth_4comp_cliff(noise_sd: float = 0.0, *, k: float = CLIFF_K,
+                            seed: Optional[int] = None) -> CliffTruth:
+    """Истина каскада: 4-комп мир + ``surface`` + ``yield`` (7 откликов).
+
+    Та же конструкция, что :func:`build_truth_3comp_cliff`; на грани D=0 —
+    бит-в-бит мир iter100. Эталон этапа с ограниченной областью/подмножеством
+    компонентов — :func:`branch_reference.branch_optimum_region`.
+    """
+    base = build_truth_4comp_gated(noise_sd=noise_sd)
+    return CliffTruth(base, k=k, noise_sd=noise_sd, seed=seed)
+
+
+class StagedLab(TornLab):
+    """Лаборатория, у которой ПРИБОРЫ появляются по ходу кампании (iter101).
+
+    Физика фиксирована (``schema`` истины: новые переменные измерять нечем,
+    ``declare_variables`` раннер отвергает), а ИЗМЕРИТЕЛЬНЫЙ контур растёт: на
+    старте доступны лишь ``available`` отклики, остальные — «прибора нет».
+    :meth:`declare_response` включает прибор — это протокол
+    ``runner.declare_response`` (iter99), который до сих пор реализовывал
+    только ручной оракул. Имя обязано существовать в истине: иначе это не
+    новый прибор, а новая физика — отказ.
+
+    Порядок столбцов ``Y`` = порядок включения приборов — ровно так растёт
+    ``runner.property_names`` после ``declare_response``. Гейтинг (MISSING при
+    ``gate < threshold``) — как у :class:`TornLab`, по доступным откликам.
+    """
+
+    def __init__(self, truth, *, available: Sequence[str],
+                 gate: str = GATE_3COMP,
+                 threshold: float = GATE_THRESHOLD_3COMP,
+                 gated: Sequence[str] = GATED_3COMP):
+        super().__init__(truth, gate=gate, threshold=threshold, gated=gated)
+        self._all = list(truth.property_names)
+        avail = [str(a) for a in available]
+        unknown = [a for a in avail if a not in self._all]
+        if unknown:
+            raise KeyError(f"available: откликов {unknown} нет в истине "
+                           f"{self._all}.")
+        if len(set(avail)) != len(avail):
+            raise ValueError(f"available: дубли имён {avail}.")
+        if self.gate not in avail:
+            raise ValueError(
+                f"Гейт '{self.gate}' обязан быть доступен с первого этапа: без "
+                f"него причины пропусков назвать нечем.")
+        self.property_names = avail
+        self._gi = self.property_names.index(self.gate)
+        self.n_declared = 0
+
+    def declare_response(self, name: str) -> None:
+        """Включить прибор: отклик истины становится измеримым."""
+        nm = str(name).strip()
+        if nm in self.property_names:
+            raise ValueError(f"Отклик '{nm}' уже измеряется.")
+        if nm not in self._all:
+            raise ValueError(
+                f"'{nm}' — не прибор, а новая физика: в истине лаборатории нет "
+                f"такого отклика ({self._all}).")
+        self.property_names.append(nm)
+        self.n_declared += 1
+
+    def evaluate(self, Xc) -> np.ndarray:
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        Yall = np.atleast_2d(self.truth.evaluate(Xc)).astype(float)
+        bad = Yall[:, self._all.index(self.gate)] < self.threshold
+        cols = [self._all.index(p) for p in self.property_names]
+        Y = Yall[:, cols].copy()
+        for g in self.gated:
+            if g in self.property_names:
+                Y[bad, self.property_names.index(g)] = np.nan
+        self.n_calls += int(len(Xc))
+        self.n_unmeasurable += int(bad.sum())
+        return Y
+
+    def reasons(self, Y) -> list:
+        Y = np.atleast_2d(np.asarray(Y, float))
+        out = []
+        for row in Y:
+            miss = {g: (f"образец не получен: {self.gate}="
+                        f"{row[self._gi]:.2f} < {self.threshold:g}")
+                    for g in self.gated
+                    if g in self.property_names
+                    and not np.isfinite(row[self.property_names.index(g)])}
+            out.append(miss or None)
+        return out
 
 
 # ----------------------------------------------------------------------

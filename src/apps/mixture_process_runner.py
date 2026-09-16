@@ -80,7 +80,7 @@ from ..design.levels import (levels_to_code, normalize_levels,
 from ..design.linked_axes import (ProcessLink, normalize_links,
                                   snap_pair_to_band)
 from ..design.branches import (Branch, branch_scores, propose_by_score,
-                               allocate_budget,
+                               allocate_budget, gate_feasibility,
                                ROLE_OPTIMIZED, ROLE_PRICE_INPUT, ROLE_REFERENCE,
                                ROLE_PRIORITY)
 from ..optimize.desirability import (ChanceConstraint, Desirability,
@@ -218,6 +218,13 @@ class MixtureProcessRunner:
         # ``optimize_xbest`` автоматически — иначе ограничение, заданное из UI,
         # молча не участвовало бы в argmax (A0.6).
         self._branch_chance: Dict[str, Dict[str, ChanceConstraint]] = {}
+        # iter100 (§16.2.1 «чёрная дыра»): ГЕЙТ ИЗМЕРИМОСТИ ветки — отклик
+        # «образец получен» и его порог. Explore-член acquisition умножается
+        # на P(измеримо|x)=Φ((μ_gate−thr)/σ_gate) из ОБЩЕГО суррогата гейта:
+        # без этого σ зависимых откликов (за кромкой они не мерились вовсе)
+        # тянет explore-слоты в неизмеримую зону. Политика раннера, как
+        # ``_branch_chance``: {branch_id: {"response", "threshold", "direction"}}.
+        self._branch_gate: Dict[str, Dict[str, Any]] = {}
 
         # §15.0.3: после движения границ области (move_region) точки, выпавшие из
         # НОВОЙ области, легально исключаются из активного pool по политике
@@ -2631,6 +2638,50 @@ class MixtureProcessRunner:
             raise KeyError(f"Нет ветки '{branch_id}'.")
         return dict(self._branch_chance.get(branch_id, {}))
 
+    # ------------------------------------------------------------------
+    # iter100: ГЕЙТ ИЗМЕРИМОСТИ ветки (feasibility-aware acquisition)
+    # ------------------------------------------------------------------
+    def set_branch_gate(self, branch_id: str, response: Optional[str],
+                        threshold: float = 0.0, direction: str = "ge") -> None:
+        """iter100: объявить гейт измеримости ветки (``response=None`` — снять).
+
+        ``response`` — отклик «образец получен» (измерим всегда; при
+        ``response < threshold`` для ``"ge"`` зависимые отклики не снимаются —
+        MISSING). Обязан быть среди свойств оракула. В :meth:`propose_points`
+        explore-член acquisition умножается на ``P(измеримо|x)`` из общего
+        суррогата гейта (:func:`design.branches.gate_feasibility`); exploit
+        (argmax) не трогается — там гейт держит цель ветки (канон §16.2.1).
+        """
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        if response is None:
+            self._branch_gate.pop(branch_id, None)
+            return
+        if response not in self.property_names:
+            raise KeyError(f"Гейт '{response}' не среди свойств оракула "
+                           f"{self.property_names}.")
+        if direction not in ("ge", "le"):
+            raise ValueError(f"direction гейта: 'ge' | 'le', дано '{direction}'.")
+        self._branch_gate[branch_id] = {"response": str(response),
+                                        "threshold": float(threshold),
+                                        "direction": str(direction)}
+
+    def branch_gate(self, branch_id: str) -> Optional[Dict[str, Any]]:
+        """iter100: гейт измеримости ветки (копия) или ``None``."""
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+        g = self._branch_gate.get(branch_id)
+        return dict(g) if g else None
+
+    def _branch_feasibility(self, branch_id: str):
+        """``X → P(измеримо|x)`` по гейту ветки, либо ``None`` (нет гейта или
+        суррогат гейта ещё не рождён — тогда честно без множителя)."""
+        g = self._branch_gate.get(branch_id)
+        if not g or g["response"] not in self.surrogates:
+            return None
+        return gate_feasibility(self.surrogates[g["response"]],
+                                g["threshold"], g["direction"])
+
 
     # ------------------------------------------------------------------
     # §5/§12 РОЛЬ ОТКЛИКА в ветке — атрибут (ветка × отклик), ВЫВОДИТСЯ из
@@ -2889,7 +2940,8 @@ class MixtureProcessRunner:
             acq, d_pred, sigma = branch_scores(
                 self.surrogates, br.goal, cands, explore_frac=explore_frac,
                 cost_fn=cost_fn, cost_name=(cost_name or "cost"),
-                cost_spec=cost_spec)
+                cost_spec=cost_spec,
+                feasibility=self._branch_feasibility(branch_id))
             acqX = propose_by_score(cands, acq, n_acq, min_dist=0.02)
             newX_list.append(np.atleast_2d(acqX))
         if n_exploit > 0:

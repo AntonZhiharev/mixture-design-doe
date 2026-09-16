@@ -158,12 +158,39 @@ class Branch:
 
 
 # ----------------------------------------------------------------------
+def gate_feasibility(surrogate: "object", threshold: float,
+                     direction: str = "ge"):
+    """``P(измеримо | x)`` из суррогата гейт-отклика (iter100).
+
+    Гейт — отклик «образец получен» (SurfaceQuality, ``surface``): измерим
+    всегда, а зависимые отклики снимаются лишь при ``gate ≥ threshold``
+    (``direction="ge"``) или ``≤`` (``"le"``). Вероятность берётся из
+    нормального постериора суррогата: ``Φ((μ−thr)/σ)``. Возвращает
+    callable ``X → p ∈ [0,1]`` для :func:`branch_scores`.
+    """
+    from scipy.special import ndtr
+
+    sign = 1.0 if direction in ("ge", ">=") else -1.0
+    if direction not in ("ge", ">=", "le", "<="):
+        raise ValueError(f"Unknown direction '{direction}' (use 'ge' | 'le').")
+    thr = float(threshold)
+
+    def _p(X) -> np.ndarray:
+        pred = surrogate.predict(np.atleast_2d(np.asarray(X, float)))
+        mu = np.asarray(pred.mean, float).ravel()
+        sd = np.maximum(np.asarray(pred.std, float).ravel(), 1e-12)
+        return np.asarray(ndtr(sign * (mu - thr) / sd), float)
+
+    return _p
+
+
 def branch_scores(surrogates: Mapping[str, "object"],
                   goal: Mapping[str, DesirabilitySpec],
                   candidates: np.ndarray,
                   explore_frac: float = 0.3, *,
                   cost_fn=None, cost_name: str = "cost",
-                  cost_spec: Optional[DesirabilitySpec] = None):
+                  cost_spec: Optional[DesirabilitySpec] = None,
+                  feasibility=None):
     """Branch acquisition over a feasible candidate set (higher = better).
 
     Если задан ``cost_fn`` (§15.6 §3): цена за изделие складывается в exploit-часть
@@ -171,6 +198,14 @@ def branch_scores(surrogates: Mapping[str, "object"],
     фиксированный диапазон цены). ``cost_fn`` собирает цену из суррогата ρ
     (``make_item_cost_fn``), поэтому explore-часть (σ̄) считается по goal-свойствам
     как и раньше — обратная совместимость без cost.
+
+    ``feasibility`` (iter100, «чёрная дыра»): callable ``X → P(измеримо|x)``
+    (см. :func:`gate_feasibility`). Explore-член умножается на эту
+    вероятность: σ отклика, который в неизмеримой зоне не снимается вовсе,
+    максимальна именно там (суррогат экстраполирует), и без множителя
+    нормированная σ̄ тянет ВСЕ explore-слоты в дыру, где измерять нечего.
+    Exploit-часть не трогается (гейт в цели ветки — канон §16.2.1).
+    ``None`` — прежнее поведение бит-в-бит.
 
     Returns ``(acq, d_pred, sigma)``:
       * acq    : blended exploit/explore score per candidate;
@@ -201,6 +236,13 @@ def branch_scores(surrogates: Mapping[str, "object"],
     d_pred = Desirability(specs).overall(means)
     smax = float(sigma.max()) if sigma.size else 0.0
     sigma_n = sigma / smax if smax > 0 else np.zeros_like(sigma)
+    if feasibility is not None:
+        p_feas = np.clip(np.asarray(feasibility(candidates), float).ravel(),
+                         0.0, 1.0)
+        if p_feas.shape != sigma_n.shape:
+            raise ValueError("feasibility должна вернуть по одной вероятности "
+                             f"на кандидата: {p_feas.shape} != {sigma_n.shape}.")
+        sigma_n = sigma_n * p_feas
     explore_frac = float(np.clip(explore_frac, 0.0, 1.0))
     acq = (1.0 - explore_frac) * d_pred + explore_frac * sigma_n
     return acq, d_pred, sigma

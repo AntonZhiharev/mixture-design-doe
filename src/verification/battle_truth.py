@@ -21,13 +21,14 @@
 """
 from __future__ import annotations
 
-from typing import Callable, Dict, Mapping, Sequence
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 
 from ..core.schema import ModelSpec, ProjectSchema, VariableBlock
 from ..design.block_model import build_model_terms
-from .mixture_process_truth import MultiMixtureProcessTruth
+from .mixture_process_truth import (MixtureProcessTruth,
+                                    MultiMixtureProcessTruth)
 
 
 # ----------------------------------------------------------------------
@@ -278,6 +279,135 @@ class TornLab:
                     if not np.isfinite(row[self.property_names.index(g)])}
             out.append(miss or None)
         return out
+
+
+# ======================================================================
+# iter100: «ОБРЫВ» — экспоненциальный рост отклика к кромке измеримости
+# ======================================================================
+#: Отклик-«обрыв»: растёт экспоненциально при приближении к порогу гейта и
+#: физически обнуляется за ним (продукт не образуется). Лаборатория за
+#: порогом отдаёт MISSING (образца нет) — см. :class:`TornLab`.
+CLIFF_RESPONSE = "yield"
+#: Крутизна экспоненты: yield = exp(k·(g_max − g)) − 1 на измеримой стороне.
+CLIFF_K = 1.0
+#: Максимум гейта ``surface`` над полной областью: A=1, T=0.5 → 6 + 1 − 0.5.
+#: (Смешение A/B даёт меньше: A=B=0.5,T=0.5 → 5.5; A=.75,B=.25 → 6.25.)
+CLIFF_G_MAX = 6.5
+
+
+class ExpCliffResponse:
+    """Неполиномиальный отклик «экспонента до обрыва» поверх истины гейта.
+
+    ``true(Xc) = exp(k·(g_max − g(Xc))) − 1`` при ``g ≥ threshold``, иначе 0:
+    чем ближе рецепт к кромке измеримости, тем выше выход, а за кромкой
+    продукта нет. Интерфейс как у :class:`MixtureProcessTruth`
+    (``true``/``evaluate`` с ``active_schema``), чтобы эталон
+    ``branch_optimum`` и :class:`TornLab` работали без правок.
+
+    Смысл для ядра: оптимум цели «yield max» лежит РОВНО на границе области
+    определения; суррогат учится только на измеримой стороне и за кромкой
+    экстраполирует рост (μ↑, σ↑) — именно там acquisition тянет в «дыру».
+    """
+
+    def __init__(self, gate_truth: MixtureProcessTruth, *, threshold: float,
+                 g_max: float = CLIFF_G_MAX, k: float = CLIFF_K,
+                 noise_sd: float = 0.0, seed: Optional[int] = None):
+        self.gate_truth = gate_truth
+        self.threshold = float(threshold)
+        self.g_max = float(g_max)
+        self.k = float(k)
+        self.noise_sd = float(noise_sd)
+        self._rng = np.random.default_rng(seed)
+
+    @property
+    def y_cliff(self) -> float:
+        """Значение отклика на самой кромке (максимум достижимого)."""
+        return float(np.exp(self.k * (self.g_max - self.threshold)) - 1.0)
+
+    def true(self, Xc, *, active_schema=None) -> np.ndarray:
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        g = np.asarray(self.gate_truth.true(Xc, active_schema=active_schema),
+                       float).ravel()
+        y = np.exp(self.k * (self.g_max - g)) - 1.0
+        y[g < self.threshold] = 0.0
+        return y
+
+    def evaluate(self, Xc, *, active_schema=None) -> np.ndarray:
+        y = self.true(Xc, active_schema=active_schema)
+        if self.noise_sd > 0:
+            y = y + self._rng.normal(0.0, self.noise_sd, size=y.shape)
+        return y
+
+    def __call__(self, Xc, *, active_schema=None) -> np.ndarray:
+        return self.evaluate(Xc, active_schema=active_schema)
+
+
+class CliffTruth:
+    """Истина 3-комп мира + гейт ``surface`` + отклик-обрыв ``yield``.
+
+    Duck-typed под :class:`MultiMixtureProcessTruth` (``schema``,
+    ``property_names``, ``truths``, ``true``/``evaluate``): полиномиальные
+    отклики — от базовой истины, ``yield`` — :class:`ExpCliffResponse`.
+    """
+
+    def __init__(self, base: MultiMixtureProcessTruth, *,
+                 gate: str = GATE_3COMP,
+                 threshold: float = GATE_THRESHOLD_3COMP,
+                 k: float = CLIFF_K, noise_sd: float = 0.0,
+                 seed: Optional[int] = None):
+        if gate not in base.property_names:
+            raise KeyError(f"Гейт '{gate}' не среди откликов базовой истины.")
+        self.base = base
+        self.schema = base.schema
+        self.terms = base.terms
+        self.gate = str(gate)
+        self.threshold = float(threshold)
+        self.property_names = list(base.property_names) + [CLIFF_RESPONSE]
+        self.truths: Dict[str, object] = dict(base.truths)
+        self.truths[CLIFF_RESPONSE] = ExpCliffResponse(
+            base.truths[gate], threshold=threshold, k=k, noise_sd=noise_sd,
+            seed=None if seed is None else int(seed) + 7919)
+
+    @property
+    def cliff(self) -> ExpCliffResponse:
+        return self.truths[CLIFF_RESPONSE]  # type: ignore[return-value]
+
+    @property
+    def n_properties(self) -> int:
+        return len(self.property_names)
+
+    def gate_true(self, Xc) -> np.ndarray:
+        """Безшумный гейт (расстояние до кромки = ``gate_true − threshold``)."""
+        Xc = np.atleast_2d(np.asarray(Xc, float))
+        return np.asarray(self.truths[self.gate].true(Xc), float).ravel()
+
+    def true(self, Xc, *, active_schema=None) -> np.ndarray:
+        return np.column_stack([self.truths[n].true(Xc, active_schema=active_schema)
+                                for n in self.property_names])
+
+    def evaluate(self, Xc, *, active_schema=None) -> np.ndarray:
+        return np.column_stack(
+            [self.truths[n].evaluate(Xc, active_schema=active_schema)
+             for n in self.property_names])
+
+    def __call__(self, Xc, *, active_schema=None) -> np.ndarray:
+        return self.evaluate(Xc, active_schema=active_schema)
+
+    def __repr__(self) -> str:
+        return (f"CliffTruth(P={self.n_properties}, gate={self.gate}>="
+                f"{self.threshold:g}, k={self.cliff.k:g})")
+
+
+def build_truth_3comp_cliff(noise_sd: float = 0.0, *, k: float = CLIFF_K,
+                            seed: Optional[int] = None) -> CliffTruth:
+    """Истина «обрыва»: 3-комп мир + ``surface`` + ``yield`` (7 откликов).
+
+    ``noise_sd`` — шум ВСЕХ откликов (полиномиальных и yield). Эталон ветки
+    считается :func:`branch_reference.branch_optimum` по этой истине: за
+    кромкой ``yield ≡ 0`` ⇒ оптимум цели «yield max» лежит НА кромке.
+    """
+    base = build_truth_3comp_gated(noise_sd=noise_sd)
+    return CliffTruth(base, k=k, noise_sd=noise_sd, seed=seed)
 
 
 # ----------------------------------------------------------------------

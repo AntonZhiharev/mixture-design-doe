@@ -271,6 +271,10 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             "branch_cost": branch_cost,
             # iter43 (§43.1): вероятностные ограничения ветки
             "branch_chance": branch_chance,
+            # iter100: гейт измеримости ветки (feasibility-aware explore)
+            "branch_gate": {bid: dict(g) for bid, g in
+                            (getattr(runner, "_branch_gate", {}) or {}).items()
+                            if g},
             "border_origin": dict(getattr(runner, "_border_origin", {}) or {}),
 
             # iter31: проектные функциональные группы (политика сэмплирования)
@@ -411,6 +415,12 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     for bid, cons in (r.get("branch_chance", {}) or {}).items():
         runner.set_branch_chance(
             bid, {prop: _chance_from_dict(d) for prop, d in (cons or {}).items()})
+    # iter100: гейт измеримости ветки — штатным сеттером (валидация отклика).
+    for bid, g in (r.get("branch_gate", {}) or {}).items():
+        if g:
+            runner.set_branch_gate(bid, str(g["response"]),
+                                   float(g.get("threshold", 0.0)),
+                                   str(g.get("direction", "ge")))
 
     runner.block_factor = str(r.get("block_factor", "") or "")
 

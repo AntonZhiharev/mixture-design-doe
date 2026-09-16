@@ -59,7 +59,7 @@ def _desirability_at(truth: MultiMixtureProcessTruth,
 def branch_optimum(truth: MultiMixtureProcessTruth,
                    goal: Mapping[str, DesirabilitySpec], *,
                    n_scan: int = 20000, seed: int = 0,
-                   refine: bool = True,
+                   refine: bool = True, n_starts: int = 5,
                    cost_fn=None, cost_name: str = "cost",
                    cost_spec: "DesirabilitySpec" = None) -> Dict[str, Any]:
     """Аналитический оптимум ветки над полной составной областью.
@@ -67,6 +67,12 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
     ``cost_fn``/``cost_name``/``cost_spec`` (§15.6 §3) — опциональная цена за
     изделие как ``min``-цель (см. :func:`_desirability_at`); ``cost_fn`` считает
     цену по ИСТИНЕ (``price_состав·rho_truth``), без Шеффе-фита.
+
+    ``n_starts`` (iter100): уточнение SLSQP запускается из top-K точек скана
+    (как в :func:`masked_branch_optimum`), берётся лучшее. Один старт садился
+    в локальный бассейн на ~1e-3 ниже глобального, и измеренный ``d_best``
+    пайплайна на нулевом шуме превышал «потолок» (iter99: 0.878 > 0.877) —
+    эталон обязан быть верхней границей.
 
     Возвращает ``{"x": составной вектор оптимума, "d": overall-desirability в
     нём, "y": {property → значение истины}, "x_scan"/"d_scan": результат
@@ -100,22 +106,24 @@ def branch_optimum(truth: MultiMixtureProcessTruth,
                 cons.append({"type": "eq",
                              "fun": lambda v: float(np.sum(v[:q]) - 1.0)})
 
-            res = minimize(
-                lambda v: -float(_desirability_at(truth, goal, v, **ckw)[0]),
-                x_scan, method="SLSQP", bounds=bounds, constraints=cons,
-                options={"maxiter": 300, "ftol": 1e-9})
+            topk = np.argsort(dvals)[::-1][:max(1, int(n_starts))]
+            for si in topk:
+                res = minimize(
+                    lambda v: -float(_desirability_at(truth, goal, v, **ckw)[0]),
+                    Xc[si], method="SLSQP", bounds=bounds, constraints=cons,
+                    options={"maxiter": 300, "ftol": 1e-9})
 
-            cand = np.asarray(res.x, float)
-            if q > 0:
-                cand[:q] = np.clip(cand[:q], 0.0, None)
-                s = cand[:q].sum()
-                if s > 0:
-                    cand[:q] = cand[:q] / s
-            if d > 0:
-                cand[q:] = np.clip(cand[q:], 0.0, 1.0)
-            d_cand = float(_desirability_at(truth, goal, cand, **ckw)[0])
-            if d_cand >= best_d:
-                best_x, best_d = cand, d_cand
+                cand = np.asarray(res.x, float)
+                if q > 0:
+                    cand[:q] = np.clip(cand[:q], 0.0, None)
+                    s = cand[:q].sum()
+                    if s > 0:
+                        cand[:q] = cand[:q] / s
+                if d > 0:
+                    cand[q:] = np.clip(cand[q:], 0.0, 1.0)
+                d_cand = float(_desirability_at(truth, goal, cand, **ckw)[0])
+                if d_cand >= best_d:
+                    best_x, best_d = cand, d_cand
         except Exception:  # noqa: BLE001 — без scipy остаётся скан-оптимум
             pass
 

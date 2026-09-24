@@ -93,6 +93,16 @@ from ..optimize.desirability import (ChanceConstraint, Desirability,
 #: ``{отклик: "почему не измерено"}`` — рядом с ``covariates``/``block``.
 MISSING_REASONS_TAG = "missing_reasons"
 
+#: iter104: ОБЛАСТЬ ОБУЧЕНИЯ суррогата отклика (REBUILD_SPEC §16.2.1.5).
+#: ``active`` — активный пул (точки внутри текущей области, как ``X``/``Y``);
+#: ``history`` — вся история проекта, мигрированная к текущей схеме, включая
+#: точки, выпавшие из области после ``move_region``. Гейт измеримости описывает
+#: физику «образец получен», а не область интереса, поэтому по умолчанию
+#: учится на истории; остальные отклики — явный выбор технолога.
+SCOPE_ACTIVE = "active"
+SCOPE_HISTORY = "history"
+TRAINING_SCOPES = (SCOPE_ACTIVE, SCOPE_HISTORY)
+
 
 def measured_desirability(specs: Mapping[str, DesirabilitySpec],
                           measured: Mapping[str, np.ndarray]) -> np.ndarray:
@@ -225,6 +235,22 @@ class MixtureProcessRunner:
         # тянет explore-слоты в неизмеримую зону. Политика раннера, как
         # ``_branch_chance``: {branch_id: {"response", "threshold", "direction"}}.
         self._branch_gate: Dict[str, Dict[str, Any]] = {}
+        # iter104: ПРОЕКТНЫЙ гейт измеримости — тот же словарь {"response",
+        # "threshold", "direction"}, но на уровне кампании: добор области без
+        # ветки (``propose_seed(feasibility=)``) и дефолт для гейта новой ветки.
+        # Гейт — свойство физики проекта (образец получен / не получен), а не
+        # намерения ветки; ветка может переопределить его своим.
+        self._project_gate: Optional[Dict[str, Any]] = None
+        # iter104 (§16.2.1.5): ОБЛАСТЬ ОБУЧЕНИЯ суррогата по отклику
+        # {отклик: SCOPE_ACTIVE | SCOPE_HISTORY}; отсутствие ключа = active.
+        # После restrict активный пул теряет точки вне области; для гейта это
+        # означает потерю ВСЕГО отрицательного класса (точки дыры несут
+        # измеренный гейт и MISSING по зависимым откликам) — суррогат гейта
+        # «забывает дыру» (iter103, точность 1.00 → 0.79). Поэтому гейт учится
+        # на истории; для остальных откликов история — явный выбор технолога
+        # (та же физика снаружи области — польза; другой режим — вред: общие
+        # гиперпараметры GP искривятся под чужие точки).
+        self._training_scope: Dict[str, str] = {}
 
         # §15.0.3: после движения границ области (move_region) точки, выпавшие из
         # НОВОЙ области, легально исключаются из активного pool по политике
@@ -1097,7 +1123,8 @@ class MixtureProcessRunner:
     # ------------------------------------------------------------------
     # Ведущая база (DataPoint) ⇄ производные numpy-кэши на ТЕКУЩЕЙ схеме
     # ------------------------------------------------------------------
-    def _migrated_points(self) -> List[DataPoint]:
+    def _migrated_points(self, *, include_outside: bool = False
+                         ) -> List[DataPoint]:
         """Активные точки базы, мигрированные к ТЕКУЩЕЙ схеме (§13.7 + §15.0.3).
 
         Различает ДВА механизма выпадения точки:
@@ -1108,6 +1135,12 @@ class MixtureProcessRunner:
             выпадение по политике ``exclude`` (§15.0.3.3): точка остаётся в
             ``self.points`` (история ≠ активный pool), при обратном расширении
             области снова пройдёт ``point_in_region`` ⇒ вернётся (обратимость).
+
+        ``include_outside=True`` (iter104) — вернуть и точки вне области: вся
+        ИСТОРИЯ проекта в координатах текущей схемы. Нужна суррогатам с
+        областью обучения ``history`` (:meth:`set_training_scope`): их
+        обучающая выборка — не активный пул. Сбой миграции — ошибка в обоих
+        режимах.
 
         baseline закрытых ранее параметров уходит в ``known-constant`` миграции;
         ИЗМЕРЕННЫЕ Y возвращаются из исходных точек дословно (responses схемы
@@ -1123,7 +1156,8 @@ class MixtureProcessRunner:
             if mig is None:
                 migration_failed.append(src)            # ось migration — баг
                 continue
-            if not point_in_region(mig, self.current_schema):
+            if not include_outside and \
+                    not point_in_region(mig, self.current_schema):
                 continue                                # вне области — exclude (история)
             mig.Y = dict(src.Y)                         # измеренные Y дословно
             used.append(mig)
@@ -1163,14 +1197,28 @@ class MixtureProcessRunner:
         потребители и так проверяют ``name in self.surrogates``), а причина
         видна в :meth:`surrogate_coverage`. Подстановок (0, среднее) НЕТ:
         отравленную модель нельзя отладить (§13.7).
+
+        iter104 (§16.2.1.5): обучающая выборка отклика определяется его
+        ОБЛАСТЬЮ ОБУЧЕНИЯ (:meth:`training_scope`): ``active`` — активный
+        пул ``X``/``Y`` (как прежде, бит-в-бит); ``history`` — вся история
+        проекта в координатах текущей схемы, включая точки, выпавшие из
+        области после ``move_region``. Кэши ``X``/``Y`` остаются активным
+        пулом в обоих случаях: измеренный рекорд ветки (``d_best``) обязан
+        лежать в области — область обучения на это не влияет.
         """
         self._rebuild_arrays()
         if self.X is None or len(self.X) == 0:
             raise RuntimeError("Нет данных: сначала seed_initial().")
         self.surrogates = {}
         self._surrogate_n_train: Dict[str, int] = {}
+        hist: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
         for i, name in enumerate(self.property_names):
-            col = self.Y[:, i]
+            if self.training_scope(name) == SCOPE_HISTORY:
+                if hist is None:            # лениво: история нужна не всегда
+                    hist = self._history_arrays()
+                Xtr, col = hist[0], hist[1][:, i]
+            else:
+                Xtr, col = self.X, self.Y[:, i]
             mask = np.isfinite(col)
             n_meas = int(mask.sum())
             self._surrogate_n_train[name] = n_meas
@@ -1178,24 +1226,179 @@ class MixtureProcessRunner:
                 continue
             gp = GPExpert(mean_model=self.gp_mean_model, kernel=self.gp_kernel,
                           seed=self.seed, n_restarts=self.n_restarts)
-            self.surrogates[name] = gp.fit(self.X[mask], col[mask])
+            self.surrogates[name] = gp.fit(Xtr[mask], col[mask])
+
+    def _history_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """iter104: ``(X, Y, inside)`` ВСЕЙ истории в координатах текущей
+        схемы (активный пул + точки вне области); MISSING → NaN как в
+        :meth:`_rebuild_arrays`; ``inside`` — булева маска «точка лежит в
+        текущей области». Пустая база — пустые массивы."""
+        mig = self._migrated_points(include_outside=True)
+        if not mig:
+            return (np.empty((0, self.dim)),
+                    np.empty((0, len(self.property_names))),
+                    np.empty(0, bool))
+        X = np.asarray(composite_matrix(self.current_schema, mig), float)
+        Y = np.asarray(
+            [[(np.nan if is_missing(p.Y.get(name, MISSING))
+               else float(p.Y[name])) for name in self.property_names]
+             for p in mig], float)
+        inside = np.asarray([point_in_region(p, self.current_schema)
+                             for p in mig], bool)
+        return X, Y, inside
 
     def surrogate_coverage(self) -> Dict[str, Dict[str, Any]]:
         """iter98: на скольких точках обучен суррогат каждого свойства.
 
-        ``{свойство → {n_train, n_base, n_missing, fitted}}`` по АКТИВНОЙ базе
-        (мигрированные к текущей схеме точки, как ``X``/``Y``). Read-only.
-        Отличие от ``response_coverage`` (campaign.py): там — по всей
-        истории ``points``, здесь — по тому, что реально видит модель.
+        ``{свойство → {n_train, n_base, n_missing, fitted[, scope]}}`` по
+        ОБУЧАЮЩЕЙ выборке свойства: для области ``active`` — активная база
+        (мигрированные к текущей схеме точки, как ``X``/``Y``), для
+        ``history`` (iter104) — вся история в координатах текущей схемы;
+        ключ ``scope`` появляется только при области ``history``. ``n_base``
+        — размер этой выборки, ``n_train`` — сколько в ней измерено.
+        Read-only. Отличие от ``response_coverage`` (campaign.py): там — по
+        всей истории ``points`` всегда, здесь — по тому, что реально видит
+        модель.
         """
         out: Dict[str, Dict[str, Any]] = {}
-        n_base = 0 if self.Y is None else int(len(self.Y))
+        n_act = 0 if self.Y is None else int(len(self.Y))
+        hist_Y: Optional[np.ndarray] = None
         for i, name in enumerate(self.property_names):
-            n_meas = (0 if self.Y is None
-                      else int(np.isfinite(self.Y[:, i]).sum()))
+            scope = self.training_scope(name)
+            if scope == SCOPE_HISTORY:
+                if hist_Y is None:
+                    hist_Y = self._history_arrays()[1]
+                col: Optional[np.ndarray] = hist_Y[:, i]
+                n_base = int(len(hist_Y))
+            else:
+                col = None if self.Y is None else self.Y[:, i]
+                n_base = n_act
+            n_meas = 0 if col is None else int(np.isfinite(col).sum())
             out[name] = {"n_train": n_meas, "n_base": n_base,
                          "n_missing": n_base - n_meas,
                          "fitted": name in self.surrogates}
+            if scope != SCOPE_ACTIVE:
+                out[name]["scope"] = scope
+        return out
+
+    # ------------------------------------------------------------------
+    # iter104 (§16.2.1.5): ОБЛАСТЬ ОБУЧЕНИЯ суррогата по отклику
+    # ------------------------------------------------------------------
+    def set_training_scope(self, response: str, scope: str) -> None:
+        """iter104: задать область обучения суррогата отклика.
+
+        ``scope`` — :data:`SCOPE_ACTIVE` (активный пул; дефолт) или
+        :data:`SCOPE_HISTORY` (вся история проекта, включая точки вне текущей
+        области). Отклик не среди свойств — ``KeyError``; неизвестная область
+        — ``ValueError``. Суррогаты переобучаются сразу (если база непуста):
+        оставить модель, обученную на другой выборке, молча нельзя (A0.6).
+
+        Когда история уместна: сужение области — «область интереса» при той
+        же физике снаружи (точки за границей опирают модель на кромке и
+        держат σ честной). Когда НЕТ: сужение вызвано сменой режима (другое
+        сырьё, оборудование, температура ниже желатинизации) — снаружи
+        другая функция в тех же координатах, и общие гиперпараметры GP
+        искривятся под неё. Различить помогает
+        :meth:`training_scope_diagnostics` (LOO на активных точках).
+        """
+        if response not in self.property_names:
+            raise KeyError(f"Отклик '{response}' не среди свойств оракула "
+                           f"{self.property_names}.")
+        if scope not in TRAINING_SCOPES:
+            raise ValueError(f"Область обучения: {TRAINING_SCOPES}, дано "
+                             f"'{scope}'.")
+        if scope == SCOPE_ACTIVE:
+            self._training_scope.pop(str(response), None)
+        else:
+            self._training_scope[str(response)] = str(scope)
+        self.refit_if_possible()
+
+    def training_scope(self, response: str) -> str:
+        """iter104: область обучения суррогата отклика (``active`` по умолчанию)."""
+        if response not in self.property_names:
+            raise KeyError(f"Отклик '{response}' не среди свойств оракула "
+                           f"{self.property_names}.")
+        return self._training_scope.get(str(response), SCOPE_ACTIVE)
+
+    def training_scopes(self) -> Dict[str, str]:
+        """iter104: ``{отклик: область обучения}`` по всем свойствам (копия)."""
+        return {n: self.training_scope(n) for n in self.property_names}
+
+    def training_scope_diagnostics(self, response: str) -> Dict[str, Any]:
+        """iter104: сравнить области обучения отклика LOO на АКТИВНЫХ точках.
+
+        Обучает две модели отклика — на активном пуле и на всей истории — и
+        оценивает обе leave-one-out по ИЗМЕРЕННЫМ точкам активного пула
+        (:meth:`GPExpert.loo_scores`, фиксированные гиперпараметры): именно
+        там модель работает для веток. Возвращает::
+
+            {"response", "scope_now", "n_active", "n_history", "n_outside",
+             "active":  {"loo_logp", "loo_rmse"},
+             "history": {"loo_logp", "loo_rmse"},
+             "history_helps": bool | None, "note": str}
+
+        ``history_helps`` — у модели на истории LOO-логплотность на активных
+        точках выше (внешние точки согласованы с внутренними — та же
+        физика); ``False`` — ниже (снаружи другой режим, история вредит);
+        ``None`` — сравнивать нечего (нет точек вне области или измерений
+        мало). Read-only: модели проекта не трогает, состояние не меняет.
+        Это рекомендация, не решение — область переключает технолог
+        (:meth:`set_training_scope`).
+        """
+        if response not in self.property_names:
+            raise KeyError(f"Отклик '{response}' не среди свойств оракула "
+                           f"{self.property_names}.")
+        i = self.prop_index[response]
+        self._rebuild_arrays()
+        hist_X, hist_Y, inside = self._history_arrays()
+        n_active = 0 if self.X is None else int(len(self.X))
+        n_hist = int(len(hist_X))
+        out: Dict[str, Any] = {
+            "response": str(response),
+            "scope_now": self.training_scope(response),
+            "n_active": n_active, "n_history": n_hist,
+            "n_outside": n_hist - n_active,
+            "active": {"loo_logp": None, "loo_rmse": None},
+            "history": {"loo_logp": None, "loo_rmse": None},
+            "history_helps": None, "note": ""}
+        if n_active == 0:
+            out["note"] = "активный пул пуст — сравнивать нечего."
+            return out
+        act_mask = np.isfinite(self.Y[:, i])
+        n_meas_act = int(act_mask.sum())
+        if n_meas_act < 3:
+            out["note"] = (f"в активном пуле измерено {n_meas_act} точек по "
+                           f"«{response}» — для LOO мало (нужно ≥ 3).")
+            return out
+        hist_mask = np.isfinite(hist_Y[:, i])
+        if int((hist_mask & ~inside).sum()) == 0:
+            out["note"] = (f"измеренных точек «{response}» вне области нет — "
+                           f"области обучения совпадают.")
+            return out
+        gp_a = GPExpert(mean_model=self.gp_mean_model, kernel=self.gp_kernel,
+                        seed=self.seed, n_restarts=self.n_restarts
+                        ).fit(self.X[act_mask], self.Y[act_mask, i])
+        lp_a, e2_a = gp_a.loo_scores()
+        gp_h = GPExpert(mean_model=self.gp_mean_model, kernel=self.gp_kernel,
+                        seed=self.seed, n_restarts=self.n_restarts
+                        ).fit(hist_X[hist_mask], hist_Y[hist_mask, i])
+        # LOO исторической модели — только по точкам ВНУТРИ области
+        lp_h, e2_h = gp_h.loo_scores(np.flatnonzero(inside[hist_mask]))
+        out["active"] = {"loo_logp": float(lp_a.mean()),
+                         "loo_rmse": float(np.sqrt(e2_a.mean()))}
+        out["history"] = {"loo_logp": float(lp_h.mean()),
+                          "loo_rmse": float(np.sqrt(e2_h.mean()))}
+        helps = bool(lp_h.mean() > lp_a.mean())
+        out["history_helps"] = helps
+        out["note"] = (
+            f"модель «{response}» на истории ({int(hist_mask.sum())} измер.) "
+            f"предсказывает активные точки "
+            + ("ЛУЧШЕ" if helps else "ХУЖЕ")
+            + f" модели на активном пуле ({n_meas_act} измер.): "
+            + ("снаружи области та же физика — историю можно включить."
+               if helps else
+               "внешние точки не согласованы с областью — оставьте активный "
+               "пул."))
         return out
 
     def missing_report(self) -> List[Dict[str, Any]]:
@@ -1278,9 +1481,20 @@ class MixtureProcessRunner:
         ``feasibility`` (iter103) — множитель измеримости ``X → P(измеримо|x)``
         для добора (см. :meth:`propose_augment`, :meth:`gate_feasibility_fn`).
         На пустой базе или при ``reuse_existing=False`` не применяется:
-        стартовый план фазы без данных о гейте выдумывать нечем."""
+        стартовый план фазы без данных о гейте выдумывать нечем.
+
+        iter104: ``feasibility=None`` при объявленном ПРОЕКТНОМ гейте
+        (:meth:`set_project_gate`) — множитель берётся из него
+        (:meth:`project_feasibility_fn`); суррогат гейта не обучен —
+        ``RuntimeError`` (гейт объявлен, а измеримость вывести нечем — A0.6).
+        ``feasibility=False`` — явно БЕЗ множителя, даже при проектном гейте.
+        """
         s = self.seed if seed is None else int(seed)
         if reuse_existing and self.points:
+            if feasibility is None:
+                feasibility = self.project_feasibility_fn()
+            elif feasibility is False:
+                feasibility = None
             return self.propose_augment(int(n), seed=s,
                                         feasibility=feasibility)
         return self._phase_candidates(int(n), s)
@@ -2744,30 +2958,96 @@ class MixtureProcessRunner:
         if response is None:
             self._branch_gate.pop(branch_id, None)
             return
+        self._branch_gate[branch_id] = self._gate_dict(response, threshold,
+                                                       direction)
+
+    def _gate_dict(self, response: str, threshold: float,
+                   direction: str) -> Dict[str, Any]:
+        """Проверить и собрать словарь гейта; объявить отклик гейтом
+        (iter104: область обучения → история, см. :meth:`set_project_gate`)."""
         if response not in self.property_names:
             raise KeyError(f"Гейт '{response}' не среди свойств оракула "
                            f"{self.property_names}.")
         if direction not in ("ge", "le"):
             raise ValueError(f"direction гейта: 'ge' | 'le', дано '{direction}'.")
-        self._branch_gate[branch_id] = {"response": str(response),
-                                        "threshold": float(threshold),
-                                        "direction": str(direction)}
+        g = {"response": str(response), "threshold": float(threshold),
+             "direction": str(direction)}
+        if self.training_scope(response) != SCOPE_HISTORY:
+            self.set_training_scope(response, SCOPE_HISTORY)
+        return g
 
     def branch_gate(self, branch_id: str) -> Optional[Dict[str, Any]]:
-        """iter100: гейт измеримости ветки (копия) или ``None``."""
+        """iter100: СОБСТВЕННЫЙ гейт измеримости ветки (копия) или ``None``.
+        Действующий гейт с учётом проектного — :meth:`effective_branch_gate`."""
         if branch_id not in self.branches:
             raise KeyError(f"Нет ветки '{branch_id}'.")
         g = self._branch_gate.get(branch_id)
         return dict(g) if g else None
 
-    def _branch_feasibility(self, branch_id: str):
-        """``X → P(измеримо|x)`` по гейту ветки, либо ``None`` (нет гейта или
-        суррогат гейта ещё не рождён — тогда честно без множителя)."""
+    # ------------------------------------------------------------------
+    # iter104: ПРОЕКТНЫЙ гейт измеримости (уровень кампании, не ветки)
+    # ------------------------------------------------------------------
+    def set_project_gate(self, response: Optional[str],
+                         threshold: float = 0.0, direction: str = "ge") -> None:
+        """iter104: объявить гейт измеримости ПРОЕКТА (``response=None`` — снять).
+
+        Гейт — отклик «образец получен» и его порог: это физика кампании
+        (при ``gate < threshold`` зависимые отклики не снимаются — MISSING),
+        а не намерение отдельной ветки. Проектный гейт нужен там, где ветки
+        ещё нет: добор области (:meth:`propose_seed` / :meth:`propose_augment`
+        с множителем :meth:`gate_feasibility_fn`) — и служит гейтом по
+        умолчанию для веток без собственного (:meth:`effective_branch_gate`).
+
+        Объявление гейта переводит область обучения его суррогата на всю
+        историю (:meth:`set_training_scope` → ``history``, §16.2.1.5): после
+        сужения области к кромке дыры активный пул теряет провалившиеся
+        точки — весь отрицательный класс гейта — и множитель измеримости
+        «забывает дыру» (iter103). Снятие гейта область обучения НЕ
+        возвращает: это отдельное решение технолога. Валидация — как у
+        :meth:`set_branch_gate` (``KeyError`` / ``ValueError``).
+        """
+        if response is None:
+            self._project_gate = None
+            return
+        self._project_gate = self._gate_dict(response, threshold, direction)
+
+    def project_gate(self) -> Optional[Dict[str, Any]]:
+        """iter104: проектный гейт измеримости (копия) или ``None``."""
+        return dict(self._project_gate) if self._project_gate else None
+
+    def effective_branch_gate(self, branch_id: str) -> Optional[Dict[str, Any]]:
+        """iter104: действующий гейт ветки — собственный, иначе проектный,
+        иначе ``None``. Копия; ключ ``source`` = ``"branch"`` | ``"project"``."""
+        if branch_id not in self.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
         g = self._branch_gate.get(branch_id)
+        if g:
+            return {**g, "source": "branch"}
+        if self._project_gate:
+            return {**self._project_gate, "source": "project"}
+        return None
+
+    def _branch_feasibility(self, branch_id: str):
+        """``X → P(измеримо|x)`` по действующему гейту ветки (собственный или
+        проектный, iter104), либо ``None`` (гейта нет или суррогат гейта ещё
+        не рождён — тогда честно без множителя)."""
+        g = self.effective_branch_gate(branch_id)
         if not g or g["response"] not in self.surrogates:
             return None
         return gate_feasibility(self.surrogates[g["response"]],
                                 g["threshold"], g["direction"])
+
+    def project_feasibility_fn(self):
+        """iter104: множитель измеримости по ПРОЕКТНОМУ гейту для добора без
+        ветки (:meth:`propose_seed` / :meth:`propose_augment`). Проектный гейт
+        не объявлен — ``None`` (добор без множителя, как прежде); суррогат
+        гейта ещё не обучен — ``RuntimeError`` из :meth:`gate_feasibility_fn`
+        (A0.6: молчаливого ``≡ 1`` нет)."""
+        g = self._project_gate
+        if not g:
+            return None
+        return self.gate_feasibility_fn(g["response"], g["threshold"],
+                                        g["direction"])
 
     def gate_feasibility_fn(self, response: str, threshold: float,
                             direction: str = "ge"):

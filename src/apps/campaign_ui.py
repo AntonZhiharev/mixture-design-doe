@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 import zlib
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -33,11 +34,12 @@ import streamlit as st
 from ..core.mass_units import (DEFAULT_MASS_UNIT, MASS_UNIT_NAMES,
                                mass_column_label, mass_from_kg, mass_to_kg,
                                normalize_mass_unit)
-from ..core.schema import ModelSpec, ProjectSchema, VariableBlock
+from ..core.schema import ModelSpec, ProjectSchema, VariableBlock, is_missing
 from ..core.simplex import parts_ranges_to_fraction_bounds
 from ..optimize.desirability import (ChanceConstraint, DesirabilitySpec,
                                      hard_threshold_spec)
-from ..apps.mixture_process_runner import MixtureProcessRunner
+from ..apps.mixture_process_runner import (MixtureProcessRunner, SCOPE_ACTIVE,
+                                           SCOPE_HISTORY)
 
 from ..apps import campaign as cv
 from ..apps import campaign_screening as csx
@@ -818,10 +820,15 @@ def surrogate_coverage_caption(runner) -> str:
         return ""
     partial = [(n, c) for n, c in cov.items() if int(c.get("n_missing", 0))]
     unfitted = [n for n, c in cov.items() if not c.get("fitted")]
+    # iter104: свойства, чья модель учится на ВСЕЙ истории (не на активной
+    # области) — сказать об этом явно, иначе «n_base» у них не совпадёт с
+    # числом активных точек и подпись будет выглядеть противоречивой.
+    on_history = [n for n, c in cov.items() if c.get("scope") == "history"]
     if not partial and not unfitted:
         n_base = next(iter(cov.values())).get("n_base", 0)
-        return (f"Модели всех свойств обучены на полной базе "
-                f"({n_base} опытов, непроведённых измерений нет).")
+        txt = (f"Модели всех свойств обучены на полной базе "
+               f"({n_base} опытов, непроведённых измерений нет).")
+        return txt + _scope_suffix(on_history, cov)
     parts = []
     for n, c in partial:
         if c.get("fitted"):
@@ -832,7 +839,127 @@ def surrogate_coverage_caption(runner) -> str:
     if unfitted:
         txt += (f" Без единого измерения — {', '.join(unfitted)}: модели нет, "
                 f"цели по этим свойствам считать не из чего.")
-    return txt
+    return txt + _scope_suffix(on_history, cov)
+
+
+def _scope_suffix(on_history: Sequence[str], cov: Mapping[str, Any]) -> str:
+    """iter104: хвост подписи про область обучения «история» (пусто — нет)."""
+    if not on_history:
+        return ""
+    return (" Область обучения «вся история» (включая точки вне текущей "
+            "области): " + ", ".join(
+                f"{n} ({cov[n]['n_train']} из {cov[n]['n_base']})"
+                for n in on_history) + ".")
+
+
+def project_gate_caption(runner) -> str:
+    """iter104: подпись о проектном гейте измеримости (чистая).
+
+    Гейт объявлен и суррогат обучен — «добор учитывает P(измеримо|x)»;
+    объявлен, но не измерен — предупреждение (добор откажет, A0.6); не
+    объявлен — как включить и зачем (только если в базе есть пропуски —
+    иначе гейт не нужен и подсказка была бы шумом).
+    """
+    gate = (runner.project_gate()
+            if hasattr(runner, "project_gate") else None)
+    cov = (runner.surrogate_coverage()
+           if hasattr(runner, "surrogate_coverage") else {})
+    if gate:
+        sign = "≥" if gate["direction"] == "ge" else "≤"
+        c = cov.get(gate["response"], {})
+        head = (f"Гейт измеримости проекта: «{gate['response']}» {sign} "
+                f"{gate['threshold']:g}.")
+        if c.get("fitted"):
+            return (head + f" Модель гейта обучена на {c.get('n_train', 0)} "
+                    f"из {c.get('n_base', 0)} опытов всей истории; добор "
+                    f"области взвешивает кандидатов на P(измеримо|x).")
+        return (head + " Гейт ещё не измерен ни разу — множитель измеримости "
+                "вывести нечем; добор области откажет до первых замеров гейта.")
+    n_missing = sum(int(c.get("n_missing", 0)) for c in cov.values())
+    if n_missing == 0:
+        return ""
+    return (f"В базе {n_missing} непроведённых измерений, а гейт измеримости "
+            "проекта не объявлен: добор области и explore веток не знают, где "
+            "образец не получается, и будут тратить точки в неизмеримой зоне. "
+            "Объявите гейт — отклик «образец получен» и его порог.")
+
+
+#: iter104: подписи направления гейта в UI ↔ код ядра
+GATE_DIRECTION_LABELS: Dict[str, str] = {"ge": "≥ (не ниже порога)",
+                                         "le": "≤ (не выше порога)"}
+
+
+def gate_direction_code(label: str) -> str:
+    """iter104: подпись направления гейта из UI → ``'ge'``/``'le'`` (чистая).
+    Неизвестная подпись — ``ValueError`` (не угадываем)."""
+    for code, lab in GATE_DIRECTION_LABELS.items():
+        if label == lab or label == code:
+            return code
+    raise ValueError(f"Направление гейта: {list(GATE_DIRECTION_LABELS.values())}, "
+                     f"дано '{label}'.")
+
+
+def gate_default_threshold(runner, response: str) -> float:
+    """iter104: дефолт порога гейта для формы — медиана ИЗМЕРЕННЫХ значений
+    отклика по всей базе (чистая; нет измерений → 0.0). Это подсказка для
+    поля ввода, не решение: порог называет технолог."""
+    vals = [float(p.Y[response]) for p in getattr(runner, "points", [])
+            if response in p.Y and not is_missing(p.Y[response])]
+    if not vals:
+        return 0.0
+    return float(np.median(np.asarray(vals, float)))
+
+
+def branch_gate_caption(runner, branch_id: str) -> str:
+    """iter104: подпись о действующем гейте измеримости ветки (чистая).
+
+    Три состояния: собственный гейт; унаследован проектный; гейта нет
+    (тогда — есть ли пропуски в базе, из-за которых он нужен).
+    """
+    g = (runner.effective_branch_gate(branch_id)
+         if hasattr(runner, "effective_branch_gate") else None)
+    if g:
+        sign = "≥" if g["direction"] == "ge" else "≤"
+        src = ("собственный гейт ветки" if g.get("source") == "branch"
+               else "проектный гейт (по умолчанию)")
+        txt = (f"Гейт измеримости — {src}: «{g['response']}» {sign} "
+               f"{g['threshold']:g}; explore-точки взвешены на P(измеримо|x).")
+        br = runner.branches.get(branch_id)
+        if br is not None and g["response"] not in (br.goal or {}):
+            txt += (f" В целях ветки «{g['response']}» нет — argmax гейта не "
+                    "видит; добавьте цель-порог по нему (§16.2.1).")
+        return txt
+    cov = (runner.surrogate_coverage()
+           if hasattr(runner, "surrogate_coverage") else {})
+    n_missing = sum(int(c.get("n_missing", 0)) for c in cov.values())
+    if n_missing:
+        return (f"Гейта измеримости у ветки нет, а в базе {n_missing} "
+                "непроведённых измерений: explore-точки могут уходить в "
+                "неизмеримую зону. Задайте гейт ниже или проектный на «Старте».")
+    return "Гейта измеримости нет (в базе нет пропусков — он и не нужен)."
+
+
+def training_scope_caption(diag: Mapping[str, Any]) -> str:
+    """iter104: подпись к LOO-диагностике области обучения (чистая).
+
+    ``diag`` — ответ :meth:`MixtureProcessRunner.training_scope_diagnostics`.
+    """
+    resp = diag.get("response", "")
+    now = diag.get("scope_now", "active")
+    now_ru = "активная область" if now == "active" else "вся история"
+    head = (f"«{resp}»: сейчас модель учится на «{now_ru}» "
+            f"(активных точек {diag.get('n_active', 0)}, вне области "
+            f"{diag.get('n_outside', 0)}).")
+    helps = diag.get("history_helps")
+    if helps is None:
+        return head + " " + str(diag.get("note", ""))
+    a, h = diag.get("active", {}), diag.get("history", {})
+    nums = (f" LOO на активных точках — активная область: RMSE "
+            f"{a.get('loo_rmse', float('nan')):.3g}, log p "
+            f"{a.get('loo_logp', float('nan')):.3g}; вся история: RMSE "
+            f"{h.get('loo_rmse', float('nan')):.3g}, log p "
+            f"{h.get('loo_logp', float('nan')):.3g}.")
+    return head + nums + " " + str(diag.get("note", ""))
 
 
 def covariate_rows_from_editor(edited, names: Sequence[str],
@@ -4765,7 +4892,94 @@ def render_setup_form() -> None:
                 st.error(str(exc))
 
 
-def render_seed_entry(ctrl: "cv.CampaignController") -> None:
+def _render_project_gate_block(ctrl: "cv.CampaignController") -> bool:
+    """iter104 (UI 2.4): ПРОЕКТНЫЙ гейт измеримости для добора области.
+
+    Форма «гейт-отклик + порог + направление → объявить / снять» поверх
+    :meth:`CampaignController.set_project_gate`; подпись состояния —
+    :func:`project_gate_caption`. Возвращает, применять ли множитель
+    измеримости к ближайшему добору (гейт объявлен и галочка не снята).
+    Всё мутирующее — по кнопке (A0.6). Ключи ``setup_gate_*`` —
+    присваиваемые виджеты (входят в черновик проекта штатно).
+    """
+    runner = ctrl.runner
+    props = list(runner.property_names)
+    gate = runner.project_gate()
+    with st.expander("🚧 Гейт измеримости проекта — добор области учитывает "
+                     "P(образец получен | x)", expanded=gate is None):
+        st.caption(
+            "Гейт — отклик «образец получен» (оценка поверхности, экструдат "
+            "вышел) и порог: ниже него зависимые отклики не снимаются "
+            "(«н/и» в базе). Добор области (кнопка «Предложить план» при "
+            "непустой базе) взвешивает кандидатов на P(измеримо|x) из модели "
+            "гейта — иначе после сужения области к кромке точки уходят в "
+            "неизмеримую зону (REBUILD_SPEC §16.2.1.4). Объявленный гейт "
+            "учится на ВСЕЙ истории проекта, включая точки вне текущей "
+            "области (§16.2.1.5), и служит гейтом по умолчанию для новых "
+            "веток.")
+        cap = project_gate_caption(runner)
+        if cap:
+            (st.info if gate else st.warning)(cap)
+        gc = st.columns([2, 1, 2, 1])
+        default_resp = (gate["response"] if gate and gate["response"] in props
+                        else props[0])
+        g_resp = gc[0].selectbox(
+            "Гейт-отклик", props, index=props.index(default_resp),
+            key="setup_gate_resp",
+            help="Отклик, измеримый ВСЕГДА, по которому видно, получился ли "
+                 "образец.")
+        g_thr = gc[1].number_input(
+            "Порог", value=float(gate["threshold"] if gate and
+                                 gate["response"] == g_resp
+                                 else gate_default_threshold(runner, g_resp)),
+            step=0.1, format="%.4g", key="setup_gate_thr",
+            help="Дефолт — медиана измеренных значений отклика (подсказка, не "
+                 "решение).")
+        dir_labels = list(GATE_DIRECTION_LABELS.values())
+        dir_default = (GATE_DIRECTION_LABELS[gate["direction"]]
+                       if gate else dir_labels[0])
+        g_dir = gc[2].selectbox("Измеримо, когда отклик", dir_labels,
+                                index=dir_labels.index(dir_default),
+                                key="setup_gate_dir")
+        if gc[3].button("Объявить гейт", key="setup_gate_set"):
+            try:
+                out = ctrl.set_project_gate(str(g_resp), float(g_thr),
+                                            gate_direction_code(g_dir))
+                cov = out.get("coverage") or {}
+                msg = (f"Гейт проекта: «{g_resp}» "
+                       f"{'≥' if out['gate']['direction'] == 'ge' else '≤'} "
+                       f"{g_thr:g}.")
+                if out["scope_before"] != out["scope_after"]:
+                    msg += (f" Модель «{g_resp}» переведена на область "
+                            f"обучения «вся история» "
+                            f"({cov.get('n_train', 0)} из "
+                            f"{cov.get('n_base', 0)} опытов).")
+                if not out["surrogate_fitted"]:
+                    msg += (" Гейт ещё не измерен — множитель заработает "
+                            "после первых замеров.")
+                _flash(msg)
+                st.rerun()
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
+        if gate is not None:
+            rc = st.columns([1, 3])
+            if rc[0].button("Снять гейт", key="setup_gate_clear"):
+                ctrl.set_project_gate(None)
+                _flash("Гейт проекта снят: добор области пойдёт без "
+                       "множителя измеримости. Область обучения модели "
+                       "гейта не менялась (отдельное решение).")
+                st.rerun()
+            use = rc[1].checkbox(
+                "Учитывать гейт при ближайшем доборе (P(измеримо|x) × maximin)",
+                value=True, key="setup_gate_use",
+                help="Снятие галочки — добор голым maximin, как без гейта; "
+                     "сам гейт остаётся объявленным.")
+            return bool(use)
+    return False
+
+
+def render_seed_entry(ctrl: "cv.CampaignController", *,
+                      augment: bool = False) -> None:
     """§17.4: ручной СТАРТОВЫЙ цикл «предложить seed → внести Y → зафиксировать».
 
     Пока стартовый дизайн не измерен (база пуста), это единственная активная
@@ -4773,19 +4987,38 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     ``commit_seed`` (доливает в общую базу origin=seed, обучает суррогаты).
     «Заполнить тестовыми» берёт Y из демо-оракула (``_measure``) — ЯВНОЕ действие
     (A0.6). Составные координаты заблокированы; правятся только столбцы «(lab)».
+
+    ``augment=True`` (iter104, UI 2.4) — тот же цикл на НЕПУСТОЙ базе: ДОБОР
+    точек текущей области без ветки (``propose_seed`` → ``propose_augment``,
+    maximin от существующих точек, iter37) — после сужения области к кромке
+    или раскрытия компонента. Здесь же объявляется проектный гейт
+    измеримости, и добор взвешивает кандидатов на ``P(измеримо|x)``
+    (§16.2.1.4/5). Точки уходят в базу тем же ``commit_seed`` (источник
+    «стартовый план», партия — следующая за существующими).
     """
     runner = ctrl.runner
     props = list(runner.property_names)
     coord_names = setup_coord_names(runner)
-    # iter65: пока база пуста, это ЕДИНСТВЕННАЯ активная секция — значит,
-    # пользователь именно здесь, и док ассистента должен спрашивать про seed.
-    publish_ui_focus("seed")
-    st.markdown("### 🌱 Стартовый план опытов — ручной ввод откликов (§17.4)")
-    st.caption(
-        f"Отклики проекта: {', '.join(props)}. Предложите N точек по области "
-        "«состав × процесс», внесите измеренные значения по каждому свойству и "
-        "зафиксируйте — точки попадут в ОБЩУЮ базу (источник «стартовый план»), "
-        "модели свойств обучатся (И-1).")
+    if augment:
+        st.markdown("### ➕ Добор точек области без ветки — ручной ввод "
+                    "откликов (§16.2.1.4)")
+        st.caption(
+            f"Отклики проекта: {', '.join(props)}. План ПРИСТЁГИВАЕТСЯ к "
+            f"{len(runner.points)} точкам базы (заполняет дыры текущей "
+            "области, а не дублирует её); при объявленном гейте измеримости "
+            "кандидаты взвешиваются на P(образец получен | x). Внесите "
+            "измеренные значения и зафиксируйте — точки попадут в ОБЩУЮ базу "
+            "(И-1), модели переобучатся.")
+    else:
+        # iter65: пока база пуста, это ЕДИНСТВЕННАЯ активная секция — значит,
+        # пользователь именно здесь, и док ассистента должен спрашивать про seed.
+        publish_ui_focus("seed")
+        st.markdown("### 🌱 Стартовый план опытов — ручной ввод откликов (§17.4)")
+        st.caption(
+            f"Отклики проекта: {', '.join(props)}. Предложите N точек по области "
+            "«состав × процесс», внесите измеренные значения по каждому свойству и "
+            "зафиксируйте — точки попадут в ОБЩУЮ базу (источник «стартовый план»), "
+            "модели свойств обучатся (И-1).")
     # Замечание 4: рекомендуемый N скрининга считаем от q компонентов и d
     # процесс-параметров — предлагаем сразу как значение по умолчанию.
     q = len(runner.current_schema.mixture_names)
@@ -4793,12 +5026,15 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
     rec_n = recommended_seed_size(q, d)
     sc = st.columns([1, 1, 1, 1])
     seed_n = sc[0].number_input(
-        "Точек в стартовом плане", min_value=2, max_value=200,
-        value=int(rec_n), step=1, key="setup_seed_n",
-        help=f"Рекомендация для скрининга: N = q·(1+d) + ⌈q·(1+d)/2⌉ = {rec_n} "
-             f"(q={q} компонентов, d={d} процесс-параметров) — число членов "
-             "кросс-модели «смесь-линейно × процесс-линейно» плюс ~50% запаса на "
-             "остаточную дисперсию. Значение можно изменить вручную.")
+        "Точек в доборе" if augment else "Точек в стартовом плане",
+        min_value=2, max_value=200,
+        value=(6 if augment else int(rec_n)), step=1, key="setup_seed_n",
+        help=("Сколько точек долить в текущую область (maximin от существующих "
+              "точек — новые заполняют дыры относительно базы)." if augment else
+              f"Рекомендация для скрининга: N = q·(1+d) + ⌈q·(1+d)/2⌉ = {rec_n} "
+              f"(q={q} компонентов, d={d} процесс-параметров) — число членов "
+              "кросс-модели «смесь-линейно × процесс-линейно» плюс ~50% запаса на "
+              "остаточную дисперсию. Значение можно изменить вручную."))
 
     seed_design = sc[1].number_input(
         "зерно ГСЧ (воспроизводимость)", value=1, step=1,
@@ -4826,8 +5062,26 @@ def render_seed_entry(ctrl: "cv.CampaignController") -> None:
              "партию.")
     runner.n_blocks_start = max(1, int(nb_blocks))
 
-    if sc[3].button("📐 Предложить стартовый план", key="setup_propose_seed"):
-        X = np.asarray(ctrl.propose_seed(int(seed_n), seed=int(seed_design)), float)
+    # iter104 (UI 2.4): ДОБОР без ветки учитывает измеримость через ПРОЕКТНЫЙ
+    # гейт. На пустой базе множитель не применяется (нечем), поэтому блок —
+    # только при непустой базе (добор области, staged-кампания).
+    use_gate = _render_project_gate_block(ctrl) if runner.points else False
+
+    if sc[3].button("📐 Предложить добор" if augment
+                    else "📐 Предложить стартовый план",
+                    key="setup_propose_seed"):
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", UserWarning)
+                X = np.asarray(ctrl.propose_seed(
+                    int(seed_n), seed=int(seed_design),
+                    feasibility=(None if use_gate else False)), float)
+            for w in caught:
+                if issubclass(w.category, UserWarning):
+                    st.warning(str(w.message))
+        except (ValueError, KeyError, RuntimeError) as exc:
+            st.error(str(exc))
+            return
         st.session_state["setup_seed_X"] = X
         # iter102: границы process-осей, под которые сгенерирован код плана
         # (для перекодировки при движении границ до фиксации и для сейва).
@@ -5681,6 +5935,60 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                      "Пусто при включённой галочке — явно БЕЗ стратификации "
                      "(отключает и проектные группы для этой ветки).")
 
+        # iter104 (UI 2.1): ГЕЙТ ИЗМЕРИМОСТИ ветки — explore-член acquisition
+        # × P(измеримо|x) (iter100). По умолчанию наследуется проектный гейт
+        # (если объявлен); override — намерение конкретной ветки.
+        st.markdown("**🚧 Гейт измеримости ветки (опц., iter100)**")
+        proj_gate = runner.project_gate() if hasattr(runner, "project_gate") \
+            else None
+        n_miss_all = sum(int(c.get("n_missing", 0))
+                         for c in runner.surrogate_coverage().values())
+        st.caption(
+            "Explore-точки ветки взвешиваются на P(образец получен | x) из "
+            "модели гейта — без этого σ зависимых откликов (за кромкой они не "
+            "мерились) тянет explore в неизмеримую зону. Гейт не заменяет "
+            "цель: чтобы argmax держался измеримой стороны, гейт-отклик должен "
+            "быть и в целях ветки порогом (канон §16.2.1). "
+            + (f"По умолчанию — проектный гейт «{proj_gate['response']}» "
+               f"{'≥' if proj_gate['direction'] == 'ge' else '≤'} "
+               f"{proj_gate['threshold']:g}."
+               if proj_gate else
+               ("Проектный гейт не объявлен" + (
+                   f", а в базе {n_miss_all} непроведённых измерений — задайте "
+                   "гейт здесь или на закладке «Старт» (добор области)."
+                   if n_miss_all else "; без пропусков в базе гейт не нужен."))))
+        use_gate = st.checkbox(
+            "Задать собственный гейт для этой ветки"
+            + (" (переопределить проектный)" if proj_gate else ""),
+            key="camp_nb_use_gate")
+        br_gate: Optional[Dict[str, Any]] = None
+        if use_gate:
+            gcol = st.columns([2, 1, 2])
+            g_default = (proj_gate["response"] if proj_gate
+                         and proj_gate["response"] in props else props[0])
+            g_resp = gcol[0].selectbox("Гейт-отклик", props,
+                                       index=props.index(g_default),
+                                       key="camp_nb_gate_resp")
+            g_thr = gcol[1].number_input(
+                "Порог", value=float(proj_gate["threshold"] if proj_gate and
+                                     proj_gate["response"] == g_resp
+                                     else gate_default_threshold(runner, g_resp)),
+                step=0.1, format="%.4g", key="camp_nb_gate_thr")
+            dir_labels = list(GATE_DIRECTION_LABELS.values())
+            g_dir = gcol[2].selectbox(
+                "Измеримо, когда отклик", dir_labels,
+                index=dir_labels.index(GATE_DIRECTION_LABELS[
+                    proj_gate["direction"] if proj_gate else "ge"]),
+                key="camp_nb_gate_dir")
+            br_gate = {"response": str(g_resp), "threshold": float(g_thr),
+                       "direction": gate_direction_code(g_dir)}
+            if not any(g.get("resp") == g_resp for g in draft):
+                st.warning(
+                    f"Гейт-отклик «{g_resp}» не входит в цели ветки: множитель "
+                    "чинит explore, но argmax (рекомендация x*) гейта не "
+                    "увидит и может уйти за кромку. Добавьте цель по "
+                    f"«{g_resp}» видом «порог» (§16.2.1).")
+
         if st.button("🌿 Создать ветку", key="camp_nb_create"):
             try:
                 if not draft:
@@ -5711,12 +6019,21 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                     cost_exp=(float(cexp) if cexp > 0 else None),
                     horizon=(float(hor) if hor > 0 else None),
                     sampling_groups=(parse_sampling_groups(br_groups_txt)
-                                     if use_groups else None))
+                                     if use_groups else None),
+                    gate=br_gate)
                 st.session_state["camp_new_goals"] = []
                 _invalidate_branch_caches()
+                # iter104: какой гейт действует у ветки (свой / проектный /
+                # нет) — сказать прямо, иначе неясно, учитывается ли измеримость.
+                eg = out.get("gate")
+                gate_txt = (
+                    f"; гейт {'собственный' if eg['source'] == 'branch' else 'проектный'}"
+                    f": {eg['response']} {'≥' if eg['direction'] == 'ge' else '≤'} "
+                    f"{eg['threshold']:g}" if eg else "; гейта измеримости нет")
                 _flash(
                     f"Ветка «{out['branch_name']}» (`{out['branch_id']}`) создана: "
-                    f"{out['n_goals']} цел., ценовая нога = {out['has_price_leg']}"
+                    f"{out['n_goals']} цел.{gate_txt}, ценовая нога = "
+                    f"{out['has_price_leg']}"
                     + (f" (ρ={out['rho_property']}, канал занулён="
                        f"{out['price_channel_suppressed']}"
                        # iter75: откуда цена и не добавлена ли цель по ρ сама —
@@ -5731,6 +6048,60 @@ def render_branch_creation(ctrl: "cv.CampaignController") -> None:
                 st.rerun()
             except (ValueError, KeyError) as exc:
                 st.error(str(exc))
+
+
+def _render_branch_gate_editor(ctrl: "cv.CampaignController", bsel: str) -> None:
+    """iter104 (UI 2.1): задать/снять собственный гейт ЖИВОЙ ветки.
+
+    Поверх :meth:`CampaignController.set_branch_gate` (обратимо, §7 — как
+    chance-ограничения iter43). Компактно, в popover (фолбэк — экспандер);
+    ключи привязаны к ветке. Всё мутирующее — по кнопке (A0.6).
+    """
+    runner = ctrl.runner
+    props = list(runner.property_names)
+    own = runner.branch_gate(bsel)
+    proj = runner.project_gate()
+    box = (st.popover("🚧 Гейт ветки") if hasattr(st, "popover")
+           else st.expander("🚧 Гейт ветки"))
+    with box:
+        st.caption("Собственный гейт переопределяет проектный только для этой "
+                   "ветки; «снять» возвращает проектный (если объявлен).")
+        seed_g = own or proj
+        g_default = (seed_g["response"] if seed_g and seed_g["response"] in props
+                     else props[0])
+        g_resp = st.selectbox("Гейт-отклик", props, index=props.index(g_default),
+                              key=f"camp_wb_gate_resp_{bsel}")
+        g_thr = st.number_input(
+            "Порог", value=float(seed_g["threshold"] if seed_g and
+                                 seed_g["response"] == g_resp
+                                 else gate_default_threshold(runner, g_resp)),
+            step=0.1, format="%.4g", key=f"camp_wb_gate_thr_{bsel}")
+        dir_labels = list(GATE_DIRECTION_LABELS.values())
+        g_dir = st.selectbox(
+            "Измеримо, когда отклик", dir_labels,
+            index=dir_labels.index(GATE_DIRECTION_LABELS[
+                seed_g["direction"] if seed_g else "ge"]),
+            key=f"camp_wb_gate_dir_{bsel}")
+        bc = st.columns(2)
+        if bc[0].button("Задать гейт ветки", key=f"camp_wb_gate_set_{bsel}"):
+            try:
+                out = ctrl.set_branch_gate(bsel, str(g_resp), float(g_thr),
+                                           gate_direction_code(g_dir))
+                _invalidate_branch_caches()
+                _flash(f"Гейт ветки «{runner.branches[bsel].name}»: "
+                       f"{g_resp} {'≥' if out['gate']['direction'] == 'ge' else '≤'} "
+                       f"{g_thr:g}. Отменить — «Отменить последнюю настройку».")
+                st.rerun()
+            except (ValueError, KeyError, RuntimeError) as exc:
+                st.error(str(exc))
+        if own and bc[1].button("Снять гейт ветки",
+                                key=f"camp_wb_gate_clear_{bsel}"):
+            ctrl.set_branch_gate(bsel, None)
+            _invalidate_branch_caches()
+            _flash("Собственный гейт ветки снят"
+                   + (f"; действует проектный «{proj['response']}»." if proj
+                      else "; гейта измеримости у ветки нет."))
+            st.rerun()
 
 
 def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
@@ -5762,6 +6133,10 @@ def render_workbench(ctrl: "cv.CampaignController", bsel: str) -> None:
         st.caption(f"Ветка «{br_now.name}»: бюджет {br_now.budget}, потрачено "
                    f"{br_now.spent}, осталось {br_now.remaining()}, "
                    f"d_best={br_now.d_best:.3f}, статус {br_now.status}.")
+        # iter104 (UI 2.1): действующий гейт измеримости ветки — виден и
+        # правится здесь (обратимо, §7), не только в форме создания.
+        st.caption(branch_gate_caption(runner, bsel))
+        _render_branch_gate_editor(ctrl, bsel)
 
         # §17.6.1 (C3): рекомендованный РЕЦЕПТ ветки x* + скачивание в Excel.
         # M8-argmax по ОБЩИМ GP-суррогатам дорогой → считаем ТОЛЬКО по
@@ -6189,6 +6564,74 @@ def render_schema_evolution(ctrl: "cv.CampaignController") -> None:
             except (ValueError, KeyError, RuntimeError) as exc:
                 st.error(str(exc))
 
+        # --- iter104 (§16.2.1.5): область обучения моделей по отклику ---
+        if runner.points:
+            _render_training_scope_block(ctrl)
+
+
+def _render_training_scope_block(ctrl: "cv.CampaignController") -> None:
+    """iter104: ОБЛАСТЬ ОБУЧЕНИЯ суррогата по отклику + LOO-подсказка.
+
+    После сужения области точки за границей выпадают из активного пула и из
+    обучения моделей. Здесь технолог решает по каждому отклику, учить ли
+    модель на всей истории (та же физика снаружи — польза на кромке) или на
+    активной области (снаружи другой режим — чужие точки искривят модель).
+    Подсказка — read-only LOO на активных точках
+    (:meth:`CampaignController.training_scope_diagnostics`), считается по
+    кнопке (две модели на отклик — не бесплатно). Мутация — по кнопке (A0.6).
+    """
+    runner = ctrl.runner
+    props = list(runner.property_names)
+    st.markdown("**🧠 Область обучения моделей свойств** (после сужения "
+                "области, §16.2.1.5)")
+    scopes = runner.training_scopes()
+    n_out = len(runner.points) - len(runner._migrated_points())
+    st.caption(
+        f"Точек вне текущей области: {n_out} из {len(runner.points)}. "
+        "«Активная область» — модель учится только на точках внутри границ "
+        "(как прежде); «вся история» — и на точках снаружи. История помогает, "
+        "если снаружи та же физика (сужение — область интереса), и вредит, "
+        "если снаружи другой режим (сырьё, оборудование, температура). "
+        "Гейт-отклик учится на истории всегда (объявление гейта). "
+        "Сейчас на истории: "
+        + (", ".join(n for n, s in scopes.items() if s == SCOPE_HISTORY)
+           or "никто") + ".")
+    tc = st.columns([2, 2, 1, 1])
+    ts_resp = tc[0].selectbox("Отклик", props, key="camp_ev_scope_resp")
+    scope_labels = {SCOPE_ACTIVE: "активная область", SCOPE_HISTORY: "вся история"}
+    now = scopes.get(ts_resp, SCOPE_ACTIVE)
+    ts_scope_label = tc[1].selectbox(
+        "Область обучения", list(scope_labels.values()),
+        index=list(scope_labels).index(now), key="camp_ev_scope_val")
+    ts_scope = [k for k, v in scope_labels.items() if v == ts_scope_label][0]
+    if tc[2].button("Применить", key="camp_ev_scope_set"):
+        try:
+            out = ctrl.set_training_scope(ts_resp, ts_scope)
+            cov = out.get("coverage") or {}
+            st.success(
+                f"«{ts_resp}»: область обучения "
+                f"{scope_labels[out['scope_before']]} → "
+                f"{scope_labels[out['scope_after']]}; модель переобучена на "
+                f"{cov.get('n_train', 0)} из {cov.get('n_base', 0)} опытов.")
+        except (ValueError, KeyError, RuntimeError) as exc:
+            st.error(str(exc))
+    if tc[3].button("LOO-проверка", key="camp_ev_scope_diag",
+                    help="Сравнить две модели отклика (актив vs история) "
+                         "leave-one-out на активных точках. Считается по "
+                         "кнопке — две модели."):
+        try:
+            with st.spinner("LOO: две модели отклика…"):
+                diag = ctrl.training_scope_diagnostics(ts_resp)
+            st.session_state["camp_ev_scope_diag_out"] = diag
+        except (ValueError, KeyError, RuntimeError) as exc:
+            st.session_state.pop("camp_ev_scope_diag_out", None)
+            st.error(str(exc))
+    diag = st.session_state.get("camp_ev_scope_diag_out")
+    if diag and diag.get("response") == ts_resp:
+        helps = diag.get("history_helps")
+        (st.info if helps is None else (st.success if helps else st.warning))(
+            training_scope_caption(diag))
+
 
 def render_screening_analysis(ctrl: "cv.CampaignController") -> None:
     """M3-минималка (UI): интерпретируемый анализ скрининга после измеренного seed.
@@ -6541,6 +6984,16 @@ def render_start_panel(ctrl: Optional["cv.CampaignController"], *,
     _blk = base_blocking_caption(runner)
     if _blk:
         st.caption(_blk)
+    # iter104 (UI 2.4): ДОБОР ОБЛАСТИ БЕЗ ВЕТКИ — тот же seed-цикл на непустой
+    # базе (после сужения области к кромке / раскрытия компонента), с
+    # проектным гейтом измеримости. По умолчанию скрыт (штатный путь после
+    # seed — ветки); переключатель, а не экспандер: внутри секции свои
+    # экспандеры (навеска, границы точки, preflight), а вложенных Streamlit
+    # не допускает. Ключ ``ui_*`` — состояние интерфейса, не черновик проекта.
+    if st.checkbox("➕ Добор точек области без ветки (после сужения области "
+                   "или нового компонента, §16.2.1.4)",
+                   key="ui_show_augment"):
+        render_seed_entry(ctrl, augment=True)
 
 
 def render_base_panel(ctrl: "cv.CampaignController") -> None:

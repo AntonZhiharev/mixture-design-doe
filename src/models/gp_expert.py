@@ -182,6 +182,40 @@ class GPExpert:
         return trend + resid_mean
 
     # ------------------------------------------------------------------
+    def loo_scores(self, indices: Optional[Sequence[int]] = None
+                   ) -> Tuple[np.ndarray, np.ndarray]:
+        """Leave-one-out на ФИКСИРОВАННЫХ гиперпараметрах (iter104).
+
+        Закрытая форма Rasmussen & Williams §5.4.2: при ``α = K⁻¹r`` и
+        ``r`` — остатках после тренда, LOO-прогноз для обучающей точки ``i``
+        равен ``μ₋ᵢ = rᵢ − αᵢ/[K⁻¹]ᵢᵢ``, ``σ²₋ᵢ = 1/[K⁻¹]ᵢᵢ`` (``K`` включает
+        WhiteKernel — дисперсия несёт шум измерения). Тренд Шеффе и
+        гиперпараметры при этом НЕ переоцениваются — это приближение
+        «честного» LOO, но оно стоит одного обращения матрицы, а не ``n``
+        обучений, и его достаточно, чтобы сравнить две области обучения
+        одного отклика (:meth:`MixtureProcessRunner.training_scope_diagnostics`).
+
+        ``indices`` — какие обучающие точки оценивать (дефолт — все).
+        Возвращает ``(log_density, sq_error)`` по этим точкам: логарифм
+        предиктивной плотности наблюдения и квадрат ошибки среднего.
+        """
+        self._check_fitted()
+        X = np.asarray(self._X, float)
+        r = np.asarray(self._resid, float).ravel()
+        idx = (np.arange(len(r)) if indices is None
+               else np.asarray(list(indices), int))
+        K = self.gp_.kernel_(X)
+        K = K + 1e-12 * np.eye(len(r))          # численная страховка
+        Kinv = np.linalg.inv(K)
+        alpha = Kinv @ r
+        diag = np.maximum(np.diag(Kinv), 1e-300)
+        mu = r - alpha / diag
+        var = 1.0 / diag
+        err2 = (r[idx] - mu[idx]) ** 2
+        logp = -0.5 * np.log(2.0 * np.pi * var[idx]) - err2 / (2.0 * var[idx])
+        return np.asarray(logp, float), np.asarray(err2, float)
+
+    # ------------------------------------------------------------------
     @property
     def lengthscales(self) -> np.ndarray:
         self._check_fitted()

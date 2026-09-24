@@ -694,12 +694,16 @@ class CampaignController:
         # прежний argmax-контекст и «рекомендация сместилась» врало бы).
         chance = (self.runner._branch_chance.get(branch_id)
                   if hasattr(self.runner, "_branch_chance") else None)
+        # iter104: гейт измеримости ветки — тоже намерение (как chance)
+        gate = (self.runner._branch_gate.get(branch_id)
+                if hasattr(self.runner, "_branch_gate") else None)
         return {
             "goal": {k: replace(v) for k, v in (br.goal or {}).items()},
             "d_best": float(br.d_best),
             "x_best": (list(br.x_best) if br.x_best is not None else None),
             "cost": (dict(cost) if cost is not None else None),
             "chance": (dict(chance) if chance is not None else None),
+            "gate": (dict(gate) if gate is not None else None),
         }
 
     def _restore(self, branch_id: str, snap: Dict[str, Any]) -> None:
@@ -719,6 +723,13 @@ class CampaignController:
                     self.runner._branch_chance[branch_id] = dict(snap["chance"])
                 else:
                     self.runner._branch_chance.pop(branch_id, None)
+        if hasattr(self.runner, "_branch_gate") and "gate" in snap:
+            # iter104: восстанавливаем СЛОВАРЬ напрямую, не сеттером — область
+            # обучения гейт-отклика (проектный факт) откату не подлежит.
+            if snap["gate"]:
+                self.runner._branch_gate[branch_id] = dict(snap["gate"])
+            else:
+                self.runner._branch_gate.pop(branch_id, None)
 
 
     # -- per-branch re-score (оценка под текущий объектив, не правда) --
@@ -1039,6 +1050,77 @@ class CampaignController:
         self._undo.clear()
         return out
 
+    # -- iter104 (§16.2.1.5): проектный гейт измеримости + область обучения --
+    def set_project_gate(self, response: Optional[str],
+                         threshold: float = 0.0,
+                         direction: str = "ge") -> Dict[str, Any]:
+        """iter104: объявить/снять ГЕЙТ ИЗМЕРИМОСТИ ПРОЕКТА.
+
+        Проброс в :meth:`MixtureProcessRunner.set_project_gate`. Проектный
+        уровень (физика кампании, не намерение ветки), поэтому undo-стек
+        веток не трогается. Объявление гейта переводит область обучения
+        гейт-отклика на историю и переобучает модели — возвращает, что
+        именно изменилось, чтобы UI сказал об этом прямо (A0.6).
+        """
+        r = self.runner
+        scope_before = (r.training_scope(response)
+                        if response is not None else None)
+        r.set_project_gate(response, threshold, direction)
+        gate = r.project_gate()
+        return {
+            "op": "set_project_gate",
+            "gate": gate,
+            "scope_before": scope_before,
+            "scope_after": (r.training_scope(response)
+                            if response is not None else None),
+            "surrogate_fitted": bool(response is not None
+                                     and response in r.surrogates),
+            "coverage": (r.surrogate_coverage().get(response)
+                         if response is not None else None),
+        }
+
+    def set_training_scope(self, response: str, scope: str) -> Dict[str, Any]:
+        """iter104: задать область обучения суррогата отклика (``active`` /
+        ``history``). Проброс в :meth:`MixtureProcessRunner.set_training_scope`
+        (там валидация и переобучение). Проектный уровень — undo веток не
+        трогается; ветки переоцениваются НЕ нужно: ``d_best`` считается по
+        измеренным точкам активного пула, который от области обучения не
+        зависит."""
+        r = self.runner
+        before = r.training_scope(response)
+        r.set_training_scope(response, scope)
+        return {"op": "set_training_scope", "response": str(response),
+                "scope_before": before, "scope_after": r.training_scope(response),
+                "coverage": r.surrogate_coverage().get(response)}
+
+    def training_scope_diagnostics(self, response: str) -> Dict[str, Any]:
+        """iter104: read-only LOO-сравнение областей обучения отклика
+        (:meth:`MixtureProcessRunner.training_scope_diagnostics`)."""
+        return self.runner.training_scope_diagnostics(response)
+
+    def set_branch_gate(self, branch_id: str, response: Optional[str],
+                        threshold: float = 0.0,
+                        direction: str = "ge") -> Dict[str, Any]:
+        """iter104 (UI 2.1): задать/снять гейт измеримости ВЕТКИ (обратимо, §7).
+
+        Гейт ветки — намерение ветки (как chance-ограничение iter43): не
+        цель, ``goal``/роли не меняются, измеренный ``d_best`` тот же; эффект
+        — в explore-члене acquisition (iter100). Валидация — в
+        :meth:`MixtureProcessRunner.set_branch_gate`. Побочный эффект
+        объявления гейта (область обучения гейт-отклика → история) —
+        проектный и откату НЕ подлежит: это факт о физике, а не намерение.
+        """
+        if branch_id not in self.runner.branches:
+            raise KeyError(f"Нет ветки '{branch_id}'.")
+
+        def _mut():
+            self.runner.set_branch_gate(branch_id, response, threshold,
+                                        direction)
+
+        out = self._apply("set_branch_gate", branch_id, None, _mut)
+        out["gate"] = self.runner.effective_branch_gate(branch_id)
+        return out
+
     # -- P3.1 (UI_REVISION_SPEC): ковариаты базы (телеметрия при точке) -------
     def set_point_covariates(self, point_index: int,
                              values: Dict[str, Any]) -> Dict[str, Any]:
@@ -1096,8 +1178,17 @@ class CampaignController:
                       volume: Optional[float] = None,
                       cost_exp: Optional[float] = None,
                       horizon: Optional[float] = None,
-                      sampling_groups: Optional[Any] = None) -> Dict[str, Any]:
+                      sampling_groups: Optional[Any] = None,
+                      gate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """§17.5 (Ш4): ВРУЧНУЮ создать ветку на ОБЩЕМ пуле — цели + опц. ценовая нога.
+
+        ``gate`` (iter104, UI 2.1) — собственный гейт измеримости ветки
+        ``{"response", "threshold", "direction"}`` (см.
+        :meth:`MixtureProcessRunner.set_branch_gate`); ``None`` — ветка
+        наследует проектный гейт, если он объявлен
+        (:meth:`MixtureProcessRunner.effective_branch_gate`). Валидация — в
+        сеттере, ДО ``_rescore``; неверный гейт — ветка не создаётся вовсе
+        (иначе осталась бы ветка без объявленного человеком гейта, A0.6).
 
         Замена авто-M7 (§17.0): пользователь сам объявляет намерение ветки —
         НЕСКОЛЬКО целей (``goals``: отклик → DesirabilitySpec, мультицель §16.3),
@@ -1117,6 +1208,16 @@ class CampaignController:
         if unknown:
             raise KeyError(f"Цели ссылаются на неизвестные свойства {sorted(unknown)} "
                            f"(есть: {list(self.runner.property_names)}).")
+        # iter104: гейт валидируем ДО add_branch — сеттер требует ветку, а
+        # неверный гейт не должен оставить после себя созданную ветку.
+        if gate is not None:
+            g_resp = str(gate.get("response", ""))
+            g_dir = str(gate.get("direction", "ge"))
+            if g_resp not in self.runner.property_names:
+                raise KeyError(f"Гейт '{g_resp}' не среди свойств оракула "
+                               f"{list(self.runner.property_names)}.")
+            if g_dir not in ("ge", "le"):
+                raise ValueError(f"direction гейта: 'ge' | 'le', дано '{g_dir}'.")
         # iter75: экономика — атрибут ПРОЕКТА (ρ + цены сырья), ветка её
         # НАСЛЕДУЕТ. Если ветке не передали свою ногу, а проект экономику
         # объявил — собираем ногу из проектных ρ/цен: одно и то же сырьё не
@@ -1176,6 +1277,10 @@ class CampaignController:
             br.cost_exp = float(cost_exp)
         if horizon is not None:
             br.horizon = float(horizon)
+        if gate is not None:
+            self.runner.set_branch_gate(br.id, str(gate["response"]),
+                                        float(gate.get("threshold", 0.0)),
+                                        str(gate.get("direction", "ge")))
 
         # переоценка под ТЕКУЩУЮ измеренную базу (если seed уже снят)
         self._rescore(br.id)
@@ -1186,6 +1291,8 @@ class CampaignController:
             "branch_id": br.id,
             "branch_name": br.name,
             "n_goals": len(br.goal or {}),
+            # iter104: действующий гейт (собственный / проектный / нет)
+            "gate": self.runner.effective_branch_gate(br.id),
             "has_price_leg": has_price,
             # iter75: откуда взялась цена (проектная экономика или своя нога
             # ветки) и добавлена ли цель по ρ автоматически — UI обязан это

@@ -39,7 +39,8 @@ from ..design.branches import Branch, ROLE_PRICE_INPUT
 from ..design.linked_axes import ProcessLink
 from ..design.phr_sampler import PhrSpec
 from ..optimize.desirability import ChanceConstraint, DesirabilitySpec
-from .mixture_process_runner import MixtureProcessRunner
+from .mixture_process_runner import (MixtureProcessRunner, SCOPE_ACTIVE,
+                                     TRAINING_SCOPES)
 
 
 FORMAT_VERSION = "campaign-v1"
@@ -86,6 +87,8 @@ SETUP_UNSETTABLE_KEYS = frozenset({
     "setup_fill_demo", "setup_seed_dl", "setup_seed_editor",
     "setup_phr_file", "setup_phr_add_group", "setup_phr_add_single",
     "setup_phr_clear",
+    # iter104: кнопки проектного гейта измеримости (блок добора области)
+    "setup_gate_set", "setup_gate_clear",
 })
 
 #: Те же неприсваиваемые виджеты с ДИНАМИЧЕСКИМ хвостом ключа (uid узла спеки,
@@ -276,6 +279,15 @@ def runner_to_state(runner: MixtureProcessRunner, *,
             "branch_gate": {bid: dict(g) for bid, g in
                             (getattr(runner, "_branch_gate", {}) or {}).items()
                             if g},
+            # iter104: ПРОЕКТНЫЙ гейт измеримости (добор без ветки, дефолт
+            # веток) и ОБЛАСТЬ ОБУЧЕНИЯ суррогатов по отклику (§16.2.1.5).
+            # Без сериализации после load гейт «забыл» бы дыру снова, а добор
+            # области молча шёл бы без множителя (A0.6).
+            "project_gate": (dict(runner._project_gate)
+                             if getattr(runner, "_project_gate", None) else None),
+            "training_scope": {str(k): str(v) for k, v in
+                               (getattr(runner, "_training_scope", {})
+                                or {}).items()},
             "border_origin": dict(getattr(runner, "_border_origin", {}) or {}),
 
             # iter31: проектные функциональные группы (политика сэмплирования)
@@ -444,12 +456,32 @@ def runner_from_state(state: Dict[str, Any], *, oracle: Any = None,
     for bid, cons in (r.get("branch_chance", {}) or {}).items():
         runner.set_branch_chance(
             bid, {prop: _chance_from_dict(d) for prop, d in (cons or {}).items()})
+    # iter104: область обучения суррогатов — ДО гейтов и напрямую в словарь:
+    # сеттер гейта сам переводит гейт-отклик на историю (и переобучал бы
+    # модели на каждом вызове), а суррогаты всё равно строятся один раз в
+    # конце загрузки. Имена/значения валидируем здесь (A0.6).
+    scopes = r.get("training_scope", {}) or {}
+    for prop, scope in scopes.items():
+        if str(prop) not in runner.property_names:
+            raise ValueError(f"training_scope: отклик '{prop}' не среди "
+                             f"свойств {list(runner.property_names)}.")
+        if str(scope) not in TRAINING_SCOPES:
+            raise ValueError(f"training_scope['{prop}']: область '{scope}' "
+                             f"неизвестна ({TRAINING_SCOPES}).")
+        if str(scope) != SCOPE_ACTIVE:
+            runner._training_scope[str(prop)] = str(scope)
     # iter100: гейт измеримости ветки — штатным сеттером (валидация отклика).
     for bid, g in (r.get("branch_gate", {}) or {}).items():
         if g:
             runner.set_branch_gate(bid, str(g["response"]),
                                    float(g.get("threshold", 0.0)),
                                    str(g.get("direction", "ge")))
+    # iter104: проектный гейт — штатным сеттером; старый сейв без ключа → нет.
+    pg = r.get("project_gate")
+    if pg:
+        runner.set_project_gate(str(pg["response"]),
+                                float(pg.get("threshold", 0.0)),
+                                str(pg.get("direction", "ge")))
 
     runner.block_factor = str(r.get("block_factor", "") or "")
 

@@ -58,13 +58,24 @@ def test_decode_and_color_strength(tmp_path):
     records = decode_colors_file(path)
     summary, r_df, ks_df = color_strength_table(records)
 
-    cs = summary["ColorStrength 400–700, %"].tolist()
+    cs = summary["ColorStrength 420–700, %"].tolist()
     ks_ref = 0.25
     ks_smp = 0.75 ** 2 / 0.5
     assert cs[0] == pytest.approx(100.0)
     assert cs[1] == pytest.approx(100.0 * ks_smp / ks_ref)
     assert summary["№ опыта"].tolist() == [34, 8]
     assert np.isnan(ks_df.loc[380].iloc[0])
+
+
+def test_lower_bound_420_excludes_short_waves(tmp_path):
+    """Точки < 420 нм не влияют на ColorStrength (нижняя граница 420)."""
+    n = 42  # 380..790 нм; 380,390,400,410 — ниже границы
+    ref = _record("ref", "эталон", [50.0] * n)
+    smp_r = [50.0] * n
+    smp_r[2] = smp_r[3] = 5.0  # 400 и 410 нм — сильно «окрашены», но вне окна
+    smp = _record("s1", "Образец 561-8", smp_r, target="ref")
+    summary, _, _ = color_strength_table([ref, smp])
+    assert summary["ColorStrength 420–700, %"].iloc[1] == pytest.approx(100.0)
 
 
 def test_run_number_absent():

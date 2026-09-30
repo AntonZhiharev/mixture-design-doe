@@ -18,7 +18,7 @@ K/S считается по Кубелке–Мунку: K/S = (1 − R)² / (2R
 
 Запуск:
     .venv\\Scripts\\python.exe tools\\colorqc_colorstrength.py "DOE 561\\Файл.colors"
-    [--out результат.xlsx] [--range 400 700]
+    [--out результат.xlsx] [--range 420 700]
 """
 import argparse
 import base64
@@ -29,8 +29,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DEFAULT_RANGE = (400, 700)
-ALT_RANGE = (400, 780)
+# Нижняя граница 420 нм — решение технолога: длины волн < 420 нм
+# в усреднение K/S не берём.
+DEFAULT_RANGE = (420, 700)
+ALT_RANGE = (420, 780)
 
 
 def decode_colors_file(path):
